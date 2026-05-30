@@ -103,14 +103,14 @@ keep and what to fix. ~mime-rs~ exists to keep the wins and kill the cuts.
         ▼                   ▼                       ▼
  ┌─────────────┐   ┌──────────────────┐   ┌────────────────────┐
  │ tulisp ctx  │   │  Buffer store    │   │  Checkpoint tree   │
- │ + editor    │◀─▶│  trees, markers, │◀─▶│  COW snapshots of  │
+ │ + editor    │◀─▶│  Quire, markers, │◀─▶│  COW snapshots of  │
  │ builtins    │   │  point/mark/     │   │  the whole         │
  │ (defun'd)   │   │  narrowing       │   │  workspace         │
  └─────────────┘   └──────────────────┘   └────────────────────┘
 #+END_SRC
 
 ** Components
-- *Editor core* — buffers (piece trees over mmapped backing), point, mark, markers, regions, narrowing;
+- *Editor core* — buffers (/Quire/: piece tree over mmapped backing), point, mark, markers, regions, narrowing;
   UTF-8-safe; the actual text data structure and its operations.
 - *tulisp editor API* — Rust closures registered on a ~TulispContext~ that expose
   the editor core to programs (§6). Buffers/markers are opaque tulisp objects.
@@ -129,8 +129,10 @@ keep and what to fix. ~mime-rs~ exists to keep the wins and kill the cuts.
 * The editor core (data model)
 
 Files can be several GB — larger than RAM — so the buffer must *not* hold all the
-text. We use a *persistent piece tree over immutable, memory-mapped backing*: VS
-Code's piece tree, made copy-on-write so it doubles as the checkpoint mechanism.
+text. The store is *Quire*: a *persistent piece tree over immutable, memory-mapped
+backing* — VS Code's piece tree, made copy-on-write so it doubles as the checkpoint
+mechanism. (A /quire/ is a gathering of folded leaves bound into a section of a book;
+ours is a document assembled from pieces.)
 
 - *Backing stores* (immutable, shared by every snapshot):
   - /original/ — the file, ~mmap~ed read-only; the OS pages it in/out, never fully
@@ -403,17 +405,14 @@ id + ~GET /jobs/:id~. ~mimectl~ is just a friendly skin over these.
 
 * Performance
 
-- *The file is never fully resident.* Piece tree over mmapped (or paged-LRU)
-  backing: editing or snapshotting a multi-GB file touches O(log n) pieces and the
-  OS page cache, not the bytes.
+- *The file is never fully resident.* Quire — piece tree over mmapped (or paged-LRU)
+  backing — touches O(log n) pieces and the OS page cache when editing or snapshotting
+  a multi-GB file, not the bytes.
 - *Checkpoints are O(spine), ~KB*, at any file size — immutable backing is shared
   across all snapshots; only the piece-tree path is copied.
-- *Parallelism is free on the read side*: an immutable snapshot is ~Arc~ /
-  ~Send + Sync~, so search / count / index / anchor-resolve fan out across cores with
-  *no locks*; bulk replace parallelizes via divide-and-conquer rebuild + ~concat~.
-  The parallel work lives *inside* Rust builtins — the tulisp program stays
-  single-threaded and deterministic (results merged in document order). Same
-  immutability that makes checkpoints cheap makes reads embarrassingly parallel.
+- *Parallelism*: immutable snapshots are ~Send + Sync~, so reads (search / count /
+  index) are lock-free parallel and map-shaped writes (e.g. ~replace-all~) parallelize
+  too — see *Concurrency & parallelism* below.
 - *Indexing is the costly op, not editing.* char/line summaries need one scan of the
   original to find boundaries — done lazily / in the background / from a persisted
   sidecar, so it never blocks the first edit.
@@ -430,6 +429,52 @@ id + ~GET /jobs/:id~. ~mimectl~ is just a friendly skin over these.
 - *Targets*: open + edit a multi-GB file at flat memory (≈ edits + page cache);
   checkpoint create/restore ~µs–ms at any size; typical agent program sub-second; the
   ulysses-annotated transform (≈43 MB) as a standing perf+correctness benchmark.
+
+* Concurrency & parallelism
+
+One decision (immutable structural sharing) buys two payoffs: cheap checkpoints *and*
+lock-free parallel reads. ~Quire~ snapshots are ~Arc~ / ~Send + Sync~ and the mmap is
+read-only and shared. Parallelism has two levels — *across sessions* (many agents,
+coarse) and *inside a heavy builtin* (fine-grained fan-out) — and the tulisp program
+never sees a thread.
+
+** Invariants
+- *Single writer per session.* Programs in a session are serialized; an edit builds a
+  new immutable version and installs it atomically. Different sessions run in parallel.
+- *Parallelism lives inside Rust builtins.* A builtin may fan out across cores and join
+  before returning; the interpreter stays single-threaded. Only ~Arc~ snapshots cross
+  threads — tulisp's own ~Rc~ objects never do, so we need no ~sync~ feature.
+- *Deterministic results.* Parallel work is merged in document order, so output is
+  identical regardless of thread count — required for ~rehearse~, audit, and replay.
+- *Cooperative cancellation.* Workers honor the per-program timeout / interrupt.
+
+** Reads — parallel and lock-free, always
+search / count / index / anchor-resolve over an immutable snapshot split into ranges,
+fanned across a work-stealing pool above a size threshold, merged in order. The one
+O(file) op — the char/line index — parallelizes as ~memchr~ newline-count per chunk +
+prefix sum. Scanning a multi-GB file uses every core.
+
+** Writes — the *map-shaped* subset (stateless per match)
+Safe exactly when each match's replacement is an independent, pure function of the
+match (a /map/) — not of a running counter, point, or earlier matches (a /fold/).
+Find-all yields disjoint matches and replacements are not re-scanned, so independent
+regions rebuild in parallel and ~concat~ with no race or cascade.
+
+| primitive                                            | shape                      | parallel?                                |
+|------------------------------------------------------+----------------------------+------------------------------------------|
+| ~(replace-all REGEX TEMPLATE)~                       | pure data                  | *always* (Rust; no Lisp per match)       |
+| ~(map-matches REGEX PURE-FN)~                        | map, per-match fn          | iff PURE-FN is pure (N tulisp instances) |
+| ~(while (re-search-forward …) … (replace-match …))~  | fold (threads point+state) | no — sequential by construction          |
+
+~replace-all~ with a backref template is pure data with no Lisp per match — the common
+case and the *first* parallel write to ship. ~map-matches~ with a pure per-match Lisp
+function is the principled ceiling but needs tulisp run on N workers (gated on purity);
+a later step. The general loop is a sequential fold — but still gets *parallel search +
+sequential apply*. So parallelism is a property of *which primitive you reach for*
+(like ~par_iter().map()~ vs a ~for~ loop), not something the agent reasons about.
+
+(mime-rs may depend on ~rayon~, ~memmap2~, ~memchr~, ~regex~/~regex-automata~; tulisp's
+zero-dependency rule is tulisp's, not ours.)
 
 * Migrating from mime
 
@@ -477,8 +522,8 @@ counts) and gives an immediate real-world acceptance test.
    search, region/regexp replace, insert/delete, narrowing, excursion);
    ~mimectl run prog.tl --file x --local~ one-shot; UTF-8-safe; structured result with
    auto diff + ~report~. /Exit: re-run a real mime transform./
-** TODO M1 — The piece tree (multi-GB ~TextStore~) [#A]
-   The real buffer: persistent measured B-tree of pieces over a ~Backing~ trait
+** TODO M1 — Quire: the piece-tree ~TextStore~ (multi-GB) [#A]
+   *Quire*, the real buffer — a persistent measured B-tree of pieces over a ~Backing~ trait
    (mmap + paged-LRU) + append-only add buffer; ~Arc~ nodes (snapshots ~Send + Sync~);
    lazy/background char-line index; anchors. Becomes the default ~TextStore~; the
    in-memory impl stays as the differential-test oracle. /Exit: open + edit a
