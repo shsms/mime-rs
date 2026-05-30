@@ -143,7 +143,9 @@ Code's piece tree, made copy-on-write so it doubles as the checkpoint mechanism.
   flags. A /piece/ is ~(source, start, len)~ — a reference into a backing store, never
   owned text. An unedited GB file is one piece; an edit splits pieces and points a new
   one at the add buffer; original bytes never move.
-- *Tree*: ~Rc~ nodes, path-copying on edit (O(log n) nodes copied); each node carries
+- *Tree*: ~Arc~ nodes (a snapshot is ~Send + Sync~ → lock-free parallel reads;
+  tulisp's own ~Rc~ objects never cross threads), path-copying on edit (O(log n)
+  nodes copied); each node carries
   a monoid /summary/ (bytes, chars, lines, + a hook for a marker index) so we seek by
   byte/char/line in O(log n). Same measured persistent B-tree as a rope — only the
   leaf payload changes from owned string to piece reference, so the spine can be our
@@ -406,6 +408,12 @@ id + ~GET /jobs/:id~. ~mimectl~ is just a friendly skin over these.
   OS page cache, not the bytes.
 - *Checkpoints are O(spine), ~KB*, at any file size — immutable backing is shared
   across all snapshots; only the piece-tree path is copied.
+- *Parallelism is free on the read side*: an immutable snapshot is ~Arc~ /
+  ~Send + Sync~, so search / count / index / anchor-resolve fan out across cores with
+  *no locks*; bulk replace parallelizes via divide-and-conquer rebuild + ~concat~.
+  The parallel work lives *inside* Rust builtins — the tulisp program stays
+  single-threaded and deterministic (results merged in document order). Same
+  immutability that makes checkpoints cheap makes reads embarrassingly parallel.
 - *Indexing is the costly op, not editing.* char/line summaries need one scan of the
   original to find boundaries — done lazily / in the background / from a persisted
   sidecar, so it never blocks the first edit.
@@ -464,34 +472,42 @@ counts) and gives an immediate real-world acceptance test.
 * Roadmap / milestones
 
 ** TODO M0 — Editor core + tulisp API (replace a mime batch) [#A]
-   in-memory buffer behind a ~TextStore~ trait; point/mark/markers/narrowing; the §6 vocabulary (exact +
-   regex + fuzzy search, region/regexp replace, insert/delete, narrowing,
-   excursion); ~mimectl run prog.tl --file x --local~ one-shot; UTF-8-safe; structured
-   result with auto diff + ~report~. /Exit: re-run a real mime transform./
-** TODO M1 — Checkpoints, transactions, dry-run [#A]
-   Workspace COW snapshots; checkpoint tree; auto-transaction per program;
-   ~with-transaction~; ~rehearse~; ~checkpoint-diff~. /Exit: rewind + dry-run work
-   on multi-buffer edits; property tests green./
-** TODO M2 — Daemon (~mimed~), ~mimectl~, sessions, warm state [#A]
-   ~mimed~ + ~mimectl~ client; session isolation + lifecycle + limits; warm
-   buffers and warm defs across programs; control API (HTTP/JSON over a unix
-   socket); WAL journaling. /Exit: two sessions edit in parallel; buffers
-   persist across programs./
-** TODO M3 — MCP server + agent ergonomics [#A]
+   In-memory ~TextStore~ (bring-up + differential-test *oracle* only — not the real
+   buffer); point/mark/markers/narrowing; the §6 vocabulary (exact + regex + fuzzy
+   search, region/regexp replace, insert/delete, narrowing, excursion);
+   ~mimectl run prog.tl --file x --local~ one-shot; UTF-8-safe; structured result with
+   auto diff + ~report~. /Exit: re-run a real mime transform./
+** TODO M1 — The piece tree (multi-GB ~TextStore~) [#A]
+   The real buffer: persistent measured B-tree of pieces over a ~Backing~ trait
+   (mmap + paged-LRU) + append-only add buffer; ~Arc~ nodes (snapshots ~Send + Sync~);
+   lazy/background char-line index; anchors. Becomes the default ~TextStore~; the
+   in-memory impl stays as the differential-test oracle. /Exit: open + edit a
+   multi-GB file at flat memory; oracle and piece tree agree under property tests./
+** TODO M2 — Checkpoints, transactions, dry-run [#A]
+   Workspace COW snapshots (clone the piece-tree spine, ~KB); checkpoint tree;
+   auto-transaction per program; ~with-transaction~; ~rehearse~; ~checkpoint-diff~.
+   /Exit: rewind + dry-run on multi-buffer edits; property tests green./
+** TODO M3 — Daemon (~mimed~), ~mimectl~, sessions, warm state [#A]
+   ~mimed~ + ~mimectl~ client; session isolation + lifecycle + limits; warm buffers
+   and warm defs across programs; control API (HTTP/JSON over a unix socket); WAL
+   journaling. /Exit: two sessions edit in parallel; buffers persist across programs./
+** TODO M4 — MCP server + agent ergonomics [#A]
    MCP tools (§11); structured results tuned for token budget; ~read_region~
-   on-demand context; permission-friendly tool schemas. /Exit: an agent edits a
-   repo end-to-end over MCP with no file re-reads./
-** TODO M4 — Safety & audit [#B]
+   on-demand context; permission-friendly tool schemas. /Exit: an agent edits a repo
+   end-to-end over MCP with no file re-reads./
+** TODO M5 — Safety & audit [#B]
    Path allowlists, read-only buffers, resource limits, interruptible eval,
    append-only audit journal + replay. /Exit: safe to grant to an autonomous agent./
-** TODO M5 — Performance [#B]
-   Bytecode-compile hot programs; dirty-span diffs; incremental markers;
-   the piece-tree-over-mmap buffer (multi-GB, non-resident) as the real ~TextStore~;
-   benchmark suite. /Exit: edit a multi-GB file at flat memory; ulysses bench beats mime./
-** TODO M6 — Structural / syntax-aware editing [#C]
-   Tree-sitter integration; node search/replace; narrow-to-defun. /Exit:
-   AST-scoped refactors on real code./
-** TODO M7 — Polish [#C]
+** TODO M6 — Parallelism & performance [#B]
+   Lock-free parallel reads over immutable snapshots (search / count / index /
+   anchor-resolve fanned across cores); parallel bulk replace (divide-and-conquer
+   rebuild + ~concat~); parallel initial line index (~memchr~ + prefix sum);
+   bytecode-compile hot programs; dirty-span diffs; benchmark suite. /Exit: search +
+   global-replace a multi-GB file scale across cores; ulysses bench beats mime./
+** TODO M7 — Structural / syntax-aware editing [#C]
+   Tree-sitter integration; node search/replace; narrow-to-defun. /Exit: AST-scoped
+   refactors on real code./
+** TODO M8 — Polish [#C]
    ~mimectl repl~; mime→mime-rs porting guide; docs; example library of helpers;
    ~cargo~ workspace + crate publish.
 
