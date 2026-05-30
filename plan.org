@@ -1,0 +1,518 @@
+#+TITLE: mime-rs — a scriptable, transactional editing engine for AI agents
+#+AUTHOR: Sahas Subramanian
+#+DATE: 2026-05-30
+#+STARTUP: overview
+#+OPTIONS: toc:3 num:t
+
+* Vision
+
+~mime-rs~ (reads "mimers") is a headless, *stateful* text-editing engine that an AI
+agent drives by submitting small programs. It is the spiritual heir to shsms's
+~mime~ (a ChaiScript-scripted buffer editor), rebuilt in Rust on top of [[file:../tulisp][tulisp]]
+(an Emacs-Lisp dialect), and re-aimed squarely at agentic use.
+
+The one-line thesis: *today's agent edit tools are stateless and
+content-addressed ("replace this exact string"); they cannot express
+programmatic, structure-aware, bulk edits, so agents fall back to ad-hoc shell
+or Python and reinvent buffer operations badly.* ~mime-rs~ gives the agent a
+third option between "brittle single-string edit" and "arbitrary code
+execution": a bounded, auditable, *transactional* editing language with warm
+buffers that persist across calls and checkpoints it can rewind to.
+
+Pitch in one breath: *run an edit program against warm buffers, see the diff,
+keep it or roll back to any checkpoint — over MCP, sandboxed, with no
+re-reading of files.*
+
+* Why this, why now
+
+** The gap in current AI editing tools
+- /Stateless/: every edit re-reads the file and reproduces exact strings. State
+  ("where am I", "what's selected") cannot be carried between operations.
+- /Content-addressed only/: "find old_string → new_string" cannot say "for every
+  match, do X within its enclosing region", "after the next =</p>=", "between
+  point and mark", or "only within this narrowed section".
+- /No transaction/: a wrong edit is not atomically revertable. There is no cheap
+  "try this whole program; if it's wrong, undo all of it".
+- /No structured feedback/: tools return prose or a whole file, not a diff +
+  machine-readable signals an agent can branch on.
+- /Stale-read races/: the agent's copy of the file drifts from disk; cf. the
+  "File has been modified since read" failure mode.
+
+** Lessons banked from `mime` (the predecessor)
+Building the ulysses-annotated pipeline on ~mime~ taught us concretely what to
+keep and what to fix. ~mime-rs~ exists to keep the wins and kill the cuts.
+
+| From mime                          | Verdict | mime-rs response                                              |
+|------------------------------------+---------+--------------------------------------------------------------|
+| buffers + multiple cursors         | keep    | first-class buffers + markers (positions that survive edits) |
+| ~narrow_to_region~ (bound a slice) | keep    | ~narrow-to-region~ + ~save-restriction~                      |
+| ~find_fuzzy~ (ws/case-insensitive) | keep    | ~search-fuzzy~ with configurable normalization               |
+| batch model (write a program, run) | keep    | batch is the *primary* mode; daemon adds warm state          |
+| ~replace~ is exact-only            | cut     | ~replace-regexp~ with capture groups, count, replace-in-region |
+| ~replace(regex(...),...)~ crashes  | cut     | regex is a first-class arg, not a dispatch accident          |
+| ~"\xa0"~ literal panics (bad UTF-8) | cut     | never panic on bytes; UTF-8-safe everywhere                  |
+| output via ~print~, scrape stdout  | cut     | structured ~(report k v)~ + auto unified diffs               |
+| single-shot, cold every run        | cut     | daemon keeps buffers + defs warm across programs             |
+| no undo / no dry-run               | cut     | checkpoint tree + transactions + ~rehearse~ (dry-run)        |
+| no audit trail                     | cut     | every program + diff logged and replayable                   |
+
+** Why tulisp
+- Emacs Lisp + buffers/markers/narrowing is the most battle-tested text-editing
+  vocabulary in existence; we adopt its model rather than invent one.
+- We *own* the interpreter: editor primitives are plain Rust closures registered
+  via ~ctx.defun("name", |..| -> ..)~ (identical to how tulisp ships its own
+  builtins, e.g. ~make-hash-table~). Buffers, markers, regions, and checkpoints
+  are exposed as opaque tulisp objects (same pattern as tulisp's ~HashTable~).
+- tulisp already has a *bytecode compiler* (=src/bytecode=), so hot edit programs
+  can be compiled once and replayed cheaply against warm buffers.
+- Dogfoods tulisp on a demanding, real workload — which matures tulisp the same
+  way the games push does.
+
+* Design principles
+1. *Batch-first.* The unit of work is a /program/, not a keystroke. One
+   round-trip submits a whole edit program; we never make the agent issue
+   cursor-moves one HTTP call at a time. (Round-trips are the thing that kills
+   interactive editor protocols for LLMs.)
+2. *Warm state.* A long-lived daemon owns buffers, kill-ring, registers, agent
+   helper definitions, and the checkpoint tree. Re-reading and re-deriving
+   context between programs is the cost we are deleting.
+3. *Transactional & reversible.* Every program is atomic by default; any state is
+   recoverable from a checkpoint. "Try it, look, keep or rewind" is the core loop.
+4. *Structured I/O.* Return diffs and machine-readable reports, not prose or whole
+   files. Be token-frugal: diffs and summaries by default, full text on demand.
+5. *Auditable & sandboxed.* A bounded command surface with no shell/network/arbitrary
+   FS. Granting "mime-rs edit" must be safe in a way that "grant bash" is not.
+6. *UTF-8-safe & panic-free.* Malformed input, missing files, and odd bytes are
+   errors, never crashes.
+7. *Deliberate Emacs subset.* We are re-implementing a chosen /slice/ of Emacs's
+   buffer model. The slice is explicit (see §6); we resist becoming Emacs.
+
+* Architecture
+
+#+BEGIN_SRC text
+            ┌──────────────────────────────────────────────────────────┐
+  clients ─▶│  mimectl (CLI) · MCP server · HTTP/JSON  →  mimed daemon │
+            └───────────────┬──────────────────────────────────────────┘
+                            │ run_program(session, src, dry_run?)
+            ┌───────────────▼──────────────────────────────────────────┐
+            │  Session manager:  sessions ⇒ {workspace, ctx, history}  │
+            │   - isolation, concurrency, lifecycle, audit log         │
+            └───────────────┬──────────────────────────────────────────┘
+                            │
+        ┌───────────────────┼───────────────────────┐
+        ▼                   ▼                       ▼
+ ┌─────────────┐   ┌──────────────────┐   ┌────────────────────┐
+ │ tulisp ctx  │   │  Buffer store    │   │  Checkpoint tree   │
+ │ + editor    │◀─▶│  ropes, markers, │◀─▶│  COW snapshots of  │
+ │ builtins    │   │  point/mark/     │   │  the whole         │
+ │ (defun'd)   │   │  narrowing       │   │  workspace         │
+ └─────────────┘   └──────────────────┘   └────────────────────┘
+#+END_SRC
+
+** Components
+- *Editor core* — buffers (ropes), point, mark, markers, regions, narrowing;
+  UTF-8-safe; the actual text data structure and its operations.
+- *tulisp editor API* — Rust closures registered on a ~TulispContext~ that expose
+  the editor core to programs (§6). Buffers/markers are opaque tulisp objects.
+- *Session manager* — maps a session id to a /workspace/ (a set of buffers + kill
+  ring + registers), a tulisp context (with warm agent definitions), a
+  checkpoint tree, and an audit log. Handles isolation and concurrency.
+- *Checkpoint/transaction layer* — copy-on-write snapshots of the whole workspace;
+  the undo/redo/branch/rewind machinery (§7).
+- *Transport* — the daemon ~mimed~ exposes one control API (HTTP/JSON over a unix
+  socket). Three clients speak it: ~mimectl~ (the CLI — what you use instead of
+  hand-rolling HTTP), an MCP server (the agent surface), and raw HTTP. All wrap the
+  same engine; a ~mimectl~ one-shot can also run the engine embedded, no daemon.
+- *Audit/journal* — append-only record of every submitted program, its diff, and
+  its resulting checkpoint, for replay and trust.
+
+* The editor core (data model)
+
+- *Buffer* := a rope of UTF-8 text + a name + an optional file path + per-buffer
+  /point/, /mark/, set of named /markers/, /narrowing/ restriction (min,max), a
+  dirty flag, and a read-only flag.
+- *Rope* (e.g. ~ropey~-style or a persistent rope) for O(log n) edits and, crucially,
+  cheap structural-sharing snapshots (a checkpoint clones via ~Arc~, copy-on-write).
+- *Coordinates*: char positions, 1-based, Emacs-style (~point-min~ = 1). All public
+  positions are char indices; byte offsets never leak. Line/column accessors are
+  provided. No operation can split a UTF-8 scalar.
+- *Markers*: positions that *move with edits* (insert before a marker pushes it).
+  This is the fix for brittle absolute offsets — the agent anchors a marker once
+  and keeps using it as the buffer mutates around it.
+- *Workspace*: the set of buffers in a session + the shared kill-ring + registers.
+  A *checkpoint snapshots the whole workspace*, not a single buffer.
+
+* The tulisp editing API (the scripting surface)
+
+Programs are tulisp. Editor primitives are kebab-case and mirror Emacs where
+sensible, so the model's prior knowledge transfers. Grouped vocabulary (initial
+target set — names illustrative):
+
+** Buffers & workspace
+| ~(open-file PATH &optional read-only)~     | open/attach a file as a buffer, return it     |
+| ~(create-buffer NAME)~ / ~(get-buffer N)~  | scratch buffers                               |
+| ~(current-buffer)~ / ~(set-buffer B)~      | the implicit target of edit ops               |
+| ~(with-current-buffer B BODY...)~          | run body with B current (restores after)      |
+| ~(buffer-list)~ / ~(buffer-name)~ / ~(kill-buffer B)~ | enumerate / introspect / drop      |
+| ~(save-buffer)~ / ~(write-file PATH)~      | the *only* way text reaches disk              |
+| ~(buffer-modified-p)~ / ~(read-only-p)~    | dirty / writability                           |
+
+** Point & navigation
+~point~, ~goto-char~, ~point-min~, ~point-max~, ~forward-char~/~backward-char~,
+~forward-line~, ~beginning-of-line~/~end-of-line~, ~beginning-of-buffer~/~end-of-buffer~,
+~line-number-at-pos~, ~char-after~/~char-before~, ~looking-at~, ~skip-chars-forward~.
+
+** Mark, region, markers
+~set-mark~, ~mark~, ~region-beginning~/~region-end~, ~exchange-point-and-mark~,
+~push-mark~/~pop-mark~; ~make-marker~, ~set-marker~, ~marker-position~, ~point-marker~,
+~copy-marker~. (Markers are the durable handles agents should prefer.)
+
+** Search (the big upgrade over mime)
+| ~(search-forward STR &optional bound)~     | exact forward, sets match data       |
+| ~(search-backward STR &optional bound)~    | exact backward                       |
+| ~(re-search-forward RE &optional bound)~   | *regex*, with capture groups         |
+| ~(re-search-backward RE &optional bound)~  | regex backward                       |
+| ~(search-fuzzy STR &optional opts)~        | ws/case-insensitive (mime's superpower) |
+| ~(match-string N)~ / ~(match-beginning N)~ / ~(match-end N)~ | capture access      |
+| ~(count-matches RE &optional beg end)~     | tally without moving                 |
+~search-fuzzy~ options: ~:ignore-case~, ~:collapse-whitespace~, ~:nbsp-is-space~ —
+all the normalizations mime baked in implicitly, now explicit and per-call.
+
+** Editing
+| ~(insert STR...)~ / ~(insert-before-markers STR)~ | write at point                  |
+| ~(delete-char N)~ / ~(delete-region BEG END)~      | remove                          |
+| ~(erase-buffer)~                                   | clear                           |
+| ~(replace-string FROM TO &optional beg end)~       | exact, *with bounds + count*    |
+| ~(replace-regexp RE TO &optional beg end)~         | regex, ~\1~ backrefs, bounds     |
+| ~(replace-match TO)~                               | replace the last match          |
+| ~(kill-region BEG END)~ / ~(copy-region-as-kill)~ / ~(yank)~ | cut/copy/paste via kill-ring |
+| ~(buffer-string)~ / ~(buffer-substring BEG END)~   | read text out                   |
+
+** Narrowing & excursion
+~narrow-to-region~, ~widen~, ~save-restriction~ (run body, restore narrowing),
+~save-excursion~ (run body, restore point+mark), ~save-mark-and-excursion~.
+These let a program operate on a slice and tidy up after itself — the chapter-
+bounding trick from the ulysses pipeline, made composable.
+
+** Kill-ring & registers
+~kill-ring~ access; ~set-register~/~get-register~ to stash text, positions, or
+rectangles by key (handy for an agent juggling several snippets).
+
+** Observability (return data to the agent)
+| ~(report KEY VALUE)~ | attach a machine-readable signal to the result (e.g. counts) |
+| ~(message FMT ...)~  | human-readable log line                                      |
+| ~(echo-region B E)~  | ask the result to include this snippet (on-demand context)   |
+~report~ replaces the "grep my stdout for =found:=" antipattern with structured
+fields the agent can branch on.
+
+** Transactions & checkpoints (callable from inside a program — see §7)
+~(checkpoint LABEL)~, ~(restore-checkpoint ID)~, ~(with-transaction BODY...)~,
+~(rollback)~, ~(checkpoint-diff A B)~.
+
+** Structural / syntax-aware editing (later milestone)
+Tree-sitter-backed: ~(treesit-search QUERY)~, ~(node-at-point)~, ~(narrow-to-defun)~,
+~(replace-node NODE STR)~ — "rename this function", "edit only inside this block".
+This is where ~mime-rs~ becomes a serious *code* editor, not just text.
+
+** Warm definitions
+A session may preload a tulisp /library/ (agent-defined helper ~defun~s),
+evaluated once and persisted across programs. So the agent teaches the editor a
+vocabulary ("join-adjacent-links", "wrap-in-tag") and reuses it cheaply.
+
+* Checkpoints, transactions, and time travel   :headline:
+
+This is the feature the user asked for first and the one agents need most.
+
+** Model
+- A *checkpoint* is a snapshot of the *entire workspace*: every buffer's text +
+  point/mark/markers/narrowing, plus kill-ring and registers.
+- Checkpoints form a *tree* (not a stack): restoring an old checkpoint and editing
+  forward creates a branch (undo-tree semantics), so the agent never loses a
+  state by exploring an alternative.
+- Snapshots are *cheap* (rope structural sharing + ~Arc~ COW); taking one is ~O(1)
+  in buffer size, paid lazily on subsequent edits.
+
+** Operations
+| ~(checkpoint "label")~        | create a named checkpoint, return its id                 |
+| ~(restore-checkpoint id)~     | rewind the whole workspace to it (current branch updates) |
+| ~(list-checkpoints)~          | the tree: id, label, parent, time, buffers touched       |
+| ~(checkpoint-diff A B)~       | unified diff of the workspace between two checkpoints     |
+| ~(current-checkpoint)~        | where we are                                             |
+| ~(forget-checkpoint id)~      | GC an unwanted branch                                    |
+
+** Automatic transaction per program
+Every submitted program is implicitly wrapped:
+1. auto-checkpoint the workspace *before* the program runs;
+2. evaluate the program;
+3. on *success* → keep the changes, the pre-checkpoint remains as the rewind point;
+   on *tulisp error / explicit ~(rollback)~* → atomically restore the
+   pre-checkpoint; the result reports ~rolled_back_to~. No partial mutation leaks.
+~(with-transaction ...)~ exposes the same all-or-nothing guarantee at sub-program
+granularity for risky inner steps.
+
+** Dry-run / rehearse
+~rehearse~ mode (CLI ~--rehearse~, MCP ~dry_run: true~) runs the program, computes the
+resulting diffs and reports, then *always rolls back* and returns the diff
+without committing. "Show me what this program /would/ do." This would have saved
+dozens of full epub rebuilds in the ulysses work.
+
+** Why this matters for agents
+Agents are wrong often. Cheap, named, *branching* rewind turns "I made a mistake,
+now reconstruct the file" into ~(restore-checkpoint "before-refactor")~. Combined
+with ~rehearse~, the agent's loop becomes: rehearse → inspect diff → commit or
+adjust → checkpoint. Mistakes cost one call, not a salvage operation.
+
+* Structured I/O for agents
+
+** Result of a program run (JSON)
+#+BEGIN_SRC json
+{
+  "ok": true,
+  "session": "s_8f3",
+  "checkpoint": "auto-42",          // pre-run rewind point; null in rehearse
+  "committed": true,                // false for rehearse
+  "buffers": [
+    { "name": "4300-h.htm", "dirty": true,
+      "diff": "@@ -120,6 +120,7 @@ ...unified...",
+      "diff_truncated": false,
+      "point": 10293, "mark": null, "narrowed": false,
+      "len_before": 4300120, "len_after": 4300140 }
+  ],
+  "reports": { "found": 4432, "distinct": 1195 },   // from (report ...)
+  "log": ["narrowed to chapter 12", "..."],          // from (message ...)
+  "elapsed_ms": 137
+}
+#+END_SRC
+
+** Error result
+#+BEGIN_SRC json
+{
+  "ok": false,
+  "error": { "kind": "tulisp-error",
+             "message": "re-search-forward: bound exceeds point-max",
+             "form": "(re-search-forward \"</a>\" 999999)",
+             "buffer": "index.php-cyclops.htm", "point": 88123,
+             "backtrace": ["fix-cyclops", "run"] },
+  "rolled_back_to": "auto-41",
+  "committed": false
+}
+#+END_SRC
+
+** Token discipline
+- Default to *diffs and summaries*, never whole buffers.
+- Cap diff size; when exceeded, return a stat summary + a handle to fetch ranges.
+- The agent pulls full text only via explicit ~read_region~ / ~(echo-region ...)~.
+- Positions, match data, and counts are returned numerically so the agent can act
+  without re-reading.
+
+* Daemon, sessions, and concurrency
+
+- *Daemon* (~mimed~ — "mimed", as in mime + d): long-lived, owns all sessions and
+  serves the control API. Clients reach it via ~mimectl~, MCP, or raw HTTP. A
+  ~mimectl~ one-shot can also run the engine in-process without a daemon.
+- *Session* = isolated workspace + tulisp context + checkpoint tree + audit log.
+  Mapped 1:1 to an agent conversation by convention. Created explicitly; idle-
+  evicted on a TTL; buffers in a session never leak to another.
+- *Concurrency*: programs within a session are serialized (a session is a single
+  writer — simplest correct model; edits are inherently ordered). Different
+  sessions run in parallel. Per-buffer write locks guard shared on-disk files
+  touched by multiple sessions.
+- *Durability*: buffers are in-memory; text reaches disk only via ~save-buffer~ /
+  ~write-file~. Optional WAL journaling of programs lets a crashed daemon replay
+  unsaved sessions. Checkpoints are in-memory by default, with an opt-in to
+  persist the tree to disk for cross-restart time travel.
+- *Lifecycle/limits*: max buffers, max total bytes, max checkpoints per session,
+  eviction policy (named checkpoints pinned; anonymous GC'd beyond N).
+
+* Transport: one API (~mimed~), three clients
+
+The daemon ~mimed~ serves a single control API; ~mimectl~, MCP, and raw HTTP are
+three front-ends to it. You should rarely hand-write HTTP — reach for ~mimectl~.
+
+** mimectl (the CLI — instead of direct HTTP)
+A thin, scriptable client over the daemon API (systemctl/kubectl-style verbs):
+| ~mimectl run PROG.tl [--file F] [--rehearse]~       | submit a program (dry-run with --rehearse) |
+| ~mimectl open FILE [--read-only]~                   | attach a file to the session            |
+| ~mimectl ls~ / ~mimectl status~                     | buffers, dirty flags, current checkpoint |
+| ~mimectl search BUF PAT [--regex\vert--fuzzy]~      | run a search, print matches             |
+| ~mimectl checkpoint [LABEL]~ / ~mimectl checkpoints~ | create / list the checkpoint tree       |
+| ~mimectl restore ID~ / ~mimectl diff A B~           | rewind / show a checkpoint diff          |
+| ~mimectl save BUF~ / ~mimectl write BUF PATH~       | persist to disk                          |
+| ~mimectl repl~                                      | interactive tulisp against the session   |
+~mimectl~ resolves its session from ~$MIME_SESSION~ or ~--session~; with ~--local~ it
+runs the engine embedded (no ~mimed~ needed) for one-shots.
+
+** MCP tools (the agent-facing surface)
+High-level conveniences, with ~run_program~ as the power-user escape hatch:
+| ~open_file(path, read_only?)~                       | attach a file                     |
+| ~run_program(program, session?, dry_run?)~          | eval a tulisp edit program        |
+| ~search(buffer, pattern, mode)~                     | exact/regex/fuzzy, returns matches |
+| ~read_region(buffer, start, end \vert around_point)~ | pull text on demand               |
+| ~checkpoint(label)~ / ~list_checkpoints~ / ~restore_checkpoint(id)~ / ~diff(a,b)~ | time travel |
+| ~save_buffer(buffer)~ / ~write_file(buffer, path)~  | persist                           |
+| ~session_status()~                                  | buffers, dirty flags, current checkpoint |
+MCP gives tool schemas, permissioning, and discovery for free — the right
+integration surface for agents. HTTP/JSON mirrors these for non-MCP clients.
+
+** HTTP/JSON (the wire ~mimectl~ and MCP ride on)
+The raw control API, served by ~mimed~ over a unix socket (TCP optional):
+~POST /sessions~, ~POST /sessions/:id/run~, ~GET /sessions/:id/buffers~,
+~POST /sessions/:id/checkpoints~, ~POST /sessions/:id/restore~,
+~GET /sessions/:id/diff?a=..&b=..~. Sync by default; long programs may return a job
+id + ~GET /jobs/:id~. ~mimectl~ is just a friendly skin over these.
+
+* Safety, sandboxing, permissioning
+
+- *Bounded vocabulary*: tulisp programs see only the editor builtins + pure lisp.
+  No shell, no process spawn, no network, no arbitrary FS. ~open-file~/~write-file~
+  are restricted to configured workspace roots (path allowlist, symlink-checked).
+- *Read-only buffers*: reference material can be attached unwritable.
+- *Resource limits*: per-program wall-clock timeout, memory cap, max buffer size,
+  max output size; eval is interruptible (cooperative cancellation in the
+  bytecode interpreter).
+- *Determinism*: no ambient time/randomness except via explicit, logged builtins.
+- *Auditability*: every program source + its diff + resulting checkpoint is
+  journaled. You can answer "what did the agent change, and why" and *replay* it.
+- *The pitch*: this is why "let the agent run mime-rs" is safe where "let the agent
+  run bash" is not — same editing power, none of the blast radius, full rewind.
+
+* Performance
+
+- Rope backing for O(log n) edits and O(1) COW snapshots; markers updated
+  incrementally on edit, never by re-scan.
+- No full re-serialization per operation (mime re-walked a 43 MB buffer
+  repeatedly); track dirty spans and diff only changed ranges.
+- Compile hot programs via tulisp's bytecode path; cache compiled programs per
+  session keyed by source hash.
+- Streaming/incremental search; bounded searches honor narrowing.
+- *Targets*: open + edit a 100 MB buffer without sweat; typical agent program
+  sub-second; the ulysses-annotated transform (≈43 MB output) as a standing
+  perf+correctness benchmark.
+
+* Migrating from mime
+
+~mime-rs~ is *not* source-compatible (mime is ChaiScript; mime-rs is tulisp), but
+the model maps almost 1:1, and the port is cleaner because the rough edges are
+gone. Vocabulary map:
+
+| mime (ChaiScript)            | mime-rs (tulisp)                          |
+|------------------------------+-------------------------------------------|
+| ~buffer(path)~               | ~(open-file path)~                        |
+| ~find~ / ~rfind~             | ~search-forward~ / ~search-backward~      |
+| ~find_fuzzy~                 | ~search-fuzzy~                            |
+| ~find(regex(...))~           | ~re-search-forward~ (regex is first-class) |
+| ~set_mark~                   | ~set-mark~ / ~point-marker~               |
+| ~goto_pos~ / ~get_pos~       | ~goto-char~ / ~point~                     |
+| ~narrow_to_region~ / ~widen~ | ~narrow-to-region~ / ~widen~              |
+| ~copy~ / ~cut~ / ~paste~     | ~buffer-substring~ / ~kill-region~ / ~insert~ |
+| ~replace(a,b)~ (exact only)  | ~replace-string~ / ~replace-regexp~ (+bounds,count) |
+| ~new_cursor~ / ~use_cursor~  | markers + ~with-current-buffer~ / ~save-excursion~ |
+| ~print~                      | ~report~ / ~message~                      |
+| (none)                       | ~checkpoint~ / ~with-transaction~ / ~rehearse~ |
+
+*Case study / integration test*: port ~ulysses-annotated/scripts/add-anno.mime~ to
+~mime-rs~ and reproduce the annotated HTML. It exercises every primitive
+(multi-buffer, narrowing, fuzzy + regex search, region replace, structured
+counts) and gives an immediate real-world acceptance test.
+
+* Testing & validation
+- *Unit*: each builtin, incl. UTF-8 edge cases (NBSP, combining marks, lone
+  surrogates rejected) — the ~\xa0~ crash becomes a permanent regression test.
+- *Property*: ∀ program P and checkpoint C, ~restore(C)~ after P == state at C;
+  ~undo~∘~edit~ == identity; markers track edits correctly.
+- *Golden*: (program + input buffer) ⇒ expected unified diff.
+- *Fuzz*: random edit programs never panic and never corrupt UTF-8.
+- *Integration*: the ulysses port (above); concurrent-session isolation;
+  daemon crash/replay from the WAL.
+- *Bench*: the 43 MB transform; 100 MB open/edit; checkpoint create/restore at size.
+
+* Roadmap / milestones
+
+** TODO M0 — Editor core + tulisp API (replace a mime batch) [#A]
+   Rope buffer; point/mark/markers/narrowing; the §6 vocabulary (exact +
+   regex + fuzzy search, region/regexp replace, insert/delete, narrowing,
+   excursion); ~mimectl run prog.tl --file x --local~ one-shot; UTF-8-safe; structured
+   result with auto diff + ~report~. /Exit: re-run a real mime transform./
+** TODO M1 — Checkpoints, transactions, dry-run [#A]
+   Workspace COW snapshots; checkpoint tree; auto-transaction per program;
+   ~with-transaction~; ~rehearse~; ~checkpoint-diff~. /Exit: rewind + dry-run work
+   on multi-buffer edits; property tests green./
+** TODO M2 — Daemon (~mimed~), ~mimectl~, sessions, warm state [#A]
+   ~mimed~ + ~mimectl~ client; session isolation + lifecycle + limits; warm
+   buffers and warm defs across programs; control API (HTTP/JSON over a unix
+   socket); WAL journaling. /Exit: two sessions edit in parallel; buffers
+   persist across programs./
+** TODO M3 — MCP server + agent ergonomics [#A]
+   MCP tools (§11); structured results tuned for token budget; ~read_region~
+   on-demand context; permission-friendly tool schemas. /Exit: an agent edits a
+   repo end-to-end over MCP with no file re-reads./
+** TODO M4 — Safety & audit [#B]
+   Path allowlists, read-only buffers, resource limits, interruptible eval,
+   append-only audit journal + replay. /Exit: safe to grant to an autonomous agent./
+** TODO M5 — Performance [#B]
+   Bytecode-compile hot programs; dirty-span diffs; incremental markers;
+   100 MB target; benchmark suite. /Exit: ulysses bench beats mime./
+** TODO M6 — Structural / syntax-aware editing [#C]
+   Tree-sitter integration; node search/replace; narrow-to-defun. /Exit:
+   AST-scoped refactors on real code./
+** TODO M7 — Polish [#C]
+   ~mimectl repl~; mime→mime-rs porting guide; docs; example library of helpers;
+   ~cargo~ workspace + crate publish.
+
+* Open questions & risks (decide deliberately)
+1. *Why not ~emacsclient~ + elisp?* It already has buffers/markers/narrowing/regexp
+   and a server. Our answer: lean single-binary embeddability, a shaped/bounded
+   primitive set, JSON-native results, transactions-for-agents, and a sandbox we
+   control. Valid — but we are choosing to reimplement a /slice/ of Emacs; name
+   the slice and stop there.
+2. *Why not sandboxed Python + a buffer lib?* The differentiators must be: warm
+   cross-call state, an auditable bounded surface, and first-class transactions.
+   If those don't feel decisive, the niche is thin — pressure-test this early.
+3. *tulisp maturity/perf*: is the interpreter (even bytecode-compiled) fast enough
+   on 100 MB? This is a forcing function for tulisp; budget for it.
+4. *Checkpoint memory & persistence*: GC policy for branches; do checkpoints
+   survive a daemon restart? (WAL replay vs. persisted tree.)
+5. *Multi-session edits to the same on-disk file*: conflict/lock policy; last-
+   writer-wins vs. detect-and-refuse.
+6. *Coordinate model*: confirmed char-based, 1-based, byte-safe — but line-oriented
+   tools may want line/col first-class too.
+7. *Diff granularity vs. token budget*: where to truncate, and the fetch-on-demand
+   contract.
+8. *Scope creep*: the gravitational pull toward "reimplement Emacs". Guard with the
+   principle in §3.7 and the explicit milestone exits.
+
+* Appendix A — end-to-end example
+
+A program that, within one chapter slice, joins adjacent same-note links, counts
+them, and checkpoints — run in ~rehearse~ first to preview the diff.
+
+#+BEGIN_SRC tulisp
+(with-current-buffer (open-file "index.php-cyclops.htm")
+  (let ((b (point-min)) (e (point-max)) (joined 0))
+    (save-restriction
+      (narrow-to-region
+        (search-forward "[ 12 ]") (search-forward "[ 13 ]"))
+      (goto-char (point-min))
+      ;; merge </a><a ...same href...> runs
+      (while (re-search-forward "</a><a href=\"\\([^\"]+\\)\"[^>]*>" nil)
+        (when (same-note-p (match-string 1))      ; a warm helper def
+          (replace-match "")
+          (setq joined (1+ joined)))))
+    (report "joined" joined)
+    (checkpoint "cyclops-links-joined")))
+#+END_SRC
+
+The result returns the unified diff for the buffer, ~"reports": {"joined": N}~, and
+the new checkpoint id — committed only if not run as ~rehearse~.
+
+* Appendix B — naming & lineage
+- Project / engine crate: ~mime-rs~ (reads "mimers"; the ~-rs~ Rust suffix completes
+  the word).
+- Daemon binary: ~mimed~ ("mimed" — mime + d, and the past tense fits: it has
+  already performed your edits).
+- CLI binary: ~mimectl~ (systemctl/kubectl convention — the control client you use
+  instead of raw HTTP).
+- Lineage: shsms's ~mime~ → ~mime-rs~. Same buffers-and-cursors soul; new powers
+  (transactions, structured I/O, MCP) and none of the cuts.
+- Tagline candidate: /"an amanuensis for your agents — it takes dictation, keeps
+  every draft, and never loses your place."/
