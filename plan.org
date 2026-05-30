@@ -103,14 +103,14 @@ keep and what to fix. ~mime-rs~ exists to keep the wins and kill the cuts.
         ▼                   ▼                       ▼
  ┌─────────────┐   ┌──────────────────┐   ┌────────────────────┐
  │ tulisp ctx  │   │  Buffer store    │   │  Checkpoint tree   │
- │ + editor    │◀─▶│  ropes, markers, │◀─▶│  COW snapshots of  │
+ │ + editor    │◀─▶│  trees, markers, │◀─▶│  COW snapshots of  │
  │ builtins    │   │  point/mark/     │   │  the whole         │
  │ (defun'd)   │   │  narrowing       │   │  workspace         │
  └─────────────┘   └──────────────────┘   └────────────────────┘
 #+END_SRC
 
 ** Components
-- *Editor core* — buffers (ropes), point, mark, markers, regions, narrowing;
+- *Editor core* — buffers (piece trees over mmapped backing), point, mark, markers, regions, narrowing;
   UTF-8-safe; the actual text data structure and its operations.
 - *tulisp editor API* — Rust closures registered on a ~TulispContext~ that expose
   the editor core to programs (§6). Buffers/markers are opaque tulisp objects.
@@ -128,17 +128,39 @@ keep and what to fix. ~mime-rs~ exists to keep the wins and kill the cuts.
 
 * The editor core (data model)
 
-- *Buffer* := a rope of UTF-8 text + a name + an optional file path + per-buffer
-  /point/, /mark/, set of named /markers/, /narrowing/ restriction (min,max), a
-  dirty flag, and a read-only flag.
-- *Rope* (e.g. ~ropey~-style or a persistent rope) for O(log n) edits and, crucially,
-  cheap structural-sharing snapshots (a checkpoint clones via ~Arc~, copy-on-write).
-- *Coordinates*: char positions, 1-based, Emacs-style (~point-min~ = 1). All public
-  positions are char indices; byte offsets never leak. Line/column accessors are
-  provided. No operation can split a UTF-8 scalar.
-- *Markers*: positions that *move with edits* (insert before a marker pushes it).
-  This is the fix for brittle absolute offsets — the agent anchors a marker once
-  and keeps using it as the buffer mutates around it.
+Files can be several GB — larger than RAM — so the buffer must *not* hold all the
+text. We use a *persistent piece tree over immutable, memory-mapped backing*: VS
+Code's piece tree, made copy-on-write so it doubles as the checkpoint mechanism.
+
+- *Backing stores* (immutable, shared by every snapshot):
+  - /original/ — the file, ~mmap~ed read-only; the OS pages it in/out, never fully
+    resident. Behind a trait, so an explicit paged-LRU reader (bounded memory, no
+    SIGBUS) can replace ~mmap~.
+  - /add buffer/ — append-only, holds *only* inserted text; spills to a temp file if
+    it grows large.
+- *Buffer* := a *persistent measured B-tree of pieces* + a name + optional file path
+  + per-buffer /point/, /mark/, /markers/, /narrowing/ (min,max), dirty and read-only
+  flags. A /piece/ is ~(source, start, len)~ — a reference into a backing store, never
+  owned text. An unedited GB file is one piece; an edit splits pieces and points a new
+  one at the add buffer; original bytes never move.
+- *Tree*: ~Rc~ nodes, path-copying on edit (O(log n) nodes copied); each node carries
+  a monoid /summary/ (bytes, chars, lines, + a hook for a marker index) so we seek by
+  byte/char/line in O(log n). Same measured persistent B-tree as a rope — only the
+  leaf payload changes from owned string to piece reference, so the spine can be our
+  own or a vendored ~sum_tree~.
+- *Snapshots are ~KB, even for GB files*: a checkpoint clones only the piece-tree
+  spine; both backing stores are shared with zero copying. Buffer memory ≈ edits + the
+  OS page cache (evictable).
+- *Coordinates*: char positions, 1-based, Emacs-style (~point-min~ = 1); byte offsets
+  never leak; line/column accessors provided; no op splits a UTF-8 scalar. char/line
+  indices over a byte-addressed original need a scan to find boundaries — built lazily
+  / in the background / from a persisted sidecar, never blocking the first edit.
+- *Markers / anchors*: an anchor = ~(backing-id, byte-offset, bias)~ into an immutable
+  store, so it is stable across *every* snapshot for free; resolving it to a line/col
+  needs only the target snapshot's tree. (Offset-shifted-on-edit markers also work
+  within one timeline; anchors are what survive the checkpoint *tree*.)
+- *Non-UTF-8* input (binary, odd logs): rejected at open initially; an explicit byte
+  mode can come later.
 - *Workspace*: the set of buffers in a session + the shared kill-ring + registers.
   A *checkpoint snapshots the whole workspace*, not a single buffer.
 
@@ -229,8 +251,9 @@ This is the feature the user asked for first and the one agents need most.
 - Checkpoints form a *tree* (not a stack): restoring an old checkpoint and editing
   forward creates a branch (undo-tree semantics), so the agent never loses a
   state by exploring an alternative.
-- Snapshots are *cheap* (rope structural sharing + ~Arc~ COW); taking one is ~O(1)
-  in buffer size, paid lazily on subsequent edits.
+- Snapshots are *cheap* even for multi-GB files: the immutable backing stores
+  (mmapped original + append-only add buffer) are shared, so a checkpoint copies only
+  the piece-tree spine (~KB) — O(1) in *file* size, paid lazily on later edits.
 
 ** Operations
 | ~(checkpoint "label")~        | create a named checkpoint, return its id                 |
@@ -378,16 +401,27 @@ id + ~GET /jobs/:id~. ~mimectl~ is just a friendly skin over these.
 
 * Performance
 
-- Rope backing for O(log n) edits and O(1) COW snapshots; markers updated
-  incrementally on edit, never by re-scan.
-- No full re-serialization per operation (mime re-walked a 43 MB buffer
-  repeatedly); track dirty spans and diff only changed ranges.
+- *The file is never fully resident.* Piece tree over mmapped (or paged-LRU)
+  backing: editing or snapshotting a multi-GB file touches O(log n) pieces and the
+  OS page cache, not the bytes.
+- *Checkpoints are O(spine), ~KB*, at any file size — immutable backing is shared
+  across all snapshots; only the piece-tree path is copied.
+- *Indexing is the costly op, not editing.* char/line summaries need one scan of the
+  original to find boundaries — done lazily / in the background / from a persisted
+  sidecar, so it never blocks the first edit.
+- *Search* streams a cursor across pieces (a ~regex-automata~ incremental DFA, so
+  matches can cross piece/backing boundaries); the common all-original case scans the
+  ~mmap~ directly (~memchr~ / ~regex::bytes~) and maps offsets back.
+- *Saving is O(file size)* by nature — stream every piece to a new file + atomic
+  rename; a tiny edit to a huge file still rewrites it. Budgeted, not hidden.
+- No full re-serialization per op (mime re-walked a 43 MB buffer repeatedly); track
+  dirty spans, diff only changed ranges, and *never materialize the whole buffer* —
+  the API stays ranged/streamed (mandatory at GB scale, not just token-thrift).
 - Compile hot programs via tulisp's bytecode path; cache compiled programs per
   session keyed by source hash.
-- Streaming/incremental search; bounded searches honor narrowing.
-- *Targets*: open + edit a 100 MB buffer without sweat; typical agent program
-  sub-second; the ulysses-annotated transform (≈43 MB output) as a standing
-  perf+correctness benchmark.
+- *Targets*: open + edit a multi-GB file at flat memory (≈ edits + page cache);
+  checkpoint create/restore ~µs–ms at any size; typical agent program sub-second; the
+  ulysses-annotated transform (≈43 MB) as a standing perf+correctness benchmark.
 
 * Migrating from mime
 
@@ -424,12 +458,13 @@ counts) and gives an immediate real-world acceptance test.
 - *Fuzz*: random edit programs never panic and never corrupt UTF-8.
 - *Integration*: the ulysses port (above); concurrent-session isolation;
   daemon crash/replay from the WAL.
-- *Bench*: the 43 MB transform; 100 MB open/edit; checkpoint create/restore at size.
+- *Bench*: the 43 MB transform; open/edit a multi-GB file at flat memory; checkpoint
+  create/restore at any size.
 
 * Roadmap / milestones
 
 ** TODO M0 — Editor core + tulisp API (replace a mime batch) [#A]
-   Rope buffer; point/mark/markers/narrowing; the §6 vocabulary (exact +
+   in-memory buffer behind a ~TextStore~ trait; point/mark/markers/narrowing; the §6 vocabulary (exact +
    regex + fuzzy search, region/regexp replace, insert/delete, narrowing,
    excursion); ~mimectl run prog.tl --file x --local~ one-shot; UTF-8-safe; structured
    result with auto diff + ~report~. /Exit: re-run a real mime transform./
@@ -451,7 +486,8 @@ counts) and gives an immediate real-world acceptance test.
    append-only audit journal + replay. /Exit: safe to grant to an autonomous agent./
 ** TODO M5 — Performance [#B]
    Bytecode-compile hot programs; dirty-span diffs; incremental markers;
-   100 MB target; benchmark suite. /Exit: ulysses bench beats mime./
+   the piece-tree-over-mmap buffer (multi-GB, non-resident) as the real ~TextStore~;
+   benchmark suite. /Exit: edit a multi-GB file at flat memory; ulysses bench beats mime./
 ** TODO M6 — Structural / syntax-aware editing [#C]
    Tree-sitter integration; node search/replace; narrow-to-defun. /Exit:
    AST-scoped refactors on real code./
@@ -469,7 +505,7 @@ counts) and gives an immediate real-world acceptance test.
    cross-call state, an auditable bounded surface, and first-class transactions.
    If those don't feel decisive, the niche is thin — pressure-test this early.
 3. *tulisp maturity/perf*: is the interpreter (even bytecode-compiled) fast enough
-   on 100 MB? This is a forcing function for tulisp; budget for it.
+   over multi-GB buffers? This is a forcing function for tulisp; budget for it.
 4. *Checkpoint memory & persistence*: GC policy for branches; do checkpoints
    survive a daemon restart? (WAL replay vs. persisted tree.)
 5. *Multi-session edits to the same on-disk file*: conflict/lock policy; last-
