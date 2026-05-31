@@ -155,6 +155,7 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         "open_text" => tool_open_text(&args, sessions),
         "run_program" => tool_run_program(&args, sessions),
         "read_region" => tool_read_region(&args, sessions),
+        "view" => tool_view(&args, sessions),
         "search" => tool_search(&args, sessions),
         "checkpoint" => tool_checkpoint(&args, sessions),
         "restore_checkpoint" => tool_restore_checkpoint(&args, sessions),
@@ -327,6 +328,33 @@ fn tool_read_region(
         .into_iter()
         .next()
         .ok_or_else(|| "read_region: no text returned".to_string())
+}
+
+/// `view {session?, lines?, pos?}` — a rendered viewport: `lines` rows of context
+/// on each side of the cursor (or of `pos`), with a gutter, the current line
+/// marked, and a header (buffer name, line/col, point/size). The agent's "look at
+/// the screen". Backed by the `window` builtin; like `read_region`, it only reads.
+fn tool_view(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result<String, String> {
+    let session = session_arg(args);
+    // Both args are optional and map straight onto `(window LINES POS)`; we build
+    // the call positionally, dropping trailing args so `window`'s own defaults
+    // (4 lines, current point) apply when they're omitted.
+    let lines = args.get("lines").and_then(Value::as_i64);
+    let pos = args.get("pos").and_then(Value::as_i64);
+    let call = match (lines, pos) {
+        (Some(n), Some(p)) => format!("(window {n} {p})"),
+        (Some(n), None) => format!("(window {n})"),
+        (None, Some(p)) => format!("(window 4 {p})"),
+        (None, None) => "(window)".to_string(),
+    };
+    // `message` stashes the rendered viewport verbatim in the log (no re-quoting),
+    // same trick as `read_region`.
+    let report = run_in_session(sessions, &session, &format!("(message {call})"))?;
+    report
+        .log
+        .into_iter()
+        .next()
+        .ok_or_else(|| "view: no text returned".to_string())
 }
 
 /// `search {session?, pattern, mode?}` — search forward from point and report
@@ -509,6 +537,19 @@ fn tool_schemas() -> Vec<Value> {
                     "session": session,
                 },
                 "required": ["start", "end"],
+            },
+        }),
+        json!({
+            "name": "view",
+            "description": "Render a viewport around the cursor (or a given position): a few lines of context on each side, with a gutter, the current line marked, and a header. Your 'look at the screen'. Read-only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "lines": { "type": "integer", "description": "Context lines on each side of the cursor line (default 4)." },
+                    "pos": { "type": "integer", "description": "1-based position to center on (default: current point)." },
+                    "session": session,
+                },
+                "required": [],
             },
         }),
         json!({
