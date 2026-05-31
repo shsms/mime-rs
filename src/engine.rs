@@ -108,13 +108,22 @@ impl Workspace {
     /// not against the original file). The error string is the formatted tulisp
     /// error.
     pub fn run(&mut self, program: &str) -> Result<RunReport, String> {
+        self.run_value(program).map(|(report, _value)| report)
+    }
+
+    /// Like [`run`], but also returns the program's final value rendered the way
+    /// tulisp prints it (strings quoted, lists as `(a b c)`, `nil` for nil) —
+    /// the warm interactive path the `mimectl repl` verb prints alongside the
+    /// diff. The buffer effects persist exactly as in [`run`]; only the extra
+    /// return value distinguishes the two.
+    pub fn run_value(&mut self, program: &str) -> Result<(RunReport, String), String> {
         // For a read-only session, keep a cheap pre-run snapshot (structural
         // sharing for Quire) so a mutating program can be rolled back.
         let guard = self
             .read_only
             .then(|| self.session.borrow().buffer.snapshot());
 
-        let report = self.eval_and_report(program, false)?;
+        let (report, value) = self.eval_and_report(program, false)?;
 
         // Enforce read-only after the fact: if the program left the buffer
         // changed, restore the snapshot and reject it. (Programs that only
@@ -125,7 +134,7 @@ impl Workspace {
             self.session.borrow_mut().buffer = snap;
             return Err("session is read-only: program modified the buffer".to_string());
         }
-        Ok(report)
+        Ok((report, value))
     }
 
     /// Dry-run `program` and return the report it *would* produce, then roll the
@@ -161,14 +170,19 @@ impl Workspace {
         s.buffer = snap;
         s.kill_ring.truncate(kill_len);
         s.checkpoints.truncate(cp_len);
-        result
+        result.map(|(report, _value)| report)
     }
 
     /// Shared core of [`run`]/[`rehearse`]: clear the per-program `reports`/`log`,
     /// evaluate `program`, and build the [`RunReport`] (diff = buffer-at-start →
-    /// buffer-at-end). Neither rolls back here — the caller decides whether the
-    /// effects persist. `rehearsed` flags the report's origin.
-    fn eval_and_report(&mut self, program: &str, rehearsed: bool) -> Result<RunReport, String> {
+    /// buffer-at-end) plus the program's final value rendered as tulisp prints
+    /// it. Neither rolls back here — the caller decides whether the effects
+    /// persist. `rehearsed` flags the report's origin.
+    fn eval_and_report(
+        &mut self,
+        program: &str,
+        rehearsed: bool,
+    ) -> Result<(RunReport, String), String> {
         let (before, name) = {
             let mut s = self.session.borrow_mut();
             s.reports.clear();
@@ -177,14 +191,16 @@ impl Workspace {
         };
         let len_before = before.chars().count();
 
-        self.ctx
+        let value = self
+            .ctx
             .eval_string(program)
-            .map_err(|e| e.format(&self.ctx))?;
+            .map_err(|e| e.format(&self.ctx))?
+            .to_string();
 
         let s = self.session.borrow();
         let after = s.buffer.text().to_string();
         let len_after = after.chars().count();
-        Ok(RunReport {
+        let report = RunReport {
             buffer_name: name,
             dirty: after != before,
             rehearsed,
@@ -195,7 +211,8 @@ impl Workspace {
             reports: s.reports.clone(),
             log: s.log.clone(),
             final_text: after,
-        })
+        };
+        Ok((report, value))
     }
 
     /// The current buffer text — used by the daemon's `save` op.
@@ -324,6 +341,22 @@ mod tests {
             .expect("read-only allows non-mutating programs");
         assert!(!r.dirty);
         assert_eq!(r.reports, vec![("found".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn run_value_returns_the_rendered_result_and_persists() {
+        // `run_value` (the warm REPL path) returns the program's final value as
+        // tulisp prints it — strings quoted, lists parenthesized — and still
+        // persists the buffer edit, so a later run sees it.
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "hi")));
+        let (r1, v1) = ws
+            .run_value(r#"(goto-char (point-max)) (insert "!") (+ 1 2)"#)
+            .unwrap();
+        assert_eq!(v1, "3");
+        assert_eq!(r1.final_text, "hi!");
+        // A string result renders quoted; a later run sees the persisted edit.
+        let (_r2, v2) = ws.run_value(r#"(buffer-string)"#).unwrap();
+        assert_eq!(v2, "\"hi!\"");
     }
 
     #[test]
