@@ -523,9 +523,10 @@ counts) and gives an immediate real-world acceptance test.
 
 * Roadmap / milestones
 
-/Status: M0 ✓, M1 ✓ (persistent measured B-tree, O(log n) seeks, O(1) snapshots), M2
-partly ✓ (checkpoints + transactions; wiring cheap snapshots into checkpoints + dry-run
-pending). 51 tests, clippy clean; M3–M8 not started./
+/Status: M0 ✓, M1 ✓ (persistent B-tree, O(log n) seeks, O(1) snapshots), M2 ✓
+(checkpoints + transactions + cheap snapshots; only daemon-level ~rehearse~ left), M3 ✓
+(~mimed~ daemon + warm sessions over a unix socket). 59 tests, clippy clean; M4–M8 not
+started./
 
 ** DONE M0 — Editor core + tulisp API (replace a mime batch) [#A]
    In-memory ~TextStore~ (bring-up + differential-test *oracle* only — not the real
@@ -556,10 +557,15 @@ pending). 51 tests, clippy clean; M3–M8 not started./
    MVP in ~Session.checkpoints~). Pending: ~KB structural-sharing snapshots (needs the
    Quire B-tree + a ~snapshot~ trait method), ~rehearse~ dry-run (daemon-level), and
    ~checkpoint-diff~./
-** TODO M3 — Daemon (~mimed~), ~mimectl~, sessions, warm state [#A]
+** DONE M3 — Daemon (~mimed~), ~mimectl~, sessions, warm state [#A]
    ~mimed~ + ~mimectl~ client; session isolation + lifecycle + limits; warm buffers
    and warm defs across programs; control API (HTTP/JSON over a unix socket); WAL
    journaling. /Exit: two sessions edit in parallel; buffers persist across programs./
+   /Done: ~Workspace~ holds a warm ~TulispContext~ + ~Session~ across programs; ~mimed~
+   serves a JSON-lines control API over a unix socket (~open~/~run~/~status~/~save~/
+   ~close~/~ping~) with a session map; ~mimectl~ gained daemon verbs (~--local~ one-shot
+   unchanged). Single-threaded loop (the ~Rc~ ctx is ~!Send~); the
+   ~Mutex<HashMap<Workspace>>~ seam is kept for future per-session sharding + WAL./
 ** TODO M4 — MCP server + agent ergonomics [#A]
    MCP tools (§11); structured results tuned for token budget; ~read_region~
    on-demand context; permission-friendly tool schemas. /Exit: an agent edits a repo
