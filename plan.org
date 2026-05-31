@@ -584,10 +584,10 @@ the agent-facing surface works end to end. M5 ✓, rehearse ✓, M7 scaffold ✓
    rebuild + ~concat~); parallel initial line index (~memchr~ + prefix sum);
    rebase-on-save compaction *[done]* (after a save, re-mmap the new file, collapse to one ~Original~ piece, release the pinned pre-save inode + reset the add buffer); bytecode-compile hot programs; dirty-span diffs; benchmark suite. /Exit: search +
    global-replace a multi-GB file scale across cores; ulysses bench beats mime./
-   /Open follow-ups: the M6 bench pulls in ~criterion~ (drags ~serde~/~syn~ into the *test*
-   build) — keep it or swap for a ~std::time~ ~#[ignore]~d bench (a leanness call). Save still
+   /Open follow-ups: the M6 bench used to pull in ~criterion~ (which dragged ~serde~/~syn~ into the *test*
+   build); now *[done]* — swapped for a ~std::time~ ~#[ignore]~d bench, ~criterion~ and its serde/syn tree dropped. Save still
    materializes the whole ~text()~ to write it (O(filesize) RAM) — streaming the pieces straight
-   to the temp file is a later perf item. No external-change detection yet — re-~open_file~ to
+   to the temp file is done — ~write_to~ + ~write_atomic_with~ stream the pieces straight to disk, no full materialization. No external-change detection yet — re-~open_file~ to
    pick up on-disk edits an agent did not make (an Emacs-style mtime/inode check is a future touch)./
 ** DOING M7 — Structural / syntax-aware editing [#C] (scaffold landed)
    Tree-sitter integration; node search/replace; narrow-to-defun. /Exit: AST-scoped
