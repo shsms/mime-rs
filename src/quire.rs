@@ -413,6 +413,40 @@ impl Quire {
         }
     }
 
+    /// Re-base onto `path` after the buffer was just saved there: re-mmap the new
+    /// file as a single `Original` piece and drop the pre-save backing (the old,
+    /// now-unlinked mmap inode) plus the add buffer. Point/mark/narrowing/markers
+    /// are kept. The saved file is byte-identical to the current content, so the
+    /// char/line totals are reused from the live summary — no re-scan. O(1) + mmap.
+    pub fn rebase_to(&mut self, path: &Path) -> std::io::Result<()> {
+        let file = std::fs::File::open(path)?;
+        // SAFETY: same immutable-mapping contract as `Quire::open`.
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let bytes_len = mmap.len();
+        debug_assert_eq!(
+            bytes_len,
+            self.total_bytes(),
+            "rebase: saved file size must equal the current content"
+        );
+        let summary = self.root.summary();
+        let root = if bytes_len == 0 {
+            Node::empty()
+        } else {
+            Arc::new(Node::leaf(vec![Piece {
+                source: Source::Original,
+                start: 0,
+                len: bytes_len,
+                chars: summary.chars,
+                lines: summary.lines,
+            }]))
+        };
+        self.original = Arc::new(Original::Mapped(mmap));
+        self.add = Arc::new(Vec::new());
+        self.root = root;
+        self.invalidate();
+        Ok(())
+    }
+
     /// Bytes of the backing store a piece points into.
     fn backing(&self, source: Source) -> &[u8] {
         match source {
@@ -1335,6 +1369,9 @@ impl TextStore for Quire {
     fn marker_set(&mut self, id: usize, pos: Option<usize>) {
         Quire::marker_set(self, id, pos)
     }
+    fn rebase_to_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        Quire::rebase_to(self, path)
+    }
 }
 
 /// Expand Emacs-style `\N` (group) and `\&` (whole match) backrefs. Mirrors
@@ -1945,6 +1982,46 @@ mod tests {
         std::fs::remove_file(&tmp).ok();
         assert_eq!(tail, tail_ref, "tail read corrupted after in-place save");
         assert_eq!(mid, mid_ref, "interior read corrupted after in-place save");
+    }
+
+    #[test]
+    fn rebase_to_collapses_and_keeps_reads_correct() {
+        let tmp = std::env::temp_dir().join(format!("mime-rebase-{}.txt", std::process::id()));
+        std::fs::write(
+            &tmp,
+            "αβγ HEAD line\nmiddle filler line\nUNIQUE-TAIL café\n",
+        )
+        .unwrap();
+        let mut q = Quire::open(&tmp).unwrap();
+        q.goto_char(1);
+        assert!(
+            q.re_search_forward(&regex::Regex::new("HEAD").unwrap(), None)
+                .is_some()
+        );
+        q.insert(" <INS> "); // grows the add buffer and splits the original piece
+        let content = q.full_text().to_string();
+        let (pt, mk) = (q.point(), q.mark());
+
+        std::fs::write(&tmp, &content).unwrap(); // the save (write_atomic in production)
+        q.rebase_to(&tmp).unwrap();
+
+        let (mut n, mut all_original) = (0usize, true);
+        q.for_each_piece(|p| {
+            n += 1;
+            all_original &= matches!(p.source, Source::Original);
+            true
+        });
+        assert_eq!(n, 1, "rebase should collapse to a single piece");
+        assert!(all_original, "the piece should be the new mmap original");
+        assert!(q.add.is_empty(), "add buffer should be reset");
+        assert_eq!(q.full_text(), content, "content preserved");
+        assert_eq!(
+            q.substring(1, q.char_len() + 1),
+            content,
+            "collect_range over the rebased single-piece tree"
+        );
+        assert_eq!((q.point(), q.mark()), (pt, mk), "cursor/mark preserved");
+        std::fs::remove_file(&tmp).ok();
     }
 
     /// Windowed reads (the `collect_range` path behind `substring`/`read_region`)

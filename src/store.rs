@@ -51,6 +51,12 @@ pub trait TextStore {
     fn marker_position(&self, id: usize) -> Option<usize>;
     /// Point marker `id` at absolute `pos`, or detach it with `None`.
     fn marker_set(&mut self, id: usize, pos: Option<usize>);
+
+    /// After the buffer has been saved to `path`, re-base the store onto that
+    /// file — for `Quire`, re-mmap the new file as one fresh original and drop the
+    /// pre-save backing (the pinned old mmap inode) and the add buffer; a no-op for
+    /// the in-memory `Buffer`. Content and point/mark/narrowing are unchanged.
+    fn rebase_to_file(&mut self, path: &std::path::Path) -> std::io::Result<()>;
 }
 
 /// Shift markers after inserting `len` chars at absolute position `at`. Emacs

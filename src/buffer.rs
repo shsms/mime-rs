@@ -415,6 +415,9 @@ impl crate::store::TextStore for Buffer {
     fn marker_set(&mut self, id: usize, pos: Option<usize>) {
         Buffer::marker_set(self, id, pos)
     }
+    fn rebase_to_file(&mut self, _path: &std::path::Path) -> std::io::Result<()> {
+        Ok(()) // in-memory: nothing is mmapped, so there is nothing to reclaim
+    }
 }
 
 /// Expand Emacs-style `\N` (group) and `\&` (whole match) backrefs.
