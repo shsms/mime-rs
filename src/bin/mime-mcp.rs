@@ -498,14 +498,15 @@ fn tool_save_buffer(
 ) -> Result<String, String> {
     let session = session_arg(args);
     let path = str_arg(args, "path")?;
-    let text = sessions
-        .get(&session)
-        .ok_or_else(|| format!("no such session: {session}"))?
-        .text();
     let checked = mime_rs::safety::check_path(Path::new(&path))?;
-    mime_rs::safety::write_atomic(&checked, text.as_bytes())
+    // save_to writes atomically (temp + rename) and re-bases the buffer onto the
+    // new file, so an in-place save reclaims the pre-save mmap backing.
+    let bytes = sessions
+        .get_mut(&session)
+        .ok_or_else(|| format!("no such session: {session}"))?
+        .save_to(&checked)
         .map_err(|e| format!("cannot write {path}: {e}"))?;
-    Ok(format!("wrote {} bytes to {path}", text.len()))
+    Ok(format!("wrote {bytes} bytes to {path}"))
 }
 
 /// `session_status {}` — the live session ids plus the sandbox the engine

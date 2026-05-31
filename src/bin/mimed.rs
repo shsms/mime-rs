@@ -231,19 +231,17 @@ fn op_save(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
         Ok(p) => p,
         Err(e) => return e,
     };
-    let text = {
-        let map = sessions.lock().unwrap();
-        let Some(ws) = map.get(&session) else {
-            return err(&format!("no such session: {session}"));
-        };
-        ws.text()
-    };
     let checked = match mime_rs::safety::check_path(Path::new(&path)) {
         Ok(p) => p,
         Err(e) => return err(&e),
     };
-    match mime_rs::safety::write_atomic(&checked, text.as_bytes()) {
-        Ok(()) => json!({ "ok": true, "session": session, "path": path, "bytes": text.len() }),
+    let mut map = sessions.lock().unwrap();
+    let Some(ws) = map.get_mut(&session) else {
+        return err(&format!("no such session: {session}"));
+    };
+    // save_to writes atomically and re-bases the buffer onto the new file.
+    match ws.save_to(&checked) {
+        Ok(bytes) => json!({ "ok": true, "session": session, "path": path, "bytes": bytes }),
         Err(e) => err(&format!("cannot write {path}: {e}")),
     }
 }

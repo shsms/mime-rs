@@ -219,6 +219,18 @@ impl Workspace {
     pub fn text(&self) -> String {
         self.session.borrow().buffer.text().to_string()
     }
+
+    /// Persist the buffer to `path` atomically (temp file + rename), then re-base
+    /// the store onto the just-written file so the pre-save mmap backing and the
+    /// add buffer are reclaimed (a no-op for the in-memory `Buffer`). Returns the
+    /// byte count written. The rebase is best-effort: if re-opening the saved file
+    /// fails, the (still correct) pre-save backing is kept and the save stands.
+    pub fn save_to(&mut self, path: &std::path::Path) -> std::io::Result<usize> {
+        let text = self.session.borrow().buffer.text().to_string();
+        crate::safety::write_atomic(path, text.as_bytes())?;
+        let _ = self.session.borrow_mut().buffer.rebase_to_file(path);
+        Ok(text.len())
+    }
 }
 
 /// Evaluate `program` (Emacs Lisp / tulisp) against `buffer` once, cold; return
@@ -317,6 +329,41 @@ mod tests {
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.clone())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn save_to_persists_rebases_and_edits_again() {
+        // save_to writes the buffer and re-bases the Quire onto the new file; the
+        // buffer is unchanged, and editing the rebased buffer + saving again keeps
+        // disk and buffer in sync (the "keep editing with the saved file as base").
+        let tmp = std::env::temp_dir().join(format!("mime-saveto-{}.txt", std::process::id()));
+        std::fs::write(&tmp, "alpha\nbeta\ngamma\n").unwrap();
+        let mut ws = Workspace::new(Box::new(Quire::open(&tmp).unwrap()));
+
+        ws.run(r#"(goto-char (point-min)) (search-forward "beta" nil t) (insert "_X")"#)
+            .unwrap();
+        let want = ws.text();
+        let n = ws.save_to(&tmp).unwrap();
+        assert_eq!(n, want.len());
+        assert_eq!(
+            std::fs::read_to_string(&tmp).unwrap(),
+            want,
+            "disk matches buffer"
+        );
+        assert_eq!(
+            ws.text(),
+            want,
+            "rebase leaves the buffer content unchanged"
+        );
+
+        // Edit the now-rebased buffer and save again — must stay consistent.
+        ws.run(r#"(goto-char (point-max)) (insert "omega\n")"#)
+            .unwrap();
+        let want2 = ws.text();
+        ws.save_to(&tmp).unwrap();
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), want2);
+        assert_eq!(ws.text(), want2);
+        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
