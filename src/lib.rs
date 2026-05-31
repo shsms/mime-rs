@@ -8,6 +8,7 @@
 
 pub mod buffer;
 pub mod builtins;
+pub mod daemon;
 pub mod engine;
 pub mod quire;
 pub mod result;
