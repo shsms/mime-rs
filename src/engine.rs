@@ -212,4 +212,20 @@ mod tests {
         );
         assert_eq!(r.final_text, "foo/bar/baz");
     }
+
+    #[test]
+    fn line_positions_and_goto_line() {
+        let r = run(
+            "hello\nworld\n",
+            r#"(goto-char 9)
+               (report "col" (current-column))
+               (report "bol" (line-beginning-position))
+               (report "eol" (line-end-position))
+               (report "g2" (goto-line 2))"#,
+        );
+        assert_eq!(r.reports[0], ("col".to_string(), "2".to_string()));
+        assert_eq!(r.reports[1], ("bol".to_string(), "7".to_string()));
+        assert_eq!(r.reports[2], ("eol".to_string(), "12".to_string()));
+        assert_eq!(r.reports[3], ("g2".to_string(), "7".to_string()));
+    }
 }

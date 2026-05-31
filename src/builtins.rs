@@ -636,4 +636,49 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             },
         );
     }
+
+    // ---- line positions & columns ----
+    {
+        let s = session.clone();
+        ctx.defun("line-beginning-position", move || -> i64 {
+            let mut sess = s.borrow_mut();
+            let saved = sess.buffer.point();
+            sess.buffer.beginning_of_line();
+            let p = sess.buffer.point();
+            sess.buffer.goto_char(saved);
+            p as i64
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun("line-end-position", move || -> i64 {
+            let mut sess = s.borrow_mut();
+            let saved = sess.buffer.point();
+            sess.buffer.end_of_line();
+            let p = sess.buffer.point();
+            sess.buffer.goto_char(saved);
+            p as i64
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun("current-column", move || -> i64 {
+            let mut sess = s.borrow_mut();
+            let saved = sess.buffer.point();
+            sess.buffer.beginning_of_line();
+            let bol = sess.buffer.point();
+            sess.buffer.goto_char(saved);
+            (saved - bol) as i64
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun("goto-line", move |n: i64| -> i64 {
+            let mut sess = s.borrow_mut();
+            let min = sess.buffer.point_min();
+            sess.buffer.goto_char(min);
+            sess.buffer.forward_line((n - 1).max(0));
+            sess.buffer.point() as i64
+        });
+    }
 }
