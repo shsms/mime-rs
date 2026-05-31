@@ -681,6 +681,9 @@ impl TextStore for Quire {
     fn name(&self) -> &str {
         &self.name
     }
+    fn last_match(&self) -> Option<&MatchData> {
+        self.last_match.as_ref()
+    }
     fn text(&self) -> &str {
         self.full_text()
     }

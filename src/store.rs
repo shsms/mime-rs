@@ -4,6 +4,8 @@
 //! positions, Emacs-style; `point_min`/`point_max` honor the narrowing.
 pub trait TextStore {
     fn name(&self) -> &str;
+    /// The most recent search's match data (whole-match span + group texts).
+    fn last_match(&self) -> Option<&crate::buffer::MatchData>;
     fn text(&self) -> &str;
     fn char_len(&self) -> usize;
 

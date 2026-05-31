@@ -3,7 +3,7 @@
 //! `Session`). M0 subset: navigation, edit, regex search/replace, reporting.
 //! Subagents extend this with region/mark, kill-ring, markers, and narrowing.
 use crate::engine::SharedSession;
-use tulisp::{Error, TulispContext, TulispObject};
+use tulisp::{Error, TulispContext, TulispObject, TulispValue};
 
 fn bad_regex(e: regex::Error) -> Error {
     Error::lisp_error(format!("Invalid regexp: {e}"))
@@ -561,6 +561,26 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                 let n = n.unwrap_or(1).max(0) as usize;
                 s.borrow_mut().buffer.insert(&"\n".repeat(n));
                 Ok(TulispObject::nil())
+            },
+        );
+    }
+
+    // ---- match data (from the store's most recent search) ----
+    {
+        let s = session.clone();
+        ctx.defun(
+            "match-string",
+            move |n: i64, _string: Option<String>| -> Result<TulispObject, Error> {
+                let text = s
+                    .borrow()
+                    .buffer
+                    .last_match()
+                    .and_then(|md| md.groups.get(n.max(0) as usize).cloned())
+                    .flatten();
+                Ok(match text {
+                    Some(t) => TulispValue::from(t).into_ref(None),
+                    None => TulispObject::nil(),
+                })
             },
         );
     }

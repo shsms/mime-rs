@@ -182,4 +182,15 @@ mod tests {
         let r = run("", r#"(insert-char 65 3) (newline) (insert-char 66 2)"#);
         assert_eq!(r.final_text, "AAA\nBB");
     }
+
+    #[test]
+    fn match_string_captures_groups() {
+        let r = run(
+            "John Doe",
+            r#"(re-search-forward "(\\w+) (\\w+)" nil t)
+               (let ((a (match-string 1)) (b (match-string 2)))
+                 (erase-buffer) (insert b) (insert " ") (insert a))"#,
+        );
+        assert_eq!(r.final_text, "Doe John");
+    }
 }
