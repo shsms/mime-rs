@@ -13,6 +13,33 @@ fn err(msg: &str) -> Error {
     Error::lisp_error(msg.to_string())
 }
 
+/// Build an RE2 pattern that matches `needle` case-insensitively and treats any
+/// run of whitespace as matching any run of whitespace (mime's `find_fuzzy`).
+fn fuzzy_regex(needle: &str) -> String {
+    let mut out = String::from("(?i)");
+    let mut lit = String::new();
+    let mut prev_ws = false;
+    for c in needle.chars() {
+        if c.is_whitespace() {
+            if !lit.is_empty() {
+                out.push_str(&regex::escape(&lit));
+                lit.clear();
+            }
+            if !prev_ws {
+                out.push_str(r"\s+");
+            }
+            prev_ws = true;
+        } else {
+            lit.push(c);
+            prev_ws = false;
+        }
+    }
+    if !lit.is_empty() {
+        out.push_str(&regex::escape(&lit));
+    }
+    out
+}
+
 pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     // ---- navigation ----
     {
@@ -698,6 +725,26 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             }
             res
         });
+    }
+
+    // ---- fuzzy search (case- and whitespace-run-insensitive) ----
+    {
+        let s = session.clone();
+        ctx.defun(
+            "search-fuzzy",
+            move |needle: String,
+                  bound: Option<i64>,
+                  noerror: Option<TulispObject>|
+                  -> Result<TulispObject, Error> {
+                let rx = regex::Regex::new(&fuzzy_regex(&needle)).map_err(bad_regex)?;
+                let bound = bound.map(|b| b.max(1) as usize);
+                match s.borrow_mut().buffer.re_search_forward(&rx, bound) {
+                    Some(p) => Ok(TulispObject::from(p as i64)),
+                    None if noerror.is_some_and(|o| o.is_truthy()) => Ok(TulispObject::nil()),
+                    None => Err(Error::lisp_error(format!("Fuzzy search failed: {needle}"))),
+                }
+            },
+        );
     }
 
     // ---- region case + match counting ----
