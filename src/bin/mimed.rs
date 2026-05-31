@@ -191,12 +191,23 @@ fn op_run(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
     }
 }
 
-/// `{"op":"status"}` — the list of live session ids.
+/// `{"op":"status"}` — the live session ids plus the sandbox the engine
+/// enforces: the allowed filesystem roots (display strings) and whether auditing
+/// is on, so a client learns the writable bounds without a rejected save.
 fn op_status(sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
     let map = sessions.lock().unwrap();
     let mut ids: Vec<&String> = map.keys().collect();
     ids.sort();
-    json!({ "ok": true, "sessions": ids })
+    let roots: Vec<String> = mime_rs::safety::roots()
+        .iter()
+        .map(|r| r.display().to_string())
+        .collect();
+    json!({
+        "ok": true,
+        "sessions": ids,
+        "roots": roots,
+        "audit": mime_rs::safety::audit_enabled(),
+    })
 }
 
 /// `{"op":"save","session":"S","path":"PATH"}` — write the session buffer's

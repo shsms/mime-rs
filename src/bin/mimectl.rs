@@ -13,7 +13,7 @@
 //!     - `mimectl --session S run PROG.tl`
 //!     - `mimectl --session S save --path PATH`
 //!     - `mimectl --session S close`
-//!     - `mimectl status`
+//!     - `mimectl status` — live sessions, the allowed roots, and audit state
 //!
 //! The session comes from `--session` or `$MIME_SESSION`. Each verb is sent as
 //! one JSON request line; the daemon's JSON response line is printed verbatim.

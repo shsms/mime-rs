@@ -481,11 +481,23 @@ fn tool_save_buffer(
     Ok(format!("wrote {} bytes to {path}", text.len()))
 }
 
-/// `session_status {}` — the live session ids.
+/// `session_status {}` — the live session ids plus the sandbox the engine
+/// enforces: the allowed filesystem roots (as display strings) and whether the
+/// audit journal is on. Advertising the roots lets the agent target a writable
+/// path up front instead of discovering the bounds via a rejected save.
 fn tool_session_status(sessions: &HashMap<String, Workspace>) -> Result<String, String> {
     let mut ids: Vec<&String> = sessions.keys().collect();
     ids.sort();
-    Ok(json!({ "sessions": ids }).to_string())
+    let roots: Vec<String> = mime_rs::safety::roots()
+        .iter()
+        .map(|r| r.display().to_string())
+        .collect();
+    Ok(json!({
+        "sessions": ids,
+        "roots": roots,
+        "audit": mime_rs::safety::audit_enabled(),
+    })
+    .to_string())
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -658,7 +670,7 @@ fn tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "session_status",
-            "description": "List the ids of the currently live sessions.",
+            "description": "Report engine status: the ids of the currently live sessions, the allowed filesystem roots that open_file/save_buffer are confined to (MIME_ROOTS, default cwd), and whether the audit journal is on. Check the roots before opening or saving to learn the writable sandbox up front.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
