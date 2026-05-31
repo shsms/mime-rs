@@ -570,7 +570,7 @@ counts) and gives an immediate real-world acceptance test.
 
 * Roadmap / milestones
 
-/Status: M0–M5 ✓; M6 partly (parallel index, rebase-on-save, streaming saves); M7 scaffold; M8 ✓; M9 ✓ (one ~mime~ binary); M10 in progress (multi-buffer ✓). 132 tests, clippy clean./
+/Status: M0–M5 ✓; M6 partly (parallel index, rebase-on-save, streaming saves); M7 scaffold; M8 ✓; M9 ✓ (one ~mime~ binary); M10 ✓ (multi-buffer + file I/O + args). 142 tests, clippy clean./
 
 ** DONE M0 — Editor core + tulisp API [#A]
    ~60 core editor builtins over the in-memory ~Buffer~ (the diff-test oracle); ~mime run --local~; structured diff + ~report~.
@@ -627,10 +627,10 @@ counts) and gives an immediate real-world acceptance test.
    A ~Capabilities~ tier (trusted vs sandboxed) chosen by the mode gates which builtin
    groups register. Drop the old binary names (no deprecation). /Exit: ~mime~,
    ~mime --daemon~, ~mime --mcp~ all work; one binary; tests green./
-** DOING M10 — Orchestration group: multi-buffer ✓, file I/O + args in flight [#B]
+** DONE M10 — Orchestration group: multi-buffer + file I/O + args [#B]
    The trusted-tier Emacs-runtime primitives: a buffer registry + ~set-buffer~ /
    ~with-current-buffer~ / ~find-file~ / ~generate-new-buffer~; ~insert-file-contents~ /
-   ~write-region~ / ~directory-files~ (~check_path~-gated); program-argument binding;
+   ~write-region~ / ~directory-files~ (UNRESTRICTED FS — trusted-tier-only, not ~check_path~-gated); program-argument binding;
    the multi-cursor convention. Registered only in the trusted tier. /Exit: a trusted
    ~mime~ program opens several files, aggregates across buffers, and writes two
    outputs./
