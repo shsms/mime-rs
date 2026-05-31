@@ -841,4 +841,33 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             },
         );
     }
+    {
+        let s = session.clone();
+        ctx.defun("list-checkpoints", move || -> Vec<String> {
+            s.borrow()
+                .checkpoints
+                .iter()
+                .map(|c| c.label.clone())
+                .collect()
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun(
+            "checkpoint-diff",
+            move |a: String, b: String| -> Result<String, Error> {
+                let sess = s.borrow();
+                let text = |label: &str| {
+                    sess.checkpoints
+                        .iter()
+                        .rev()
+                        .find(|c| c.label == label)
+                        .map(|c| c.text())
+                };
+                let ta = text(&a).ok_or_else(|| err(&format!("No checkpoint named {a}")))?;
+                let tb = text(&b).ok_or_else(|| err(&format!("No checkpoint named {b}")))?;
+                Ok(crate::result::unified_diff(&ta, &tb))
+            },
+        );
+    }
 }

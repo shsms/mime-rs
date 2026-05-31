@@ -30,6 +30,9 @@ impl Checkpoint {
     pub fn restore(&self) -> Box<dyn TextStore> {
         self.snap.snapshot()
     }
+    pub fn text(&self) -> String {
+        self.snap.text().to_string()
+    }
 }
 
 pub struct Session {
@@ -276,6 +279,19 @@ mod tests {
     fn transaction_keeps_on_success() {
         let r = run("a", r#"(goto-char 2) (with-transaction (insert "b"))"#);
         assert_eq!(r.final_text, "ab");
+    }
+
+    #[test]
+    fn checkpoint_diff_and_list() {
+        let r = run(
+            "one",
+            r#"(checkpoint "a") (erase-buffer) (insert "two") (checkpoint "b")
+               (report "diff" (checkpoint-diff "a" "b"))
+               (report "labels" (length (list-checkpoints)))"#,
+        );
+        assert!(r.reports[0].1.contains("-one"));
+        assert!(r.reports[0].1.contains("+two"));
+        assert_eq!(r.reports[1], ("labels".to_string(), "2".to_string()));
     }
 
     #[test]
