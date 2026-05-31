@@ -1715,4 +1715,120 @@ mod tests {
     fn differential_multibyte_initial() {
         run_diff(99, 3000, "αβγδ\n世界へようこそ\nfoo bar baz\n");
     }
+
+    /// Windowed reads (the `collect_range` path behind `substring`/`read_region`)
+    /// must match the oracle for many ranges, not just the whole text.
+    fn assert_reads_in_sync(b: &Buffer, q: &Quire, step: usize) {
+        let len = TextStore::char_len(b);
+        let probes = [
+            (1, len + 1),
+            (len.saturating_sub(5).max(1), len + 1), // tail window
+            (len / 2 + 1, len + 1),
+            (1, len / 2 + 1),
+            (len / 3 + 1, 2 * len / 3 + 1),
+        ];
+        for (a, c) in probes {
+            assert_eq!(
+                TextStore::substring(b, a, c),
+                TextStore::substring(q, a, c),
+                "substring({a},{c}) mismatch after step {step}; len={len}"
+            );
+        }
+    }
+
+    /// Like `run_diff`, but holds a rolling set of `snapshot()`s so the add/root
+    /// `Arc`s stay shared — every edit then copies-on-write off a live snapshot,
+    /// the warm-session regime `run_diff` never exercises. Checks windowed reads
+    /// each step, since `full_text` can be right while a windowed seek is wrong.
+    fn run_diff_snap(seed: u64, steps: usize, initial: &str, mut q: Quire) {
+        let mut b = Buffer::from_string("t", initial);
+        let mut rng = Lcg(seed);
+        let mut held: Vec<Quire> = Vec::new();
+        let inserts = ["x", "ab", "\n", "héllo", "世界", " foo ", "Z\nZ", "12"];
+        let needles = ["a", "x", "foo", "\n", "Z", "é", "界", "ab"];
+        let regexes = [
+            regex::Regex::new(r"\w+").unwrap(),
+            regex::Regex::new(r"[a-z]+").unwrap(),
+            regex::Regex::new(r".").unwrap(),
+        ];
+        let replacements = ["", "Q", "<\\&>", "ab"];
+        assert_in_sync(&b, &q, 0, "init");
+        for step in 1..=steps {
+            let len = TextStore::char_len(&b);
+            match rng.below(8) {
+                0 | 1 => {
+                    let s = inserts[rng.below(inserts.len())];
+                    let p = rng.pos(len);
+                    TextStore::goto_char(&mut b, p);
+                    TextStore::goto_char(&mut q, p);
+                    TextStore::insert(&mut b, s);
+                    TextStore::insert(&mut q, s);
+                }
+                2 => {
+                    let (a, c) = (rng.pos(len), rng.pos(len));
+                    TextStore::delete_region(&mut b, a, c);
+                    TextStore::delete_region(&mut q, a, c);
+                }
+                3 | 4 => {
+                    let re = &regexes[rng.below(regexes.len())];
+                    let rep = replacements[rng.below(replacements.len())];
+                    let hb = TextStore::re_search_forward(&mut b, re, None).is_some();
+                    let hq = TextStore::re_search_forward(&mut q, re, None).is_some();
+                    assert_eq!(hb, hq, "search step {step}");
+                    if hb {
+                        let _ = TextStore::replace_match(&mut b, rep);
+                        let _ = TextStore::replace_match(&mut q, rep);
+                    }
+                }
+                5 => {
+                    let n = needles[rng.below(needles.len())];
+                    let p = rng.pos(len);
+                    TextStore::goto_char(&mut b, p);
+                    TextStore::goto_char(&mut q, p);
+                    let rb = TextStore::search_forward(&mut b, n, None);
+                    let rq = TextStore::search_forward(&mut q, n, None);
+                    assert_eq!(rb, rq, "search_forward step {step}");
+                }
+                _ => {
+                    // Hold a snapshot so the next edits copy-on-write off it.
+                    held.push(q.snapshot());
+                    if held.len() > 40 {
+                        held.remove(0);
+                    }
+                }
+            }
+            assert_in_sync(&b, &q, step, "snap-op");
+            assert_reads_in_sync(&b, &q, step);
+        }
+        let _ = held;
+    }
+
+    const SNAP_INITIAL: &str =
+        "αβγδ\n世界へようこそ\nThe quick brown fox\njumps over\nthe lazy dog.\nfoo bar baz qux\n";
+    const SNAP_SEEDS: [u64; 8] = [1, 7, 42, 1000, 0xdead_beef, 0x5eed, 0xc0ffee, 0x1234_5678];
+
+    #[test]
+    fn differential_with_held_snapshots() {
+        for seed in SNAP_SEEDS {
+            run_diff_snap(
+                seed,
+                4000,
+                SNAP_INITIAL,
+                Quire::from_string("t", SNAP_INITIAL),
+            );
+        }
+    }
+
+    #[test]
+    fn differential_with_held_snapshots_mmap() {
+        // Same stress, but the Quire is opened from a real file → mmap-backed
+        // original (the open_file path the warm MCP server uses), combined with
+        // held snapshots and windowed reads.
+        let path = std::env::temp_dir().join(format!("mime-quire-snap-{}.txt", std::process::id()));
+        std::fs::write(&path, SNAP_INITIAL).unwrap();
+        for seed in SNAP_SEEDS {
+            run_diff_snap(seed, 4000, SNAP_INITIAL, Quire::open(&path).unwrap());
+        }
+        std::fs::remove_file(&path).ok();
+    }
 }

@@ -225,11 +225,26 @@ mod tests {
         // behind buffer-substring/read_region/search) must both match the oracle.
         let (q, o) = (quire.text().to_string(), oracle.text().to_string());
         let probe = "(message (buffer-substring (max 1 (- (point-max) 300)) (point-max)))";
-        let qr = quire.run(probe).unwrap().log.first().cloned().unwrap_or_default();
-        let or = oracle.run(probe).unwrap().log.first().cloned().unwrap_or_default();
+        let qr = quire
+            .run(probe)
+            .unwrap()
+            .log
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        let or = oracle
+            .run(probe)
+            .unwrap()
+            .log
+            .first()
+            .cloned()
+            .unwrap_or_default();
         std::fs::remove_file(&path).ok();
         assert_eq!(q, o, "spine (full_text) diverged from the oracle");
-        assert_eq!(qr, or, "windowed readout (collect_range) diverged from the oracle");
+        assert_eq!(
+            qr, or,
+            "windowed readout (collect_range) diverged from the oracle"
+        );
     }
 
     fn report(r: &RunReport, key: &str) -> String {
