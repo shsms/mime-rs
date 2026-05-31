@@ -270,4 +270,21 @@ mod tests {
         );
         assert_eq!(r.final_text, "original");
     }
+
+    #[test]
+    fn transaction_rolls_back_on_error() {
+        let r = run(
+            "keep",
+            r#"(condition-case e
+                  (with-transaction (erase-buffer) (insert "gone") (error "boom"))
+                (error nil))"#,
+        );
+        assert_eq!(r.final_text, "keep");
+    }
+
+    #[test]
+    fn transaction_keeps_on_success() {
+        let r = run("a", r#"(goto-char 2) (with-transaction (insert "b"))"#);
+        assert_eq!(r.final_text, "ab");
+    }
 }

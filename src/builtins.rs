@@ -682,6 +682,24 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         });
     }
 
+    // ---- transactions (atomic edits: roll the workspace back on error) ----
+    {
+        let s = session.clone();
+        ctx.defspecial("with-transaction", move |ctx, args| {
+            let snapshot = {
+                let sess = s.borrow();
+                Checkpoint::capture(String::new(), &*sess.buffer)
+            };
+            let res = ctx.eval_progn(args);
+            if res.is_err() {
+                let mut sess = s.borrow_mut();
+                let name = sess.buffer.name().to_string();
+                sess.buffer = snapshot.restore(&name);
+            }
+            res
+        });
+    }
+
     // ---- checkpoints (workspace time travel — M0: full-text snapshots) ----
     {
         let s = session.clone();
