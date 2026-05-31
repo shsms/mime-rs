@@ -3,7 +3,7 @@
 //! `Session`). M0 subset: navigation, edit, regex search/replace, reporting.
 //! Subagents extend this with region/mark, kill-ring, markers, and narrowing.
 use crate::engine::{Checkpoint, SharedSession};
-use tulisp::{Error, TulispContext, TulispObject, TulispValue};
+use tulisp::{Error, Shared, TulispContext, TulispConvertible, TulispObject, TulispValue};
 
 fn bad_regex(e: regex::Error) -> Error {
     Error::lisp_error(format!("Invalid regexp: {e}"))
@@ -11,6 +11,35 @@ fn bad_regex(e: regex::Error) -> Error {
 
 fn err(msg: &str) -> Error {
     Error::lisp_error(msg.to_string())
+}
+
+/// A buffer marker: a durable position handle. The `id` indexes the store's
+/// marker registry (`TextStore::marker_*`), where the live position lives and
+/// auto-adjusts across edits. A first-class tulisp value (via `TulispConvertible`)
+/// so `markerp` can tell it apart from a plain integer position, and `goto-char`
+/// accepts either.
+#[derive(Clone, Copy)]
+struct Marker {
+    id: usize,
+}
+
+impl std::fmt::Display for Marker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "#<marker {}>", self.id)
+    }
+}
+
+impl TulispConvertible for Marker {
+    fn from_tulisp(value: &TulispObject) -> Result<Self, Error> {
+        value
+            .as_any()
+            .ok()
+            .and_then(|v| v.downcast_ref::<Marker>().copied())
+            .ok_or_else(|| err("expected a marker"))
+    }
+    fn into_tulisp(self) -> TulispObject {
+        Shared::new(self).into()
+    }
 }
 
 /// Build an RE2 pattern that matches `needle` case-insensitively and treats any
@@ -60,10 +89,18 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         let s = session.clone();
-        ctx.defun("goto-char", move |p: i64| -> i64 {
+        // Accepts an integer position or a marker (Emacs `goto-char`).
+        ctx.defun("goto-char", move |p: TulispObject| -> Result<i64, Error> {
             let mut b = s.borrow_mut();
-            b.buffer.goto_char(p.max(1) as usize);
-            b.buffer.point() as i64
+            let pos = if let Ok(m) = Marker::from_tulisp(&p) {
+                b.buffer
+                    .marker_position(m.id)
+                    .ok_or_else(|| err("goto-char: marker points nowhere"))?
+            } else {
+                i64::from_tulisp(&p)?.max(1) as usize
+            };
+            b.buffer.goto_char(pos);
+            Ok(b.buffer.point() as i64)
         });
     }
     {
@@ -306,6 +343,68 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             sess.buffer.set_mark(p);
             sess.buffer.goto_char(m);
             Ok(sess.buffer.point() as i64)
+        });
+    }
+
+    // ---- markers (durable positions; the multi-cursor / viewport primitive) ----
+    {
+        let s = session.clone();
+        // (make-marker) — a marker that points nowhere until `set-marker`.
+        ctx.defun("make-marker", move || -> Marker {
+            Marker {
+                id: s.borrow_mut().buffer.marker_create(None),
+            }
+        });
+    }
+    {
+        let s = session.clone();
+        // (point-marker) — a marker at point.
+        ctx.defun("point-marker", move || -> Marker {
+            let mut sess = s.borrow_mut();
+            let p = sess.buffer.point();
+            Marker {
+                id: sess.buffer.marker_create(Some(p)),
+            }
+        });
+    }
+    {
+        let s = session.clone();
+        // (copy-marker &optional POS) — a new marker at POS (default point).
+        ctx.defun("copy-marker", move |pos: Option<i64>| -> Marker {
+            let mut sess = s.borrow_mut();
+            let p = pos.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
+            Marker {
+                id: sess.buffer.marker_create(Some(p)),
+            }
+        });
+    }
+    {
+        let s = session.clone();
+        // (set-marker MARKER POS) — point MARKER at POS, or detach it with nil.
+        ctx.defun("set-marker", move |m: Marker, pos: Option<i64>| -> Marker {
+            s.borrow_mut()
+                .buffer
+                .marker_set(m.id, pos.map(|p| p.max(1) as usize));
+            m
+        });
+    }
+    {
+        let s = session.clone();
+        // (marker-position MARKER) — its position, or nil if detached.
+        ctx.defun(
+            "marker-position",
+            move |m: Marker| -> Result<TulispObject, Error> {
+                Ok(match s.borrow().buffer.marker_position(m.id) {
+                    Some(p) => TulispValue::from(p as i64).into_ref(None),
+                    None => TulispObject::nil(),
+                })
+            },
+        );
+    }
+    {
+        // (markerp OBJECT) — t if OBJECT is a marker.
+        ctx.defun("markerp", move |obj: TulispObject| -> bool {
+            Marker::from_tulisp(&obj).is_ok()
         });
     }
 

@@ -173,6 +173,14 @@ mod tests {
         run_program(Box::new(Buffer::from_string("t", text)), program).expect("program should run")
     }
 
+    fn report(r: &RunReport, key: &str) -> String {
+        r.reports
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    }
+
     #[test]
     fn read_only_rejects_mutation_and_preserves_buffer() {
         let mut ws = Workspace::new_read_only(Box::new(Buffer::from_string("ref", "keep me")));
@@ -249,6 +257,28 @@ mod tests {
         );
         assert_eq!(r.final_text, "a W b W");
         assert!(r.dirty);
+    }
+
+    #[test]
+    fn marker_tracks_position_across_edits() {
+        // A marker set inside the text rides edits made before it; `goto-char`
+        // accepts the marker, and `markerp` tells a marker from an integer.
+        let r = run(
+            "hello world",
+            r#"(let ((m (copy-marker 9)))
+                 (goto-char 1)
+                 (insert "XX")
+                 (report "pos" (marker-position m))
+                 (goto-char m)
+                 (report "point" (point))
+                 (report "is-marker" (if (markerp m) 1 0))
+                 (report "not-marker" (if (markerp 5) 1 0)))"#,
+        );
+        assert_eq!(r.final_text, "XXhello world");
+        assert_eq!(report(&r, "pos"), "11"); // 9, shifted right by the 2-char insert
+        assert_eq!(report(&r, "point"), "11"); // goto-char followed the marker
+        assert_eq!(report(&r, "is-marker"), "1");
+        assert_eq!(report(&r, "not-marker"), "0");
     }
 
     #[test]
