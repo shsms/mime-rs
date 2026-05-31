@@ -145,12 +145,24 @@ impl Buffer {
             .take()
             .ok_or("replace-match: no preceding match")?;
         let expanded = expand_backrefs(replacement, &md.groups);
+        let new_len = expanded.chars().count();
+        let old_len = md.end - md.start;
         let (lb, hb) = (self.byte_of(md.start), self.byte_of(md.end));
         self.text.replace_range(lb..hb, &expanded);
-        self.point = md.start + expanded.chars().count();
+        self.point = md.start + new_len;
+        // The narrowing's upper bound must track the net length change (the
+        // replaced span lies inside the region), exactly as insert/delete_region
+        // do — otherwise a length-changing replace leaves a stale restriction.
+        if let Some((nlo, nhi)) = self.narrowing.as_mut() {
+            if new_len >= old_len {
+                *nhi += new_len - old_len;
+            } else {
+                *nhi = nhi.saturating_sub(old_len - new_len).max(*nlo);
+            }
+        }
         // A replace is a delete of the match span followed by an insert at its start.
         crate::store::markers_after_delete(&mut self.markers, md.start, md.end);
-        crate::store::markers_after_insert(&mut self.markers, md.start, expanded.chars().count());
+        crate::store::markers_after_insert(&mut self.markers, md.start, new_len);
         Ok(())
     }
 

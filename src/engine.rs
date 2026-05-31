@@ -793,6 +793,22 @@ mod tests {
     }
 
     #[test]
+    fn length_changing_replace_under_narrowing_tracks_point_max() {
+        // A replace that changes length inside a restriction must shrink/grow
+        // point-max, like insert/delete do — otherwise the bound goes stale and
+        // the region silently pulls in text from outside (regression).
+        let r = run(
+            "AA[xx]BB outside",
+            r#"(narrow-to-region 1 7)                ; "AA[xx]" accessible
+               (goto-char (point-min)) (replace-string "xx" "")
+               (report "pmax" (point-max))
+               (report "acc" (buffer-substring (point-min) (point-max)))"#,
+        );
+        assert_eq!(r.reports[0], ("pmax".to_string(), "5".to_string()));
+        assert_eq!(r.reports[1], ("acc".to_string(), "\"AA[]\"".to_string()));
+    }
+
+    #[test]
     fn save_excursion_restores_point() {
         let r = run(
             "hello",

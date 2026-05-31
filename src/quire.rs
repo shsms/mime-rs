@@ -1039,14 +1039,23 @@ impl Quire {
             .ok_or("replace-match: no preceding match")?;
         let expanded = expand_backrefs(replacement, &md.groups);
         let (start, end) = (md.start, md.end);
-        // Splice directly so this matches the oracle's `replace_match` byte for
-        // byte: it leaves narrowing *untouched* (unlike `insert`/`delete_region`,
-        // which each shift the narrowing bound) and only moves point.
+        let new_len = expanded.chars().count();
+        let old_len = end - start;
         self.splice_delete(start, end);
         self.splice_insert(start, &expanded);
-        self.point = start + expanded.chars().count();
+        self.point = start + new_len;
+        // Track the net length change on the narrowing bound, like
+        // insert/delete_region do (the replaced span is inside the region) —
+        // a length-changing replace under a restriction must not leave it stale.
+        if let Some((nlo, nhi)) = self.narrowing.as_mut() {
+            if new_len >= old_len {
+                *nhi += new_len - old_len;
+            } else {
+                *nhi = nhi.saturating_sub(old_len - new_len).max(*nlo);
+            }
+        }
         crate::store::markers_after_delete(&mut self.markers, start, end);
-        crate::store::markers_after_insert(&mut self.markers, start, expanded.chars().count());
+        crate::store::markers_after_insert(&mut self.markers, start, new_len);
         self.invalidate();
         Ok(())
     }
