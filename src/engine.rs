@@ -50,6 +50,12 @@ pub struct Session {
     pub kill_ring: Vec<String>,
     pub reports: Vec<(String, String)>,
     pub log: Vec<String>,
+    /// Program arguments passed in by the trusted CLI: a key→value list in the
+    /// order given, read back by the `(arg "KEY")` builtin. A bare `--flag`
+    /// stores `(flag, "t")`. Only the trusted (orchestration) tier ever reads
+    /// these; the sandboxed agent-facing tier leaves them empty and has no `arg`
+    /// builtin to reach them anyway.
+    pub args: Vec<(String, String)>,
 }
 
 impl Session {
@@ -100,6 +106,24 @@ impl Session {
         self.inactive
             .push(Box::new(crate::Buffer::from_string(actual.clone(), "")));
         actual
+    }
+
+    /// Install an already-built store (e.g. a `Quire` opened from a file) as a
+    /// buffer, the analog of [`generate_new_buffer`] for a store that exists. If
+    /// `make_current`, the present current buffer is stashed into `inactive` and
+    /// `store` becomes current; otherwise `store` joins `inactive`. Returns its
+    /// name. Unlike `generate_new_buffer` the name is taken as-is (callers that
+    /// want reuse-by-name check `has_buffer` first); the trusted `find-file`
+    /// builtin does exactly that.
+    pub fn install_buffer(&mut self, store: Box<dyn TextStore>, make_current: bool) -> String {
+        let name = store.name().to_string();
+        if make_current {
+            let previous = std::mem::replace(&mut self.buffer, store);
+            self.inactive.push(previous);
+        } else {
+            self.inactive.push(store);
+        }
+        name
     }
 
     /// `name` if free, else the first available `name<N>` (N ≥ 2), Emacs-style.
@@ -187,6 +211,15 @@ impl Workspace {
         self.capabilities
     }
 
+    /// Install the program arguments the trusted CLI collected, readable from a
+    /// program via `(arg "KEY")`. Each entry is a `(KEY, VALUE)` pair; a bare
+    /// `--flag` is stored as `(flag, "t")`. Only meaningful on the trusted tier
+    /// (the sandboxed tier registers no `arg` builtin), but harmless to call on
+    /// either. Replaces any previously-set arguments.
+    pub fn set_program_args(&self, args: Vec<(String, String)>) {
+        self.session.borrow_mut().args = args;
+    }
+
     fn with_mode(
         buffer: Box<dyn TextStore>,
         read_only: bool,
@@ -199,6 +232,7 @@ impl Workspace {
             kill_ring: Vec::new(),
             reports: Vec::new(),
             log: Vec::new(),
+            args: Vec::new(),
         }));
 
         let mut ctx = TulispContext::new();

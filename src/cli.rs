@@ -39,6 +39,11 @@ struct Args {
     text: Option<String>,
     path: Option<String>,
     prog_path: Option<String>,
+    /// Extra CLI arguments that are not known mime flags — passed through to the
+    /// trusted program as `(arg "KEY")` values. `--KEY VALUE` becomes
+    /// `(KEY, VALUE)`; a bare `--KEY` (next is another `--…` or the end) becomes
+    /// `(KEY, "t")`. Only the local trusted run path forwards these on.
+    prog_args: Vec<(String, String)>,
 }
 
 pub fn run() {
@@ -90,6 +95,20 @@ fn parse(argv: &[String]) -> Args {
             "--path" => {
                 i += 1;
                 a.path = argv.get(i).cloned();
+            }
+            // Any other `--KEY` is a program argument forwarded to the trusted
+            // program: `--KEY VALUE` → (KEY, VALUE) when the next arg is a plain
+            // value; a bare `--KEY` (next is another `--…` or the end) → (KEY,
+            // "t"), so a flag reads back as "t".
+            flag if flag.starts_with("--") => {
+                let key = flag.trim_start_matches('-').to_string();
+                match argv.get(i + 1) {
+                    Some(v) if !v.starts_with("--") => {
+                        a.prog_args.push((key, v.clone()));
+                        i += 1;
+                    }
+                    _ => a.prog_args.push((key, "t".to_string())),
+                }
             }
             other if a.prog_path.is_none() => a.prog_path = Some(other.to_string()),
             other => {
@@ -151,6 +170,10 @@ fn run_local(args: &Args, verb: &str) {
     // Trusted tier: the local `mime` CLI also gets the orchestration group
     // (multiple buffers, file I/O, args) — see Workspace::new_trusted / Capabilities.
     let mut ws = crate::Workspace::new_trusted(store);
+    // Forward the extra CLI args (everything that is not a known mime flag) to
+    // the trusted program, readable via `(arg "KEY")`. This is what parameterizes
+    // a program like add-anno (--date, --anno_path, --infile, …).
+    ws.set_program_args(args.prog_args.clone());
     let result = if rehearse {
         ws.rehearse(&program)
     } else {
@@ -522,6 +545,58 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         repl_loop(&mut ws, std::io::Cursor::new(stdin.to_string()), &mut out);
         String::from_utf8(out).unwrap()
+    }
+
+    /// argv as `parse` expects it: argv[0] is the program name, ignored.
+    fn argv(rest: &[&str]) -> Vec<String> {
+        std::iter::once("mime".to_string())
+            .chain(rest.iter().map(|s| s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn parse_collects_unknown_flags_as_program_args() {
+        // Known flags (--local, --file, --write) and the program path are still
+        // consumed normally; every other `--KEY` is forwarded as a program arg.
+        let a = parse(&argv(&[
+            "run",
+            "--local",
+            "prog.tl",
+            "--file",
+            "doc.md",
+            "--write",
+            "--date",
+            "May 1",
+            "--anno_path",
+            "anno.json",
+            "--with_badges",
+        ]));
+        assert!(a.local);
+        assert!(a.write_back);
+        assert_eq!(a.file.as_deref(), Some("doc.md"));
+        assert_eq!(a.prog_path.as_deref(), Some("prog.tl"));
+        // `--KEY VALUE` → (KEY, VALUE); a trailing bare `--KEY` → (KEY, "t").
+        assert_eq!(
+            a.prog_args,
+            vec![
+                ("date".to_string(), "May 1".to_string()),
+                ("anno_path".to_string(), "anno.json".to_string()),
+                ("with_badges".to_string(), "t".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_treats_a_bare_flag_before_another_flag_as_t() {
+        // `--with_badges` followed by another `--KEY` (not a value) is a bare flag.
+        let a = parse(&argv(&["run", "--with_badges", "--date", "May 1"]));
+        assert_eq!(
+            a.prog_args,
+            vec![
+                ("with_badges".to_string(), "t".to_string()),
+                ("date".to_string(), "May 1".to_string()),
+            ]
+        );
     }
 
     #[test]
