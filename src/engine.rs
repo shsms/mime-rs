@@ -11,8 +11,40 @@ use tulisp::TulispContext;
 /// State shared between a running program and the editor builtins. The editor
 /// primitives close over an `Rc<RefCell<Session>>` (tulisp is single-threaded,
 /// so interior mutability via `RefCell` is sound for these leaf operations).
+/// A saved workspace snapshot. M0 stores the full text; the persistent B-tree
+/// (Quire upgrade) will make these ~KB via structural sharing.
+#[derive(Clone)]
+pub struct Checkpoint {
+    pub label: String,
+    text: String,
+    point: usize,
+    mark: Option<usize>,
+    narrowing: Option<(usize, usize)>,
+}
+
+impl Checkpoint {
+    pub fn capture(label: String, store: &dyn TextStore) -> Self {
+        Checkpoint {
+            label,
+            text: store.text().to_string(),
+            point: store.point(),
+            mark: store.mark(),
+            narrowing: store.narrowing(),
+        }
+    }
+    /// Rebuild a store from this checkpoint (M0: an in-memory Buffer).
+    pub fn restore(&self, name: &str) -> Box<dyn TextStore> {
+        let mut b = crate::buffer::Buffer::from_string(name, self.text.clone());
+        b.set_restriction(self.narrowing);
+        b.goto_char(self.point);
+        b.set_mark_opt(self.mark);
+        Box::new(b)
+    }
+}
+
 pub struct Session {
     pub buffer: Box<dyn TextStore>,
+    pub checkpoints: Vec<Checkpoint>,
     pub kill_ring: Vec<String>,
     pub reports: Vec<(String, String)>,
     pub log: Vec<String>,
@@ -29,6 +61,7 @@ pub fn run_program(buffer: Box<dyn TextStore>, program: &str) -> Result<RunRepor
 
     let session: SharedSession = Rc::new(RefCell::new(Session {
         buffer,
+        checkpoints: Vec::new(),
         kill_ring: Vec::new(),
         reports: Vec::new(),
         log: Vec::new(),
@@ -227,5 +260,14 @@ mod tests {
         assert_eq!(r.reports[1], ("bol".to_string(), "7".to_string()));
         assert_eq!(r.reports[2], ("eol".to_string(), "12".to_string()));
         assert_eq!(r.reports[3], ("g2".to_string(), "7".to_string()));
+    }
+
+    #[test]
+    fn checkpoint_and_restore() {
+        let r = run(
+            "original",
+            r#"(checkpoint "c1") (erase-buffer) (insert "changed") (restore-checkpoint "c1")"#,
+        );
+        assert_eq!(r.final_text, "original");
     }
 }

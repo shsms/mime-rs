@@ -2,7 +2,7 @@
 //! Emacs-Lisp names over an implicit current buffer (held in the shared
 //! `Session`). M0 subset: navigation, edit, regex search/replace, reporting.
 //! Subagents extend this with region/mark, kill-ring, markers, and narrowing.
-use crate::engine::SharedSession;
+use crate::engine::{Checkpoint, SharedSession};
 use tulisp::{Error, TulispContext, TulispObject, TulispValue};
 
 fn bad_regex(e: regex::Error) -> Error {
@@ -680,5 +680,43 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             sess.buffer.forward_line((n - 1).max(0));
             sess.buffer.point() as i64
         });
+    }
+
+    // ---- checkpoints (workspace time travel — M0: full-text snapshots) ----
+    {
+        let s = session.clone();
+        ctx.defun(
+            "checkpoint",
+            move |label: Option<String>| -> Result<TulispObject, Error> {
+                let mut sess = s.borrow_mut();
+                let label = label.unwrap_or_else(|| format!("auto-{}", sess.checkpoints.len()));
+                let cp = Checkpoint::capture(label.clone(), &*sess.buffer);
+                sess.checkpoints.push(cp);
+                Ok(TulispValue::from(label).into_ref(None))
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        ctx.defun(
+            "restore-checkpoint",
+            move |label: String| -> Result<TulispObject, Error> {
+                let mut sess = s.borrow_mut();
+                let cp = sess
+                    .checkpoints
+                    .iter()
+                    .rev()
+                    .find(|c| c.label == label)
+                    .cloned();
+                match cp {
+                    Some(c) => {
+                        let name = sess.buffer.name().to_string();
+                        sess.buffer = c.restore(&name);
+                        Ok(TulispObject::t())
+                    }
+                    None => Err(err(&format!("No checkpoint named {label}"))),
+                }
+            },
+        );
     }
 }
