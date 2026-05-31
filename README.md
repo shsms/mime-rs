@@ -13,21 +13,30 @@ and roadmap.
 
 ## Status
 
-Early but real: **M0–M4 work end to end** — the editor core, the `Quire` store,
-checkpoints/transactions, the `mimed` daemon (warm sessions), and **`mime-mcp`** (the
-MCP server). 62 tests, `clippy` clean.
+Real and dogfooded: **M0–M5 work end to end**, plus markers, a dry-run, and an M7
+syntax scaffold. The editor core, the `Quire` store, checkpoints/transactions, the
+`mimed` daemon (warm sessions), **`mime-mcp`** (the MCP server), and a path-allowlist
++ audit safety layer all work. **108 tests, `clippy` clean.**
 
 - **`TextStore`** trait with two implementations: an in-memory `Buffer` (the
   differential-test oracle) and **`Quire`**, a persistent measured-B-tree piece store
   over an *mmapped* original + append-only add buffer (so multi-GB files never go
-  fully resident; O(log n) seeks, O(1) structural-sharing snapshots).
-- ~60 Emacs-Lisp editor primitives + a `regex`-backed string library, all on the
-  [`tulisp`](../tulisp) interpreter.
-- `checkpoint` / `restore-checkpoint` / `with-transaction` — workspace snapshots
-  and atomic, roll-back-on-error edits.
+  fully resident; O(log n) seeks, O(1) structural-sharing snapshots). Saves are
+  **atomic** (temp file + rename), so an in-place save never disturbs the live mmap.
+- **~90 Emacs-Lisp editor primitives** — motion, mark/region, regex & fuzzy
+  search/replace, kill-ring, narrowing, **markers** (durable positions), a `window`
+  viewport, and an M7 `treesit-*` (tree-sitter) scaffold — plus a `regex`-backed
+  string library, all on the [`tulisp`](../tulisp) interpreter.
+- `checkpoint` / `restore-checkpoint` / `with-transaction` — workspace snapshots and
+  atomic, roll-back-on-error edits — and **`rehearse`**, a dry-run that returns a
+  program's diff then rolls the buffer back so nothing persists.
 - **`mimed`** — a daemon serving warm sessions over a unix socket (JSON-lines); and
-  **`mime-mcp`** — an MCP server (JSON-RPC over stdio) exposing the engine as 10 tools
-  (`open_file`, `run_program`, `read_region`, `search`, `checkpoint`, …) for agents.
+  **`mime-mcp`** — an MCP server (JSON-RPC over stdio) exposing the engine as 13 tools
+  (`open_file`, `run_program`, `rehearse`, `read_region`, `view`, `insert_text`,
+  `search`, `checkpoint`, `save_buffer`, `session_status`, …) for agents.
+- **Safety**: `open_file` / `save_buffer` are confined to `$MIME_ROOTS` (or the cwd),
+  which `session_status` advertises up front; `$MIME_AUDIT` logs one JSON line per
+  run. No shell, no network, no arbitrary filesystem access.
 
 Regex is **RE2** (the `regex` crate) — linear-time and streamable; Emacs
 *function names*, RE2 *syntax* (no in-pattern backreferences).
@@ -64,12 +73,14 @@ Programs are Emacs Lisp on `tulisp` (control flow, `let`, `lambda`, `dolist`,
 | Motion | `point` `point-min` `point-max` `goto-char` `goto-line` `forward-char` `forward-line` `forward-word` `backward-word` `beginning-of-buffer` `end-of-buffer` `beginning-of-line` `end-of-line` `line-beginning-position` `line-end-position` `line-number-at-pos` `current-column` |
 | Predicates / chars | `bolp` `eolp` `bobp` `eobp` `char-after` `char-before` `looking-at` |
 | Mark & region | `set-mark` `mark` `region-beginning` `region-end` `exchange-point-and-mark` |
+| Markers | `make-marker` `point-marker` `copy-marker` `set-marker` `marker-position` `markerp` (durable positions; `goto-char` accepts a marker) |
 | Edit | `insert` `insert-char` `newline` `delete-char` `delete-region` `erase-buffer` `buffer-string` `buffer-substring` `upcase-region` `downcase-region` |
 | Kill ring | `kill-region` `copy-region-as-kill` `yank` |
-| Search & replace | `re-search-forward` `search-forward` `search-backward` `replace-match` `match-string` `replace-string` `replace-regexp` `count-matches` |
+| Search & replace | `re-search-forward` `search-forward` `search-backward` `replace-match` `match-string` `replace-string` `replace-regexp` `count-matches` `search-fuzzy` |
 | Narrowing & scope | `narrow-to-region` `widen` `save-excursion` `save-restriction` |
 | Time travel | `checkpoint` `restore-checkpoint` `with-transaction` |
-| Observability | `report` `message` |
+| Structural (M7) | `treesit-root-type` `treesit-node-at` `treesit-beginning-of-defun` `treesit-end-of-defun` (tree-sitter; Markdown) |
+| Observability | `report` `message` `window` |
 | String library | `replace-regexp-in-string` `substring` `split-string` `string-trim`(`-left`/`-right`) `string-prefix-p` `string-suffix-p` `string-search` `string-replace` `string-join` `string-empty-p` `number-to-string` `string-to-number` `upcase` `downcase` `capitalize` `char-to-string` `string-to-char` |
 
 ## Build
@@ -86,7 +97,9 @@ cargo test
 - `src/quire.rs` — `Quire`, the mmap-backed persistent-B-tree piece store.
 - `src/builtins.rs` — editor primitives registered on a `tulisp` context.
 - `src/strings.rs` — the RE2-backed string library.
-- `src/engine.rs` — `run_program`, the session, checkpoints.
+- `src/syntax.rs` — the tree-sitter scaffold behind the `treesit-*` builtins (M7).
+- `src/engine.rs` — `run_program` / `rehearse`, the session, checkpoints.
+- `src/safety.rs` — path allowlisting (`$MIME_ROOTS`), atomic saves, audit journal.
 - `src/bin/mimectl.rs` — the CLI client (`--local` one-shot + daemon verbs).
 - `src/bin/mimed.rs` — the warm-session daemon (unix socket, JSON-lines).
 - `src/bin/mime-mcp.rs` — the MCP server (JSON-RPC over stdio).
