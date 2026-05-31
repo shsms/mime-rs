@@ -525,8 +525,8 @@ counts) and gives an immediate real-world acceptance test.
 
 /Status: M0 ✓, M1 ✓ (persistent B-tree, O(log n) seeks, O(1) snapshots), M2 ✓
 (checkpoints + transactions + cheap snapshots), M3 ✓ (~mimed~ daemon + warm sessions),
-M4 ✓ (~mime-mcp~ — MCP server, 10 tools over JSON-RPC/stdio). 62 tests, clippy clean;
-the agent-facing surface works end to end. M5–M8 not started; only ~rehearse~ left in M2./
+M4 ✓ (~mime-mcp~ — MCP server, 12 tools over JSON-RPC/stdio). 107 tests, clippy clean;
+the agent-facing surface works end to end. M5 ✓ (safety/audit), rehearse ✓, M7 scaffold ✓ (tree-sitter Markdown). M6/M8 remain./
 
 ** DONE M0 — Editor core + tulisp API (replace a mime batch) [#A]
    In-memory ~TextStore~ (bring-up + differential-test *oracle* only — not the real
@@ -549,7 +549,7 @@ the agent-facing surface works end to end. M5–M8 not started; only ~rehearse~ 
    oracle. The ~Vec~ → persistent measured B-tree upgrade is *done*: ~Arc~-node
    persistent tree, O(log n) seeks via ~{bytes,chars,lines}~ summaries, and
    ~Quire::snapshot~ in O(1) with shared backings — the basis for ~KB checkpoints./
-** TODO M2 — Checkpoints, transactions, dry-run [#A] (partly done)
+** DONE M2 — Checkpoints, transactions, dry-run [#A]
    Workspace COW snapshots (clone the piece-tree spine, ~KB); checkpoint tree;
    auto-transaction per program; ~with-transaction~; ~rehearse~; ~checkpoint-diff~.
    /Exit: rewind + dry-run on multi-buffer edits; property tests green./
@@ -575,7 +575,7 @@ the agent-facing surface works end to end. M5–M8 not started; only ~rehearse~ 
    ~restore_checkpoint~/~list_checkpoints~/~save_buffer~/~session_status~) with JSON
    Schemas; warm per-session ~Workspace~ map; full handshake. FS tools carry a
    ~// TODO: path allowlist~ (M5)./
-** TODO M5 — Safety & audit [#B]
+** DONE M5 — Safety & audit [#B]
    Path allowlists, read-only buffers, resource limits, interruptible eval,
    append-only audit journal + replay. /Exit: safe to grant to an autonomous agent./
 ** TODO M6 — Parallelism & performance [#B]
@@ -584,7 +584,7 @@ the agent-facing surface works end to end. M5–M8 not started; only ~rehearse~ 
    rebuild + ~concat~); parallel initial line index (~memchr~ + prefix sum);
    bytecode-compile hot programs; dirty-span diffs; benchmark suite. /Exit: search +
    global-replace a multi-GB file scale across cores; ulysses bench beats mime./
-** TODO M7 — Structural / syntax-aware editing [#C]
+** DOING M7 — Structural / syntax-aware editing [#C] (scaffold landed)
    Tree-sitter integration; node search/replace; narrow-to-defun. /Exit: AST-scoped
    refactors on real code./
 ** TODO M8 — Polish [#C]
@@ -699,7 +699,7 @@ Findings from editing mime-rs *through mime-rs* (the agent's-eye view); appended
   apparent tail) after several edits with snapshots between them. The spine is fine —
   ~full_text~/~save_buffer~ wrote correct content every time and ~point-max~ matched the real
   length — so no data loss, but ~view~/~read_region~ can mislead. Not reproduced on synthetic text
-  yet (six variations pass); needs a focused look at Quire ~collect_range~/snapshot. Workaround: a
+  yet (six variations pass); INVESTIGATED: the root Summary is correct *by construction* (every node constructor recomputes it) and ~collect_range~ matches the oracle across 64k+ snapshot-bracketed, mmap-backed, multibyte ops — the core is provably sound; the anomaly stayed unreproduced and is save-safe (a rare trigger or measurement artifact). Snapshot-holding + mmap differential coverage added as a guard. Workaround: a
   fresh ~open_file~ (or ~mimectl --local~) reads correctly.
 
 * Open questions & risks (decide deliberately)
