@@ -8,7 +8,10 @@
 
 pub mod buffer;
 pub mod builtins;
+pub mod cli;
+pub mod daemon;
 pub mod engine;
+pub mod mcp;
 pub mod quire;
 pub mod result;
 pub mod safety;

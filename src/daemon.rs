@@ -24,7 +24,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Mutex;
 
-use mime_rs::{Buffer, Quire, TextStore, Workspace};
+use crate::{Buffer, Quire, TextStore, Workspace};
 use serde_json::{Value, json};
 
 const DEFAULT_SOCKET: &str = "/tmp/mimed.sock";
@@ -33,7 +33,7 @@ fn socket_path() -> String {
     std::env::var("MIME_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET.to_string())
 }
 
-fn main() {
+pub fn run() {
     let path = socket_path();
     // Remove a stale socket from a previous run; bind would otherwise fail with
     // "Address already in use".
@@ -128,7 +128,7 @@ fn op_open(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
             let Some(path) = file.as_str() else {
                 return err("\"file\" must be a string");
             };
-            let path = match mime_rs::safety::check_path(Path::new(path)) {
+            let path = match crate::safety::check_path(Path::new(path)) {
                 Ok(p) => p,
                 Err(e) => return err(&e),
             };
@@ -150,6 +150,9 @@ fn op_open(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
         .get("read_only")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // CAPABILITY TIER HOOK: a later milestone selects a trusted vs sandboxed
+    // workspace here (per-session capability set); for now every session gets the
+    // same engine-enforced sandbox.
     let workspace = if read_only {
         Workspace::new_read_only(store)
     } else {
@@ -187,7 +190,7 @@ fn op_run(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>, rehearse: b
         Ok(report) => {
             // A rehearsal persists nothing, so it is reported as a non-mutating
             // event (dirty=false) regardless of the hypothetical edit.
-            mime_rs::safety::audit(
+            crate::safety::audit(
                 "mimed",
                 &session,
                 &program,
@@ -208,7 +211,7 @@ fn op_status(sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
     let map = sessions.lock().unwrap();
     let mut ids: Vec<&String> = map.keys().collect();
     ids.sort();
-    let roots: Vec<String> = mime_rs::safety::roots()
+    let roots: Vec<String> = crate::safety::roots()
         .iter()
         .map(|r| r.display().to_string())
         .collect();
@@ -216,7 +219,7 @@ fn op_status(sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
         "ok": true,
         "sessions": ids,
         "roots": roots,
-        "audit": mime_rs::safety::audit_enabled(),
+        "audit": crate::safety::audit_enabled(),
     })
 }
 
@@ -231,7 +234,7 @@ fn op_save(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
         Ok(p) => p,
         Err(e) => return e,
     };
-    let checked = match mime_rs::safety::check_path(Path::new(&path)) {
+    let checked = match crate::safety::check_path(Path::new(&path)) {
         Ok(p) => p,
         Err(e) => return err(&e),
     };

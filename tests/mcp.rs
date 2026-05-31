@@ -1,16 +1,16 @@
-//! Integration test for the `mime-mcp` MCP server.
+//! Integration test for the MCP server (`mime --mcp`).
 //!
-//! Spawns the built `mime-mcp` binary as a subprocess with piped stdin/stdout
-//! and drives it with real JSON-RPC 2.0 lines, asserting on the responses. This
-//! exercises the full stdio protocol path — handshake, `tools/list`,
-//! `tools/call` for a real edit program, and the checkpoint → mutate → restore
-//! round-trip — exactly as an MCP client would.
+//! Spawns the built `mime` binary in MCP mode as a subprocess with piped
+//! stdin/stdout and drives it with real JSON-RPC 2.0 lines, asserting on the
+//! responses. This exercises the full stdio protocol path — handshake,
+//! `tools/list`, `tools/call` for a real edit program, and the checkpoint →
+//! mutate → restore round-trip — exactly as an MCP client would.
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use serde_json::{Value, json};
 
-/// A live `mime-mcp` subprocess with line-buffered stdin/stdout handles.
+/// A live `mime --mcp` subprocess with line-buffered stdin/stdout handles.
 struct Server {
     child: Child,
     stdin: ChildStdin,
@@ -22,17 +22,18 @@ impl Server {
         Server::spawn_with_env(&[])
     }
 
-    /// Spawn `mime-mcp` with extra environment variables (e.g. `MIME_ROOTS`,
+    /// Spawn `mime --mcp` with extra environment variables (e.g. `MIME_ROOTS`,
     /// `MIME_AUDIT`) — used by the safety tests.
     fn spawn_with_env(env: &[(&str, &std::path::Path)]) -> Server {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mime-mcp"));
-        cmd.stdin(Stdio::piped())
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mime"));
+        cmd.arg("--mcp")
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let mut child = cmd.spawn().expect("spawn mime-mcp");
+        let mut child = cmd.spawn().expect("spawn mime --mcp");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         Server {

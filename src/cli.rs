@@ -1,25 +1,25 @@
-//! mimectl — the CLI client.
+//! The CLI front-end (the `mime` default mode).
 //!
-//! Two modes share one parser:
+//! Three modes share one parser:
 //!
 //! * One-shot, embedded (no daemon):
-//!   `mimectl run --local PROG.tl [--file FILE] [--write]` runs a tulisp edit
+//!   `mime run --local PROG.tl [--file FILE] [--write]` runs a tulisp edit
 //!   program against FILE (or stdin) in-process and prints the structured JSON
 //!   result; `--write` saves the edited text back to FILE.
 //!
 //! * Interactive, embedded (no daemon):
-//!   `mimectl repl [--file FILE]` opens a warm in-process session and reads
+//!   `mime repl [--file FILE]` opens a warm in-process session and reads
 //!   tulisp from stdin a form at a time, printing the diff + reports + value for
 //!   each. State (buffer, kill-ring, checkpoints, `defun`s) persists across
 //!   lines; nothing is ever written back to disk.
 //!
-//! * Daemon-backed (talks to `mimed` over its unix socket — `$MIME_SOCKET` or
-//!   `/tmp/mimed.sock`):
-//!     - `mimectl --session S open --file FILE` / `--text STR`
-//!     - `mimectl --session S run PROG.tl`
-//!     - `mimectl --session S save --path PATH`
-//!     - `mimectl --session S close`
-//!     - `mimectl status` — live sessions, the allowed roots, and audit state
+//! * Daemon-backed (talks to `mime --daemon` over its unix socket —
+//!   `$MIME_SOCKET` or `/tmp/mimed.sock`):
+//!     - `mime --session S open --file FILE` / `--text STR`
+//!     - `mime --session S run PROG.tl`
+//!     - `mime --session S save --path PATH`
+//!     - `mime --session S close`
+//!     - `mime status` — live sessions, the allowed roots, and audit state
 //!
 //! The session comes from `--session` or `$MIME_SESSION`. Each verb is sent as
 //! one JSON request line; the daemon's JSON response line is printed verbatim.
@@ -41,7 +41,7 @@ struct Args {
     prog_path: Option<String>,
 }
 
-fn main() {
+pub fn run() {
     let argv: Vec<String> = std::env::args().collect();
     let args = parse(&argv);
 
@@ -122,16 +122,16 @@ fn run_local(args: &Args, verb: &str) {
 
     // A file is opened through Quire — the mmap-backed piece-table store (the
     // production path, GB-capable); stdin uses the in-memory Buffer.
-    let store: Box<dyn mime_rs::TextStore> = match &args.file {
+    let store: Box<dyn crate::TextStore> = match &args.file {
         Some(f) => {
-            let path = match mime_rs::safety::check_path(std::path::Path::new(f)) {
+            let path = match crate::safety::check_path(std::path::Path::new(f)) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("{e}");
                     exit(2);
                 }
             };
-            match mime_rs::Quire::open(&path) {
+            match crate::Quire::open(&path) {
                 Ok(q) => Box::new(q),
                 Err(e) => {
                     eprintln!("cannot open file {f}: {e}");
@@ -142,13 +142,15 @@ fn run_local(args: &Args, verb: &str) {
         None => {
             let mut s = String::new();
             std::io::stdin().read_to_string(&mut s).ok();
-            Box::new(mime_rs::Buffer::from_string("*stdin*", s))
+            Box::new(crate::Buffer::from_string("*stdin*", s))
         }
     };
 
     // `rehearse` rolls back inside the workspace, so the result is identical to
     // discarding the report; we just never write it back. `run` may persist.
-    let mut ws = mime_rs::Workspace::new(store);
+    // CAPABILITY TIER HOOK: a later milestone selects a trusted vs sandboxed
+    // workspace here; for now the engine-enforced sandbox is the only tier.
+    let mut ws = crate::Workspace::new(store);
     let result = if rehearse {
         ws.rehearse(&program)
     } else {
@@ -167,7 +169,7 @@ fn run_local(args: &Args, verb: &str) {
             } else if args.write_back {
                 match &args.file {
                     Some(f) => {
-                        let path = match mime_rs::safety::check_path(std::path::Path::new(f)) {
+                        let path = match crate::safety::check_path(std::path::Path::new(f)) {
                             Ok(p) => p,
                             Err(e) => {
                                 eprintln!("{e}");
@@ -175,7 +177,7 @@ fn run_local(args: &Args, verb: &str) {
                             }
                         };
                         if let Err(e) =
-                            mime_rs::safety::write_atomic(&path, report.final_text.as_bytes())
+                            crate::safety::write_atomic(&path, report.final_text.as_bytes())
                         {
                             eprintln!("cannot write {f}: {e}");
                             exit(1);
@@ -192,7 +194,7 @@ fn run_local(args: &Args, verb: &str) {
     }
 }
 
-/// The interactive REPL (`mimectl repl [--file FILE]`): a single warm,
+/// The interactive REPL (`mime repl [--file FILE]`): a single warm,
 /// in-process [`Workspace`] that survives across lines, so the buffer, the
 /// kill-ring, checkpoints, and any `defun`s persist between expressions. Reads
 /// tulisp from stdin a form at a time and prints, for each, the diff (if the
@@ -201,18 +203,18 @@ fn run_local(args: &Args, verb: &str) {
 /// `--file FILE` loads FILE into the session first (via Quire, the production
 /// store); without it the session starts on an empty in-memory buffer. The REPL
 /// never writes anything back to disk — it is a scratchpad for *trying* edits;
-/// use `mimectl --session … save` (daemon) or `run --local … --write` to persist.
+/// use `mime --session … save` (daemon) or `run --local … --write` to persist.
 fn run_repl(args: &Args) {
-    let store: Box<dyn mime_rs::TextStore> = match &args.file {
+    let store: Box<dyn crate::TextStore> = match &args.file {
         Some(f) => {
-            let path = match mime_rs::safety::check_path(std::path::Path::new(f)) {
+            let path = match crate::safety::check_path(std::path::Path::new(f)) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("{e}");
                     exit(2);
                 }
             };
-            match mime_rs::Quire::open(&path) {
+            match crate::Quire::open(&path) {
                 Ok(q) => Box::new(q),
                 Err(e) => {
                     eprintln!("cannot open file {f}: {e}");
@@ -220,10 +222,12 @@ fn run_repl(args: &Args) {
                 }
             }
         }
-        None => Box::new(mime_rs::Buffer::from_string("*repl*", String::new())),
+        None => Box::new(crate::Buffer::from_string("*repl*", String::new())),
     };
 
-    let mut ws = mime_rs::Workspace::new(store);
+    // CAPABILITY TIER HOOK: a later milestone selects a trusted vs sandboxed
+    // workspace here; for now the engine-enforced sandbox is the only tier.
+    let mut ws = crate::Workspace::new(store);
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     repl_loop(&mut ws, stdin.lock(), &mut stdout.lock());
@@ -234,7 +238,7 @@ fn run_repl(args: &Args) {
 /// until a complete (paren-balanced, not mid-string) form is in hand — or a
 /// blank line forces a submit — evaluates the form against `ws`, and writes the
 /// formatted result. Returns cleanly on EOF.
-fn repl_loop<R: BufRead, W: Write>(ws: &mut mime_rs::Workspace, mut input: R, out: &mut W) {
+fn repl_loop<R: BufRead, W: Write>(ws: &mut crate::Workspace, mut input: R, out: &mut W) {
     let prompt = |out: &mut W, first: bool| {
         // A continuation prompt ("..") signals "I'm waiting for the rest of the
         // form"; the primary prompt is "mime>".
@@ -290,7 +294,7 @@ fn repl_loop<R: BufRead, W: Write>(ws: &mut mime_rs::Workspace, mut input: R, ou
 /// when the buffer changed, each `(message …)` line, each `(report K V)` pair,
 /// and the value (tulisp-printed) after `=>`. A tulisp error prints as
 /// `error: …` and does not abort the loop.
-fn eval_and_print<W: Write>(ws: &mut mime_rs::Workspace, form: &str, out: &mut W) {
+fn eval_and_print<W: Write>(ws: &mut crate::Workspace, form: &str, out: &mut W) {
     match ws.run_value(form) {
         Ok((report, value)) => {
             // The diff is the agent-facing payload — show it only when the edit
@@ -387,7 +391,7 @@ fn form_complete(src: &str) -> bool {
 }
 
 /// The daemon-backed path: build the JSON request for `verb`, send it to
-/// `mimed`, and print the response line.
+/// the daemon, and print the response line.
 fn run_daemon(args: &Args, verb: &str) {
     let req = match verb {
         "status" => serde_json::json!({ "op": "status" }),
@@ -409,7 +413,7 @@ fn run_daemon(args: &Args, verb: &str) {
         "run" | "rehearse" => {
             let session = require_session(args);
             let Some(prog_path) = args.prog_path.as_deref() else {
-                eprintln!("{verb} needs a program path: mimectl --session S {verb} PROG.tl");
+                eprintln!("{verb} needs a program path: mime --session S {verb} PROG.tl");
                 exit(2);
             };
             let program = read_or_die(prog_path, "program");
@@ -449,11 +453,11 @@ fn run_daemon(args: &Args, verb: &str) {
     }
 }
 
-/// Send one JSON request line to `mimed` and return its one response line.
+/// Send one JSON request line to the daemon and return its one response line.
 fn request(req: &serde_json::Value) -> String {
     let path = std::env::var("MIME_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET.to_string());
     let stream = UnixStream::connect(&path).unwrap_or_else(|e| {
-        eprintln!("cannot connect to mimed at {path}: {e} (is mimed running?)");
+        eprintln!("cannot connect to mimed at {path}: {e} (is `mime --daemon` running?)");
         exit(2);
     });
     let mut writer = stream.try_clone().unwrap_or_else(|e| {
@@ -488,15 +492,15 @@ fn require_session(args: &Args) -> String {
 fn usage() {
     eprintln!(
         "usage:\n  \
-         mimectl run --local PROG.tl [--file FILE] [--write]   (embedded one-shot)\n  \
-         mimectl rehearse --local PROG.tl [--file FILE]        (embedded dry-run; never writes)\n  \
-         mimectl repl [--file FILE]                            (interactive warm session; never writes)\n  \
-         mimectl --session S open --file FILE | --text STR     (daemon)\n  \
-         mimectl --session S run PROG.tl                       (daemon)\n  \
-         mimectl --session S rehearse PROG.tl                  (daemon dry-run; nothing persists)\n  \
-         mimectl --session S save --path PATH                  (daemon)\n  \
-         mimectl --session S close                             (daemon)\n  \
-         mimectl status                                        (daemon)"
+         mime run --local PROG.tl [--file FILE] [--write]      (embedded one-shot)\n  \
+         mime rehearse --local PROG.tl [--file FILE]           (embedded dry-run; never writes)\n  \
+         mime repl [--file FILE]                               (interactive warm session; never writes)\n  \
+         mime --session S open --file FILE | --text STR        (daemon)\n  \
+         mime --session S run PROG.tl                          (daemon)\n  \
+         mime --session S rehearse PROG.tl                     (daemon dry-run; nothing persists)\n  \
+         mime --session S save --path PATH                     (daemon)\n  \
+         mime --session S close                                (daemon)\n  \
+         mime status                                           (daemon)"
     );
 }
 
@@ -514,7 +518,7 @@ mod tests {
     /// Drive `repl_loop` with canned stdin against a fresh workspace seeded with
     /// `text`, and return everything it wrote to stdout as a String.
     fn repl(text: &str, stdin: &str) -> String {
-        let mut ws = mime_rs::Workspace::new(Box::new(mime_rs::Buffer::from_string("*t*", text)));
+        let mut ws = crate::Workspace::new(Box::new(crate::Buffer::from_string("*t*", text)));
         let mut out: Vec<u8> = Vec::new();
         repl_loop(&mut ws, std::io::Cursor::new(stdin.to_string()), &mut out);
         String::from_utf8(out).unwrap()
