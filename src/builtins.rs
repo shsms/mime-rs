@@ -370,4 +370,116 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             res
         });
     }
+
+    // ---- kill ring ----
+    {
+        let s = session.clone();
+        ctx.defun(
+            "kill-region",
+            move |a: i64, b: i64| -> Result<TulispObject, Error> {
+                let (a, b) = (a.max(1) as usize, b.max(1) as usize);
+                let mut sess = s.borrow_mut();
+                let text = sess.buffer.substring(a, b);
+                sess.kill_ring.push(text);
+                sess.buffer.delete_region(a, b);
+                Ok(TulispObject::nil())
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        ctx.defun(
+            "copy-region-as-kill",
+            move |a: i64, b: i64| -> Result<TulispObject, Error> {
+                let mut sess = s.borrow_mut();
+                let text = sess.buffer.substring(a.max(1) as usize, b.max(1) as usize);
+                sess.kill_ring.push(text);
+                Ok(TulispObject::nil())
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        ctx.defun("yank", move || -> Result<TulispObject, Error> {
+            let mut sess = s.borrow_mut();
+            if let Some(text) = sess.kill_ring.last().cloned() {
+                sess.buffer.insert(&text);
+            }
+            Ok(TulispObject::nil())
+        });
+    }
+
+    // ---- more edit primitives ----
+    {
+        let s = session.clone();
+        ctx.defun(
+            "delete-char",
+            move |n: i64| -> Result<TulispObject, Error> {
+                let mut sess = s.borrow_mut();
+                let p = sess.buffer.point() as i64;
+                sess.buffer
+                    .delete_region(p.max(1) as usize, (p + n).max(1) as usize);
+                Ok(TulispObject::nil())
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        ctx.defun("erase-buffer", move || -> Result<TulispObject, Error> {
+            let mut sess = s.borrow_mut();
+            let (lo, hi) = (sess.buffer.point_min(), sess.buffer.point_max());
+            sess.buffer.delete_region(lo, hi);
+            Ok(TulispObject::nil())
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun("bolp", move || -> Result<TulispObject, Error> {
+            let sess = s.borrow();
+            let p = sess.buffer.point();
+            let at = p == sess.buffer.point_min() || sess.buffer.char_before(p) == Some('\n');
+            Ok(if at {
+                TulispObject::t()
+            } else {
+                TulispObject::nil()
+            })
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun("eolp", move || -> Result<TulispObject, Error> {
+            let sess = s.borrow();
+            let p = sess.buffer.point();
+            let at = p == sess.buffer.point_max() || sess.buffer.char_after(p) == Some('\n');
+            Ok(if at {
+                TulispObject::t()
+            } else {
+                TulispObject::nil()
+            })
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun("bobp", move || -> Result<TulispObject, Error> {
+            let sess = s.borrow();
+            let at = sess.buffer.point() == sess.buffer.point_min();
+            Ok(if at {
+                TulispObject::t()
+            } else {
+                TulispObject::nil()
+            })
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun("eobp", move || -> Result<TulispObject, Error> {
+            let sess = s.borrow();
+            let at = sess.buffer.point() == sess.buffer.point_max();
+            Ok(if at {
+                TulispObject::t()
+            } else {
+                TulispObject::nil()
+            })
+        });
+    }
 }

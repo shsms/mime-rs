@@ -13,6 +13,7 @@ use tulisp::TulispContext;
 /// so interior mutability via `RefCell` is sound for these leaf operations).
 pub struct Session {
     pub buffer: Box<dyn TextStore>,
+    pub kill_ring: Vec<String>,
     pub reports: Vec<(String, String)>,
     pub log: Vec<String>,
 }
@@ -28,6 +29,7 @@ pub fn run_program(buffer: Box<dyn TextStore>, program: &str) -> Result<RunRepor
 
     let session: SharedSession = Rc::new(RefCell::new(Session {
         buffer,
+        kill_ring: Vec::new(),
         reports: Vec::new(),
         log: Vec::new(),
     }));
@@ -149,5 +151,20 @@ mod tests {
         );
         assert_eq!(r.reports[0], ("in".to_string(), "4".to_string()));
         assert_eq!(r.reports[1], ("out".to_string(), "8".to_string()));
+    }
+
+    #[test]
+    fn kill_and_yank() {
+        let r = run(
+            "hello world",
+            r#"(kill-region 1 7) (goto-char (point-max)) (yank)"#,
+        );
+        assert_eq!(r.final_text, "worldhello ");
+    }
+
+    #[test]
+    fn erase_buffer_clears() {
+        let r = run("abc", "(erase-buffer)");
+        assert_eq!(r.final_text, "");
     }
 }
