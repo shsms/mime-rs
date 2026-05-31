@@ -316,12 +316,18 @@ fn sessions_are_isolated_and_warm() {
     let r: Value = serde_json::from_str(&r).unwrap();
     assert_eq!(r["len_after"], 4); // "aaa!"
 
-    // session_status lists both.
+    // session_status lists both sessions and advertises the sandbox: at least
+    // one allowed root (defaults to the subprocess cwd here) and audit off (no
+    // MIME_AUDIT in this server's env).
     let status = s.call_ok(6, "session_status", json!({}));
     let status: Value = serde_json::from_str(&status).unwrap();
     let ids = status["sessions"].as_array().unwrap();
     assert!(ids.iter().any(|v| v == "one"));
     assert!(ids.iter().any(|v| v == "two"));
+    let roots = status["roots"].as_array().expect("roots array");
+    assert!(!roots.is_empty(), "expected at least one root: {status}");
+    assert!(roots.iter().all(|r| r.is_string()), "roots are strings");
+    assert_eq!(status["audit"], false, "audit should be off: {status}");
 
     // "two" is untouched and does not know `tag`.
     let two = s.request(json!({
