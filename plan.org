@@ -699,7 +699,7 @@ Findings from editing mime-rs *through mime-rs* (the agent's-eye view); appended
   apparent tail) after several edits with snapshots between them. The spine is fine —
   ~full_text~/~save_buffer~ wrote correct content every time and ~point-max~ matched the real
   length — so no data loss, but ~view~/~read_region~ can mislead. Not reproduced on synthetic text
-  yet (six variations pass); INVESTIGATED: the root Summary is correct *by construction* (every node constructor recomputes it) and ~collect_range~ matches the oracle across 64k+ snapshot-bracketed, mmap-backed, multibyte ops — the core is provably sound; the anomaly stayed unreproduced and is save-safe (a rare trigger or measurement artifact). Snapshot-holding + mmap differential coverage added as a guard. Workaround: a
+  yet (six variations pass); RESOLVED — FIXED. The root Summary is correct *by construction* (every node constructor recomputes it) and ~collect_range~ matches the oracle across 64k+ snapshot-bracketed, mmap-backed, multibyte ops — the core is provably sound; the *B-tree itself was correct all along*. The actual fault: ~save_buffer~ overwrote the same file ~Quire~ had mmapped as its immutable original, mutating those bytes under the live pieces, so mmap-backed reads (~collect_range~ behind ~buffer-substring~/~read_region~/search) returned shifted content while ~full_text~/save (cache) stayed correct. FIX: saves now go through ~safety::write_atomic~ (temp file + atomic rename), leaving the mmapped inode intact. Regression-tested end to end (open → edit → in-place save → reads stay byte-correct; the guard fails with a plain in-place write). Workaround: a
   fresh ~open_file~ (or ~mimectl --local~) reads correctly.
 
 * Open questions & risks (decide deliberately)
