@@ -287,4 +287,19 @@ mod tests {
         let r = run("a", r#"(goto-char 2) (with-transaction (insert "b"))"#);
         assert_eq!(r.final_text, "ab");
     }
+
+    #[test]
+    fn upcase_region_works() {
+        let r = run("hello world", r#"(upcase-region 1 6)"#);
+        assert_eq!(r.final_text, "HELLO world");
+    }
+
+    #[test]
+    fn count_matches_counts() {
+        let r = run(
+            "a a a a",
+            r#"(goto-char (point-min)) (report "n" (count-matches "a"))"#,
+        );
+        assert_eq!(r.reports[0], ("n".to_string(), "4".to_string()));
+    }
 }

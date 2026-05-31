@@ -700,6 +700,66 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         });
     }
 
+    // ---- region case + match counting ----
+    {
+        let s = session.clone();
+        ctx.defun(
+            "upcase-region",
+            move |a: i64, b: i64| -> Result<TulispObject, Error> {
+                let (lo, hi) = (a.min(b).max(1) as usize, a.max(b).max(1) as usize);
+                let mut sess = s.borrow_mut();
+                let text = sess.buffer.substring(lo, hi).to_uppercase();
+                sess.buffer.delete_region(lo, hi);
+                sess.buffer.goto_char(lo);
+                sess.buffer.insert(&text);
+                Ok(TulispObject::nil())
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        ctx.defun(
+            "downcase-region",
+            move |a: i64, b: i64| -> Result<TulispObject, Error> {
+                let (lo, hi) = (a.min(b).max(1) as usize, a.max(b).max(1) as usize);
+                let mut sess = s.borrow_mut();
+                let text = sess.buffer.substring(lo, hi).to_lowercase();
+                sess.buffer.delete_region(lo, hi);
+                sess.buffer.goto_char(lo);
+                sess.buffer.insert(&text);
+                Ok(TulispObject::nil())
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        ctx.defun(
+            "count-matches",
+            move |re: String, start: Option<i64>, end: Option<i64>| -> Result<i64, Error> {
+                let rx = regex::Regex::new(&re).map_err(bad_regex)?;
+                let mut sess = s.borrow_mut();
+                let saved = sess.buffer.point();
+                if let Some(st) = start {
+                    sess.buffer.goto_char(st.max(1) as usize);
+                }
+                let bound = end.map(|e| e.max(1) as usize);
+                let mut count = 0i64;
+                loop {
+                    let p0 = sess.buffer.point();
+                    if sess.buffer.re_search_forward(&rx, bound).is_none() {
+                        break;
+                    }
+                    count += 1;
+                    if sess.buffer.point() <= p0 {
+                        break;
+                    }
+                }
+                sess.buffer.goto_char(saved);
+                Ok(count)
+            },
+        );
+    }
+
     // ---- checkpoints (workspace time travel — M0: full-text snapshots) ----
     {
         let s = session.clone();
