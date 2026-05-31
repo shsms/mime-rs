@@ -636,9 +636,36 @@ the agent-facing surface works end to end. M5 ✓, rehearse ✓, M7 scaffold ✓
    materializes the whole ~text()~ to write it (O(filesize) RAM) — streaming the pieces straight
    to the temp file is done — ~write_to~ + ~write_atomic_with~ stream the pieces straight to disk, no full materialization. No external-change detection yet — re-~open_file~ to
    pick up on-disk edits an agent did not make (an Emacs-style mtime/inode check is a future touch)./
-** DOING M7 — Structural / syntax-aware editing [#C] (scaffold landed)
-   Tree-sitter integration; node search/replace; narrow-to-defun. /Exit: AST-scoped
-   refactors on real code./
+** DOING M7 — Structural / syntax-aware editing [#C] (navigation scaffold landed)
+
+   /Done (scaffold):/ tree-sitter + ~tree-sitter-md~ (Markdown); ~src/syntax.rs~ re-parses
+   ~buffer.text()~ fresh each call (byte↔1-based-char mapping, multibyte-safe); builtins
+   ~treesit-root-type~, ~treesit-node-at~ (smallest named node at point → type + char span),
+   ~treesit-beginning-of-defun~/~treesit-end-of-defun~ (enclosing Markdown ~section~). This is
+   read-only *navigation* on prose — a proof of concept.
+   /For an agent to edit CODE structurally (prioritized):/
+   1. *Code grammars + language detection* — Markdown-only today, so it cannot touch code at
+      all. Add ~tree-sitter-rust~/~-python~/~-js~/… ; dispatch by extension / buffer name;
+      generalize "top-level construct" (~section~ → ~function_item~ / ~function_definition~).
+   2. *Structural query — the keystone.* Agents locate code by structure ("the function
+      ~parse_args~", "every call to ~foo~"), not char positions. Expose tree-sitter *queries*
+      (~.scm~ patterns + captures): ~treesit-query~ / ~treesit-search-forward~ by node type or
+      query. No query builtin exists yet; this is what makes it more than a fancier ~point~.
+   3. *Persistent per-~Session~ tree (the lever).* Keep the parse on the ~Session~ instead of
+      re-parsing every call. Unlocks at once: relational navigation + fields (~node-parent~/
+      ~child~/~next-sibling~/~child-by-field-name~ — body vs. name vs. params), which needs
+      *nodes as first-class values* (a live tree to reference, like markers); *incremental
+      re-parse* (feed ~InputEdit~s, not O(buffer) per call); and *error-tree handling*
+      (~treesit-has-error~ — code mid-edit is usually syntactically broken).
+   4. *AST-edit ops* — ~replace-node~/~wrap-node~/~raise-node~/~kill-node~/insert-sibling. The
+      smaller part: ~treesit-node-at~ already gives a char range, so "replace the node at point"
+      is reachable today via ~delete-region~ + ~insert~; these wrap the common cases once #2/#3
+      land.
+   Adjacencies: structural code editing wants a *formatter* (~rustfmt~, via ~call-process~ in
+   the trusted tier) and *project context* (sibling files, via file I/O / orchestration), so
+   M7-for-code and M10 reinforce each other. Sequence: grammars → query → persistent tree →
+   edit ops — likely its own milestone once M9/M10 land. /Exit: AST-scoped refactors on real
+   code; find-and-edit by structure, not regex./
 ** DOING M8 — Polish [#C] (repl + porting guide + examples landed; crate publish later)
    ~mimectl repl~; mime→mime-rs porting guide; docs; example library of helpers;
    ~cargo~ workspace + crate publish.
