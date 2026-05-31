@@ -226,10 +226,17 @@ impl Workspace {
     /// byte count written. The rebase is best-effort: if re-opening the saved file
     /// fails, the (still correct) pre-save backing is kept and the save stands.
     pub fn save_to(&mut self, path: &std::path::Path) -> std::io::Result<usize> {
-        let text = self.session.borrow().buffer.text().to_string();
-        crate::safety::write_atomic(path, text.as_bytes())?;
+        let bytes = {
+            let s = self.session.borrow();
+            let mut written = 0usize;
+            crate::safety::write_atomic_with(path, |w| {
+                written = s.buffer.write_to(w)?;
+                Ok(())
+            })?;
+            written
+        };
         let _ = self.session.borrow_mut().buffer.rebase_to_file(path);
-        Ok(text.len())
+        Ok(bytes)
     }
 }
 
