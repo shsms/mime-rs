@@ -208,9 +208,9 @@ fn bool_arg(args: &Value, key: &str) -> bool {
 
 /// Build a warm [`Workspace`], read-only when requested.
 fn make_workspace(store: Box<dyn TextStore>, read_only: bool) -> Workspace {
-    // CAPABILITY TIER HOOK: a later milestone selects a trusted vs sandboxed
-    // workspace here (per-session capability set); for now read-only vs writable
-    // is the only distinction and the engine-enforced sandbox is the only tier.
+    // Sandboxed (agent-facing) tier: the MCP server registers the core editing
+    // vocabulary only, never the orchestration group — read-only vs writable is
+    // the only per-session distinction.
     if read_only {
         Workspace::new_read_only(store)
     } else {

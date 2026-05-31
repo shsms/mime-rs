@@ -148,9 +148,9 @@ fn run_local(args: &Args, verb: &str) {
 
     // `rehearse` rolls back inside the workspace, so the result is identical to
     // discarding the report; we just never write it back. `run` may persist.
-    // CAPABILITY TIER HOOK: a later milestone selects a trusted vs sandboxed
-    // workspace here; for now the engine-enforced sandbox is the only tier.
-    let mut ws = crate::Workspace::new(store);
+    // Trusted tier: the local `mime` CLI also gets the orchestration group
+    // (multiple buffers, file I/O, args) — see Workspace::new_trusted / Capabilities.
+    let mut ws = crate::Workspace::new_trusted(store);
     let result = if rehearse {
         ws.rehearse(&program)
     } else {
@@ -225,9 +225,9 @@ fn run_repl(args: &Args) {
         None => Box::new(crate::Buffer::from_string("*repl*", String::new())),
     };
 
-    // CAPABILITY TIER HOOK: a later milestone selects a trusted vs sandboxed
-    // workspace here; for now the engine-enforced sandbox is the only tier.
-    let mut ws = crate::Workspace::new(store);
+    // Trusted tier: the local `mime` CLI also gets the orchestration group
+    // (multiple buffers, file I/O, args) — see Workspace::new_trusted / Capabilities.
+    let mut ws = crate::Workspace::new_trusted(store);
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     repl_loop(&mut ws, stdin.lock(), &mut stdout.lock());

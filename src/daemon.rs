@@ -150,9 +150,9 @@ fn op_open(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
         .get("read_only")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    // CAPABILITY TIER HOOK: a later milestone selects a trusted vs sandboxed
-    // workspace here (per-session capability set); for now every session gets the
-    // same engine-enforced sandbox.
+    // Sandboxed (agent-facing) tier: core editing vocabulary only — the daemon
+    // never registers the orchestration group. (A local daemon could opt up with
+    // a future --trusted flag.)
     let workspace = if read_only {
         Workspace::new_read_only(store)
     } else {

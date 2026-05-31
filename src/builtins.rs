@@ -1142,3 +1142,15 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         });
     }
 }
+
+/// Register the *orchestration* builtin group — multiple buffers, file I/O,
+/// directory listing, and program arguments — on top of the core vocabulary.
+/// Only the TRUSTED tier calls this (see [`crate::engine::Capabilities`]); the
+/// sandboxed, agent-facing tier never does. This is the seam M10 fills in; today
+/// it is empty (the core group is the whole vocabulary).
+pub fn register_orchestration(_ctx: &mut TulispContext, _session: &SharedSession) {
+    // M10: set-buffer / with-current-buffer / current-buffer / buffer-name /
+    // buffer-list / generate-new-buffer / kill-buffer (a buffer registry on the
+    // Session); find-file / insert-file-contents / write-region / directory-files
+    // (check_path-gated); program-argument binding (command-line-args / argv).
+}

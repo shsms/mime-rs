@@ -62,22 +62,51 @@ pub struct Workspace {
     /// "reference material attached unwritable" case). The edit is rolled back
     /// from a pre-run snapshot and `run` returns an error instead of a report.
     read_only: bool,
+    /// The trust tier; `Trusted` additionally registers the orchestration builtin
+    /// group. Fixed at construction — an agent cannot escalate it.
+    capabilities: Capabilities,
+}
+
+/// The trust tier a workspace runs at, chosen by the front-end MODE at launch
+/// (not by the program). `Sandboxed` (the agent-facing MCP / daemon) registers
+/// only the core editing vocabulary; `Trusted` (the local `mime` CLI) also
+/// registers the *orchestration* group — multiple buffers, file I/O, directory
+/// listing, program arguments. See plan.org §"Single binary & capability tiers".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capabilities {
+    Sandboxed,
+    Trusted,
 }
 
 impl Workspace {
     /// Build the session + context and register the editor builtins and string
     /// library ONCE. Subsequent `run` calls reuse them — the warm path.
     pub fn new(buffer: Box<dyn TextStore>) -> Workspace {
-        Workspace::with_mode(buffer, false)
+        Workspace::with_mode(buffer, false, Capabilities::Sandboxed)
     }
 
     /// A read-only workspace: programs may navigate, search, and `report`, but
     /// any program that leaves the buffer modified is rolled back and rejected.
     pub fn new_read_only(buffer: Box<dyn TextStore>) -> Workspace {
-        Workspace::with_mode(buffer, true)
+        Workspace::with_mode(buffer, true, Capabilities::Sandboxed)
     }
 
-    fn with_mode(buffer: Box<dyn TextStore>, read_only: bool) -> Workspace {
+    /// A trusted, writable workspace — the local `mime` CLI tier, which also gets
+    /// the orchestration builtin group (multiple buffers, file I/O, arguments).
+    pub fn new_trusted(buffer: Box<dyn TextStore>) -> Workspace {
+        Workspace::with_mode(buffer, false, Capabilities::Trusted)
+    }
+
+    /// This workspace's trust tier.
+    pub fn capabilities(&self) -> Capabilities {
+        self.capabilities
+    }
+
+    fn with_mode(
+        buffer: Box<dyn TextStore>,
+        read_only: bool,
+        capabilities: Capabilities,
+    ) -> Workspace {
         let session: SharedSession = Rc::new(RefCell::new(Session {
             buffer,
             checkpoints: Vec::new(),
@@ -89,11 +118,17 @@ impl Workspace {
         let mut ctx = TulispContext::new();
         crate::builtins::register(&mut ctx, &session);
         crate::strings::register(&mut ctx);
+        // The trusted tier additionally gets the orchestration group; the
+        // sandboxed agent-facing tier never registers it.
+        if capabilities == Capabilities::Trusted {
+            crate::builtins::register_orchestration(&mut ctx, &session);
+        }
 
         Workspace {
             ctx,
             session,
             read_only,
+            capabilities,
         }
     }
 
