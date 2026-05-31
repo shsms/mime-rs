@@ -88,6 +88,15 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         let s = session.clone();
+        ctx.defun("backward-char", move |n: Option<i64>| -> i64 {
+            let mut b = s.borrow_mut();
+            let p = b.buffer.point() as i64 - n.unwrap_or(1);
+            b.buffer.goto_char(p.max(1) as usize);
+            b.buffer.point() as i64
+        });
+    }
+    {
+        let s = session.clone();
         ctx.defun("beginning-of-buffer", move || -> i64 {
             let mut b = s.borrow_mut();
             let m = b.buffer.point_min();
@@ -1280,6 +1289,31 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
                 crate::Quire::open(p).map_err(|e| err(&format!("find-file {path}: {e}")))?,
             );
             Ok(sess.install_buffer(store, true))
+        });
+    }
+    {
+        let s = session.clone();
+        // (find-file-noselect PATH) — open PATH into a buffer WITHOUT making it
+        // current (Emacs `find-file-noselect`); returns the buffer name. Reuses an
+        // already-open buffer of the same name, like find-file.
+        // TODO: dedup by canonical path, not basename — two files sharing a
+        // basename in different dirs collide (the second aliases the first).
+        // Fix: key buffers by visited path; uniquify the name (Emacs `doc.txt<2>`).
+        // Same limitation in `find-file` above.
+        ctx.defun("find-file-noselect", move |path: String| -> Result<String, Error> {
+            let p = std::path::Path::new(&path);
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            let mut sess = s.borrow_mut();
+            if sess.has_buffer(&name) {
+                return Ok(name);
+            }
+            let store: Box<dyn crate::store::TextStore> = Box::new(
+                crate::Quire::open(p).map_err(|e| err(&format!("find-file-noselect {path}: {e}")))?,
+            );
+            Ok(sess.install_buffer(store, false))
         });
     }
     {
