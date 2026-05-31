@@ -661,6 +661,21 @@ Items 1â€“2 are the critical path (Emacs editing is regex-and-string-shaped); 3â
 incremental. Several already sit on tulisp's own roadmap, so mime-rs is a forcing
 function for both.
 
+* Dogfooding friction log
+
+Findings from editing mime-rs *through mime-rs* (the agent's-eye view); appended as we go.
+
+- Allowlist gotcha (M5): the first cross-repo edit failed until ~MIME_ROOTS~ was set to
+  touch a file outside cwd. Correct + a clear error, but an agent hits it immediately;
+  the daemon/MCP should advertise the allowed roots up front.
+- Viewing was indirect: ~(message (window ...))~ then digging the string out of the JSON
+  ~log~ is clunky; ~view~ wants to be a first-class MCP tool returning the text. [building]
+- No durable markers yet: multiple viewports work via ~(window N pos)~ + vars, but a saved
+  position does not survive edits; Emacs markers on Quire anchors are the fix. [next]
+- Inserting big literal blocks is awkward: tulisp-string escaping of newlines is
+  error-prone (this very section was a long escaped ~insert~); want an ~insert_text~ MCP
+  tool that takes the text as a JSON string, no tulisp escaping.
+
 * Open questions & risks (decide deliberately)
 1. *Why not ~emacsclient~ + elisp?* It already has buffers/markers/narrowing/regexp
    and a server. Our answer: lean single-binary embeddability, a shaped/bounded
