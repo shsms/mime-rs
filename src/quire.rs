@@ -100,14 +100,105 @@ impl Original {
             Original::Mapped(m) => m,
         }
     }
+}
 
-    /// The original as `&str`. Validated UTF-8 at construction, so this is total.
-    fn as_str(&self) -> &str {
-        // SAFETY: both constructors validate the original is UTF-8 up front
-        // (`from_string` takes a `String`; `open` runs `str::from_utf8`), and the
-        // bytes are immutable thereafter.
-        unsafe { std::str::from_utf8_unchecked(self.bytes()) }
+// ----------------------------------------------------------------------------
+// Initial char/line index (the one O(filesize) scan at open time)
+// ----------------------------------------------------------------------------
+
+/// Below this many bytes the initial char/line scan stays single-threaded:
+/// spawning scoped threads (stack setup, joins) has a roughly fixed cost
+/// (~0.2 ms on commodity hardware) that swamps the work on small inputs — at
+/// 256 KiB the parallel path is actually ~2x *slower*, and it only pulls clearly
+/// ahead past ~1 MiB. We set the cutoff at 1 MiB, where the sequential scan is
+/// still only ~0.5 ms (so nothing user-visible is lost below it) and the
+/// parallel driver already wins ~1.8x and climbs toward the core count as the
+/// file grows. Above this, `count_chars_lines_parallel` fans the scan out over
+/// the available cores.
+const PARALLEL_INDEX_THRESHOLD: usize = 1024 * 1024;
+
+/// Count Unicode scalar values (chars) and `\n` bytes in a UTF-8 slice.
+///
+/// Chars are counted as the number of non-continuation bytes — in valid UTF-8
+/// every scalar value has exactly one leading byte `b` with `(b & 0xC0) != 0x80`
+/// — which equals `bytes.chars().count()` but works directly on `&[u8]`. This
+/// is a *pure* helper so the parallel driver and the unit tests can compare it
+/// against the sequential count. O(bytes).
+///
+/// `#[doc(hidden)] pub` only so `benches/parallel_index.rs` can time it against
+/// the parallel driver; it is not part of the supported API.
+#[doc(hidden)]
+pub fn count_chars_lines(bytes: &[u8]) -> (usize, usize) {
+    let mut chars = 0;
+    let mut lines = 0;
+    for &b in bytes {
+        // Leading byte of a scalar value (ASCII or a multi-byte lead): not a
+        // 0b10xx_xxxx UTF-8 continuation byte.
+        chars += usize::from((b & 0xC0) != 0x80);
+        lines += usize::from(b == b'\n');
     }
+    (chars, lines)
+}
+
+/// Advance `i` forward to the next UTF-8 char boundary at or after it, so a
+/// chunk split never lands inside a multi-byte scalar value. Continuation bytes
+/// match `(b & 0xC0) == 0x80`; we skip past them. `bytes.len()` is always a
+/// boundary, so this terminates. Equivalent to `str::is_char_boundary` but on
+/// the raw slice we already hold.
+fn next_char_boundary(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
+        i += 1;
+    }
+    i
+}
+
+/// Parallel driver for [`count_chars_lines`]: split `bytes` into roughly
+/// `available_parallelism()` contiguous chunks **aligned to char boundaries**,
+/// count each chunk on its own scoped thread, and sum the per-chunk totals.
+///
+/// Because the splits land only on char boundaries and char/newline counts are
+/// additive over a partition, the result is **bit-for-bit identical** to the
+/// sequential `count_chars_lines(bytes)`. Uses [`std::thread::scope`] so the
+/// threads borrow `bytes` directly — no copy, no `'static` bound, no new crate.
+///
+/// `#[doc(hidden)] pub` only so `benches/parallel_index.rs` can time it against
+/// the sequential helper; it is not part of the supported API.
+#[doc(hidden)]
+pub fn count_chars_lines_parallel(bytes: &[u8]) -> (usize, usize) {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1);
+    if threads == 1 || bytes.len() < 2 {
+        return count_chars_lines(bytes);
+    }
+
+    // Partition into char-boundary-aligned chunks: target an even byte split,
+    // then nudge each boundary forward off any continuation byte. Empty trailing
+    // chunks (if a nudge consumed the rest) are simply skipped.
+    let target = bytes.len().div_ceil(threads);
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(threads);
+    let mut start = 0;
+    while start < bytes.len() {
+        let raw_end = (start + target).min(bytes.len());
+        let end = next_char_boundary(bytes, raw_end);
+        ranges.push((start, end));
+        start = end;
+    }
+
+    // Scoped threads borrow `bytes` immutably; the scope joins them all before
+    // returning, so no `'static` lifetime is required and nothing is copied.
+    let partials: Vec<(usize, usize)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ranges
+            .iter()
+            .map(|&(lo, hi)| scope.spawn(move || count_chars_lines(&bytes[lo..hi])))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    partials
+        .into_iter()
+        .fold((0, 0), |(c, l), (pc, pl)| (c + pc, l + pl))
 }
 
 // ----------------------------------------------------------------------------
@@ -265,16 +356,21 @@ impl Quire {
 
     fn with_original(name: String, original: Original) -> Quire {
         // One piece spanning the whole original. Counting its chars/lines is the
-        // one up-front scan; for a GB file this is the lazy line/char index the
-        // plan wants done off the first-edit path — acceptable here, and the
-        // obvious place to make incremental/background later (TODO).
-        let bytes_len = original.bytes().len();
-        let s = original.as_str();
+        // one up-front scan and the real cost of opening a multi-GB file. It is
+        // parallelized over the available cores above `PARALLEL_INDEX_THRESHOLD`
+        // (see `count_chars_lines_parallel`); the tree itself is still the single
+        // whole-file piece — only the counting is fanned out. (Making it
+        // incremental/background remains a later option — TODO.)
+        let bytes = original.bytes();
+        let bytes_len = bytes.len();
         let root = if bytes_len == 0 {
             Node::empty()
         } else {
-            let chars = s.chars().count();
-            let lines = s.bytes().filter(|&b| b == b'\n').count();
+            let (chars, lines) = if bytes_len >= PARALLEL_INDEX_THRESHOLD {
+                count_chars_lines_parallel(bytes)
+            } else {
+                count_chars_lines(bytes)
+            };
             Arc::new(Node::leaf(vec![Piece {
                 source: Source::Original,
                 start: 0,
@@ -878,6 +974,15 @@ impl Quire {
     /// document; for the common all-original case the plan calls for scanning the
     /// mmap directly and an incremental DFA across pieces — TODO. Capturing
     /// `replace_match`'s groups needs the matched substrings regardless.
+    ///
+    /// TODO (M6, deferred): parallelize search/replace the way the initial
+    /// char/line index already is (see `count_chars_lines_parallel`). It is left
+    /// sequential on purpose — unlike a char/newline *count*, which is additive
+    /// over any char-boundary partition, a regex match can straddle a chunk seam,
+    /// so naive chunking misses boundary-spanning hits and double-counts overlaps.
+    /// Doing it right needs per-chunk overlap regions (≥ the max match width) and
+    /// dedup of seam matches, which interacts with `last_match`/replace ordering;
+    /// out of scope for this slice.
     fn re_search_forward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize> {
         let from = self.point;
         let to = bound.unwrap_or_else(|| self.point_max());
@@ -1326,6 +1431,93 @@ mod tests {
         assert_eq!(TextStore::text(&q), "héXXllo wörld");
         assert_eq!(TextStore::char_after(&q, 3), Some('X'));
         assert_eq!(TextStore::char_before(&q, 3), Some('é'));
+    }
+
+    // ---- parallel initial char/line index (M6) ----
+
+    /// The pure per-chunk counter must equal the obvious `chars().count()` /
+    /// newline filter on a known mixed-width string.
+    #[test]
+    fn count_chars_lines_matches_str_methods() {
+        let s = "aé世\n𝄞z\n\nbar"; // 1+2+3-byte chars, blank line, ascii tail
+        let (chars, lines) = count_chars_lines(s.as_bytes());
+        assert_eq!(chars, s.chars().count());
+        assert_eq!(lines, s.bytes().filter(|&b| b == b'\n').count());
+        // Empty slice: zero of both.
+        assert_eq!(count_chars_lines(b""), (0, 0));
+    }
+
+    /// `next_char_boundary` snaps forward off continuation bytes and is a no-op
+    /// on bytes that already start a scalar value (matching `is_char_boundary`).
+    #[test]
+    fn next_char_boundary_aligns_forward() {
+        let s = "a世b"; // bytes: [a][世.0][世.1][世.2][b]; 世 spans 1..=3
+        let b = s.as_bytes();
+        assert_eq!(next_char_boundary(b, 0), 0); // 'a' lead, already aligned
+        assert_eq!(next_char_boundary(b, 1), 1); // '世' lead, already aligned
+        assert_eq!(next_char_boundary(b, 2), 4); // mid-'世' → next lead is 'b'
+        assert_eq!(next_char_boundary(b, 3), 4); // still mid-'世'
+        assert_eq!(next_char_boundary(b, 4), 4); // 'b' lead
+        assert_eq!(next_char_boundary(b, b.len()), b.len()); // end is a boundary
+        for i in 0..=b.len() {
+            // Every result must be a real char boundary of the str.
+            assert!(s.is_char_boundary(next_char_boundary(b, i)));
+        }
+    }
+
+    /// The parallel driver must return EXACTLY the sequential count, including
+    /// when chunk splits would otherwise fall inside a multi-byte char. Covers
+    /// empty, tiny, and large multibyte inputs of many sizes.
+    #[test]
+    fn parallel_count_equals_sequential() {
+        // A unit whose every char is multi-byte so naive even-byte splits land
+        // mid-char unless realigned; the repeats below sweep many total lengths
+        // (and thus many distinct split offsets relative to char boundaries).
+        let unit = "héllo 世界 𝄞\nnaïve café—test\n";
+        for reps in [0usize, 1, 2, 3, 5, 17, 100, 1000, 5000, 20_000] {
+            let s = unit.repeat(reps);
+            let bytes = s.as_bytes();
+            let seq = count_chars_lines(bytes);
+            let par = count_chars_lines_parallel(bytes);
+            assert_eq!(
+                par,
+                seq,
+                "parallel != sequential at reps={reps} (len={} bytes)",
+                bytes.len()
+            );
+            // And both agree with the std-library ground truth.
+            assert_eq!(
+                seq,
+                (s.chars().count(), s.bytes().filter(|&b| b == b'\n').count()),
+                "sequential disagrees with str methods at reps={reps}"
+            );
+        }
+        // Pure-ASCII and empty edge cases through the parallel path too.
+        assert_eq!(count_chars_lines_parallel(b""), (0, 0));
+        assert_eq!(count_chars_lines_parallel(b"x"), (1, 0));
+        assert_eq!(count_chars_lines_parallel(b"\n\n\n"), (3, 3));
+    }
+
+    /// End-to-end: a `from_string` original past the parallel threshold must
+    /// report char_len / line counts identical to a `Buffer` oracle over the
+    /// same text — i.e. the parallel index wired into `with_original` is exact.
+    #[test]
+    fn with_original_large_index_matches_oracle() {
+        let unit = "αβγ line with 世界 and a tail café\n";
+        // Comfortably above PARALLEL_INDEX_THRESHOLD so the parallel path runs.
+        let reps = (PARALLEL_INDEX_THRESHOLD / unit.len()) + 1_000;
+        let text = unit.repeat(reps);
+        assert!(text.len() >= PARALLEL_INDEX_THRESHOLD);
+        let q = Quire::from_string("t", text.clone());
+        let oracle = Buffer::from_string("t", text.clone());
+        assert_eq!(TextStore::char_len(&q), TextStore::char_len(&oracle));
+        let pmax = TextStore::point_max(&q);
+        assert_eq!(
+            TextStore::line_number_at_pos(&q, pmax),
+            TextStore::line_number_at_pos(&oracle, pmax),
+            "total line count drifted for the parallel index"
+        );
+        assert_eq!(TextStore::char_len(&q), text.chars().count());
     }
 
     #[test]
