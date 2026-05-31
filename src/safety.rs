@@ -13,20 +13,35 @@ use std::path::{Path, PathBuf};
 /// The allowed filesystem roots: the colon-separated absolute paths in
 /// `$MIME_ROOTS`, or the current working directory when that is unset or empty.
 ///
+/// This is the SAME set [`check_path`] enforces, exposed so callers (the daemon
+/// `status` op, the MCP `session_status` tool) can advertise the sandbox to an
+/// agent up front instead of leaving it to discover the bounds by a rejected
+/// write.
+///
 /// Each entry is canonicalized (symlinks + `.`/`..` resolved) so the containment
 /// check in [`check_path`] compares real paths against real paths. Entries that
 /// don't exist or can't be canonicalized are skipped — a misconfigured root
 /// simply doesn't grant access rather than silently widening it.
-fn allowed_roots() -> Vec<PathBuf> {
-    let raw = std::env::var("MIME_ROOTS").unwrap_or_default();
+pub fn roots() -> Vec<PathBuf> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    parse_roots(std::env::var("MIME_ROOTS").ok(), &cwd)
+}
+
+/// Pure core of [`roots`]: resolve the raw `$MIME_ROOTS` value (already read from
+/// the environment) against `cwd`. Split out so it can be unit-tested without the
+/// process-global env mutation that makes [`roots`] itself racy under the test
+/// harness.
+///
+/// `raw` unset or whitespace-only => the single canonicalized `cwd` (default-deny
+/// everything outside the working directory). Otherwise each colon-separated,
+/// trimmed, non-empty entry is canonicalized; ones that can't be are dropped.
+fn parse_roots(raw: Option<String>, cwd: &Path) -> Vec<PathBuf> {
+    let raw = raw.unwrap_or_default();
     let raw = raw.trim();
     if raw.is_empty() {
         // Default-deny everything *outside* the cwd: the process's own working
         // directory is the implicit single root.
-        return std::env::current_dir()
-            .and_then(|d| d.canonicalize())
-            .into_iter()
-            .collect();
+        return cwd.canonicalize().into_iter().collect();
     }
     raw.split(':')
         .map(str::trim)
@@ -35,7 +50,14 @@ fn allowed_roots() -> Vec<PathBuf> {
         .collect()
 }
 
-/// Verify `path` resolves to a location inside one of the [`allowed_roots`] and
+/// Whether the audit journal is active, i.e. `$MIME_AUDIT` is set (to any value,
+/// including empty). Lets the status surfaces report whether runs are being
+/// recorded, without exposing the log path.
+pub fn audit_enabled() -> bool {
+    std::env::var_os("MIME_AUDIT").is_some()
+}
+
+/// Verify `path` resolves to a location inside one of the [`roots`] and
 /// return its canonical form; otherwise return a human-readable `Err`.
 ///
 /// Semantics:
@@ -50,7 +72,7 @@ fn allowed_roots() -> Vec<PathBuf> {
 /// The returned `PathBuf` is the canonical path the caller should actually open
 /// or write, so the resolved location and the checked location are the same.
 pub fn check_path(path: &Path) -> Result<PathBuf, String> {
-    let roots = allowed_roots();
+    let roots = roots();
     if roots.is_empty() {
         return Err("no allowed roots configured (set $MIME_ROOTS to absolute paths)".to_string());
     }
@@ -241,5 +263,73 @@ mod tests {
         );
         // ...and an absolute path well outside it is still rejected.
         assert!(check_path(Path::new("/etc/passwd")).is_err());
+    }
+
+    // `parse_roots` is the pure core — no env, no lock needed. These exercise the
+    // parsing/canonicalization directly, which `roots()` only wraps.
+
+    #[test]
+    fn parse_roots_uses_mime_roots_when_set() {
+        let root = temp_root();
+        let raw = root.display().to_string();
+        let roots = parse_roots(Some(raw), Path::new("/nonexistent-cwd-should-be-ignored"));
+        assert_eq!(roots, vec![root]);
+    }
+
+    #[test]
+    fn parse_roots_splits_multiple_entries() {
+        let a = temp_root();
+        let b = {
+            let mut p = a.clone();
+            p.push("second");
+            std::fs::create_dir_all(&p).unwrap();
+            p.canonicalize().unwrap()
+        };
+        let raw = format!("{}:{}", a.display(), b.display());
+        let roots = parse_roots(Some(raw), Path::new("/ignored"));
+        assert_eq!(roots, vec![a, b]);
+    }
+
+    #[test]
+    fn parse_roots_skips_nonexistent_entries() {
+        let root = temp_root();
+        // A bogus path can't be canonicalized and is dropped, leaving the real one.
+        let raw = format!("/no/such/dir/anywhere:{}", root.display());
+        let roots = parse_roots(Some(raw), Path::new("/ignored"));
+        assert_eq!(roots, vec![root]);
+    }
+
+    #[test]
+    fn parse_roots_defaults_to_cwd_when_none() {
+        let cwd = temp_root();
+        let roots = parse_roots(None, &cwd);
+        assert_eq!(roots, vec![cwd.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn parse_roots_defaults_to_cwd_when_blank() {
+        let cwd = temp_root();
+        // Whitespace-only is treated as unset.
+        let roots = parse_roots(Some("   ".to_string()), &cwd);
+        assert_eq!(roots, vec![cwd.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn roots_matches_check_path_default() {
+        let _g = lock();
+        unsafe { std::env::remove_var("MIME_ROOTS") };
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        // The wrapper reads the (now-unset) env and falls back to the cwd, the
+        // same root check_path enforces.
+        assert_eq!(roots(), vec![cwd]);
+    }
+
+    #[test]
+    fn audit_enabled_tracks_env() {
+        let _g = lock();
+        unsafe { std::env::set_var("MIME_AUDIT", "/tmp/whatever.log") };
+        assert!(audit_enabled());
+        unsafe { std::env::remove_var("MIME_AUDIT") };
+        assert!(!audit_enabled());
     }
 }
