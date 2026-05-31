@@ -168,9 +168,68 @@ pub fn run_program(buffer: Box<dyn TextStore>, program: &str) -> Result<RunRepor
 mod tests {
     use super::*;
     use crate::buffer::Buffer;
+    use crate::quire::Quire;
 
     fn run(text: &str, program: &str) -> RunReport {
         run_program(Box::new(Buffer::from_string("t", text)), program).expect("program should run")
+    }
+
+    #[test]
+    fn warm_quire_matches_oracle_across_separate_runs() {
+        // Warm-Quire consistency guard: a session that snapshots between programs
+        // (the diff baseline) must stay byte-for-byte equal to the in-memory
+        // oracle — both the spine (full_text) and a windowed readout
+        // (collect_range, behind buffer-substring/read_region), over a realistic
+        // multibyte, mmap-backed document and several snapshot-bracketed edits.
+        // NOTE: an *intermittent*, save-safe readout discrepancy was observed
+        // editing plan.org through the warm MCP server (buffer-substring/read_region
+        // returning the wrong window while full_text/save stayed correct) that this
+        // synthetic case does not yet reproduce — tracked in the friction log.
+        // Multibyte content throughout (em dashes, tildes) so char positions and
+        // byte offsets diverge — the regime where a piece-tree offset bug bites.
+        let mut text = String::new();
+        for i in 0..800 {
+            text.push_str(&format!("line {i:04} — körner ~filler~ ‸content here\n"));
+        }
+        text.push_str("ANCHOR-TARGET — marker line\n");
+        for i in 0..800 {
+            text.push_str(&format!("more {i:04} — naïve ~filler~ café content\n"));
+        }
+        text.push_str("UNIQUE-TAIL-END-SENTINEL\n");
+
+        // Each program is its own warm run, so the Workspace snapshots the buffer
+        // between them (sharing Quire's Arc backings), then the next edit grows the
+        // add buffer (must copy-on-write off the snapshot's share).
+        let progs = [
+            r#"(goto-char (point-min)) (search-forward "line 0100" nil t) (insert " INSERTED-ONE ")"#,
+            "(buffer-string)", // mirrors save_buffer materializing text()
+            r#"(goto-char (point-min)) (search-forward "more 0100" nil t) (insert " INSERTED-TWO ")"#,
+            r#"(goto-char (point-min)) (if (search-forward "ANCHOR-TARGET marker line" nil t) (replace-match "REPLACED-ANCHOR-WITH-A-RATHER-LONGER-STRING"))"#,
+            "(buffer-string)",
+            r#"(goto-char (point-min)) (search-forward "line 0700" nil t) (insert " INSERTED-THREE ")"#,
+        ];
+
+        // Quire opened from a real file → mmap-backed original (the open_file path
+        // the MCP server uses), which from_string-based tests don't exercise.
+        let path =
+            std::env::temp_dir().join(format!("mime-warm-regression-{}.txt", std::process::id()));
+        std::fs::write(&path, &text).unwrap();
+
+        let mut oracle = Workspace::new(Box::new(Buffer::from_string("t", &text)));
+        let mut quire = Workspace::new(Box::new(Quire::open(&path).unwrap()));
+        for p in progs {
+            oracle.run(p).unwrap();
+            quire.run(p).unwrap();
+        }
+        // The spine (full_text) and a windowed readout (collect_range, the path
+        // behind buffer-substring/read_region/search) must both match the oracle.
+        let (q, o) = (quire.text().to_string(), oracle.text().to_string());
+        let probe = "(message (buffer-substring (max 1 (- (point-max) 300)) (point-max)))";
+        let qr = quire.run(probe).unwrap().log.first().cloned().unwrap_or_default();
+        let or = oracle.run(probe).unwrap().log.first().cloned().unwrap_or_default();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(q, o, "spine (full_text) diverged from the oracle");
+        assert_eq!(qr, or, "windowed readout (collect_range) diverged from the oracle");
     }
 
     fn report(r: &RunReport, key: &str) -> String {
