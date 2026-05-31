@@ -410,6 +410,53 @@ id + ~GET /jobs/:id~. ~mimectl~ is just a friendly skin over these.
 - *The pitch*: this is why "let the agent run mime-rs" is safe where "let the agent
   run bash" is not — same editing power, none of the blast radius, full rewind.
 
+* Single binary & capability tiers
+
+mime ships as ONE binary, ~mime~ (like the original), and the launch MODE picks
+both the protocol AND the trust tier:
+
+  mime PROG.tl [--file F] [--write]   one-shot local run    → TRUSTED
+  mime --daemon [--socket S]          warm-session daemon   → SANDBOXED (--trusted opts up)
+  mime --mcp                          MCP server (stdio)    → SANDBOXED
+  mime <verb> --connect …             daemon client (run/open/save/status/close/rehearse)
+
+The tier is set by HOW the host launches the binary, NOT by the program. An agent
+driving ~mime --mcp~ speaks only JSON-RPC tool calls over that pipe — it cannot
+change argv or spawn ~mime~, so it is pinned to the sandboxed tier it started in.
+(Same as Emacs: you run ~emacs~ with full power; a server you expose to others you
+lock down — one binary, different front doors.) That is what makes a single fat
+binary safe.
+
+The tier decides which builtin GROUPS register on the context:
+- *core* (always): the editing vocabulary — motion, search/replace, mark, kill,
+  narrowing, markers, checkpoints, transactions, ~rehearse~, ~report~, ~window~,
+  ~treesit-*~. One implicit buffer.
+- *orchestration* (trusted only): multiple buffers, file read/write, directory
+  listing, program arguments, and (later) ~call-process~.
+~check_path~ / ~MIME_ROOTS~ still sits underneath: unrestricted in the trusted tier,
+mandatory and tight in the sandboxed tier. Replaces the old three binaries
+(~mimectl~ / ~mimed~ / ~mime-mcp~) — now modes of ~mime~; the old names are dropped.
+
+** Orchestration group — what a full elisp batch (and add-anno) needs
+
+~add-anno.mime~ is an Emacs slice written in ChaiScript: it opens the HTML plus a
+buffer per annotation file plus templates, drives three cursors on the main buffer,
+and writes two outputs. The per-cursor editing is already covered by the core
+vocabulary; the orchestration group adds the Emacs *runtime* primitives (trusted
+tier only):
+- *Multiple buffers* (the keystone): a buffer registry on the ~Session~; ~get-buffer~,
+  ~generate-new-buffer~, ~set-buffer~ / ~with-current-buffer~, ~current-buffer~,
+  ~buffer-name~, ~buffer-list~, ~kill-buffer~. The editing builtins act on the
+  *current* buffer. (Emacs-faithful; the sandboxed tier never registers these — it
+  stays one-buffer, tool-mediated.)
+- *File I/O*: ~find-file~ (open a path into a buffer), ~insert-file-contents~,
+  ~write-region~ / ~write-file~ / ~save-buffer~ to a path, ~directory-files~. All
+  ~check_path~-gated.
+- *Program arguments*: bind the CLI params (~--date~, ~--anno-path~, ~--with-badges~)
+  into the program — a ~command-line-args~ / ~argv~ accessor or pre-bound vars.
+- *Multi-cursor*: markers already give durable positions; a "cursor" is markers +
+  per-cursor narrowing — a thin ~with-cursor~ convention, or a real cursor object.
+
 * Performance
 
 - *The file is never fully resident.* Quire — piece tree over mmapped (or paged-LRU)
@@ -596,6 +643,27 @@ the agent-facing surface works end to end. M5 ✓, rehearse ✓, M7 scaffold ✓
    ~mimectl repl~; mime→mime-rs porting guide; docs; example library of helpers;
    ~cargo~ workspace + crate publish.
 
+** TODO M9 — One ~mime~ binary + capability tiers [#A]
+   Merge ~mimectl~/~mimed~/~mime-mcp~ into a single ~mime~ (modes: default local /
+   ~--daemon~ / ~--mcp~ / ~--connect~). Move the three ~main~ bodies into the lib
+   (~cli::run~ / ~daemon::run~ / ~mcp::run~); one ~src/main.rs~ dispatches on the mode.
+   A ~Capabilities~ tier (trusted vs sandboxed) chosen by the mode gates which builtin
+   groups register. Drop the old binary names (no deprecation). /Exit: ~mime~,
+   ~mime --daemon~, ~mime --mcp~ all work; one binary; tests green./
+** TODO M10 — Orchestration group: multi-buffer + file I/O + args [#B]
+   The trusted-tier Emacs-runtime primitives: a buffer registry + ~set-buffer~ /
+   ~with-current-buffer~ / ~find-file~ / ~generate-new-buffer~; ~insert-file-contents~ /
+   ~write-region~ / ~directory-files~ (~check_path~-gated); program-argument binding;
+   the multi-cursor convention. Registered only in the trusted tier. /Exit: a trusted
+   ~mime~ program opens several files, aggregates across buffers, and writes two
+   outputs./
+** TODO M11 — Port ulysses-annotated add-anno to mime-rs [#C]
+   Re-architect ~scripts/add-anno.mime~ (+ ~upd-epub-to-jp.mime~) as a trusted ~mime~
+   elisp program: orchestration in elisp (args, the annotation dir, two outputs,
+   multi-buffer aggregation), editing in the core vocabulary. The canonical
+   integration test the plan has pointed at from the start. /Exit: the pipeline
+   reproduces the annotated EPUB; the ulysses bench beats ~mime~./
+
 * tulisp substrate — what mime-rs relies on
 
 Read against tulisp 0.28's *tests, doc-comments, and code*. (The loose ~docs/*.md~ and
@@ -756,10 +824,10 @@ the new checkpoint id — committed only if not run as ~rehearse~.
 * Appendix B — naming & lineage
 - Project / engine crate: ~mime-rs~ (reads "mimers"; the ~-rs~ Rust suffix completes
   the word).
-- Daemon binary: ~mimed~ ("mimed" — mime + d, and the past tense fits: it has
-  already performed your edits).
-- CLI binary: ~mimectl~ (systemctl/kubectl convention — the control client you use
-  instead of raw HTTP).
+- Binary: ~mime~ — one binary, like the original. Modes: ~mime PROG.tl~ (local,
+  trusted), ~mime --daemon~, ~mime --mcp~ (both sandboxed), ~mime <verb> --connect~ (daemon
+  client). Briefly split into ~mimectl~/~mimed~/~mime-mcp~; folded back into one, the mode
+  picking protocol + trust tier.
 - Lineage: shsms's ~mime~ → ~mime-rs~. Same buffers-and-cursors soul; new powers
   (transactions, structured I/O, MCP) and none of the cuts.
 - Tagline candidate: /"an amanuensis for your agents — it takes dictation, keeps
