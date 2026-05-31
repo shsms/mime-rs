@@ -1148,9 +1148,278 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
 /// Only the TRUSTED tier calls this (see [`crate::engine::Capabilities`]); the
 /// sandboxed, agent-facing tier never does. This is the seam M10 fills in; today
 /// it is empty (the core group is the whole vocabulary).
-pub fn register_orchestration(_ctx: &mut TulispContext, _session: &SharedSession) {
-    // M10: set-buffer / with-current-buffer / current-buffer / buffer-name /
-    // buffer-list / generate-new-buffer / kill-buffer (a buffer registry on the
-    // Session); find-file / insert-file-contents / write-region / directory-files
-    // (check_path-gated); program-argument binding (command-line-args / argv).
+pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) {
+    // ---- multiple buffers ----
+    // These close over the SharedSession exactly like the core editing builtins.
+    // The ~90 core primitives all act on `sess.buffer` (the current buffer);
+    // `set-buffer` swaps which store that is, so per-buffer editing just works.
+    {
+        let s = session.clone();
+        // (generate-new-buffer NAME) — create an empty in-memory buffer, name
+        // uniquified Emacs-style if taken; returns the actual name. Does not
+        // switch to it.
+        ctx.defun("generate-new-buffer", move |name: String| -> String {
+            s.borrow_mut().generate_new_buffer(&name)
+        });
+    }
+    {
+        let s = session.clone();
+        // (set-buffer NAME) — make NAME the current buffer; returns NAME. Errors
+        // if no such buffer exists.
+        ctx.defun(
+            "set-buffer",
+            move |name: String| -> Result<TulispObject, Error> {
+                s.borrow_mut().set_buffer(&name).map_err(|e| err(&e))?;
+                Ok(TulispValue::from(name).into_ref(None))
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (current-buffer) — the current buffer's name.
+        ctx.defun("current-buffer", move || -> String {
+            s.borrow().current_buffer_name()
+        });
+    }
+    {
+        let s = session.clone();
+        // (buffer-name) — the current buffer's name (alias of current-buffer
+        // here, since mime identifies buffers by name).
+        ctx.defun("buffer-name", move || -> String {
+            s.borrow().current_buffer_name()
+        });
+    }
+    {
+        let s = session.clone();
+        // (buffer-list) — all buffer names: current first, then inactive in
+        // creation order. The Vec converts to a Lisp list of strings.
+        ctx.defun("buffer-list", move || -> Vec<String> {
+            s.borrow().buffer_names()
+        });
+    }
+    {
+        let s = session.clone();
+        // (get-buffer NAME) — NAME if such a buffer exists (current or inactive),
+        // else nil.
+        ctx.defun(
+            "get-buffer",
+            move |name: String| -> Result<TulispObject, Error> {
+                Ok(if s.borrow().has_buffer(&name) {
+                    TulispValue::from(name).into_ref(None)
+                } else {
+                    TulispObject::nil()
+                })
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (kill-buffer NAME) — remove the inactive buffer NAME; returns t.
+        // Killing the current buffer is an error for now.
+        ctx.defun(
+            "kill-buffer",
+            move |name: String| -> Result<TulispObject, Error> {
+                s.borrow_mut().kill_buffer(&name).map_err(|e| err(&e))?;
+                Ok(TulispObject::t())
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (with-current-buffer NAME BODY...) — evaluate BODY with NAME current,
+        // then restore the previously-current buffer *even if BODY errors*. NAME
+        // (the first arg) is evaluated; BODY is the rest. Returns BODY's value.
+        ctx.defspecial("with-current-buffer", move |ctx, args| {
+            let name_form = args.car_and_then(|f| Ok(f.clone()))?;
+            let name = ctx.eval(&name_form)?.as_string()?;
+            let body = args.cdr_and_then(|b| Ok(b.clone()))?;
+
+            let previous = s.borrow().current_buffer_name();
+            s.borrow_mut().set_buffer(&name).map_err(|e| err(&e))?;
+            // Capture BODY's result, restore the previous buffer regardless, then
+            // surface the result (value or error).
+            let res = ctx.eval_progn(&body);
+            s.borrow_mut().set_buffer(&previous).map_err(|e| err(&e))?;
+            res
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Workspace;
+    use crate::buffer::Buffer;
+    use crate::result::RunReport;
+
+    /// A trusted workspace (so `register_orchestration` runs) over a "main"
+    /// buffer with the given text.
+    fn trusted(text: &str) -> Workspace {
+        Workspace::new_trusted(Box::new(Buffer::from_string("main", text)))
+    }
+
+    fn report(r: &RunReport, key: &str) -> String {
+        r.reports
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn two_buffers_stay_isolated_with_their_own_text_and_point() {
+        let mut ws = trusted("main-body");
+        // Put point somewhere non-trivial in `main`, then create+edit `other`.
+        ws.run(
+            r#"(goto-char 5)
+               (generate-new-buffer "other")
+               (set-buffer "other")
+               (insert "other-text")
+               (goto-char 3)"#,
+        )
+        .unwrap();
+        // `other` is current and holds only its own edits.
+        let r = ws
+            .run(r#"(report "txt" (buffer-string)) (report "pt" (point))"#)
+            .unwrap();
+        assert_eq!(report(&r, "txt"), "\"other-text\"");
+        assert_eq!(report(&r, "pt"), "3");
+
+        // Switching back to `main` preserves its text AND its point (5) — the
+        // edits to `other` never touched it.
+        let r = ws
+            .run(r#"(set-buffer "main") (report "txt" (buffer-string)) (report "pt" (point))"#)
+            .unwrap();
+        assert_eq!(report(&r, "txt"), "\"main-body\"");
+        assert_eq!(report(&r, "pt"), "5");
+    }
+
+    #[test]
+    fn with_current_buffer_evaluates_in_name_and_restores_after() {
+        let mut ws = trusted("MAIN");
+        ws.run(r#"(generate-new-buffer "side") (set-buffer "side") (insert "SIDE") (set-buffer "main")"#)
+            .unwrap();
+        // BODY runs in "side" (sees "SIDE"); afterwards "main" is current again.
+        let r = ws
+            .run(
+                r#"(report "in" (with-current-buffer "side" (buffer-string)))
+                   (report "cur" (current-buffer))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "in"), "\"SIDE\"");
+        // `report` stringifies its value the way tulisp prints it, so a string
+        // return renders quoted.
+        assert_eq!(report(&r, "cur"), "\"main\"");
+    }
+
+    #[test]
+    fn with_current_buffer_restores_even_when_body_errors() {
+        let mut ws = trusted("MAIN");
+        ws.run(r#"(generate-new-buffer "scratch")"#).unwrap();
+        // BODY switches into "scratch", mutates it, then signals an error; the
+        // error is caught, but the current buffer must already be back to "main".
+        let r = ws
+            .run(
+                r#"(condition-case e
+                      (with-current-buffer "scratch" (insert "X") (error "boom"))
+                    (error nil))
+                   (report "cur" (current-buffer))
+                   (set-buffer "scratch")
+                   (report "scratch" (buffer-string))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "cur"), "\"main\"");
+        // The pre-error edit inside BODY still happened (it is not rolled back —
+        // only the *current buffer* is restored), proving BODY did run in scratch.
+        assert_eq!(report(&r, "scratch"), "\"X\"");
+    }
+
+    #[test]
+    fn buffer_list_current_get_and_kill_buffer_behave() {
+        let mut ws = trusted("MAIN");
+        ws.run(r#"(generate-new-buffer "a") (generate-new-buffer "b")"#)
+            .unwrap();
+        // buffer-list: current first, then inactive in creation order.
+        let r = ws
+            .run(
+                r#"(report "list" (buffer-list))
+                   (report "cur" (current-buffer))
+                   (report "name" (buffer-name))
+                   (report "got" (get-buffer "a"))
+                   (report "miss" (get-buffer "nope"))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "list"), "(\"main\" \"a\" \"b\")");
+        assert_eq!(report(&r, "cur"), "\"main\"");
+        assert_eq!(report(&r, "name"), "\"main\"");
+        assert_eq!(report(&r, "got"), "\"a\""); // existing buffer → its name
+        assert_eq!(report(&r, "miss"), "nil"); // absent → nil
+
+        // kill-buffer removes an inactive buffer; it then drops out of buffer-list.
+        let r = ws
+            .run(r#"(report "k" (kill-buffer "a")) (report "list" (buffer-list))"#)
+            .unwrap();
+        assert_eq!(report(&r, "k"), "t");
+        assert_eq!(report(&r, "list"), "(\"main\" \"b\")");
+    }
+
+    #[test]
+    fn kill_buffer_errors_on_missing_and_on_current() {
+        let mut ws = trusted("MAIN");
+        // Missing buffer → error.
+        match ws.run(r#"(kill-buffer "ghost")"#) {
+            Err(e) => assert!(e.contains("no buffer named ghost"), "got: {e}"),
+            Ok(_) => panic!("killing a missing buffer should error"),
+        }
+        // The current buffer cannot be killed (no replacement policy yet).
+        match ws.run(r#"(kill-buffer "main")"#) {
+            Err(e) => assert!(e.contains("current buffer"), "got: {e}"),
+            Ok(_) => panic!("killing the current buffer should error"),
+        }
+    }
+
+    #[test]
+    fn set_buffer_errors_on_unknown_name() {
+        let mut ws = trusted("MAIN");
+        match ws.run(r#"(set-buffer "nope")"#) {
+            Err(e) => assert!(e.contains("no buffer named nope"), "got: {e}"),
+            Ok(_) => panic!("set-buffer on an unknown name should error"),
+        }
+    }
+
+    #[test]
+    fn generate_new_buffer_uniquifies_duplicate_names() {
+        let mut ws = trusted("MAIN");
+        let r = ws
+            .run(
+                r#"(report "a" (generate-new-buffer "dup"))
+                   (report "b" (generate-new-buffer "dup"))
+                   (report "c" (generate-new-buffer "dup"))"#,
+            )
+            .unwrap();
+        // First takes the bare name; later ones get Emacs-style <N> suffixes.
+        assert_eq!(report(&r, "a"), "\"dup\"");
+        assert_eq!(report(&r, "b"), "\"dup<2>\"");
+        assert_eq!(report(&r, "c"), "\"dup<3>\"");
+    }
+
+    #[test]
+    fn sandboxed_tier_lacks_the_orchestration_buffer_builtins() {
+        // The sandboxed (agent-facing) workspace never registers the
+        // orchestration group, so `set-buffer` is not defined: calling it fails
+        // as a void/undefined symbol rather than switching buffers.
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("main", "x")));
+        let e = match ws.run(r#"(set-buffer "x")"#) {
+            Err(e) => e,
+            Ok(_) => panic!("sandboxed tier must not expose set-buffer"),
+        };
+        assert!(
+            e.contains("void") && e.contains("set-buffer"),
+            "expected a void/undefined error for set-buffer, got: {e}"
+        );
+        // generate-new-buffer is likewise absent on the sandboxed tier.
+        assert!(
+            ws.run(r#"(generate-new-buffer "y")"#).is_err(),
+            "sandboxed tier must not expose generate-new-buffer"
+        );
+    }
 }
