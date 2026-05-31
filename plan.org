@@ -674,7 +674,7 @@ Findings from editing mime-rs *through mime-rs* (the agent's-eye view); appended
   position does not survive edits; Emacs markers on Quire anchors are the fix. [next]
 - Inserting big literal blocks is awkward: tulisp-string escaping of newlines is
   error-prone (this very section was a long escaped ~insert~); want an ~insert_text~ MCP
-  tool that takes the text as a JSON string, no tulisp escaping.
+  tool that takes the text as a JSON string, no tulisp escaping. [done: insert_text]
 - Structural code edits are hard: adding the ~view~ MCP tool meant three separate
   sites (a handler fn, a dispatch arm, a schema entry). Search/replace is the wrong
   instrument for "add an arm to this match" / "add a field to this struct", so I used a
