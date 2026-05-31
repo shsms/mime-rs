@@ -1,30 +1,39 @@
-//! Quire — the piece-table `TextStore` over an immutable, memory-mapped original
-//! plus an append-only add buffer (M1). This is VS Code's piece tree in its
-//! first, copy-on-write-ready form: the document is an ordered sequence of
-//! *pieces* `(source, start, len)` that reference one of two immutable backing
-//! stores; the original is `mmap`ed (paged by the OS, never fully resident) and
-//! the add buffer holds only inserted text. An edit splits pieces and points a
-//! new one at the add buffer — original bytes never move.
+//! Quire — the `TextStore` over an immutable, memory-mapped original plus an
+//! append-only add buffer (M1), with a **persistent measured B-tree** spine.
+//! This is VS Code's piece tree in its copy-on-write form: the document is an
+//! ordered sequence of *pieces* `(source, start, len)` that reference one of two
+//! immutable backing stores; the original is `mmap`ed (paged by the OS, never
+//! fully resident) and the add buffer holds only inserted text. An edit splits
+//! pieces and points a new one at the add buffer — original bytes never move.
 //!
 //! Positions are 1-based char positions, Emacs-style, exactly like
 //! [`crate::buffer::Buffer`] (the differential-test oracle this matches
 //! byte-for-byte). `point_min`/`point_max` honor the narrowing.
 //!
-//! ## Data structure (Vec of pieces, not a tree — yet)
-//! The spine is a `Vec<Piece>`. The plan's endgame is a *persistent measured
-//! B-tree* (`Arc` nodes, path-copied per edit, monoid summaries for O(log n)
-//! byte/char/line seeks and free checkpoints). A `Vec` keeps every method
-//! correct and the editing path O(pieces) rather than O(bytes) — inserts/deletes
-//! splice a handful of pieces, search/index walk pieces — but an individual
-//! edit is O(pieces) to splice and seeks are O(pieces) (binary search on a
-//! cached prefix sum + a within-piece byte scan). For an unedited file that is
-//! one piece; it degrades linearly in the number of edits, which is why the tree
-//! is the planned upgrade. Swapping `Vec<Piece>` → measured tree is local to this
-//! file and changes no `TextStore` behavior. See `plan.org` §"The editor core".
+//! ## Data structure: a persistent measured B-tree
+//! The spine is an [`Arc`]-wrapped B-tree ([`Node`]). Internal nodes hold child
+//! pointers plus a monoid [`Summary`] (total bytes / chars / lines) for the whole
+//! subtree; leaves hold a small `Vec<Piece>` and that run's summary. Seeks
+//! (char → leaf/piece/offset, char → line, accumulated newlines before a
+//! position) descend the tree guided by the summaries, so they are **O(log n)**
+//! in the number of pieces instead of a linear scan of a piece vector. Edits
+//! (`insert`, `delete_region`, `replace_match`) rebuild only the root→leaf path
+//! they touch ([path-copying]); every prior version stays intact, so the tree is
+//! **persistent** and a snapshot is just a clone of the root `Arc`. See
+//! `plan.org` §"The editor core" and §"Performance".
+//!
+//! ## Shared, immutable backings → O(1) snapshots
+//! Both backing stores are `Arc`-shared. The original (mmap or owned string) is
+//! immutable for the program's life. The add buffer is append-only; a `Quire`
+//! appends to it in place while it is uniquely owned, and **copies it on write**
+//! the first time it must grow while a snapshot still shares it (so divergent
+//! timelines never clobber each other's bytes). A snapshot therefore clones two
+//! `Arc`s and copies only the cursor state — no document bytes move. See
+//! [`Quire::snapshot`].
 //!
 //! ## What is (and isn't) materialized
-//! Editing, search, line/char navigation and snapshotting touch O(pieces) and
-//! the OS page cache, never a full copy of the text. The *one* exception is
+//! Editing, search, line/char navigation and snapshotting touch O(log n) nodes
+//! and the OS page cache, never a full copy of the text. The *one* exception is
 //! [`TextStore::text`], whose signature returns `&str`: a borrow has to point at
 //! contiguous bytes that live somewhere, so the first `text()` after a mutation
 //! lazily fills a cached `String` (see [`Quire::full_text`]). That cache is a
@@ -32,11 +41,14 @@
 //! is the single place a GB file would be brought fully resident — flagged so it
 //! can be removed once the surface is fully ranged/streamed. No internal method
 //! calls it.
+//!
+//! [path-copying]: https://en.wikipedia.org/wiki/Persistent_data_structure
 
 use crate::buffer::MatchData;
 use crate::store::TextStore;
 use std::cell::RefCell;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Which immutable backing store a piece points into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,18 +60,31 @@ enum Source {
 }
 
 /// A reference into a backing store: `[start, start + len)` *bytes*. Never owns
-/// text. `chars` caches the code-point count of that byte range so position math
-/// is a prefix sum over pieces rather than a rescan of the bytes.
+/// text. `chars` / `lines` cache the code-point and newline counts of that byte
+/// range so the tree summaries are prefix sums over pieces, not rescans.
 #[derive(Debug, Clone, Copy)]
 struct Piece {
     source: Source,
     start: usize,
     len: usize,
     chars: usize,
+    /// Number of `\n` bytes in `[start, start + len)`.
+    lines: usize,
+}
+
+impl Piece {
+    fn summary(&self) -> Summary {
+        Summary {
+            bytes: self.len,
+            chars: self.chars,
+            lines: self.lines,
+        }
+    }
 }
 
 /// The immutable original: either an mmap of a file or owned text. Both are
 /// treated uniformly as `&[u8]` / `&str`; the mmap is never copied wholesale.
+/// Wrapped in an [`Arc`] so every snapshot shares it with zero copying.
 enum Original {
     /// `from_string` — owns its "original" text (no file). Needed for tests and
     /// scratch buffers without a path.
@@ -85,16 +110,113 @@ impl Original {
     }
 }
 
-/// Quire — a piece-table `TextStore`. See the module docs for the data model.
+// ----------------------------------------------------------------------------
+// Measured B-tree
+// ----------------------------------------------------------------------------
+
+/// Monoid summary of a subtree (or a single piece): the measures we seek by.
+/// `lines` is the newline count (not 1-based line numbers), which composes
+/// additively; the 1-based line number at a position is `lines_before + 1`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Summary {
+    bytes: usize,
+    chars: usize,
+    lines: usize,
+}
+
+impl Summary {
+    fn add(self, other: Summary) -> Summary {
+        Summary {
+            bytes: self.bytes + other.bytes,
+            chars: self.chars + other.chars,
+            lines: self.lines + other.lines,
+        }
+    }
+}
+
+/// Branching factor: the max number of children (internal) or pieces (leaf) a
+/// node holds before it splits at its midpoint. Small documents in the
+/// differential test keep the tree shallow regardless; this governs fan-out at
+/// scale. A midpoint split of `MAX + 1` items yields two well-occupied halves
+/// (≥ `MAX / 2` each). Persistence does not require strict B-tree underflow
+/// rebalancing for correctness, so deletes may leave a node sparsely populated;
+/// that only affects depth, never results — a TODO for a later compaction pass.
+const MAX: usize = 16;
+
+/// A node of the persistent measured B-tree. Shared via [`Arc`]; edits copy only
+/// the root→leaf path (path-copying), so older roots stay valid snapshots.
+enum Node {
+    /// A run of pieces plus their combined summary.
+    Leaf {
+        pieces: Vec<Piece>,
+        summary: Summary,
+    },
+    /// Child pointers plus the combined summary of the whole subtree. `height`
+    /// is the number of internal levels below the root inclusive (a leaf is 0).
+    Internal {
+        children: Vec<Arc<Node>>,
+        summary: Summary,
+        height: usize,
+    },
+}
+
+impl Node {
+    fn summary(&self) -> Summary {
+        match self {
+            Node::Leaf { summary, .. } | Node::Internal { summary, .. } => *summary,
+        }
+    }
+
+    fn height(&self) -> usize {
+        match self {
+            Node::Leaf { .. } => 0,
+            Node::Internal { height, .. } => *height,
+        }
+    }
+
+    /// A leaf holding no pieces — the canonical empty subtree. `delete_rec`
+    /// drops exactly these from a rebuilt parent (an internal node that lost all
+    /// its children is collapsed to one of these, never kept as a child).
+    fn is_empty_leaf(&self) -> bool {
+        matches!(self, Node::Leaf { pieces, .. } if pieces.is_empty())
+    }
+
+    fn leaf(pieces: Vec<Piece>) -> Node {
+        let summary = pieces
+            .iter()
+            .fold(Summary::default(), |acc, p| acc.add(p.summary()));
+        Node::Leaf { pieces, summary }
+    }
+
+    fn internal(children: Vec<Arc<Node>>) -> Node {
+        let height = children.first().map_or(1, |c| c.height() + 1);
+        let summary = children
+            .iter()
+            .fold(Summary::default(), |acc, c| acc.add(c.summary()));
+        Node::Internal {
+            children,
+            summary,
+            height,
+        }
+    }
+
+    /// An empty document: a single empty leaf.
+    fn empty() -> Arc<Node> {
+        Arc::new(Node::leaf(Vec::new()))
+    }
+}
+
+/// Quire — a persistent measured B-tree `TextStore`. See the module docs.
 pub struct Quire {
     name: String,
-    original: Original,
-    /// Append-only; pieces with `source == Add` reference ranges in here.
-    add: String,
-    /// The document, as an ordered sequence of pieces.
-    pieces: Vec<Piece>,
-    /// Cached total char count of `pieces` (sum of `Piece::chars`).
-    total_chars: usize,
+    /// Immutable original backing, shared by every snapshot.
+    original: Arc<Original>,
+    /// Append-only add buffer, shared by every snapshot; copied-on-write before
+    /// a shared `Quire` grows it (see [`Quire::add_mut`]). Pieces with
+    /// `source == Add` reference byte ranges in here.
+    add: Arc<Vec<u8>>,
+    /// The document spine: a persistent measured B-tree of pieces.
+    root: Arc<Node>,
 
     /// Point: 1-based char position in `point_min()..=point_max()`.
     point: usize,
@@ -139,28 +261,30 @@ impl Quire {
     }
 
     fn with_original(name: String, original: Original) -> Quire {
-        // One piece spanning the whole original. Counting its chars is the one
-        // up-front scan; for a GB file this is the lazy line/char index the plan
-        // wants done off the first-edit path — acceptable here, and the obvious
-        // place to make incremental/background later (TODO).
+        // One piece spanning the whole original. Counting its chars/lines is the
+        // one up-front scan; for a GB file this is the lazy line/char index the
+        // plan wants done off the first-edit path — acceptable here, and the
+        // obvious place to make incremental/background later (TODO).
         let bytes_len = original.bytes().len();
-        let chars = original.as_str().chars().count();
-        let pieces = if bytes_len == 0 {
-            Vec::new()
+        let s = original.as_str();
+        let root = if bytes_len == 0 {
+            Node::empty()
         } else {
-            vec![Piece {
+            let chars = s.chars().count();
+            let lines = s.bytes().filter(|&b| b == b'\n').count();
+            Arc::new(Node::leaf(vec![Piece {
                 source: Source::Original,
                 start: 0,
                 len: bytes_len,
                 chars,
-            }]
+                lines,
+            }]))
         };
         Quire {
             name,
-            original,
-            add: String::new(),
-            pieces,
-            total_chars: chars,
+            original: Arc::new(original),
+            add: Arc::new(Vec::new()),
+            root,
             point: 1,
             mark: None,
             narrowing: None,
@@ -173,7 +297,7 @@ impl Quire {
     fn backing(&self, source: Source) -> &[u8] {
         match source {
             Source::Original => self.original.bytes(),
-            Source::Add => self.add.as_bytes(),
+            Source::Add => &self.add,
         }
     }
 
@@ -181,12 +305,24 @@ impl Quire {
     fn piece_str(&self, p: &Piece) -> &str {
         let bytes = &self.backing(p.source)[p.start..p.start + p.len];
         // SAFETY: both backings are UTF-8 and pieces are only ever split on char
-        // boundaries (see `byte_of` / `split_for`), so this slice is valid UTF-8.
+        // boundaries (see `split_piece`), so this slice is valid UTF-8.
         unsafe { std::str::from_utf8_unchecked(bytes) }
     }
 
+    /// A mutable handle to the add buffer, performing copy-on-write if it is
+    /// still shared by a snapshot. Appends thereafter are in place and O(1)
+    /// amortized; the COW clone happens at most once per "first edit after a
+    /// snapshot" and copies only inserted text (typically tiny vs the document).
+    fn add_mut(&mut self) -> &mut Vec<u8> {
+        Arc::make_mut(&mut self.add)
+    }
+
     fn char_len(&self) -> usize {
-        self.total_chars
+        self.root.summary().chars
+    }
+
+    fn total_chars(&self) -> usize {
+        self.root.summary().chars
     }
 
     fn point_min(&self) -> usize {
@@ -194,64 +330,162 @@ impl Quire {
     }
 
     fn point_max(&self) -> usize {
-        self.narrowing.map_or(self.total_chars + 1, |(_, hi)| hi)
+        self.narrowing.map_or(self.total_chars() + 1, |(_, hi)| hi)
     }
 
-    /// Locate 1-based char position `p` (clamped to `1..=char_len+1`): returns
-    /// the piece index and the *byte* offset of that char within the piece. A
-    /// position at end-of-document returns `(pieces.len(), 0)`. O(pieces) over
-    /// the prefix sum + a within-piece byte scan (the part a measured tree would
-    /// turn into O(log n)).
-    fn locate(&self, p: usize) -> (usize, usize) {
-        let p = p.clamp(1, self.total_chars + 1);
-        let target = p - 1; // chars before the position
-        let mut acc = 0usize;
-        for (i, piece) in self.pieces.iter().enumerate() {
-            if target < acc + piece.chars {
-                let within = target - acc; // chars into this piece
-                let byte = self
-                    .piece_str(piece)
-                    .char_indices()
-                    .nth(within)
-                    .map_or(piece.len, |(b, _)| b);
-                return (i, byte);
-            }
-            acc += piece.chars;
-        }
-        (self.pieces.len(), 0)
-    }
-
-    /// Split the piece list so that 1-based char position `p` is exactly a piece
-    /// boundary; return the index of the first piece at/after `p` (the insertion
-    /// index). Splits never land inside a UTF-8 scalar (offsets come from
-    /// [`Self::locate`], which is char-indexed).
-    fn split_at(&mut self, p: usize) -> usize {
-        let (idx, byte) = self.locate(p);
-        if idx >= self.pieces.len() || byte == 0 {
-            return idx;
-        }
-        let piece = self.pieces[idx];
-        let left_chars = self.piece_str(&piece)[..byte].chars().count();
-        let left = Piece {
-            source: piece.source,
-            start: piece.start,
-            len: byte,
-            chars: left_chars,
-        };
-        let right = Piece {
-            source: piece.source,
-            start: piece.start + byte,
-            len: piece.len - byte,
-            chars: piece.chars - left_chars,
-        };
-        self.pieces[idx] = left;
-        self.pieces.insert(idx + 1, right);
-        idx + 1
+    fn goto_char(&mut self, p: usize) {
+        self.point = p.clamp(self.point_min(), self.point_max());
     }
 
     /// Drop the lazy `text()` cache. Called from every mutation.
     fn invalidate(&mut self) {
         *self.text_cache.borrow_mut() = None;
+    }
+
+    // ---- O(log n) seeks via the tree summaries ----------------------------
+
+    /// Locate 1-based char position `p` (clamped to `1..=char_len+1`): descend
+    /// the tree by the `chars` summary to the leaf and piece containing it, then
+    /// resolve the *byte* offset of that char within the piece. Returns
+    /// `(leaf piece slice as &str, byte offset, char offset within piece)` for
+    /// the boundary piece, or `None` at end-of-document. **O(log n)** node hops
+    /// plus one within-piece char scan (was O(pieces) over a Vec prefix sum).
+    fn locate(&self, p: usize) -> Option<(Piece, usize)> {
+        let p = p.clamp(1, self.total_chars() + 1);
+        let mut target = p - 1; // chars before the position
+        let mut node = self.root.as_ref();
+        // Descend internal levels, peeling off whole children by char count.
+        loop {
+            match node {
+                Node::Internal { children, .. } => {
+                    let mut next = None;
+                    for child in children {
+                        let c = child.summary().chars;
+                        if target < c {
+                            next = Some(child.as_ref());
+                            break;
+                        }
+                        target -= c;
+                    }
+                    match next {
+                        Some(n) => node = n,
+                        // `target` ran past the last child → end of document.
+                        None => return None,
+                    }
+                }
+                Node::Leaf { pieces, .. } => {
+                    for piece in pieces {
+                        if target < piece.chars {
+                            let byte = self
+                                .piece_str(piece)
+                                .char_indices()
+                                .nth(target)
+                                .map_or(piece.len, |(b, _)| b);
+                            return Some((*piece, byte));
+                        }
+                        target -= piece.chars;
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// The char at 1-based position `p` (absolute; ignores narrowing), or `None`
+    /// at/after end-of-document. O(log n) + a small within-piece scan.
+    fn char_at(&self, p: usize) -> Option<char> {
+        if p < 1 || p > self.total_chars() {
+            return None;
+        }
+        let (piece, byte) = self.locate(p)?;
+        self.piece_str(&piece)[byte..].chars().next()
+    }
+
+    /// Accumulated summary of everything strictly before 1-based char position
+    /// `p` (clamped). Descending the tree, we sum the summaries of children/
+    /// pieces wholly before `p` and scan only the boundary piece's prefix.
+    /// **O(log n)** + one within-piece byte scan. `summary.lines` is the count
+    /// of newlines before `p`; `summary.bytes` the byte offset of `p`.
+    fn summary_before(&self, p: usize) -> Summary {
+        let p = p.clamp(1, self.total_chars() + 1);
+        let mut target = p - 1; // chars before the position
+        let mut acc = Summary::default();
+        let mut node = self.root.as_ref();
+        loop {
+            match node {
+                Node::Internal { children, .. } => {
+                    let mut descended = false;
+                    for child in children {
+                        let c = child.summary().chars;
+                        if target < c {
+                            node = child.as_ref();
+                            descended = true;
+                            break;
+                        }
+                        target -= c;
+                        acc = acc.add(child.summary());
+                    }
+                    if !descended {
+                        return acc; // past the end: whole-tree summary accumulated
+                    }
+                }
+                Node::Leaf { pieces, .. } => {
+                    for piece in pieces {
+                        if target < piece.chars {
+                            // Partial piece: scan its first `target` chars.
+                            let s = self.piece_str(piece);
+                            let bend = s.char_indices().nth(target).map_or(s.len(), |(b, _)| b);
+                            let pre = &s[..bend];
+                            acc = acc.add(Summary {
+                                bytes: bend,
+                                chars: target,
+                                lines: pre.bytes().filter(|&b| b == b'\n').count(),
+                            });
+                            return acc;
+                        }
+                        target -= piece.chars;
+                        acc = acc.add(piece.summary());
+                    }
+                    return acc;
+                }
+            }
+        }
+    }
+
+    /// Count newlines in the absolute char range `[1, p)` — how many line breaks
+    /// precede position `p`. **O(log n)** via [`Self::summary_before`].
+    fn newlines_before(&self, p: usize) -> usize {
+        self.summary_before(p).lines
+    }
+
+    fn total_bytes(&self) -> usize {
+        self.root.summary().bytes
+    }
+
+    /// Visit each piece of the document in order. The closure may stop early by
+    /// returning `false`. Used by whole-document and range materialization.
+    fn for_each_piece<F: FnMut(&Piece) -> bool>(&self, mut f: F) {
+        fn walk<F: FnMut(&Piece) -> bool>(node: &Node, f: &mut F) -> bool {
+            match node {
+                Node::Leaf { pieces, .. } => {
+                    for p in pieces {
+                        if !f(p) {
+                            return false;
+                        }
+                    }
+                    true
+                }
+                Node::Internal { children, .. } => {
+                    for c in children {
+                        if !walk(c, f) {
+                            return false;
+                        }
+                    }
+                    true
+                }
+            }
+        }
+        walk(self.root.as_ref(), &mut f);
     }
 
     /// Materialize the whole document into the lazy cache and hand back a `&str`
@@ -261,9 +495,10 @@ impl Quire {
     fn full_text(&self) -> &str {
         if self.text_cache.borrow().is_none() {
             let mut s = String::with_capacity(self.total_bytes());
-            for piece in &self.pieces {
+            self.for_each_piece(|piece| {
                 s.push_str(self.piece_str(piece));
-            }
+                true
+            });
             *self.text_cache.borrow_mut() = Some(s);
         }
         // SAFETY: we only hand out a borrow tied to `&self`; the cache is an
@@ -275,33 +510,18 @@ impl Quire {
         unsafe { (*ptr).as_ref().unwrap().as_str() }
     }
 
-    fn total_bytes(&self) -> usize {
-        self.pieces.iter().map(|p| p.len).sum()
-    }
-
-    /// The char at 1-based position `p` (absolute; ignores narrowing), or `None`
-    /// at/after end-of-document. O(pieces) + a small within-piece scan.
-    fn char_at(&self, p: usize) -> Option<char> {
-        if p < 1 || p > self.total_chars {
-            return None;
-        }
-        let (idx, byte) = self.locate(p);
-        let piece = self.pieces.get(idx)?;
-        self.piece_str(piece)[byte..].chars().next()
-    }
-
     /// Materialize the absolute char range `[lo, hi)` (1-based) into an owned
     /// `String` by walking pieces. Used for region reads and as the search
-    /// window. O(range), not O(document) — only the requested span is copied.
+    /// window. O(range + log n) — only the requested span is copied.
     fn collect_range(&self, lo: usize, hi: usize) -> String {
-        let lo = lo.clamp(1, self.total_chars + 1);
-        let hi = hi.clamp(lo, self.total_chars + 1);
+        let lo = lo.clamp(1, self.total_chars() + 1);
+        let hi = hi.clamp(lo, self.total_chars() + 1);
         let mut out = String::new();
         if lo == hi {
             return out;
         }
         let mut pos = 1usize; // 1-based char position at the start of `piece`
-        for piece in &self.pieces {
+        self.for_each_piece(|piece| {
             let piece_end = pos + piece.chars; // exclusive
             if piece_end > lo && pos < hi {
                 let s = self.piece_str(piece);
@@ -316,85 +536,274 @@ impl Quire {
                 out.push_str(&s[bstart..bend]);
             }
             pos = piece_end;
-            if pos >= hi {
-                break;
-            }
-        }
+            pos < hi
+        });
         out
     }
 
-    /// Count newlines in the absolute char range `[1, p)` — i.e. how many line
-    /// breaks precede position `p`. Walks pieces; the part of the boundary piece
-    /// before `p` is scanned. O(bytes before p) worst case (a measured tree
-    /// would carry a line-count summary for O(log n)); TODO: lazy line index.
-    fn newlines_before(&self, p: usize) -> usize {
-        let p = p.clamp(1, self.total_chars + 1);
-        if p <= 1 {
-            return 0;
-        }
-        let mut count = 0usize;
-        let mut pos = 1usize;
-        for piece in &self.pieces {
-            let piece_end = pos + piece.chars;
-            let s = self.piece_str(piece);
-            if piece_end <= p {
-                count += s.bytes().filter(|&b| b == b'\n').count();
-            } else {
-                let within = p - pos; // chars of this piece that precede `p`
-                let bend = s.char_indices().nth(within).map_or(s.len(), |(b, _)| b);
-                count += s[..bend].bytes().filter(|&b| b == b'\n').count();
-                break;
-            }
-            pos = piece_end;
-            if pos >= p {
-                break;
-            }
-        }
-        count
-    }
-
-    fn goto_char(&mut self, p: usize) {
-        self.point = p.clamp(self.point_min(), self.point_max());
-    }
-
-    // ---- low-level piece splicing (touch only pieces / total_chars / add) ----
+    // ---- low-level tree splicing (touch only the spine / add buffer) -------
     // These never touch point, mark, narrowing, last_match, or the text cache;
     // each public mutator layers its own oracle-matching bookkeeping on top.
+    // They rebuild only the root→leaf path (path-copying), so prior roots — and
+    // therefore snapshots — are unaffected.
 
-    /// Insert `s` at the piece boundary for 1-based char position `p`, appending
-    /// to the add buffer. Returns the char count inserted. O(pieces).
+    /// Build a `Piece` over a freshly known byte range, counting chars/lines.
+    fn make_piece(&self, source: Source, start: usize, len: usize) -> Piece {
+        let bytes = &self.backing(source)[start..start + len];
+        // SAFETY: callers pass char-boundary-aligned ranges into UTF-8 backings.
+        let s = unsafe { std::str::from_utf8_unchecked(bytes) };
+        Piece {
+            source,
+            start,
+            len,
+            chars: s.chars().count(),
+            lines: s.bytes().filter(|&b| b == b'\n').count(),
+        }
+    }
+
+    /// Split `piece` at `byte` (a char boundary within it) into `(left, right)`.
+    fn split_piece(&self, piece: &Piece, byte: usize) -> (Piece, Piece) {
+        let left = self.make_piece(piece.source, piece.start, byte);
+        let right = self.make_piece(piece.source, piece.start + byte, piece.len - byte);
+        (left, right)
+    }
+
+    /// Insert `s` at 1-based char position `p` (append to the add buffer, then
+    /// splice one new piece into the spine). Returns the char count inserted.
+    /// Rebuilds only the touched root→leaf path. O(log n) + the within-leaf
+    /// piece shuffle.
     fn splice_insert(&mut self, p: usize, s: &str) -> usize {
         let n = s.chars().count();
-        let idx = self.split_at(p);
         let start = self.add.len();
-        self.add.push_str(s);
-        // The add buffer is append-only, so existing Add-pieces keep referencing
-        // stable byte ranges; only the new piece points at `[start, ..)`.
-        self.pieces.insert(
-            idx,
-            Piece {
-                source: Source::Add,
-                start,
-                len: s.len(),
-                chars: n,
-            },
-        );
-        self.total_chars += n;
+        self.add_mut().extend_from_slice(s.as_bytes());
+        let piece = self.make_piece(Source::Add, start, s.len());
+        let target = p.clamp(1, self.total_chars() + 1) - 1; // chars before p
+        let root = Arc::clone(&self.root);
+        self.root = self.insert_piece(&root, target, piece);
         n
     }
 
     /// Delete the absolute char range `[lo, hi)` (1-based, already ordered and
-    /// clamped) by splitting both ends and dropping the pieces between. O(pieces).
+    /// clamped). Rebuilds only the touched paths. O(log n) per boundary.
     fn splice_delete(&mut self, lo: usize, hi: usize) {
-        // Split the low end first: splitting at the (later) high end can only
-        // insert pieces at an index > `lo_idx`, so `lo_idx` stays valid; doing it
-        // the other way round would shift the high boundary the low split crosses.
-        let lo_idx = self.split_at(lo);
-        let hi_idx = self.split_at(hi);
-        self.pieces.drain(lo_idx..hi_idx);
-        self.total_chars -= hi - lo;
+        if lo >= hi {
+            return;
+        }
+        let from = lo - 1; // chars before lo
+        let len = hi - lo; // chars to remove
+        let root = Arc::clone(&self.root);
+        self.root = Self::delete_chars(self, &root, from, len);
     }
 
+    /// Persistently insert `piece` so that `target` chars precede it. Returns a
+    /// new root; the input root is untouched (path-copying). Splits propagate up.
+    fn insert_piece(&self, root: &Arc<Node>, target: usize, piece: Piece) -> Arc<Node> {
+        match self.insert_rec(root, target, piece) {
+            (node, None) => node,
+            // Root split: grow a new level.
+            (left, Some(right)) => Arc::new(Node::internal(vec![left, right])),
+        }
+    }
+
+    /// Recursive insert. Returns the rebuilt node and, if it overflowed, the
+    /// right half of a split to be linked in by the caller. A piece straddled by
+    /// the insertion point is split on its char boundary first (recounting
+    /// chars/lines from the real backing via [`Self::split_piece`]), so the new
+    /// piece always lands at an exact boundary.
+    fn insert_rec(
+        &self,
+        node: &Arc<Node>,
+        target: usize,
+        piece: Piece,
+    ) -> (Arc<Node>, Option<Arc<Node>>) {
+        match node.as_ref() {
+            Node::Leaf { pieces, .. } => {
+                let mut out = pieces.clone();
+                // Find the piece index and within-piece char offset for `target`.
+                let mut acc = 0usize;
+                let mut idx = out.len();
+                let mut split_at: Option<(usize, usize)> = None; // (piece idx, char off)
+                for (i, p) in out.iter().enumerate() {
+                    if target < acc + p.chars {
+                        let within = target - acc;
+                        if within == 0 {
+                            idx = i;
+                        } else {
+                            split_at = Some((i, within));
+                            idx = i + 1;
+                        }
+                        break;
+                    }
+                    acc += p.chars;
+                    idx = i + 1;
+                }
+                if let Some((i, within)) = split_at {
+                    // Split the straddled piece on a char boundary, then insert.
+                    let s = self.piece_str(&out[i]);
+                    let byte = s.char_indices().nth(within).map_or(out[i].len, |(b, _)| b);
+                    let (l, r) = self.split_piece(&out[i], byte);
+                    out[i] = l;
+                    out.insert(i + 1, r);
+                }
+                out.insert(idx, piece);
+                Self::leaf_from(out)
+            }
+            Node::Internal {
+                children, height, ..
+            } => {
+                let mut t = target;
+                let mut ci = children.len() - 1;
+                for (i, c) in children.iter().enumerate() {
+                    let cc = c.summary().chars;
+                    if t <= cc {
+                        ci = i;
+                        break;
+                    }
+                    t -= cc;
+                }
+                let (new_child, split) = self.insert_rec(&children[ci], t, piece);
+                let mut kids = children.clone();
+                kids[ci] = new_child;
+                if let Some(extra) = split {
+                    kids.insert(ci + 1, extra);
+                }
+                Self::internal_from(kids, *height)
+            }
+        }
+    }
+
+    /// Persistently delete `len` chars starting after `from` chars. Returns a new
+    /// root; the input root is untouched. The root is collapsed while it has a
+    /// single child so height stays minimal.
+    fn delete_chars(&self, root: &Arc<Node>, from: usize, len: usize) -> Arc<Node> {
+        let node = self.delete_rec(root, from, len);
+        Self::collapse_root(node)
+    }
+
+    /// Recursive delete of `[from, from+len)` chars within `node`. Returns the
+    /// rebuilt node (possibly underfull — see [`MIN`]).
+    fn delete_rec(&self, node: &Arc<Node>, from: usize, len: usize) -> Arc<Node> {
+        match node.as_ref() {
+            Node::Leaf { pieces, .. } => {
+                let mut out: Vec<Piece> = Vec::with_capacity(pieces.len() + 1);
+                let mut acc = 0usize;
+                let lo = from;
+                let hi = from + len;
+                for p in pieces {
+                    let p_lo = acc;
+                    let p_hi = acc + p.chars;
+                    acc = p_hi;
+                    if p_hi <= lo || p_lo >= hi {
+                        // Entirely outside the deletion range: keep as-is.
+                        out.push(*p);
+                        continue;
+                    }
+                    // Overlaps: keep the surviving prefix and/or suffix.
+                    let keep_left = lo.saturating_sub(p_lo); // chars kept at front
+                    let drop_to = hi.min(p_hi) - p_lo; // chars dropped up to (excl)
+                    let s = self.piece_str(p);
+                    if keep_left > 0 {
+                        let bend = s.char_indices().nth(keep_left).map_or(s.len(), |(b, _)| b);
+                        out.push(self.make_piece(p.source, p.start, bend));
+                    }
+                    if drop_to < p.chars {
+                        let bstart = s.char_indices().nth(drop_to).map_or(s.len(), |(b, _)| b);
+                        out.push(self.make_piece(p.source, p.start + bstart, p.len - bstart));
+                    }
+                }
+                Arc::new(Node::leaf(out))
+            }
+            Node::Internal { children, .. } => {
+                let mut kids: Vec<Arc<Node>> = Vec::with_capacity(children.len());
+                let mut acc = 0usize;
+                let lo = from;
+                let hi = from + len;
+                for c in children {
+                    let c_lo = acc;
+                    let c_chars = c.summary().chars;
+                    let c_hi = acc + c_chars;
+                    acc = c_hi;
+                    if c_hi <= lo || c_lo >= hi {
+                        kids.push(Arc::clone(c)); // untouched subtree, shared
+                        continue;
+                    }
+                    let local_from = lo.saturating_sub(c_lo);
+                    let local_len = hi.min(c_hi) - lo.max(c_lo);
+                    let nc = self.delete_rec(c, local_from, local_len);
+                    // Keep the rebuilt child unless the deletion emptied it.
+                    if !nc.is_empty_leaf() {
+                        kids.push(nc);
+                    }
+                }
+                if kids.is_empty() {
+                    return Node::empty();
+                }
+                Arc::new(Node::internal(kids))
+            }
+        }
+    }
+
+    /// Collapse single-child internal roots so the root's height is minimal, and
+    /// turn an all-empty tree into the canonical empty leaf.
+    fn collapse_root(node: Arc<Node>) -> Arc<Node> {
+        let mut node = node;
+        loop {
+            match node.as_ref() {
+                Node::Internal { children, .. } if children.len() == 1 => {
+                    node = Arc::clone(&children[0]);
+                }
+                _ => break,
+            }
+        }
+        node
+    }
+
+    /// Build a leaf from `pieces`, splitting into two sibling leaves if it now
+    /// exceeds [`MAX`]. Returns `(node, split-right?)`.
+    fn leaf_from(mut pieces: Vec<Piece>) -> (Arc<Node>, Option<Arc<Node>>) {
+        if pieces.len() <= MAX {
+            return (Arc::new(Node::leaf(pieces)), None);
+        }
+        let right = pieces.split_off(pieces.len() / 2);
+        (
+            Arc::new(Node::leaf(pieces)),
+            Some(Arc::new(Node::leaf(right))),
+        )
+    }
+
+    /// Build an internal node from `children`, splitting into two siblings at the
+    /// same `height` if it exceeds [`MAX`].
+    fn internal_from(
+        mut children: Vec<Arc<Node>>,
+        height: usize,
+    ) -> (Arc<Node>, Option<Arc<Node>>) {
+        if children.len() <= MAX {
+            return (Arc::new(Node::internal_h(children, height)), None);
+        }
+        let right = children.split_off(children.len() / 2);
+        (
+            Arc::new(Node::internal_h(children, height)),
+            Some(Arc::new(Node::internal_h(right, height))),
+        )
+    }
+}
+
+impl Node {
+    /// Build an internal node at an explicit `height` (used when rebuilding a
+    /// level whose children already carry their own heights).
+    fn internal_h(children: Vec<Arc<Node>>, height: usize) -> Node {
+        let summary = children
+            .iter()
+            .fold(Summary::default(), |acc, c| acc.add(c.summary()));
+        Node::Internal {
+            children,
+            summary,
+            height,
+        }
+    }
+}
+
+impl Quire {
     fn insert(&mut self, s: &str) {
         if s.is_empty() {
             return;
@@ -411,8 +820,8 @@ impl Quire {
 
     fn delete_region(&mut self, a: usize, b: usize) {
         let (lo, hi) = (a.min(b), a.max(b));
-        let lo = lo.clamp(1, self.total_chars + 1);
-        let hi = hi.clamp(lo, self.total_chars + 1);
+        let lo = lo.clamp(1, self.total_chars() + 1);
+        let hi = hi.clamp(lo, self.total_chars() + 1);
         if lo == hi {
             return;
         }
@@ -489,7 +898,7 @@ impl Quire {
         // that needs to read past point-max still sees the bytes. TODO: replace
         // the materialized tail with an incremental DFA reading a piece cursor so
         // this never copies past the match.
-        let window = self.collect_range(self.point, self.total_chars + 1);
+        let window = self.collect_range(self.point, self.total_chars() + 1);
         re.find(&window).is_some_and(|m| m.start() == 0)
     }
 
@@ -507,7 +916,7 @@ impl Quire {
         self.narrowing
     }
     fn narrow_to_region(&mut self, a: usize, b: usize) {
-        let full = self.total_chars + 1;
+        let full = self.total_chars() + 1;
         let lo = a.min(b).clamp(1, full);
         let hi = a.max(b).clamp(lo, full);
         self.narrowing = Some((lo, hi));
@@ -518,7 +927,7 @@ impl Quire {
         self.narrowing = None;
     }
     fn set_restriction(&mut self, r: Option<(usize, usize)>) {
-        let full = self.total_chars + 1;
+        let full = self.total_chars() + 1;
         self.narrowing = r.map(|(lo, hi)| {
             let lo = lo.clamp(1, full);
             (lo, hi.clamp(lo, full))
@@ -532,7 +941,7 @@ impl Quire {
         // Walk back from point over non-newline chars. O(line length). The
         // oracle's `byte_of` clamps point into the buffer first, so we do too —
         // point may sit at point-max even when that exceeds char_len+1.
-        let mut p = self.point.min(self.total_chars + 1);
+        let mut p = self.point.min(self.total_chars() + 1);
         while p > 1 {
             if self.char_at(p - 1) == Some('\n') {
                 break;
@@ -543,7 +952,7 @@ impl Quire {
     }
     /// Move point to the end of its line (just before the next newline, or eob).
     fn end_of_line(&mut self) {
-        let max = self.total_chars + 1;
+        let max = self.total_chars() + 1;
         let mut p = self.point.min(max); // clamp like the oracle's `byte_of`
         while p < max {
             if self.char_at(p) == Some('\n') {
@@ -560,7 +969,7 @@ impl Quire {
         let mut left = n.abs();
         // Like the oracle, newline scanning runs over the *full* document; only
         // the terminal "ran off the end" case clamps to point_min/point_max.
-        let doc_max = self.total_chars + 1;
+        let doc_max = self.total_chars() + 1;
         while left > 0 {
             if n >= 0 {
                 // advance to just past the next newline at/after point
@@ -676,7 +1085,7 @@ impl Quire {
     }
 }
 
-/// Quire is the piece-table `TextStore` (matches the `Buffer` oracle exactly).
+/// Quire is the persistent-B-tree `TextStore` (matches the `Buffer` oracle).
 impl TextStore for Quire {
     fn name(&self) -> &str {
         &self.name
