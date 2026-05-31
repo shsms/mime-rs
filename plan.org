@@ -523,22 +523,38 @@ counts) and gives an immediate real-world acceptance test.
 
 * Roadmap / milestones
 
-** TODO M0 — Editor core + tulisp API (replace a mime batch) [#A]
+/Status: M0 ✓, M1 first cut ✓ (B-tree upgrade in progress), M2 partly ✓ (checkpoints
++ transactions; cheap snapshots & dry-run pending). 46 tests, clippy clean; M3–M8 not
+started./
+
+** DONE M0 — Editor core + tulisp API (replace a mime batch) [#A]
    In-memory ~TextStore~ (bring-up + differential-test *oracle* only — not the real
    buffer); point/mark/markers/narrowing; the §6 vocabulary (exact + regex + fuzzy
    search, region/regexp replace, insert/delete, narrowing, excursion);
    ~mimectl run prog.tl --file x --local~ one-shot; UTF-8-safe; structured result with
    auto diff + ~report~. /Exit: re-run a real mime transform./
-** TODO M1 — Quire: the piece-tree ~TextStore~ (multi-GB) [#A]
+   /Done: ~60 Emacs-Lisp builtins (motion, mark/region, search incl. ~search-fuzzy~,
+   ~replace-string~/~replace-regexp~, kill-ring, narrowing, ~save-excursion~/
+   ~save-restriction~) + the RE2 string library; ~mimectl run --local~ opens files via
+   Quire; 46 tests./
+** DONE M1 — Quire: the piece-tree ~TextStore~ (multi-GB) [#A]
    *Quire*, the real buffer — a persistent measured B-tree of pieces over a ~Backing~ trait
    (mmap + paged-LRU) + append-only add buffer; ~Arc~ nodes (snapshots ~Send + Sync~);
    lazy/background char-line index; anchors. Becomes the default ~TextStore~; the
    in-memory impl stays as the differential-test oracle. /Exit: open + edit a
    multi-GB file at flat memory; oracle and piece tree agree under property tests./
-** TODO M2 — Checkpoints, transactions, dry-run [#A]
+   /Done: first cut is a piece-table (~Vec<Piece>~ over the mmapped original + add
+   buffer), all 30 ~TextStore~ methods, differential-tested ~24k random ops vs the
+   oracle. The ~Vec~ → persistent measured B-tree upgrade (cheap snapshots/anchors) is
+   in progress (subagent)./
+** TODO M2 — Checkpoints, transactions, dry-run [#A] (partly done)
    Workspace COW snapshots (clone the piece-tree spine, ~KB); checkpoint tree;
    auto-transaction per program; ~with-transaction~; ~rehearse~; ~checkpoint-diff~.
    /Exit: rewind + dry-run on multi-buffer edits; property tests green./
+   /Done: ~checkpoint~ / ~restore-checkpoint~ / ~with-transaction~ (full-text snapshot
+   MVP in ~Session.checkpoints~). Pending: ~KB structural-sharing snapshots (needs the
+   Quire B-tree + a ~snapshot~ trait method), ~rehearse~ dry-run (daemon-level), and
+   ~checkpoint-diff~./
 ** TODO M3 — Daemon (~mimed~), ~mimectl~, sessions, warm state [#A]
    ~mimed~ + ~mimectl~ client; session isolation + lifecycle + limits; warm buffers
    and warm defs across programs; control API (HTTP/JSON over a unix socket); WAL
@@ -621,7 +637,7 @@ roughly in priority order:
    string-prefix-p string-suffix-p number-to-string string-to-number upcase downcase
    capitalize char-to-string string-to-char~.
 3. *~format~ conversions* — has ~%s %S %d %f~ (+ widths/flags); add ~%x %o %c %e %g~.
-4. *~unwind-protect~* — only ~condition-case~ exists today; needed for guaranteed
+4. *~unwind-protect~* — *DONE*, merged into tulisp: the special form for guaranteed
    cleanup (temp files, locks) around fallible edits.
 5. *Obarray introspection* — enumerate defined symbols / arity / docs, so MCP can
    advertise the live vocabulary and tooling can reflect on a session.
