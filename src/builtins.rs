@@ -324,4 +324,50 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             },
         );
     }
+
+    // ---- narrowing & excursion ----
+    {
+        let s = session.clone();
+        ctx.defun(
+            "narrow-to-region",
+            move |a: i64, b: i64| -> Result<TulispObject, Error> {
+                s.borrow_mut()
+                    .buffer
+                    .narrow_to_region(a.max(1) as usize, b.max(1) as usize);
+                Ok(TulispObject::nil())
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        ctx.defun("widen", move || -> Result<TulispObject, Error> {
+            s.borrow_mut().buffer.widen();
+            Ok(TulispObject::nil())
+        });
+    }
+    {
+        // (save-excursion BODY...) — run BODY, then restore point and mark.
+        let s = session.clone();
+        ctx.defspecial("save-excursion", move |ctx, args| {
+            let (pt, mk) = {
+                let sess = s.borrow();
+                (sess.buffer.point(), sess.buffer.mark())
+            };
+            let res = ctx.eval_progn(args);
+            let mut sess = s.borrow_mut();
+            sess.buffer.goto_char(pt);
+            sess.buffer.set_mark_opt(mk);
+            res
+        });
+    }
+    {
+        // (save-restriction BODY...) — run BODY, then restore the narrowing.
+        let s = session.clone();
+        ctx.defspecial("save-restriction", move |ctx, args| {
+            let saved = s.borrow().buffer.narrowing();
+            let res = ctx.eval_progn(args);
+            s.borrow_mut().buffer.set_restriction(saved);
+            res
+        });
+    }
 }

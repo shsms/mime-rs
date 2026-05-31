@@ -112,4 +112,41 @@ mod tests {
         );
         assert_eq!(r.reports, vec![("n".to_string(), "4".to_string())]);
     }
+
+    #[test]
+    fn narrowing_restricts_search() {
+        let r = run(
+            "aaa BBB aaa",
+            r#"(narrow-to-region 5 8) (goto-char (point-min))
+               (report "pmin" (point-min)) (report "pmax" (point-max))
+               (report "found" (if (search-forward "aaa" nil t) 1 0))
+               (widen)"#,
+        );
+        assert_eq!(r.reports[0], ("pmin".to_string(), "5".to_string()));
+        assert_eq!(r.reports[1], ("pmax".to_string(), "8".to_string()));
+        assert_eq!(r.reports[2], ("found".to_string(), "0".to_string()));
+    }
+
+    #[test]
+    fn save_excursion_restores_point() {
+        let r = run(
+            "hello",
+            r#"(goto-char 1)
+               (save-excursion (goto-char 5) (report "in" (point)))
+               (report "out" (point))"#,
+        );
+        assert_eq!(r.reports[0], ("in".to_string(), "5".to_string()));
+        assert_eq!(r.reports[1], ("out".to_string(), "1".to_string()));
+    }
+
+    #[test]
+    fn save_restriction_restores() {
+        let r = run(
+            "aaaaaaa",
+            r#"(save-restriction (narrow-to-region 2 4) (report "in" (point-max)))
+               (report "out" (point-max))"#,
+        );
+        assert_eq!(r.reports[0], ("in".to_string(), "4".to_string()));
+        assert_eq!(r.reports[1], ("out".to_string(), "8".to_string()));
+    }
 }

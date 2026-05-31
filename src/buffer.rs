@@ -18,6 +18,9 @@ pub struct Buffer {
     point: usize,
     /// Mark: the other end of the region, if set (1-based char position).
     mark: Option<usize>,
+    /// Narrowing restriction `(lo, hi)` in 1-based char positions; the accessible
+    /// region is `[lo, hi)`. `None` = whole buffer.
+    narrowing: Option<(usize, usize)>,
     pub name: String,
     pub last_match: Option<MatchData>,
 }
@@ -28,6 +31,7 @@ impl Buffer {
             text: text.into(),
             point: 1,
             mark: None,
+            narrowing: None,
             name: name.into(),
             last_match: None,
         }
@@ -43,15 +47,16 @@ impl Buffer {
         self.point
     }
     pub fn point_min(&self) -> usize {
-        1
+        self.narrowing.map_or(1, |(lo, _)| lo)
     }
     pub fn point_max(&self) -> usize {
-        self.char_len() + 1
+        self.narrowing.map_or(self.char_len() + 1, |(_, hi)| hi)
     }
 
     /// Byte offset of 1-based char position `p` (clamped into the buffer).
     fn byte_of(&self, p: usize) -> usize {
-        let p = p.clamp(1, self.point_max());
+        // Positions are absolute (narrowing-independent); clamp to the full text.
+        let p = p.clamp(1, self.char_len() + 1);
         self.text
             .char_indices()
             .nth(p - 1)
@@ -69,9 +74,13 @@ impl Buffer {
     }
 
     pub fn insert(&mut self, s: &str) {
+        let n = s.chars().count();
         let at = self.byte_of(self.point);
         self.text.insert_str(at, s);
-        self.point += s.chars().count();
+        self.point += n;
+        if let Some((_, hi)) = self.narrowing.as_mut() {
+            *hi += n; // inserted text falls inside the accessible region
+        }
         self.last_match = None;
     }
 
@@ -83,6 +92,9 @@ impl Buffer {
             self.point -= hi - lo;
         } else if self.point > lo {
             self.point = lo;
+        }
+        if let Some((nlo, nhi)) = self.narrowing.as_mut() {
+            *nhi = nhi.saturating_sub(hi - lo).max(*nlo);
         }
         self.last_match = None;
     }
@@ -143,6 +155,36 @@ impl Buffer {
     }
     pub fn set_mark(&mut self, p: usize) {
         self.mark = Some(p.clamp(self.point_min(), self.point_max()));
+    }
+    pub fn set_mark_opt(&mut self, m: Option<usize>) {
+        self.mark = m;
+    }
+
+    // ---- narrowing ----
+    pub fn narrowing(&self) -> Option<(usize, usize)> {
+        self.narrowing
+    }
+    pub fn narrow_to_region(&mut self, a: usize, b: usize) {
+        let full = self.char_len() + 1;
+        let lo = a.min(b).clamp(1, full);
+        let hi = a.max(b).clamp(lo, full);
+        self.narrowing = Some((lo, hi));
+        self.point = self.point.clamp(lo, hi);
+        self.mark = self.mark.map(|m| m.clamp(lo, hi));
+    }
+    pub fn widen(&mut self) {
+        self.narrowing = None;
+    }
+    /// Restore a saved restriction (used by `save-restriction`), clamped to the
+    /// current text.
+    pub fn set_restriction(&mut self, r: Option<(usize, usize)>) {
+        let full = self.char_len() + 1;
+        self.narrowing = r.map(|(lo, hi)| {
+            let lo = lo.clamp(1, full);
+            (lo, hi.clamp(lo, full))
+        });
+        let (lo, hi) = (self.point_min(), self.point_max());
+        self.point = self.point.clamp(lo, hi);
     }
 
     // ---- line navigation ----
