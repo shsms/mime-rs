@@ -1243,6 +1243,105 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
             res
         });
     }
+
+    // ---- file I/O (trusted tier only → UNRESTRICTED filesystem) ----
+    // These run only on the trusted, local CLI tier, so they get the user's full
+    // filesystem reach — NO `safety::check_path` root/allowlist check. (The
+    // sandboxed agent-facing tier never registers this group.) Writes still go
+    // through `safety::write_atomic` so a save is atomic (temp file + rename) and
+    // never mutates a file in place under a live mmap.
+    {
+        let s = session.clone();
+        // (find-file PATH) — open PATH (mmap-backed Quire) into a new buffer and
+        // make it current; returns the buffer name. If a buffer with that file's
+        // name is already open, switch to it instead of opening a duplicate (like
+        // Emacs `find-file`). IO errors propagate as a tulisp Error.
+        ctx.defun("find-file", move |path: String| -> Result<String, Error> {
+            let p = std::path::Path::new(&path);
+            // The name a freshly-opened Quire would carry (its file name); reuse
+            // an already-open buffer with that name rather than opening it twice.
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            let mut sess = s.borrow_mut();
+            if sess.has_buffer(&name) {
+                sess.set_buffer(&name).map_err(|e| err(&e))?;
+                return Ok(name);
+            }
+            let store: Box<dyn crate::store::TextStore> = Box::new(
+                crate::Quire::open(p).map_err(|e| err(&format!("find-file {path}: {e}")))?,
+            );
+            Ok(sess.install_buffer(store, true))
+        });
+    }
+    {
+        let s = session.clone();
+        // (insert-file-contents PATH) — read PATH and insert its text at point in
+        // the CURRENT buffer (no new buffer); returns the char count inserted.
+        ctx.defun(
+            "insert-file-contents",
+            move |path: String| -> Result<i64, Error> {
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| err(&format!("insert-file-contents {path}: {e}")))?;
+                let n = text.chars().count() as i64;
+                s.borrow_mut().buffer.insert(&text);
+                Ok(n)
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (write-file PATH) — write the CURRENT buffer's text to PATH atomically;
+        // returns the byte count written. Streams the buffer via `write_to`, so a
+        // multi-GB Quire is never materialized into one allocation just to save.
+        ctx.defun("write-file", move |path: String| -> Result<i64, Error> {
+            let sess = s.borrow();
+            let mut written = 0usize;
+            crate::safety::write_atomic_with(std::path::Path::new(&path), |w| {
+                written = sess.buffer.write_to(w)?;
+                Ok(())
+            })
+            .map_err(|e| err(&format!("write-file {path}: {e}")))?;
+            Ok(written as i64)
+        });
+    }
+    {
+        let s = session.clone();
+        // (write-region START END PATH) — write the buffer substring [START, END)
+        // to PATH atomically; returns the byte count written.
+        ctx.defun(
+            "write-region",
+            move |start: i64, end: i64, path: String| -> Result<i64, Error> {
+                let text = {
+                    let sess = s.borrow();
+                    sess.buffer
+                        .substring(start.max(1) as usize, end.max(1) as usize)
+                };
+                crate::safety::write_atomic(std::path::Path::new(&path), text.as_bytes())
+                    .map_err(|e| err(&format!("write-region {path}: {e}")))?;
+                Ok(text.len() as i64)
+            },
+        );
+    }
+    {
+        // (directory-files DIR) — the entry names in DIR (names only, not full
+        // paths, like Emacs), sorted. IO errors propagate as a tulisp Error.
+        ctx.defun(
+            "directory-files",
+            move |dir: String| -> Result<Vec<String>, Error> {
+                let mut names = Vec::new();
+                let entries = std::fs::read_dir(&dir)
+                    .map_err(|e| err(&format!("directory-files {dir}: {e}")))?;
+                for entry in entries {
+                    let entry = entry.map_err(|e| err(&format!("directory-files {dir}: {e}")))?;
+                    names.push(entry.file_name().to_string_lossy().into_owned());
+                }
+                names.sort();
+                Ok(names)
+            },
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1421,5 +1520,140 @@ mod tests {
             ws.run(r#"(generate-new-buffer "y")"#).is_err(),
             "sandboxed tier must not expose generate-new-buffer"
         );
+    }
+
+    /// A unique temp directory for an I/O test (process- and test-scoped so the
+    /// parallel harness doesn't collide). Created fresh; the caller cleans up.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "mime-io-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn find_file_opens_into_a_current_buffer_and_reuses_on_revisit() {
+        let dir = temp_dir("find-file");
+        let file = dir.join("doc.txt");
+        std::fs::write(&file, "file body here").unwrap();
+        let path = file.to_string_lossy().into_owned();
+
+        let mut ws = trusted("main-body");
+        // find-file opens the file into a new buffer named after the file and
+        // makes it current; its text is present and current-buffer is its name.
+        let r = ws
+            .run(&format!(
+                r#"(report "name" (find-file "{path}"))
+                   (report "txt" (buffer-string))
+                   (report "cur" (current-buffer))
+                   (report "list" (buffer-list))"#
+            ))
+            .unwrap();
+        assert_eq!(report(&r, "name"), "\"doc.txt\"");
+        assert_eq!(report(&r, "txt"), "\"file body here\"");
+        assert_eq!(report(&r, "cur"), "\"doc.txt\"");
+        // The original "main" buffer was stashed inactive — both are present.
+        assert_eq!(report(&r, "list"), "(\"doc.txt\" \"main\")");
+
+        // Revisiting the same file reuses the existing buffer (no duplicate): the
+        // buffer-list is unchanged and still has exactly the two buffers.
+        let r = ws
+            .run(&format!(
+                r#"(set-buffer "main")
+                   (report "name" (find-file "{path}"))
+                   (report "cur" (current-buffer))
+                   (report "list" (buffer-list))"#
+            ))
+            .unwrap();
+        assert_eq!(report(&r, "name"), "\"doc.txt\"");
+        assert_eq!(report(&r, "cur"), "\"doc.txt\"");
+        assert_eq!(report(&r, "list"), "(\"doc.txt\" \"main\")");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn insert_file_contents_inserts_at_point_in_the_current_buffer() {
+        let dir = temp_dir("insert-file");
+        let file = dir.join("frag.txt");
+        std::fs::write(&file, "INSERTED").unwrap();
+        let path = file.to_string_lossy().into_owned();
+
+        let mut ws = trusted("ab");
+        // Insert at point (between 'a' and 'b' after goto-char 2) — no new buffer,
+        // current stays "main"; returns the char count inserted.
+        let r = ws
+            .run(&format!(
+                r#"(goto-char 2)
+                   (report "n" (insert-file-contents "{path}"))
+                   (report "txt" (buffer-string))
+                   (report "cur" (current-buffer))"#
+            ))
+            .unwrap();
+        assert_eq!(report(&r, "n"), "8"); // "INSERTED" is 8 chars
+        assert_eq!(report(&r, "txt"), "\"aINSERTEDb\"");
+        assert_eq!(report(&r, "cur"), "\"main\"");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_file_round_trips_the_whole_buffer() {
+        let dir = temp_dir("write-file");
+        let file = dir.join("out.txt");
+        let path = file.to_string_lossy().into_owned();
+
+        let mut ws = trusted("save me whole");
+        let r = ws
+            .run(&format!(r#"(report "n" (write-file "{path}"))"#))
+            .unwrap();
+        // The byte count is reported and the file on disk matches the buffer.
+        assert_eq!(report(&r, "n"), "13"); // "save me whole"
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "save me whole");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_region_round_trips_a_substring() {
+        let dir = temp_dir("write-region");
+        let file = dir.join("region.txt");
+        let path = file.to_string_lossy().into_owned();
+
+        let mut ws = trusted("abcdefgh");
+        // [3, 6) is "cde".
+        let r = ws
+            .run(&format!(r#"(report "n" (write-region 3 6 "{path}"))"#))
+            .unwrap();
+        assert_eq!(report(&r, "n"), "3");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "cde");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn directory_files_lists_entry_names_sorted() {
+        let dir = temp_dir("dir-files");
+        // Populate out of order; directory-files returns names only, sorted.
+        std::fs::write(dir.join("beta.txt"), "b").unwrap();
+        std::fs::write(dir.join("alpha.txt"), "a").unwrap();
+        std::fs::create_dir_all(dir.join("subdir")).unwrap();
+        let path = dir.to_string_lossy().into_owned();
+
+        let mut ws = trusted("main");
+        let r = ws
+            .run(&format!(r#"(report "files" (directory-files "{path}"))"#))
+            .unwrap();
+        // Names only (not full paths), sorted; the subdir is listed too.
+        assert_eq!(
+            report(&r, "files"),
+            "(\"alpha.txt\" \"beta.txt\" \"subdir\")"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

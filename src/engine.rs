@@ -102,6 +102,24 @@ impl Session {
         actual
     }
 
+    /// Install an already-built store (e.g. a `Quire` opened from a file) as a
+    /// buffer, the analog of [`generate_new_buffer`] for a store that exists. If
+    /// `make_current`, the present current buffer is stashed into `inactive` and
+    /// `store` becomes current; otherwise `store` joins `inactive`. Returns its
+    /// name. Unlike `generate_new_buffer` the name is taken as-is (callers that
+    /// want reuse-by-name check `has_buffer` first); the trusted `find-file`
+    /// builtin does exactly that.
+    pub fn install_buffer(&mut self, store: Box<dyn TextStore>, make_current: bool) -> String {
+        let name = store.name().to_string();
+        if make_current {
+            let previous = std::mem::replace(&mut self.buffer, store);
+            self.inactive.push(previous);
+        } else {
+            self.inactive.push(store);
+        }
+        name
+    }
+
     /// `name` if free, else the first available `name<N>` (N ≥ 2), Emacs-style.
     fn unique_buffer_name(&self, name: &str) -> String {
         if !self.has_buffer(name) {
