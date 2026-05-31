@@ -582,7 +582,7 @@ the agent-facing surface works end to end. M5 ✓ (safety/audit), rehearse ✓, 
    Lock-free parallel reads over immutable snapshots (search / count / index /
    anchor-resolve fanned across cores); parallel bulk replace (divide-and-conquer
    rebuild + ~concat~); parallel initial line index (~memchr~ + prefix sum);
-   bytecode-compile hot programs; dirty-span diffs; benchmark suite. /Exit: search +
+   rebase-on-save compaction (after a save, re-mmap the new file, collapse to one ~Original~ piece, release the pinned pre-save inode + reset the add buffer); bytecode-compile hot programs; dirty-span diffs; benchmark suite. /Exit: search +
    global-replace a multi-GB file scale across cores; ulysses bench beats mime./
 ** DOING M7 — Structural / syntax-aware editing [#C] (scaffold landed)
    Tree-sitter integration; node search/replace; narrow-to-defun. /Exit: AST-scoped
