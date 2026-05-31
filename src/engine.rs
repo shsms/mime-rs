@@ -50,6 +50,12 @@ pub struct Session {
     pub kill_ring: Vec<String>,
     pub reports: Vec<(String, String)>,
     pub log: Vec<String>,
+    /// Program arguments passed in by the trusted CLI: a key→value list in the
+    /// order given, read back by the `(arg "KEY")` builtin. A bare `--flag`
+    /// stores `(flag, "t")`. Only the trusted (orchestration) tier ever reads
+    /// these; the sandboxed agent-facing tier leaves them empty and has no `arg`
+    /// builtin to reach them anyway.
+    pub args: Vec<(String, String)>,
 }
 
 impl Session {
@@ -205,6 +211,15 @@ impl Workspace {
         self.capabilities
     }
 
+    /// Install the program arguments the trusted CLI collected, readable from a
+    /// program via `(arg "KEY")`. Each entry is a `(KEY, VALUE)` pair; a bare
+    /// `--flag` is stored as `(flag, "t")`. Only meaningful on the trusted tier
+    /// (the sandboxed tier registers no `arg` builtin), but harmless to call on
+    /// either. Replaces any previously-set arguments.
+    pub fn set_program_args(&self, args: Vec<(String, String)>) {
+        self.session.borrow_mut().args = args;
+    }
+
     fn with_mode(
         buffer: Box<dyn TextStore>,
         read_only: bool,
@@ -217,6 +232,7 @@ impl Workspace {
             kill_ring: Vec::new(),
             reports: Vec::new(),
             log: Vec::new(),
+            args: Vec::new(),
         }));
 
         let mut ctx = TulispContext::new();

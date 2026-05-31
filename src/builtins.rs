@@ -1342,6 +1342,39 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
             },
         );
     }
+
+    // ---- program arguments (trusted CLI) ----
+    {
+        let s = session.clone();
+        // (arg "KEY") — the value the trusted CLI passed for KEY, or nil if it
+        // wasn't given. A bare `--flag` reads back as the string "t", so a flag
+        // and a string option are queried the same way.
+        ctx.defun("arg", move |key: String| -> Result<TulispObject, Error> {
+            Ok(match s.borrow().args.iter().find(|(k, _)| *k == key) {
+                Some((_, v)) => TulispValue::from(v.clone()).into_ref(None),
+                None => TulispObject::nil(),
+            })
+        });
+    }
+    {
+        let s = session.clone();
+        // (args) — the whole argument list as an alist `((KEY . VALUE) …)`, in the
+        // order the CLI gave them. Each element is a cons of two strings.
+        ctx.defun("args", move || -> TulispObject {
+            let pairs: Vec<TulispObject> = s
+                .borrow()
+                .args
+                .iter()
+                .map(|(k, v)| {
+                    TulispObject::cons(
+                        TulispValue::from(k.clone()).into_ref(None),
+                        TulispValue::from(v.clone()).into_ref(None),
+                    )
+                })
+                .collect();
+            TulispObject::from(pairs)
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1655,5 +1688,81 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn program_args_are_readable_via_arg() {
+        let mut ws = trusted("main");
+        ws.set_program_args(vec![
+            ("date".into(), "May 1".into()),
+            ("with_badges".into(), "t".into()),
+        ]);
+        // A string option, a flag (reads back as "t"), and an absent key (nil).
+        let r = ws
+            .run(
+                r#"(report "date" (arg "date"))
+                   (report "badges" (arg "with_badges"))
+                   (report "missing" (arg "missing"))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "date"), "\"May 1\"");
+        assert_eq!(report(&r, "badges"), "\"t\"");
+        assert_eq!(report(&r, "missing"), "nil");
+    }
+
+    #[test]
+    fn args_returns_the_whole_alist() {
+        let mut ws = trusted("main");
+        ws.set_program_args(vec![
+            ("infile".into(), "in.md".into()),
+            ("with_badges".into(), "t".into()),
+        ]);
+        let r = ws.run(r#"(report "all" (args))"#).unwrap();
+        // An alist of (KEY . VALUE) string conses, in the order given.
+        assert_eq!(
+            report(&r, "all"),
+            "((\"infile\" . \"in.md\") (\"with_badges\" . \"t\"))"
+        );
+    }
+
+    #[test]
+    fn sandboxed_tier_lacks_file_io_and_arg_builtins() {
+        // The sandboxed (agent-facing) tier never registers the orchestration
+        // group, so neither the file-I/O builtins nor `arg` exist: they fail as
+        // void/undefined symbols rather than touching the filesystem or args.
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("main", "x")));
+        // Even with args set on the session, the sandboxed tier has no `arg` to
+        // reach them.
+        ws.set_program_args(vec![("y".into(), "v".into())]);
+
+        let e = match ws.run(r#"(find-file "x")"#) {
+            Err(e) => e,
+            Ok(_) => panic!("sandboxed tier must not expose find-file"),
+        };
+        assert!(
+            e.contains("void") && e.contains("find-file"),
+            "expected a void/undefined error for find-file, got: {e}"
+        );
+        let e = match ws.run(r#"(arg "y")"#) {
+            Err(e) => e,
+            Ok(_) => panic!("sandboxed tier must not expose arg"),
+        };
+        assert!(
+            e.contains("void") && e.contains("arg"),
+            "expected a void/undefined error for arg, got: {e}"
+        );
+        // The remaining file-I/O builtins are absent too.
+        for prog in [
+            r#"(insert-file-contents "x")"#,
+            r#"(write-file "x")"#,
+            r#"(write-region 1 2 "x")"#,
+            r#"(directory-files "x")"#,
+            r#"(args)"#,
+        ] {
+            assert!(
+                ws.run(prog).is_err(),
+                "sandboxed tier must not expose {prog}"
+            );
+        }
     }
 }
