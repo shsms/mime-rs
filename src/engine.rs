@@ -961,15 +961,6 @@ mod tests {
         assert_eq!(r.reports[0], ("n".to_string(), "4".to_string()));
     }
 
-    #[test]
-    fn search_fuzzy_ignores_case_and_whitespace() {
-        let r = run(
-            "The   Quick\nBROWN fox",
-            r#"(goto-char (point-min)) (search-fuzzy "quick brown") (report "p" (point))"#,
-        );
-        assert_eq!(r.reports[0], ("p".to_string(), "18".to_string()));
-    }
-
     // A small Markdown document the M7 (tree-sitter) builtin tests parse.
     const MD: &str = "# Title\n\nHello para.\n\n## Sub\n\nMore text here.\n";
 

@@ -417,23 +417,21 @@ fn tool_insert_text(
 
 /// `search {session?, pattern, mode?}` — search forward from point and report
 /// the 1-based position just after the match (Emacs `*-search-forward`
-/// semantics), or report that nothing matched. `mode` ∈ exact|regex|fuzzy
+/// semantics), or report that nothing matched. `mode` ∈ exact|regex
 /// (default exact). Point moves to the match, as in Emacs.
 fn tool_search(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result<String, String> {
     let session = session_arg(args);
     let pattern = str_arg(args, "pattern")?;
     let mode = args.get("mode").and_then(Value::as_str).unwrap_or("exact");
-    // `search-forward` is literal, `re-search-forward` is regex,
-    // `search-fuzzy` is whitespace/case-insensitive. Each takes
-    // `(NEEDLE BOUND NOERROR)`; passing noerror=t makes a miss return nil
-    // instead of erroring, so we can report "not found" cleanly.
-    let lisp_fn = match mode {
-        "exact" => "search-forward",
-        "regex" => "re-search-forward",
-        "fuzzy" => "search-fuzzy",
-        other => return Err(format!("unknown search mode: {other} (exact|regex|fuzzy)")),
+    // `search-forward` is literal, `re-search-forward` is regex. Each takes
+    // `(NEEDLE BOUND NOERROR)`; noerror=t makes a miss return nil instead of
+    // erroring. (Whitespace/case-insensitive "fuzzy" matching isn't a built-in:
+    // pass a regex — that's all mime's find_fuzzy compiles to.)
+    let (lisp_fn, needle) = match mode {
+        "exact" => ("search-forward", lisp_escape(&pattern)),
+        "regex" => ("re-search-forward", lisp_escape(&pattern)),
+        other => return Err(format!("unknown search mode: {other} (exact|regex)")),
     };
-    let needle = lisp_escape(&pattern);
     let program = format!(
         "(let ((p ({lisp_fn} \"{needle}\" nil t)))\
            (if p (progn (report \"found\" 1) (report \"pos\" p))\
@@ -658,8 +656,8 @@ fn tool_schemas() -> Vec<Value> {
                     "pattern": { "type": "string", "description": "What to search for." },
                     "mode": {
                         "type": "string",
-                        "enum": ["exact", "regex", "fuzzy"],
-                        "description": "exact (literal), regex (RE2), or fuzzy (case- and whitespace-run-insensitive). Defaults to exact.",
+                        "enum": ["exact", "regex"],
+                        "description": "exact (literal) or regex (RE2). Defaults to exact. (For whitespace/case-insensitive matching, pass a regex.)",
                     },
                     "session": session,
                 },

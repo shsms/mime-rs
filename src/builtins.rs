@@ -43,33 +43,6 @@ impl TulispConvertible for Marker {
     }
 }
 
-/// Build an RE2 pattern that matches `needle` case-insensitively and treats any
-/// run of whitespace as matching any run of whitespace (mime's `find_fuzzy`).
-fn fuzzy_regex(needle: &str) -> String {
-    let mut out = String::from("(?i)");
-    let mut lit = String::new();
-    let mut prev_ws = false;
-    for c in needle.chars() {
-        if c.is_whitespace() {
-            if !lit.is_empty() {
-                out.push_str(&regex::escape(&lit));
-                lit.clear();
-            }
-            if !prev_ws {
-                out.push_str(r"\s+");
-            }
-            prev_ws = true;
-        } else {
-            lit.push(c);
-            prev_ws = false;
-        }
-    }
-    if !lit.is_empty() {
-        out.push_str(&regex::escape(&lit));
-    }
-    out
-}
-
 pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     // ---- navigation ----
     {
@@ -916,24 +889,11 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         });
     }
 
-    // ---- fuzzy search (case- and whitespace-run-insensitive) ----
+    // ---- regexp-quote: escape regex metacharacters so a string matches
+    // literally (Emacs `regexp-quote`; escapes for the RE2 engine that
+    // `re-search-forward` uses). Lets fuzzy matching be built in elisp. ----
     {
-        let s = session.clone();
-        ctx.defun(
-            "search-fuzzy",
-            move |needle: String,
-                  bound: Option<i64>,
-                  noerror: Option<TulispObject>|
-                  -> Result<TulispObject, Error> {
-                let rx = regex::Regex::new(&fuzzy_regex(&needle)).map_err(bad_regex)?;
-                let bound = bound.map(|b| b.max(1) as usize);
-                match s.borrow_mut().buffer.re_search_forward(&rx, bound) {
-                    Some(p) => Ok(TulispObject::from(p as i64)),
-                    None if noerror.is_some_and(|o| o.is_truthy()) => Ok(TulispObject::nil()),
-                    None => Err(Error::lisp_error(format!("Fuzzy search failed: {needle}"))),
-                }
-            },
-        );
+        ctx.defun("regexp-quote", |s: String| -> String { regex::escape(&s) });
     }
 
     // ---- region case + match counting ----
