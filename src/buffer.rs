@@ -288,6 +288,94 @@ impl Buffer {
     }
 }
 
+/// Thin delegation: the in-memory `Buffer` is the `TextStore` oracle.
+impl crate::store::TextStore for Buffer {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn text(&self) -> &str {
+        Buffer::text(self)
+    }
+    fn char_len(&self) -> usize {
+        Buffer::char_len(self)
+    }
+    fn point(&self) -> usize {
+        Buffer::point(self)
+    }
+    fn point_min(&self) -> usize {
+        Buffer::point_min(self)
+    }
+    fn point_max(&self) -> usize {
+        Buffer::point_max(self)
+    }
+    fn goto_char(&mut self, p: usize) {
+        Buffer::goto_char(self, p)
+    }
+    fn mark(&self) -> Option<usize> {
+        Buffer::mark(self)
+    }
+    fn set_mark(&mut self, p: usize) {
+        Buffer::set_mark(self, p)
+    }
+    fn set_mark_opt(&mut self, m: Option<usize>) {
+        Buffer::set_mark_opt(self, m)
+    }
+    fn insert(&mut self, s: &str) {
+        Buffer::insert(self, s)
+    }
+    fn delete_region(&mut self, a: usize, b: usize) {
+        Buffer::delete_region(self, a, b)
+    }
+    fn substring(&self, a: usize, b: usize) -> String {
+        Buffer::substring(self, a, b)
+    }
+    fn re_search_forward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize> {
+        Buffer::re_search_forward(self, re, bound)
+    }
+    fn search_forward(&mut self, needle: &str, bound: Option<usize>) -> Option<usize> {
+        Buffer::search_forward(self, needle, bound)
+    }
+    fn search_backward(&mut self, needle: &str, bound: Option<usize>) -> Option<usize> {
+        Buffer::search_backward(self, needle, bound)
+    }
+    fn replace_match(&mut self, replacement: &str) -> Result<(), String> {
+        Buffer::replace_match(self, replacement)
+    }
+    fn looking_at(&self, re: &regex::Regex) -> bool {
+        Buffer::looking_at(self, re)
+    }
+    fn beginning_of_line(&mut self) {
+        Buffer::beginning_of_line(self)
+    }
+    fn end_of_line(&mut self) {
+        Buffer::end_of_line(self)
+    }
+    fn forward_line(&mut self, n: i64) -> i64 {
+        Buffer::forward_line(self, n)
+    }
+    fn line_number_at_pos(&self, p: usize) -> usize {
+        Buffer::line_number_at_pos(self, p)
+    }
+    fn char_after(&self, p: usize) -> Option<char> {
+        Buffer::char_after(self, p)
+    }
+    fn char_before(&self, p: usize) -> Option<char> {
+        Buffer::char_before(self, p)
+    }
+    fn narrowing(&self) -> Option<(usize, usize)> {
+        Buffer::narrowing(self)
+    }
+    fn narrow_to_region(&mut self, a: usize, b: usize) {
+        Buffer::narrow_to_region(self, a, b)
+    }
+    fn widen(&mut self) {
+        Buffer::widen(self)
+    }
+    fn set_restriction(&mut self, r: Option<(usize, usize)>) {
+        Buffer::set_restriction(self, r)
+    }
+}
+
 /// Expand Emacs-style `\N` (group) and `\&` (whole match) backrefs.
 fn expand_backrefs(rep: &str, groups: &[Option<String>]) -> String {
     let mut out = String::new();

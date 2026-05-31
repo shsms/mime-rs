@@ -49,7 +49,7 @@ fn main() {
     };
 
     let buffer = mime_rs::Buffer::from_string(name, text);
-    match mime_rs::run_program(buffer, &program) {
+    match mime_rs::run_program(Box::new(buffer), &program) {
         Ok(report) => {
             println!(
                 "{}",

@@ -10,8 +10,10 @@ pub mod buffer;
 pub mod builtins;
 pub mod engine;
 pub mod result;
+pub mod store;
 pub mod strings;
 
 pub use buffer::Buffer;
 pub use engine::run_program;
 pub use result::RunReport;
+pub use store::TextStore;

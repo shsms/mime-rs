@@ -2,8 +2,8 @@
 //!
 //! M0 runs cold (a fresh `TulispContext` per program). Warm buffers + warm
 //! definitions across programs (the daemon) arrive in M3.
-use crate::buffer::Buffer;
 use crate::result::{RunReport, unified_diff};
+use crate::store::TextStore;
 use std::cell::RefCell;
 use std::rc::Rc;
 use tulisp::TulispContext;
@@ -12,7 +12,7 @@ use tulisp::TulispContext;
 /// primitives close over an `Rc<RefCell<Session>>` (tulisp is single-threaded,
 /// so interior mutability via `RefCell` is sound for these leaf operations).
 pub struct Session {
-    pub buffer: Buffer,
+    pub buffer: Box<dyn TextStore>,
     pub reports: Vec<(String, String)>,
     pub log: Vec<String>,
 }
@@ -21,10 +21,10 @@ pub type SharedSession = Rc<RefCell<Session>>;
 
 /// Evaluate `program` (Emacs Lisp / tulisp) against `buffer`; return the diff,
 /// reports, and final state. The error string is the formatted tulisp error.
-pub fn run_program(buffer: Buffer, program: &str) -> Result<RunReport, String> {
+pub fn run_program(buffer: Box<dyn TextStore>, program: &str) -> Result<RunReport, String> {
     let before = buffer.text().to_string();
     let len_before = before.chars().count();
-    let name = buffer.name.clone();
+    let name = buffer.name().to_string();
 
     let session: SharedSession = Rc::new(RefCell::new(Session {
         buffer,
@@ -57,9 +57,10 @@ pub fn run_program(buffer: Buffer, program: &str) -> Result<RunReport, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::Buffer;
 
     fn run(text: &str, program: &str) -> RunReport {
-        run_program(Buffer::from_string("t", text), program).expect("program should run")
+        run_program(Box::new(Buffer::from_string("t", text)), program).expect("program should run")
     }
 
     #[test]
