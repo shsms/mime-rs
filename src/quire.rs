@@ -224,6 +224,9 @@ pub struct Quire {
     mark: Option<usize>,
     /// Narrowing `(lo, hi)`; accessible region is `[lo, hi)`. `None` = whole.
     narrowing: Option<(usize, usize)>,
+    /// Live markers, indexed by id; `None` = detached. Absolute 1-based positions
+    /// that auto-adjust across edits (Emacs markers). Cloned on `snapshot`.
+    markers: Vec<Option<usize>>,
     /// Most recent successful search, in 1-based char positions.
     last_match: Option<MatchData>,
 
@@ -288,6 +291,7 @@ impl Quire {
             point: 1,
             mark: None,
             narrowing: None,
+            markers: Vec::new(),
             last_match: None,
             text_cache: RefCell::new(None),
         }
@@ -307,6 +311,7 @@ impl Quire {
             point: self.point,
             mark: self.mark,
             narrowing: self.narrowing,
+            markers: self.markers.clone(),
             last_match: self.last_match.clone(),
             text_cache: RefCell::new(None),
         }
@@ -833,6 +838,7 @@ impl Quire {
         if let Some((_, hi)) = self.narrowing.as_mut() {
             *hi += n; // inserted text falls inside the accessible region
         }
+        crate::store::markers_after_insert(&mut self.markers, at, n);
         self.last_match = None;
         self.invalidate();
     }
@@ -854,6 +860,7 @@ impl Quire {
         if let Some((nlo, nhi)) = self.narrowing.as_mut() {
             *nhi = nhi.saturating_sub(removed).max(*nlo);
         }
+        crate::store::markers_after_delete(&mut self.markers, lo, hi);
         self.last_match = None;
         self.invalidate();
     }
@@ -907,8 +914,26 @@ impl Quire {
         self.splice_delete(start, end);
         self.splice_insert(start, &expanded);
         self.point = start + expanded.chars().count();
+        crate::store::markers_after_delete(&mut self.markers, start, end);
+        crate::store::markers_after_insert(&mut self.markers, start, expanded.chars().count());
         self.invalidate();
         Ok(())
+    }
+
+    // ---- markers ----
+    fn marker_create(&mut self, pos: Option<usize>) -> usize {
+        let pos = pos.map(|p| p.clamp(1, Quire::char_len(self) + 1));
+        self.markers.push(pos);
+        self.markers.len() - 1
+    }
+    fn marker_position(&self, id: usize) -> Option<usize> {
+        self.markers.get(id).copied().flatten()
+    }
+    fn marker_set(&mut self, id: usize, pos: Option<usize>) {
+        let pos = pos.map(|p| p.clamp(1, Quire::char_len(self) + 1));
+        if let Some(slot) = self.markers.get_mut(id) {
+            *slot = pos;
+        }
     }
 
     fn looking_at(&self, re: &regex::Regex) -> bool {
@@ -1195,6 +1220,15 @@ impl TextStore for Quire {
     }
     fn set_restriction(&mut self, r: Option<(usize, usize)>) {
         Quire::set_restriction(self, r)
+    }
+    fn marker_create(&mut self, pos: Option<usize>) -> usize {
+        Quire::marker_create(self, pos)
+    }
+    fn marker_position(&self, id: usize) -> Option<usize> {
+        Quire::marker_position(self, id)
+    }
+    fn marker_set(&mut self, id: usize, pos: Option<usize>) {
+        Quire::marker_set(self, id, pos)
     }
 }
 

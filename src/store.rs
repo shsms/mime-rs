@@ -42,4 +42,35 @@ pub trait TextStore {
     fn narrow_to_region(&mut self, a: usize, b: usize);
     fn widen(&mut self);
     fn set_restriction(&mut self, r: Option<(usize, usize)>);
+
+    /// Create a marker at absolute position `pos` (detached if `None`); returns
+    /// its id. Markers auto-adjust as text is inserted/deleted — Emacs markers,
+    /// the durable positions that back multiple cursors/viewports.
+    fn marker_create(&mut self, pos: Option<usize>) -> usize;
+    /// The marker's current absolute 1-based position, or `None` if detached.
+    fn marker_position(&self, id: usize) -> Option<usize>;
+    /// Point marker `id` at absolute `pos`, or detach it with `None`.
+    fn marker_set(&mut self, id: usize, pos: Option<usize>);
+}
+
+/// Shift markers after inserting `len` chars at absolute position `at`. Emacs
+/// insertion-type nil: a marker exactly at `at` stays before the new text.
+pub(crate) fn markers_after_insert(markers: &mut [Option<usize>], at: usize, len: usize) {
+    for m in markers.iter_mut().flatten() {
+        if *m > at {
+            *m += len;
+        }
+    }
+}
+
+/// Shift markers after deleting the absolute region `[start, end)`: positions
+/// inside collapse to `start`, positions at or beyond `end` shift down by its width.
+pub(crate) fn markers_after_delete(markers: &mut [Option<usize>], start: usize, end: usize) {
+    for m in markers.iter_mut().flatten() {
+        if *m >= end {
+            *m -= end - start;
+        } else if *m > start {
+            *m = start;
+        }
+    }
 }

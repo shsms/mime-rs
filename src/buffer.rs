@@ -21,6 +21,9 @@ pub struct Buffer {
     /// Narrowing restriction `(lo, hi)` in 1-based char positions; the accessible
     /// region is `[lo, hi)`. `None` = whole buffer.
     narrowing: Option<(usize, usize)>,
+    /// Live markers, indexed by id; `None` = detached. Absolute 1-based
+    /// positions that auto-adjust across edits (Emacs markers).
+    markers: Vec<Option<usize>>,
     pub name: String,
     pub last_match: Option<MatchData>,
 }
@@ -32,6 +35,7 @@ impl Buffer {
             point: 1,
             mark: None,
             narrowing: None,
+            markers: Vec::new(),
             name: name.into(),
             last_match: None,
         }
@@ -75,12 +79,14 @@ impl Buffer {
 
     pub fn insert(&mut self, s: &str) {
         let n = s.chars().count();
+        let at_char = self.point;
         let at = self.byte_of(self.point);
         self.text.insert_str(at, s);
         self.point += n;
         if let Some((_, hi)) = self.narrowing.as_mut() {
             *hi += n; // inserted text falls inside the accessible region
         }
+        crate::store::markers_after_insert(&mut self.markers, at_char, n);
         self.last_match = None;
     }
 
@@ -96,6 +102,7 @@ impl Buffer {
         if let Some((nlo, nhi)) = self.narrowing.as_mut() {
             *nhi = nhi.saturating_sub(hi - lo).max(*nlo);
         }
+        crate::store::markers_after_delete(&mut self.markers, lo, hi);
         self.last_match = None;
     }
 
@@ -141,6 +148,9 @@ impl Buffer {
         let (lb, hb) = (self.byte_of(md.start), self.byte_of(md.end));
         self.text.replace_range(lb..hb, &expanded);
         self.point = md.start + expanded.chars().count();
+        // A replace is a delete of the match span followed by an insert at its start.
+        crate::store::markers_after_delete(&mut self.markers, md.start, md.end);
+        crate::store::markers_after_insert(&mut self.markers, md.start, expanded.chars().count());
         Ok(())
     }
 
@@ -286,6 +296,22 @@ impl Buffer {
         self.point = start;
         Some(start)
     }
+
+    // ---- markers ----
+    pub fn marker_create(&mut self, pos: Option<usize>) -> usize {
+        let pos = pos.map(|p| p.clamp(1, self.char_len() + 1));
+        self.markers.push(pos);
+        self.markers.len() - 1
+    }
+    pub fn marker_position(&self, id: usize) -> Option<usize> {
+        self.markers.get(id).copied().flatten()
+    }
+    pub fn marker_set(&mut self, id: usize, pos: Option<usize>) {
+        let pos = pos.map(|p| p.clamp(1, self.char_len() + 1));
+        if let Some(slot) = self.markers.get_mut(id) {
+            *slot = pos;
+        }
+    }
 }
 
 /// Thin delegation: the in-memory `Buffer` is the `TextStore` oracle.
@@ -380,6 +406,15 @@ impl crate::store::TextStore for Buffer {
     fn set_restriction(&mut self, r: Option<(usize, usize)>) {
         Buffer::set_restriction(self, r)
     }
+    fn marker_create(&mut self, pos: Option<usize>) -> usize {
+        Buffer::marker_create(self, pos)
+    }
+    fn marker_position(&self, id: usize) -> Option<usize> {
+        Buffer::marker_position(self, id)
+    }
+    fn marker_set(&mut self, id: usize, pos: Option<usize>) {
+        Buffer::marker_set(self, id, pos)
+    }
 }
 
 /// Expand Emacs-style `\N` (group) and `\&` (whole match) backrefs.
@@ -458,5 +493,56 @@ mod tests {
         b.delete_region(2, 4); // remove "bc"
         assert_eq!(b.text(), "adef");
         assert_eq!(b.point(), 5);
+    }
+
+    #[test]
+    fn marker_adjusts_on_insert() {
+        let mut b = Buffer::from_string("t", "abcdef");
+        let m = b.marker_create(Some(4)); // at 'd'
+        b.goto_char(2);
+        b.insert("XY"); // 2 chars before the marker → it shifts right
+        assert_eq!(b.marker_position(m), Some(6));
+        b.goto_char(6);
+        b.insert("Z"); // exactly at the marker → stays put (insertion-type nil)
+        assert_eq!(b.marker_position(m), Some(6));
+        b.goto_char(b.point_max());
+        b.insert("!"); // after the marker → no move
+        assert_eq!(b.marker_position(m), Some(6));
+    }
+
+    #[test]
+    fn marker_adjusts_on_delete() {
+        let mut b = Buffer::from_string("t", "abcdefgh");
+        let before = b.marker_create(Some(2));
+        let inside = b.marker_create(Some(4));
+        let after = b.marker_create(Some(7));
+        b.delete_region(3, 6); // remove "cde"
+        assert_eq!(b.text(), "abfgh");
+        assert_eq!(b.marker_position(before), Some(2)); // unchanged
+        assert_eq!(b.marker_position(inside), Some(3)); // collapsed to region start
+        assert_eq!(b.marker_position(after), Some(4)); // 7 - 3
+    }
+
+    #[test]
+    fn marker_survives_replace_match() {
+        let mut b = Buffer::from_string("t", "foo bar");
+        let m = b.marker_create(Some(5)); // start of "bar"
+        let re = regex::Regex::new("foo").unwrap();
+        b.goto_char(1);
+        assert!(b.re_search_forward(&re, None).is_some());
+        b.replace_match("hello").unwrap(); // grows the match by 2 chars
+        assert_eq!(b.text(), "hello bar");
+        assert_eq!(b.marker_position(m), Some(7)); // still at 'b' of "bar"
+    }
+
+    #[test]
+    fn marker_detach_and_clamp() {
+        let mut b = Buffer::from_string("t", "abc");
+        let m = b.marker_create(None);
+        assert_eq!(b.marker_position(m), None); // detached
+        b.marker_set(m, Some(99)); // clamps to char_len + 1
+        assert_eq!(b.marker_position(m), Some(4));
+        b.marker_set(m, None);
+        assert_eq!(b.marker_position(m), None);
     }
 }
