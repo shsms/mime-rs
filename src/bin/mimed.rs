@@ -125,9 +125,13 @@ fn op_open(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
             let Some(path) = file.as_str() else {
                 return err("\"file\" must be a string");
             };
-            match Quire::open(Path::new(path)) {
+            let path = match mime_rs::safety::check_path(Path::new(path)) {
+                Ok(p) => p,
+                Err(e) => return err(&e),
+            };
+            match Quire::open(&path) {
                 Ok(q) => Box::new(q),
-                Err(e) => return err(&format!("cannot open file {path}: {e}")),
+                Err(e) => return err(&format!("cannot open file {}: {e}", path.display())),
             }
         }
         (None, Some(text)) => {
@@ -193,7 +197,11 @@ fn op_save(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
         };
         ws.text()
     };
-    match std::fs::write(&path, &text) {
+    let checked = match mime_rs::safety::check_path(Path::new(&path)) {
+        Ok(p) => p,
+        Err(e) => return err(&e),
+    };
+    match std::fs::write(&checked, &text) {
         Ok(()) => json!({ "ok": true, "session": session, "path": path, "bytes": text.len() }),
         Err(e) => err(&format!("cannot write {path}: {e}")),
     }

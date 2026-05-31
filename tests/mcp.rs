@@ -19,12 +19,20 @@ struct Server {
 
 impl Server {
     fn spawn() -> Server {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_mime-mcp"))
-            .stdin(Stdio::piped())
+        Server::spawn_with_env(&[])
+    }
+
+    /// Spawn `mime-mcp` with extra environment variables (e.g. `MIME_ROOTS`,
+    /// `MIME_AUDIT`) — used by the safety tests.
+    fn spawn_with_env(env: &[(&str, &std::path::Path)]) -> Server {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mime-mcp"));
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn mime-mcp");
+            .stderr(Stdio::null());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("spawn mime-mcp");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         Server {
@@ -70,6 +78,25 @@ impl Server {
         assert_eq!(
             result["isError"], false,
             "tool {name} unexpectedly errored: {result}"
+        );
+        result["content"][0]["text"]
+            .as_str()
+            .expect("text content")
+            .to_string()
+    }
+
+    /// Call a tool expecting a tool-level failure; assert `isError` and return
+    /// the error text.
+    fn call_err(&mut self, id: i64, name: &str, arguments: Value) -> String {
+        let resp = self.request(json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": name, "arguments": arguments },
+        }));
+        assert_eq!(resp["id"], id);
+        let result = &resp["result"];
+        assert_eq!(
+            result["isError"], true,
+            "tool {name} unexpectedly succeeded: {result}"
         );
         result["content"][0]["text"]
             .as_str()
@@ -263,4 +290,70 @@ fn sessions_are_isolated_and_warm() {
         "calling tag in session two should fail: {}",
         two["result"]
     );
+}
+
+/// A unique temp directory for one safety test, used as the `MIME_ROOTS` root.
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("mime-mcp-it-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).expect("create temp dir");
+    p
+}
+
+#[test]
+fn open_file_and_save_buffer_reject_out_of_root_paths() {
+    // The agent is granted exactly one root; everything else is off-limits.
+    let root = temp_dir("reject");
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", root.as_path())]);
+    s.request(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }));
+
+    // open_file on an absolute path outside the root is refused.
+    let err = s.call_err(2, "open_file", json!({ "path": "/etc/passwd" }));
+    assert!(
+        err.contains("outside the allowed roots"),
+        "open_file error was: {err}"
+    );
+
+    // A `..` escape that climbs out of the root is refused too.
+    let escape = root.join("..").join("escape.txt");
+    let err = s.call_err(3, "open_file", json!({ "path": escape.to_str().unwrap() }));
+    assert!(
+        err.contains("outside the allowed roots"),
+        "open_file ../ error was: {err}"
+    );
+
+    // Open an in-memory buffer (no FS) and try to save it outside the root.
+    s.call_ok(4, "open_text", json!({ "text": "secret" }));
+    let err = s.call_err(
+        5,
+        "save_buffer",
+        json!({ "path": "/tmp/mime-escape-should-fail.txt" }),
+    );
+    assert!(
+        err.contains("outside the allowed roots"),
+        "save_buffer error was: {err}"
+    );
+    assert!(
+        !std::path::Path::new("/tmp/mime-escape-should-fail.txt").exists(),
+        "save_buffer must not have written outside the root"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn save_buffer_writes_inside_root() {
+    // A save to a new file *inside* the granted root is permitted.
+    let root = temp_dir("allow");
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", root.as_path())]);
+    s.request(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }));
+
+    s.call_ok(2, "open_text", json!({ "text": "hello world" }));
+    let dest = root.join("out.txt");
+    let msg = s.call_ok(3, "save_buffer", json!({ "path": dest.to_str().unwrap() }));
+    assert!(msg.contains("wrote"), "save said: {msg}");
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "hello world");
+
+    let _ = std::fs::remove_dir_all(&root);
 }

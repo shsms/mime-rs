@@ -11,6 +11,7 @@ pub mod builtins;
 pub mod engine;
 pub mod quire;
 pub mod result;
+pub mod safety;
 pub mod store;
 pub mod strings;
 

@@ -106,13 +106,22 @@ fn run_local(args: &Args, verb: &str) {
     // A file is opened through Quire — the mmap-backed piece-table store (the
     // production path, GB-capable); stdin uses the in-memory Buffer.
     let store: Box<dyn mime_rs::TextStore> = match &args.file {
-        Some(f) => match mime_rs::Quire::open(std::path::Path::new(f)) {
-            Ok(q) => Box::new(q),
-            Err(e) => {
-                eprintln!("cannot open file {f}: {e}");
-                exit(2);
+        Some(f) => {
+            let path = match mime_rs::safety::check_path(std::path::Path::new(f)) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{e}");
+                    exit(2);
+                }
+            };
+            match mime_rs::Quire::open(&path) {
+                Ok(q) => Box::new(q),
+                Err(e) => {
+                    eprintln!("cannot open file {f}: {e}");
+                    exit(2);
+                }
             }
-        },
+        }
         None => {
             let mut s = String::new();
             std::io::stdin().read_to_string(&mut s).ok();
@@ -129,7 +138,14 @@ fn run_local(args: &Args, verb: &str) {
             if args.write_back {
                 match &args.file {
                     Some(f) => {
-                        if let Err(e) = std::fs::write(f, &report.final_text) {
+                        let path = match mime_rs::safety::check_path(std::path::Path::new(f)) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("{e}");
+                                exit(1);
+                            }
+                        };
+                        if let Err(e) = std::fs::write(&path, &report.final_text) {
                             eprintln!("cannot write {f}: {e}");
                             exit(1);
                         }

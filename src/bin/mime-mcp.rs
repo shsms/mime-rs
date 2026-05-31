@@ -222,20 +222,23 @@ fn report_value(report: &mime_rs::RunReport, key: &str) -> Option<String> {
 
 // ---- tools -----------------------------------------------------------------
 
-// TODO: path allowlist (symlink-checked workspace roots) — see plan.org
-// §"Safety, sandboxing, permissioning". open_file/save_buffer touch the FS
-// directly for now; no shell/network is ever exposed.
+// open_file/save_buffer are the only FS-touching tools; both run their path
+// through `safety::check_path`, which confines them to the configured workspace
+// roots ($MIME_ROOTS, default cwd) and rejects `..`/symlink/absolute escapes.
+// No shell, process spawn, or network is ever exposed — see plan.org §"Safety,
+// sandboxing, permissioning".
 
 /// `open_file {path, session?}` — open a file via `Quire` into `session`,
-/// replacing any existing session of that name.
+/// replacing any existing session of that name. The path must resolve inside an
+/// allowed root.
 fn tool_open_file(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
     let session = session_arg(args);
     let path = str_arg(args, "path")?;
-    let quire =
-        Quire::open(Path::new(&path)).map_err(|e| format!("cannot open file {path}: {e}"))?;
+    let checked = mime_rs::safety::check_path(Path::new(&path))?;
+    let quire = Quire::open(&checked).map_err(|e| format!("cannot open file {path}: {e}"))?;
     let name = quire.name().to_string();
     let len = quire.char_len();
     sessions.insert(session.clone(), Workspace::new(Box::new(quire)));
@@ -388,8 +391,8 @@ fn tool_save_buffer(
         .get(&session)
         .ok_or_else(|| format!("no such session: {session}"))?
         .text();
-    // TODO: path allowlist — see the note above.
-    std::fs::write(&path, &text).map_err(|e| format!("cannot write {path}: {e}"))?;
+    let checked = mime_rs::safety::check_path(Path::new(&path))?;
+    std::fs::write(&checked, &text).map_err(|e| format!("cannot write {path}: {e}"))?;
     Ok(format!("wrote {} bytes to {path}", text.len()))
 }
 
@@ -430,7 +433,7 @@ fn tool_schemas() -> Vec<Value> {
     vec![
         json!({
             "name": "open_file",
-            "description": "Open a file from disk into a warm session (replacing any existing session of that name). The buffer stays resident so later tools need no file re-reads.",
+            "description": "Open a file from disk into a warm session (replacing any existing session of that name). The buffer stays resident so later tools need no file re-reads. The path must resolve inside an allowed root (MIME_ROOTS, default cwd).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
