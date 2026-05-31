@@ -198,6 +198,61 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             msg
         });
     }
+    {
+        // (window &optional N POS) — a text viewport: N lines (default 4) before and
+        // after POS (default point), the focus line marked with '‸' at the column,
+        // plus line numbers and a header. The agent's eyes. POS lets you "look" at
+        // any position (e.g. a saved marker) — several calls = several viewports.
+        let s = session.clone();
+        ctx.defun(
+            "window",
+            move |n: Option<i64>, pos: Option<i64>| -> String {
+                let n = n.unwrap_or(4).max(0) as usize;
+                let mut sess = s.borrow_mut();
+                let saved = sess.buffer.point();
+                let center =
+                    pos.map_or(saved, |p| (p.max(1) as usize).min(sess.buffer.point_max()));
+                let cur_line = sess.buffer.line_number_at_pos(center);
+                sess.buffer.goto_char(center);
+                sess.buffer.beginning_of_line();
+                let col = center - sess.buffer.point();
+                let total = sess.buffer.line_number_at_pos(sess.buffer.point_max());
+                let lo = cur_line.saturating_sub(n).max(1);
+                let hi = (cur_line + n).min(total);
+                let pmax = sess.buffer.point_max();
+                let mut out = format!(
+                    "\u{2014} {}  line {} col {}  point {}/{} \u{2014}\n",
+                    sess.buffer.name(),
+                    cur_line,
+                    col,
+                    center,
+                    pmax - 1
+                );
+                let m = sess.buffer.point_min();
+                sess.buffer.goto_char(m);
+                sess.buffer.forward_line(lo as i64 - 1);
+                for line_no in lo..=hi {
+                    let start = sess.buffer.point();
+                    sess.buffer.end_of_line();
+                    let end = sess.buffer.point();
+                    let mut text = sess.buffer.substring(start, end);
+                    if line_no == cur_line {
+                        let at = col.min(text.chars().count());
+                        let byte = text.char_indices().nth(at).map_or(text.len(), |(b, _)| b);
+                        text.insert(byte, '\u{2038}');
+                    }
+                    let gutter = if line_no == cur_line { '>' } else { ' ' };
+                    out.push_str(&format!("{line_no:>5} {gutter} {text}\n"));
+                    if line_no < hi {
+                        sess.buffer.goto_char(end);
+                        sess.buffer.forward_line(1);
+                    }
+                }
+                sess.buffer.goto_char(saved);
+                out
+            },
+        );
+    }
 
     // ---- mark & region ----
     {
