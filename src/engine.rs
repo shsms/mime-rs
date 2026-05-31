@@ -108,6 +108,67 @@ impl Workspace {
     /// not against the original file). The error string is the formatted tulisp
     /// error.
     pub fn run(&mut self, program: &str) -> Result<RunReport, String> {
+        // For a read-only session, keep a cheap pre-run snapshot (structural
+        // sharing for Quire) so a mutating program can be rolled back.
+        let guard = self
+            .read_only
+            .then(|| self.session.borrow().buffer.snapshot());
+
+        let report = self.eval_and_report(program, false)?;
+
+        // Enforce read-only after the fact: if the program left the buffer
+        // changed, restore the snapshot and reject it. (Programs that only
+        // navigate/search/report are unaffected.)
+        if let Some(snap) = guard
+            && report.dirty
+        {
+            self.session.borrow_mut().buffer = snap;
+            return Err("session is read-only: program modified the buffer".to_string());
+        }
+        Ok(report)
+    }
+
+    /// Dry-run `program` and return the report it *would* produce, then roll the
+    /// session back so nothing persists — the "try before you commit" path. The
+    /// returned [`RunReport`] still shows `dirty`/`diff`/`reports`/`log` for the
+    /// hypothetical edit (with `rehearsed = true`), but afterwards [`text`] is
+    /// unchanged and the kill-ring/checkpoints are exactly as before.
+    ///
+    /// Rollback reuses the [`Checkpoint`] mechanism: a pre-run `snapshot()` of
+    /// the buffer (which carries text *and* point/mark/narrowing, since those
+    /// live in the store) is swapped back in, undoing every buffer-level effect
+    /// in one move. Session-level state a rehearsal must not keep — entries the
+    /// program pushed onto the kill-ring or `checkpoints` — is truncated back to
+    /// its pre-run length. A rehearsal works the same whether or not the session
+    /// is read-only: it never persists, so there is nothing to reject.
+    ///
+    /// `defun`s the program defined in the `TulispContext` are intentionally
+    /// kept: tulisp has no cheap context rollback, the bindings are harmless
+    /// (callable, but inert until something runs them), and keeping them lets an
+    /// agent rehearse a helper definition and then a `run` that uses it.
+    pub fn rehearse(&mut self, program: &str) -> Result<RunReport, String> {
+        // Snapshot everything a rehearsal must restore *before* the program runs.
+        let (snap, kill_len, cp_len) = {
+            let s = self.session.borrow();
+            (s.buffer.snapshot(), s.kill_ring.len(), s.checkpoints.len())
+        };
+
+        // Run with the same machinery as `run`; on a tulisp error we still roll
+        // back, so a failed rehearsal leaves no trace either.
+        let result = self.eval_and_report(program, true);
+
+        let mut s = self.session.borrow_mut();
+        s.buffer = snap;
+        s.kill_ring.truncate(kill_len);
+        s.checkpoints.truncate(cp_len);
+        result
+    }
+
+    /// Shared core of [`run`]/[`rehearse`]: clear the per-program `reports`/`log`,
+    /// evaluate `program`, and build the [`RunReport`] (diff = buffer-at-start →
+    /// buffer-at-end). Neither rolls back here — the caller decides whether the
+    /// effects persist. `rehearsed` flags the report's origin.
+    fn eval_and_report(&mut self, program: &str, rehearsed: bool) -> Result<RunReport, String> {
         let (before, name) = {
             let mut s = self.session.borrow_mut();
             s.reports.clear();
@@ -115,25 +176,10 @@ impl Workspace {
             (s.buffer.text().to_string(), s.buffer.name().to_string())
         };
         let len_before = before.chars().count();
-        // For a read-only session, keep a cheap pre-run snapshot (structural
-        // sharing for Quire) so a mutating program can be rolled back.
-        let guard = self
-            .read_only
-            .then(|| self.session.borrow().buffer.snapshot());
 
         self.ctx
             .eval_string(program)
             .map_err(|e| e.format(&self.ctx))?;
-
-        // Enforce read-only after the fact: if the program left the buffer
-        // changed, restore the snapshot and reject it. (Programs that only
-        // navigate/search/report are unaffected.)
-        if let Some(snap) = guard
-            && self.session.borrow().buffer.text() != before
-        {
-            self.session.borrow_mut().buffer = snap;
-            return Err("session is read-only: program modified the buffer".to_string());
-        }
 
         let s = self.session.borrow();
         let after = s.buffer.text().to_string();
@@ -141,6 +187,7 @@ impl Workspace {
         Ok(RunReport {
             buffer_name: name,
             dirty: after != before,
+            rehearsed,
             diff: unified_diff(&before, &after),
             point: s.buffer.point(),
             len_before,
@@ -225,11 +272,26 @@ mod tests {
         // behind buffer-substring/read_region/search) must both match the oracle.
         let (q, o) = (quire.text().to_string(), oracle.text().to_string());
         let probe = "(message (buffer-substring (max 1 (- (point-max) 300)) (point-max)))";
-        let qr = quire.run(probe).unwrap().log.first().cloned().unwrap_or_default();
-        let or = oracle.run(probe).unwrap().log.first().cloned().unwrap_or_default();
+        let qr = quire
+            .run(probe)
+            .unwrap()
+            .log
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        let or = oracle
+            .run(probe)
+            .unwrap()
+            .log
+            .first()
+            .cloned()
+            .unwrap_or_default();
         std::fs::remove_file(&path).ok();
         assert_eq!(q, o, "spine (full_text) diverged from the oracle");
-        assert_eq!(qr, or, "windowed readout (collect_range) diverged from the oracle");
+        assert_eq!(
+            qr, or,
+            "windowed readout (collect_range) diverged from the oracle"
+        );
     }
 
     fn report(r: &RunReport, key: &str) -> String {
@@ -306,6 +368,99 @@ mod tests {
         ws.run(r#"(kill-region 1 7)"#).unwrap(); // "hello " into the kill-ring
         let r2 = ws.run(r#"(goto-char (point-max)) (yank)"#).unwrap();
         assert_eq!(r2.final_text, "worldhello ");
+    }
+
+    #[test]
+    fn rehearse_reports_the_edit_but_leaves_the_buffer_unchanged() {
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "hello")));
+        // The rehearsal's report describes what *would* happen...
+        let r = ws
+            .rehearse(r#"(goto-char (point-max)) (insert " world") (report "did" 1)"#)
+            .unwrap();
+        assert!(r.rehearsed);
+        assert!(r.dirty);
+        assert_eq!(r.final_text, "hello world");
+        assert_eq!(r.len_before, 5);
+        assert_eq!(r.len_after, 11);
+        assert!(r.diff.contains("-hello"));
+        assert!(r.diff.contains("+hello world"));
+        assert_eq!(r.reports, vec![("did".to_string(), "1".to_string())]);
+        // ...but the live buffer is untouched.
+        assert_eq!(ws.text(), "hello");
+    }
+
+    #[test]
+    fn rehearse_then_run_persists_normally() {
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "hello")));
+        // A rehearsal first — discarded.
+        ws.rehearse(r#"(goto-char (point-max)) (insert " THROWN-AWAY")"#)
+            .unwrap();
+        assert_eq!(ws.text(), "hello");
+        // A normal run after a rehearsal still persists, and sees the original.
+        let r = ws
+            .run(r#"(goto-char (point-max)) (insert " world")"#)
+            .unwrap();
+        assert!(!r.rehearsed);
+        assert_eq!(r.final_text, "hello world");
+        assert_eq!(ws.text(), "hello world");
+    }
+
+    #[test]
+    fn rehearse_restores_point_mark_and_narrowing() {
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "abcdefgh")));
+        // Establish point/mark/narrowing state the rehearsal will perturb.
+        ws.run(r#"(goto-char 3) (set-mark 5)"#).unwrap();
+        ws.rehearse(r#"(narrow-to-region 1 4) (goto-char 2) (insert "XYZ")"#)
+            .unwrap();
+        // Point, mark, and the (un-narrowed) bounds are all back to pre-rehearsal.
+        let r = ws
+            .run(r#"(report "point" (point)) (report "pmax" (point-max)) (report "mark" (mark))"#)
+            .unwrap();
+        assert_eq!(report(&r, "point"), "3");
+        assert_eq!(report(&r, "pmax"), "9"); // 8 chars + 1, i.e. not narrowed
+        assert_eq!(report(&r, "mark"), "5");
+        assert_eq!(ws.text(), "abcdefgh");
+    }
+
+    #[test]
+    fn rehearse_does_not_keep_kill_ring_or_checkpoints() {
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "hello world")));
+        // Seed one kill-ring entry and one checkpoint before the rehearsal.
+        ws.run(r#"(kill-region 1 7) (checkpoint "keep")"#).unwrap(); // kills "hello "
+        // The rehearsal pushes onto both — and must not keep either.
+        ws.rehearse(r#"(kill-region 1 4) (checkpoint "throwaway") (checkpoint "throwaway2")"#)
+            .unwrap();
+        let r = ws
+            .run(r#"(report "cps" (list-checkpoints)) (goto-char (point-max)) (yank)"#)
+            .unwrap();
+        // Only the pre-rehearsal checkpoint remains.
+        assert_eq!(report(&r, "cps"), "(\"keep\")");
+        // The yank pulled the pre-rehearsal kill ("hello "), not the rehearsal's.
+        assert_eq!(r.final_text, "worldhello ");
+    }
+
+    #[test]
+    fn rehearse_rolls_back_even_when_the_program_errors() {
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "keep")));
+        // A program that mutates then errors: the rehearsal returns Err, but the
+        // buffer is still rolled back to its pre-rehearsal text.
+        let res = ws.rehearse(r#"(erase-buffer) (insert "gone") (error "boom")"#);
+        assert!(res.is_err());
+        assert_eq!(ws.text(), "keep");
+    }
+
+    #[test]
+    fn rehearse_on_read_only_session_still_reports() {
+        // A rehearsal never persists, so it is allowed (and useful) even on a
+        // read-only session — the agent can preview an edit it could not commit.
+        let mut ws = Workspace::new_read_only(Box::new(Buffer::from_string("ref", "keep me")));
+        let r = ws
+            .rehearse(r#"(goto-char (point-max)) (insert " EDITED")"#)
+            .unwrap();
+        assert!(r.rehearsed);
+        assert!(r.dirty);
+        assert_eq!(r.final_text, "keep me EDITED");
+        assert_eq!(ws.text(), "keep me");
     }
 
     #[test]
