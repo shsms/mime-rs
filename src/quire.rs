@@ -124,7 +124,11 @@ const PARALLEL_INDEX_THRESHOLD: usize = 1024 * 1024;
 /// — which equals `bytes.chars().count()` but works directly on `&[u8]`. This
 /// is a *pure* helper so the parallel driver and the unit tests can compare it
 /// against the sequential count. O(bytes).
-fn count_chars_lines(bytes: &[u8]) -> (usize, usize) {
+///
+/// `#[doc(hidden)] pub` only so `benches/parallel_index.rs` can time it against
+/// the parallel driver; it is not part of the supported API.
+#[doc(hidden)]
+pub fn count_chars_lines(bytes: &[u8]) -> (usize, usize) {
     let mut chars = 0;
     let mut lines = 0;
     for &b in bytes {
@@ -156,7 +160,11 @@ fn next_char_boundary(bytes: &[u8], mut i: usize) -> usize {
 /// additive over a partition, the result is **bit-for-bit identical** to the
 /// sequential `count_chars_lines(bytes)`. Uses [`std::thread::scope`] so the
 /// threads borrow `bytes` directly — no copy, no `'static` bound, no new crate.
-fn count_chars_lines_parallel(bytes: &[u8]) -> (usize, usize) {
+///
+/// `#[doc(hidden)] pub` only so `benches/parallel_index.rs` can time it against
+/// the sequential helper; it is not part of the supported API.
+#[doc(hidden)]
+pub fn count_chars_lines_parallel(bytes: &[u8]) -> (usize, usize) {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
