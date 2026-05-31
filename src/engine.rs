@@ -167,4 +167,19 @@ mod tests {
         let r = run("abc", "(erase-buffer)");
         assert_eq!(r.final_text, "");
     }
+
+    #[test]
+    fn forward_word_moves_to_word_ends() {
+        let r = run(
+            "  foo bar  baz",
+            r#"(goto-char 1) (forward-word 2) (report "p" (point))"#,
+        );
+        assert_eq!(r.reports[0], ("p".to_string(), "10".to_string()));
+    }
+
+    #[test]
+    fn insert_char_and_newline() {
+        let r = run("", r#"(insert-char 65 3) (newline) (insert-char 66 2)"#);
+        assert_eq!(r.final_text, "AAA\nBB");
+    }
 }

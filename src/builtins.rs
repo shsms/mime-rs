@@ -482,4 +482,86 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             })
         });
     }
+
+    // ---- text objects & insertion ----
+    {
+        let s = session.clone();
+        ctx.defun("forward-word", move |n: Option<i64>| -> i64 {
+            let mut sess = s.borrow_mut();
+            for _ in 0..n.unwrap_or(1).max(0) {
+                let mut p = sess.buffer.point();
+                let max = sess.buffer.point_max();
+                while p < max
+                    && !sess
+                        .buffer
+                        .char_after(p)
+                        .is_some_and(|c| c.is_alphanumeric())
+                {
+                    p += 1;
+                }
+                while p < max
+                    && sess
+                        .buffer
+                        .char_after(p)
+                        .is_some_and(|c| c.is_alphanumeric())
+                {
+                    p += 1;
+                }
+                sess.buffer.goto_char(p);
+            }
+            sess.buffer.point() as i64
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun("backward-word", move |n: Option<i64>| -> i64 {
+            let mut sess = s.borrow_mut();
+            for _ in 0..n.unwrap_or(1).max(0) {
+                let mut p = sess.buffer.point();
+                let min = sess.buffer.point_min();
+                while p > min
+                    && !sess
+                        .buffer
+                        .char_before(p)
+                        .is_some_and(|c| c.is_alphanumeric())
+                {
+                    p -= 1;
+                }
+                while p > min
+                    && sess
+                        .buffer
+                        .char_before(p)
+                        .is_some_and(|c| c.is_alphanumeric())
+                {
+                    p -= 1;
+                }
+                sess.buffer.goto_char(p);
+            }
+            sess.buffer.point() as i64
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun(
+            "insert-char",
+            move |ch: i64, count: Option<i64>| -> Result<TulispObject, Error> {
+                let c = char::from_u32(ch.max(0) as u32)
+                    .ok_or_else(|| err("insert-char: invalid character code"))?;
+                let n = count.unwrap_or(1).max(0) as usize;
+                s.borrow_mut().buffer.insert(&c.to_string().repeat(n));
+                Ok(TulispObject::nil())
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        ctx.defun(
+            "newline",
+            move |n: Option<i64>| -> Result<TulispObject, Error> {
+                let n = n.unwrap_or(1).max(0) as usize;
+                s.borrow_mut().buffer.insert(&"\n".repeat(n));
+                Ok(TulispObject::nil())
+            },
+        );
+    }
 }
