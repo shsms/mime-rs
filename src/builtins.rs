@@ -805,6 +805,51 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         );
     }
 
+    // ---- more line commands ----
+    {
+        let s = session.clone();
+        ctx.defun("kill-line", move || -> Result<TulispObject, Error> {
+            let mut sess = s.borrow_mut();
+            let p = sess.buffer.point();
+            sess.buffer.end_of_line();
+            let eol = sess.buffer.point();
+            sess.buffer.goto_char(p);
+            // Kill to end of line; if already there, kill the newline (like Emacs).
+            let end = if p == eol && p < sess.buffer.point_max() {
+                p + 1
+            } else {
+                eol
+            };
+            let text = sess.buffer.substring(p, end);
+            sess.kill_ring.push(text);
+            sess.buffer.delete_region(p, end);
+            Ok(TulispObject::nil())
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun(
+            "delete-trailing-whitespace",
+            move || -> Result<TulispObject, Error> {
+                let rx = regex::Regex::new(r"(?m)[ \t]+$").map_err(bad_regex)?;
+                let mut sess = s.borrow_mut();
+                let m = sess.buffer.point_min();
+                sess.buffer.goto_char(m);
+                loop {
+                    let start = sess.buffer.point();
+                    if sess.buffer.re_search_forward(&rx, None).is_none() {
+                        break;
+                    }
+                    sess.buffer.replace_match("").map_err(Error::lisp_error)?;
+                    if sess.buffer.point() <= start {
+                        break;
+                    }
+                }
+                Ok(TulispObject::nil())
+            },
+        );
+    }
+
     // ---- checkpoints (workspace time travel — M0: full-text snapshots) ----
     {
         let s = session.clone();
