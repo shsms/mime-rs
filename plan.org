@@ -669,12 +669,17 @@ Findings from editing mime-rs *through mime-rs* (the agent's-eye view); appended
   touch a file outside cwd. Correct + a clear error, but an agent hits it immediately;
   the daemon/MCP should advertise the allowed roots up front.
 - Viewing was indirect: ~(message (window ...))~ then digging the string out of the JSON
-  ~log~ is clunky; ~view~ wants to be a first-class MCP tool returning the text. [building]
+  ~log~ is clunky; ~view~ wants to be a first-class MCP tool returning the text. [done: the view tool]
 - No durable markers yet: multiple viewports work via ~(window N pos)~ + vars, but a saved
   position does not survive edits; Emacs markers on Quire anchors are the fix. [next]
 - Inserting big literal blocks is awkward: tulisp-string escaping of newlines is
   error-prone (this very section was a long escaped ~insert~); want an ~insert_text~ MCP
   tool that takes the text as a JSON string, no tulisp escaping.
+- Structural code edits are hard: adding the ~view~ MCP tool meant three separate
+  sites (a handler fn, a dispatch arm, a schema entry). Search/replace is the wrong
+  instrument for "add an arm to this match" / "add a field to this struct", so I used a
+  plain editor for those. This is the argument for AST-aware ops (M7 tree-sitter):
+  mime-rs shines at prose and find/replace transforms, less so at structural code.
 
 * Open questions & risks (decide deliberately)
 1. *Why not ~emacsclient~ + elisp?* It already has buffers/markers/narrowing/regexp
