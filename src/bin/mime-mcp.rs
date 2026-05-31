@@ -156,6 +156,7 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         "run_program" => tool_run_program(&args, sessions),
         "read_region" => tool_read_region(&args, sessions),
         "view" => tool_view(&args, sessions),
+        "insert_text" => tool_insert_text(&args, sessions),
         "search" => tool_search(&args, sessions),
         "checkpoint" => tool_checkpoint(&args, sessions),
         "restore_checkpoint" => tool_restore_checkpoint(&args, sessions),
@@ -357,6 +358,34 @@ fn tool_view(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result<
         .ok_or_else(|| "view: no text returned".to_string())
 }
 
+/// `insert_text {session?, text, pos?}` — insert literal `text` at point (or at
+/// `pos`). The text arrives as a raw JSON string and is escaped for tulisp *on the
+/// server*, so the agent never hand-escapes a program — the fix for the "big
+/// literal blocks" friction (no JSON-over-Lisp double escaping). Newlines and tabs
+/// become `\n`/`\t` so the generated `(insert "…")` stays a single, unambiguous
+/// line. Edits the warm buffer; call `save_buffer` to persist.
+fn tool_insert_text(
+    args: &Value,
+    sessions: &mut HashMap<String, Workspace>,
+) -> Result<String, String> {
+    let session = session_arg(args);
+    let text = str_arg(args, "text")?;
+    // lisp_escape handles \ and "; we additionally fold real newlines/tabs into
+    // their escape sequences (valid in a tulisp string literal) to keep the
+    // program on one line.
+    let escaped = lisp_escape(&text).replace('\n', "\\n").replace('\t', "\\t");
+    let program = match args.get("pos").and_then(Value::as_i64) {
+        Some(pos) => {
+            format!("(progn (goto-char {pos}) (insert \"{escaped}\") (report \"point\" (point)))")
+        }
+        None => format!("(progn (insert \"{escaped}\") (report \"point\" (point)))"),
+    };
+    let report = run_in_session(sessions, &session, &program)?;
+    let chars = text.chars().count();
+    let point = report_value(&report, "point").unwrap_or_default();
+    Ok(format!("inserted {chars} chars; point is now {point}"))
+}
+
 /// `search {session?, pattern, mode?}` — search forward from point and report
 /// the 1-based position just after the match (Emacs `*-search-forward`
 /// semantics), or report that nothing matched. `mode` ∈ exact|regex|fuzzy
@@ -550,6 +579,19 @@ fn tool_schemas() -> Vec<Value> {
                     "session": session,
                 },
                 "required": [],
+            },
+        }),
+        json!({
+            "name": "insert_text",
+            "description": "Insert literal text at point (or at `pos`). Pass the text as a plain string — no Lisp escaping needed, the server handles it. Prefer this over run_program with (insert …) for multi-line or quote-heavy content. Edits the warm buffer; call save_buffer to persist.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "The literal text to insert." },
+                    "pos": { "type": "integer", "description": "1-based position to insert at (default: current point)." },
+                    "session": session,
+                },
+                "required": ["text"],
             },
         }),
         json!({
