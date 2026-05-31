@@ -9,6 +9,10 @@ fn bad_regex(e: regex::Error) -> Error {
     Error::lisp_error(format!("Invalid regexp: {e}"))
 }
 
+fn err(msg: &str) -> Error {
+    Error::lisp_error(msg.to_string())
+}
+
 pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     // ---- navigation ----
     {
@@ -166,5 +170,158 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             s.borrow_mut().log.push(msg.clone());
             msg
         });
+    }
+
+    // ---- mark & region ----
+    {
+        let s = session.clone();
+        ctx.defun("set-mark", move |p: i64| -> i64 {
+            let p = p.max(1);
+            s.borrow_mut().buffer.set_mark(p as usize);
+            p
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun("mark", move || -> Result<TulispObject, Error> {
+            Ok(match s.borrow().buffer.mark() {
+                Some(m) => TulispObject::from(m as i64),
+                None => TulispObject::nil(),
+            })
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun("region-beginning", move || -> Result<i64, Error> {
+            let sess = s.borrow();
+            let m = sess
+                .buffer
+                .mark()
+                .ok_or_else(|| err("The mark is not set now"))?;
+            Ok(sess.buffer.point().min(m) as i64)
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun("region-end", move || -> Result<i64, Error> {
+            let sess = s.borrow();
+            let m = sess
+                .buffer
+                .mark()
+                .ok_or_else(|| err("The mark is not set now"))?;
+            Ok(sess.buffer.point().max(m) as i64)
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun("exchange-point-and-mark", move || -> Result<i64, Error> {
+            let mut sess = s.borrow_mut();
+            let m = sess
+                .buffer
+                .mark()
+                .ok_or_else(|| err("No mark set in this buffer"))?;
+            let p = sess.buffer.point();
+            sess.buffer.set_mark(p);
+            sess.buffer.goto_char(m);
+            Ok(sess.buffer.point() as i64)
+        });
+    }
+
+    // ---- line navigation ----
+    {
+        let s = session.clone();
+        ctx.defun("beginning-of-line", move || -> i64 {
+            let mut sess = s.borrow_mut();
+            sess.buffer.beginning_of_line();
+            sess.buffer.point() as i64
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun("end-of-line", move || -> i64 {
+            let mut sess = s.borrow_mut();
+            sess.buffer.end_of_line();
+            sess.buffer.point() as i64
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun("forward-line", move |n: Option<i64>| -> i64 {
+            s.borrow_mut().buffer.forward_line(n.unwrap_or(1))
+        });
+    }
+    {
+        let s = session.clone();
+        ctx.defun("line-number-at-pos", move |p: Option<i64>| -> i64 {
+            let sess = s.borrow();
+            let pos = p.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
+            sess.buffer.line_number_at_pos(pos) as i64
+        });
+    }
+
+    // ---- char access ----
+    {
+        let s = session.clone();
+        ctx.defun(
+            "char-after",
+            move |p: Option<i64>| -> Result<TulispObject, Error> {
+                let sess = s.borrow();
+                let pos = p.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
+                Ok(match sess.buffer.char_after(pos) {
+                    Some(c) => TulispObject::from(c as i64),
+                    None => TulispObject::nil(),
+                })
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        ctx.defun(
+            "char-before",
+            move |p: Option<i64>| -> Result<TulispObject, Error> {
+                let sess = s.borrow();
+                let pos = p.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
+                Ok(match sess.buffer.char_before(pos) {
+                    Some(c) => TulispObject::from(c as i64),
+                    None => TulispObject::nil(),
+                })
+            },
+        );
+    }
+
+    // ---- exact search ----
+    {
+        let s = session.clone();
+        ctx.defun(
+            "search-forward",
+            move |needle: String,
+                  bound: Option<i64>,
+                  noerror: Option<TulispObject>|
+                  -> Result<TulispObject, Error> {
+                let bound = bound.map(|b| b.max(1) as usize);
+                match s.borrow_mut().buffer.search_forward(&needle, bound) {
+                    Some(p) => Ok(TulispObject::from(p as i64)),
+                    None if noerror.is_some_and(|o| o.is_truthy()) => Ok(TulispObject::nil()),
+                    None => Err(Error::lisp_error(format!("Search failed: {needle}"))),
+                }
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        ctx.defun(
+            "search-backward",
+            move |needle: String,
+                  bound: Option<i64>,
+                  noerror: Option<TulispObject>|
+                  -> Result<TulispObject, Error> {
+                let bound = bound.map(|b| b.max(1) as usize);
+                match s.borrow_mut().buffer.search_backward(&needle, bound) {
+                    Some(p) => Ok(TulispObject::from(p as i64)),
+                    None if noerror.is_some_and(|o| o.is_truthy()) => Ok(TulispObject::nil()),
+                    None => Err(Error::lisp_error(format!("Search failed: {needle}"))),
+                }
+            },
+        );
     }
 }

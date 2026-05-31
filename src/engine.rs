@@ -53,3 +53,63 @@ pub fn run_program(buffer: Buffer, program: &str) -> Result<RunReport, String> {
         final_text: after,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(text: &str, program: &str) -> RunReport {
+        run_program(Buffer::from_string("t", text), program).expect("program should run")
+    }
+
+    #[test]
+    fn regex_replace_loop() {
+        let r = run(
+            "a world b world",
+            r#"(while (re-search-forward "world" nil t) (replace-match "W"))"#,
+        );
+        assert_eq!(r.final_text, "a W b W");
+        assert!(r.dirty);
+    }
+
+    #[test]
+    fn exact_search_replace() {
+        let r = run(
+            "foo bar foo",
+            r#"(while (search-forward "foo" nil t) (replace-match "X"))"#,
+        );
+        assert_eq!(r.final_text, "X bar X");
+    }
+
+    #[test]
+    fn mark_and_region() {
+        let r = run(
+            "hello world",
+            r#"(goto-char 1) (set-mark 6) (report "len" (- (region-end) (region-beginning)))"#,
+        );
+        assert_eq!(r.reports, vec![("len".to_string(), "5".to_string())]);
+    }
+
+    #[test]
+    fn line_navigation_and_char_after() {
+        let r = run(
+            "one\ntwo\nthree\n",
+            r#"(goto-char 1) (forward-line 2)
+               (report "line" (line-number-at-pos (point)))
+               (report "ch" (char-after (point)))"#,
+        );
+        assert_eq!(r.reports[0], ("line".to_string(), "3".to_string()));
+        assert_eq!(r.reports[1], ("ch".to_string(), "116".to_string())); // 't'
+    }
+
+    #[test]
+    fn report_count_via_loop() {
+        let r = run(
+            "x x x x",
+            r#"(let ((n 0))
+                 (while (search-forward "x" nil t) (setq n (1+ n)))
+                 (report "n" n))"#,
+        );
+        assert_eq!(r.reports, vec![("n".to_string(), "4".to_string())]);
+    }
+}

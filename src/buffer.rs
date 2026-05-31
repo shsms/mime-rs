@@ -16,6 +16,8 @@ pub struct Buffer {
     text: String,
     /// Point: 1-based char position in `1..=point_max()`.
     point: usize,
+    /// Mark: the other end of the region, if set (1-based char position).
+    mark: Option<usize>,
     pub name: String,
     pub last_match: Option<MatchData>,
 }
@@ -25,6 +27,7 @@ impl Buffer {
         Buffer {
             text: text.into(),
             point: 1,
+            mark: None,
             name: name.into(),
             last_match: None,
         }
@@ -132,6 +135,114 @@ impl Buffer {
     pub fn looking_at(&self, re: &regex::Regex) -> bool {
         let b = self.byte_of(self.point);
         re.find(&self.text[b..]).is_some_and(|m| m.start() == 0)
+    }
+
+    // ---- mark & region ----
+    pub fn mark(&self) -> Option<usize> {
+        self.mark
+    }
+    pub fn set_mark(&mut self, p: usize) {
+        self.mark = Some(p.clamp(self.point_min(), self.point_max()));
+    }
+
+    // ---- line navigation ----
+    /// Move point to the first char of its line (just after the previous newline).
+    pub fn beginning_of_line(&mut self) {
+        let b = self.byte_of(self.point);
+        let start = self.text[..b].rfind('\n').map_or(0, |i| i + 1);
+        self.point = self.char_of(start);
+    }
+    /// Move point to the end of its line (just before the next newline, or eob).
+    pub fn end_of_line(&mut self) {
+        let b = self.byte_of(self.point);
+        let end = self.text[b..].find('\n').map_or(self.text.len(), |i| b + i);
+        self.point = self.char_of(end);
+    }
+    /// Move point `n` lines forward, to a line beginning. Returns the count of
+    /// lines that could not be moved (0 on full success), like Emacs.
+    pub fn forward_line(&mut self, n: i64) -> i64 {
+        self.beginning_of_line();
+        let mut left = n.abs();
+        while left > 0 {
+            let b = self.byte_of(self.point);
+            if n >= 0 {
+                match self.text[b..].find('\n') {
+                    Some(i) => self.point = self.char_of(b + i + 1),
+                    None => {
+                        self.point = self.point_max();
+                        return left;
+                    }
+                }
+            } else {
+                match self.text[..b.saturating_sub(1)].rfind('\n') {
+                    Some(i) => self.point = self.char_of(i + 1),
+                    None => {
+                        self.point = self.point_min();
+                        return left;
+                    }
+                }
+            }
+            left -= 1;
+        }
+        0
+    }
+    /// 1-based line number containing 1-based char position `p`.
+    pub fn line_number_at_pos(&self, p: usize) -> usize {
+        self.text[..self.byte_of(p)].matches('\n').count() + 1
+    }
+
+    // ---- char access (returns Unicode code points, like Emacs characters) ----
+    pub fn char_after(&self, p: usize) -> Option<char> {
+        if p < self.point_max() {
+            self.text[self.byte_of(p)..].chars().next()
+        } else {
+            None
+        }
+    }
+    pub fn char_before(&self, p: usize) -> Option<char> {
+        if p > self.point_min() {
+            self.char_after(p - 1)
+        } else {
+            None
+        }
+    }
+
+    // ---- exact search ----
+    /// Exact forward search from point (bounded). On a hit: set match-data,
+    /// move point past the match, return the new point.
+    pub fn search_forward(&mut self, needle: &str, bound: Option<usize>) -> Option<usize> {
+        if needle.is_empty() {
+            return Some(self.point);
+        }
+        let start_b = self.byte_of(self.point);
+        let end_b = self.byte_of(bound.unwrap_or_else(|| self.point_max()));
+        let abs = start_b + self.text.get(start_b..end_b)?.find(needle)?;
+        let end = self.char_of(abs + needle.len());
+        self.last_match = Some(MatchData {
+            start: self.char_of(abs),
+            end,
+            groups: vec![Some(needle.to_string())],
+        });
+        self.point = end;
+        Some(end)
+    }
+    /// Exact backward search from point (bounded below). On a hit: set
+    /// match-data, move point to the match start, return it.
+    pub fn search_backward(&mut self, needle: &str, bound: Option<usize>) -> Option<usize> {
+        if needle.is_empty() {
+            return Some(self.point);
+        }
+        let lo_b = self.byte_of(bound.unwrap_or_else(|| self.point_min()));
+        let hi_b = self.byte_of(self.point);
+        let abs = lo_b + self.text.get(lo_b..hi_b)?.rfind(needle)?;
+        let start = self.char_of(abs);
+        self.last_match = Some(MatchData {
+            start,
+            end: self.char_of(abs + needle.len()),
+            groups: vec![Some(needle.to_string())],
+        });
+        self.point = start;
+        Some(start)
     }
 }
 
