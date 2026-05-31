@@ -58,7 +58,7 @@ fn parse(argv: &[String]) -> Args {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "run" | "open" | "status" | "save" | "close" if a.verb.is_none() => {
+            "run" | "rehearse" | "open" | "status" | "save" | "close" if a.verb.is_none() => {
                 a.verb = Some(argv[i].clone());
             }
             "--local" => a.local = true,
@@ -90,13 +90,18 @@ fn parse(argv: &[String]) -> Args {
     a
 }
 
-/// The embedded one-shot path (`--local`). Only `run` is supported; behavior is
-/// unchanged from M0.
+/// The embedded one-shot path (`--local`). Supports `run` (persisting, honours
+/// `--write`) and `rehearse` (dry-run: report only, NEVER writes — even if a
+/// stray `--write` is passed).
 fn run_local(args: &Args, verb: &str) {
-    if verb != "run" {
-        eprintln!("--local supports only `run` (got `{verb}`)");
-        exit(2);
-    }
+    let rehearse = match verb {
+        "run" => false,
+        "rehearse" => true,
+        _ => {
+            eprintln!("--local supports only `run` and `rehearse` (got `{verb}`)");
+            exit(2);
+        }
+    };
     let Some(prog_path) = args.prog_path.as_deref() else {
         usage();
         exit(2);
@@ -129,13 +134,25 @@ fn run_local(args: &Args, verb: &str) {
         }
     };
 
-    match mime_rs::run_program(store, &program) {
+    // `rehearse` rolls back inside the workspace, so the result is identical to
+    // discarding the report; we just never write it back. `run` may persist.
+    let mut ws = mime_rs::Workspace::new(store);
+    let result = if rehearse {
+        ws.rehearse(&program)
+    } else {
+        ws.run(&program)
+    };
+    match result {
         Ok(report) => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&report.to_json()).unwrap()
             );
-            if args.write_back {
+            // A rehearsal is a dry-run by definition: never touch the file, even
+            // if `--write` was passed by mistake.
+            if args.write_back && rehearse {
+                eprintln!("note: --write ignored for a rehearsal (a rehearsal never writes)");
+            } else if args.write_back {
                 match &args.file {
                     Some(f) => {
                         let path = match mime_rs::safety::check_path(std::path::Path::new(f)) {
@@ -181,14 +198,16 @@ fn run_daemon(args: &Args, verb: &str) {
                 }
             }
         }
-        "run" => {
+        "run" | "rehearse" => {
             let session = require_session(args);
             let Some(prog_path) = args.prog_path.as_deref() else {
-                eprintln!("run needs a program path: mimectl --session S run PROG.tl");
+                eprintln!("{verb} needs a program path: mimectl --session S {verb} PROG.tl");
                 exit(2);
             };
             let program = read_or_die(prog_path, "program");
-            serde_json::json!({ "op": "run", "session": session, "program": program })
+            // `rehearse` is the dry-run twin of `run`: same request shape, the
+            // daemon rolls the session back and never persists.
+            serde_json::json!({ "op": verb, "session": session, "program": program })
         }
         "save" => {
             let session = require_session(args);
@@ -262,8 +281,10 @@ fn usage() {
     eprintln!(
         "usage:\n  \
          mimectl run --local PROG.tl [--file FILE] [--write]   (embedded one-shot)\n  \
+         mimectl rehearse --local PROG.tl [--file FILE]        (embedded dry-run; never writes)\n  \
          mimectl --session S open --file FILE | --text STR     (daemon)\n  \
          mimectl --session S run PROG.tl                       (daemon)\n  \
+         mimectl --session S rehearse PROG.tl                  (daemon dry-run; nothing persists)\n  \
          mimectl --session S save --path PATH                  (daemon)\n  \
          mimectl --session S close                             (daemon)\n  \
          mimectl status                                        (daemon)"
