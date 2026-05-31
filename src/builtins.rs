@@ -584,4 +584,56 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             },
         );
     }
+
+    // ---- buffer-level replace commands (map-shaped bulk edits) ----
+    {
+        let s = session.clone();
+        ctx.defun(
+            "replace-regexp",
+            move |re: String, to: String| -> Result<TulispObject, Error> {
+                let rx = regex::Regex::new(&re).map_err(bad_regex)?;
+                let mut sess = s.borrow_mut();
+                let mut count = 0i64;
+                loop {
+                    let start = sess.buffer.point();
+                    if sess.buffer.re_search_forward(&rx, None).is_none() {
+                        break;
+                    }
+                    sess.buffer.replace_match(&to).map_err(Error::lisp_error)?;
+                    count += 1;
+                    if sess.buffer.point() <= start {
+                        break; // no forward progress (empty match) — avoid looping
+                    }
+                }
+                Ok(TulispObject::from(count))
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        ctx.defun(
+            "replace-string",
+            move |from: String, to: String| -> Result<TulispObject, Error> {
+                // Literal replacement: escape backslashes so replace-match does no
+                // \N / \& expansion.
+                let literal = to.replace('\\', "\\\\");
+                let mut sess = s.borrow_mut();
+                let mut count = 0i64;
+                loop {
+                    let start = sess.buffer.point();
+                    if sess.buffer.search_forward(&from, None).is_none() {
+                        break;
+                    }
+                    sess.buffer
+                        .replace_match(&literal)
+                        .map_err(Error::lisp_error)?;
+                    count += 1;
+                    if sess.buffer.point() <= start {
+                        break;
+                    }
+                }
+                Ok(TulispObject::from(count))
+            },
+        );
+    }
 }

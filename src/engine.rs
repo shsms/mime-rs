@@ -193,4 +193,23 @@ mod tests {
         );
         assert_eq!(r.final_text, "Doe John");
     }
+
+    #[test]
+    fn replace_regexp_all() {
+        let r = run(
+            "a1 b2 c3",
+            r##"(goto-char (point-min)) (report "n" (replace-regexp "[0-9]" "#"))"##,
+        );
+        assert_eq!(r.final_text, "a# b# c#");
+        assert_eq!(r.reports[0], ("n".to_string(), "3".to_string()));
+    }
+
+    #[test]
+    fn replace_string_is_literal() {
+        let r = run(
+            "foo.bar.baz",
+            r#"(goto-char (point-min)) (replace-string "." "/")"#,
+        );
+        assert_eq!(r.final_text, "foo/bar/baz");
+    }
 }
