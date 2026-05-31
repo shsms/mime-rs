@@ -584,10 +584,15 @@ the agent-facing surface works end to end. M5 ✓, rehearse ✓, M7 scaffold ✓
    rebuild + ~concat~); parallel initial line index (~memchr~ + prefix sum);
    rebase-on-save compaction *[done]* (after a save, re-mmap the new file, collapse to one ~Original~ piece, release the pinned pre-save inode + reset the add buffer); bytecode-compile hot programs; dirty-span diffs; benchmark suite. /Exit: search +
    global-replace a multi-GB file scale across cores; ulysses bench beats mime./
+   /Open follow-ups: the M6 bench pulls in ~criterion~ (drags ~serde~/~syn~ into the *test*
+   build) — keep it or swap for a ~std::time~ ~#[ignore]~d bench (a leanness call). Save still
+   materializes the whole ~text()~ to write it (O(filesize) RAM) — streaming the pieces straight
+   to the temp file is a later perf item. No external-change detection yet — re-~open_file~ to
+   pick up on-disk edits an agent did not make (an Emacs-style mtime/inode check is a future touch)./
 ** DOING M7 — Structural / syntax-aware editing [#C] (scaffold landed)
    Tree-sitter integration; node search/replace; narrow-to-defun. /Exit: AST-scoped
    refactors on real code./
-** TODO M8 — Polish [#C]
+** DOING M8 — Polish [#C] (repl + porting guide + examples landed; crate publish later)
    ~mimectl repl~; mime→mime-rs porting guide; docs; example library of helpers;
    ~cargo~ workspace + crate publish.
 
