@@ -1364,6 +1364,26 @@ impl TextStore for Quire {
     fn rebase_to_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         Quire::rebase_to(self, path)
     }
+    fn write_to(&self, w: &mut dyn std::io::Write) -> std::io::Result<usize> {
+        // Stream each piece's bytes in document order — equals `full_text()` byte
+        // for byte, but never materializes the whole document.
+        let mut written = 0usize;
+        let mut err = None;
+        self.for_each_piece(|p| {
+            let bytes = self.piece_str(p).as_bytes();
+            match w.write_all(bytes) {
+                Ok(()) => {
+                    written += bytes.len();
+                    true
+                }
+                Err(e) => {
+                    err = Some(e);
+                    false
+                }
+            }
+        });
+        err.map_or(Ok(written), Err)
+    }
 }
 
 /// Expand Emacs-style `\N` (group) and `\&` (whole match) backrefs. Mirrors
@@ -2046,6 +2066,19 @@ mod tests {
         );
         assert_eq!((q.point(), q.mark()), (pt, mk), "cursor/mark preserved");
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn write_to_streams_full_document() {
+        let mut q = Quire::from_string("t", "αβγ line\nhello world\ntail 世界\n");
+        q.goto_char(1);
+        q.re_search_forward(&regex::Regex::new("hello").unwrap(), None);
+        q.insert("X"); // split into several pieces (original + add + original)
+        let full = q.full_text().to_string();
+        let mut buf: Vec<u8> = Vec::new();
+        let n = TextStore::write_to(&q, &mut buf).unwrap();
+        assert_eq!(n, full.len(), "byte count");
+        assert_eq!(buf, full.as_bytes(), "streamed bytes equal full_text");
     }
 
     /// Windowed reads (the `collect_range` path behind `substring`/`read_region`)

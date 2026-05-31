@@ -92,16 +92,20 @@ pub fn check_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Write `contents` to `path` atomically: write a sibling temp file, fsync it,
-/// then rename it over `path`. This NEVER mutates `path`'s bytes in place —
-/// essential because a `Quire` may have `path` mmapped as its immutable original,
+/// Save to `path` atomically by streaming: write a sibling temp file via `write`,
+/// fsync it, then rename it over `path`. This NEVER mutates `path`'s bytes in place
+/// — essential because a `Quire` may have `path` mmapped as its immutable original,
 /// so an in-place overwrite would change those bytes under the live piece tree and
 /// later reads through the mmap would return shifted garbage. The rename leaves the
 /// old inode (and any mapping of it) intact while swapping the directory entry to
 /// the new content; it is also crash-atomic (a reader sees the whole old file or
-/// the whole new one). `path` should already be vetted by [`check_path`].
-pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
+/// the whole new one). `write` receives a buffered writer, so a multi-GB buffer is
+/// streamed piece by piece and never materialized into one allocation just to save
+/// it. `path` should already be vetted by [`check_path`].
+pub fn write_atomic_with<F>(path: &Path, write: F) -> std::io::Result<()>
+where
+    F: FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+{
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -111,10 +115,14 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "buffer".to_string());
     let tmp = dir.join(format!(".{stem}.tmp.{}", std::process::id()));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(contents)?;
-        f.sync_all()?;
+    let result = (|| -> std::io::Result<()> {
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        write(&mut f)?;
+        f.into_inner().map_err(|e| e.into_error())?.sync_all()
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
     // Match the destination's permissions when it already exists.
     if let Ok(meta) = std::fs::metadata(path) {
@@ -127,6 +135,12 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
             Err(e)
         }
     }
+}
+
+/// Write `contents` to `path` atomically — the all-in-memory wrapper over
+/// [`write_atomic_with`] for callers that already hold the bytes.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    write_atomic_with(path, |w| w.write_all(contents))
 }
 
 /// Canonicalize `path` whether or not it exists yet. An existing path is

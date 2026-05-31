@@ -418,6 +418,11 @@ impl crate::store::TextStore for Buffer {
     fn rebase_to_file(&mut self, _path: &std::path::Path) -> std::io::Result<()> {
         Ok(()) // in-memory: nothing is mmapped, so there is nothing to reclaim
     }
+    fn write_to(&self, w: &mut dyn std::io::Write) -> std::io::Result<usize> {
+        let bytes = Buffer::text(self).as_bytes();
+        w.write_all(bytes)?;
+        Ok(bytes.len())
+    }
 }
 
 /// Expand Emacs-style `\N` (group) and `\&` (whole match) backrefs.

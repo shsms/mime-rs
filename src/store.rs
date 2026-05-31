@@ -57,6 +57,11 @@ pub trait TextStore {
     /// pre-save backing (the pinned old mmap inode) and the add buffer; a no-op for
     /// the in-memory `Buffer`. Content and point/mark/narrowing are unchanged.
     fn rebase_to_file(&mut self, path: &std::path::Path) -> std::io::Result<()>;
+
+    /// Stream the buffer's bytes into `w` and return the byte count written. The
+    /// streaming atomic save uses this so a multi-GB `Quire` is written piece by
+    /// piece, never materialized into one allocation; `Buffer` writes its string.
+    fn write_to(&self, w: &mut dyn std::io::Write) -> std::io::Result<usize>;
 }
 
 /// Shift markers after inserting `len` chars at absolute position `at`. Emacs
