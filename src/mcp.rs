@@ -5,7 +5,7 @@
 //! `eprintln!` for logs so stdout stays a clean protocol channel) and exposes
 //! the editing engine as MCP tools.
 //!
-//! Like `mimed`, it embeds the engine directly — it does NOT talk to a running
+//! Like the daemon, it embeds the engine directly — it does NOT talk to a running
 //! daemon. It owns a `HashMap<String, Workspace>` of *warm* sessions: each
 //! `Workspace` holds a long-lived `TulispContext` + `Session`, so a buffer,
 //! checkpoints, kill-ring, and agent-defined `defun`s persist across
@@ -16,7 +16,7 @@
 //! Threading: a `Workspace` embeds an `Rc`-based `TulispContext` and is `!Send`,
 //! so this server is single-threaded — it reads, dispatches, and replies on one
 //! thread, one request to completion before the next. MCP over stdio is a single
-//! client, so this is the natural model (mirrors mimed's single-writer loop).
+//! client, so this is the natural model (mirrors the daemon's single-writer loop).
 //!
 //! Most tools are implemented by running a tiny tulisp program through
 //! `Workspace::run` (so there is one editing code path) and reading values back
@@ -26,13 +26,13 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::Path;
 
-use mime_rs::{Buffer, Quire, TextStore, Workspace};
+use crate::{Buffer, Quire, TextStore, Workspace};
 use serde_json::{Value, json};
 
 const DEFAULT_SESSION: &str = "default";
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
-fn main() {
+pub fn run() {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -208,6 +208,9 @@ fn bool_arg(args: &Value, key: &str) -> bool {
 
 /// Build a warm [`Workspace`], read-only when requested.
 fn make_workspace(store: Box<dyn TextStore>, read_only: bool) -> Workspace {
+    // CAPABILITY TIER HOOK: a later milestone selects a trusted vs sandboxed
+    // workspace here (per-session capability set); for now read-only vs writable
+    // is the only distinction and the engine-enforced sandbox is the only tier.
     if read_only {
         Workspace::new_read_only(store)
     } else {
@@ -223,7 +226,7 @@ fn run_in_session(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
     program: &str,
-) -> Result<mime_rs::RunReport, String> {
+) -> Result<crate::RunReport, String> {
     run_or_rehearse(sessions, session, program, false)
 }
 
@@ -234,7 +237,7 @@ fn run_or_rehearse(
     session: &str,
     program: &str,
     rehearse: bool,
-) -> Result<mime_rs::RunReport, String> {
+) -> Result<crate::RunReport, String> {
     let ws = sessions
         .get_mut(session)
         .ok_or_else(|| format!("no such session: {session} (open_file/open_text first)"))?;
@@ -246,7 +249,7 @@ fn run_or_rehearse(
 }
 
 /// Pull the value a `(report KEY ...)` recorded, by key.
-fn report_value(report: &mime_rs::RunReport, key: &str) -> Option<String> {
+fn report_value(report: &crate::RunReport, key: &str) -> Option<String> {
     report
         .reports
         .iter()
@@ -272,7 +275,7 @@ fn tool_open_file(
     let session = session_arg(args);
     let path = str_arg(args, "path")?;
     let read_only = bool_arg(args, "read_only");
-    let checked = mime_rs::safety::check_path(Path::new(&path))?;
+    let checked = crate::safety::check_path(Path::new(&path))?;
     let quire = Quire::open(&checked).map_err(|e| format!("cannot open file {path}: {e}"))?;
     let name = quire.name().to_string();
     let len = quire.char_len();
@@ -324,7 +327,7 @@ fn tool_run_program(
     // wall-clock/CPU bound can't be enforced until tulisp eval is cancellable.
     let report = run_or_rehearse(sessions, &session, &program, rehearse)?;
     // A rehearsal persists nothing, so it audits as a non-mutating event.
-    mime_rs::safety::audit(
+    crate::safety::audit(
         "mime-mcp",
         &session,
         &program,
@@ -498,7 +501,7 @@ fn tool_save_buffer(
 ) -> Result<String, String> {
     let session = session_arg(args);
     let path = str_arg(args, "path")?;
-    let checked = mime_rs::safety::check_path(Path::new(&path))?;
+    let checked = crate::safety::check_path(Path::new(&path))?;
     // save_to writes atomically (temp + rename) and re-bases the buffer onto the
     // new file, so an in-place save reclaims the pre-save mmap backing.
     let bytes = sessions
@@ -516,14 +519,14 @@ fn tool_save_buffer(
 fn tool_session_status(sessions: &HashMap<String, Workspace>) -> Result<String, String> {
     let mut ids: Vec<&String> = sessions.keys().collect();
     ids.sort();
-    let roots: Vec<String> = mime_rs::safety::roots()
+    let roots: Vec<String> = crate::safety::roots()
         .iter()
         .map(|r| r.display().to_string())
         .collect();
     Ok(json!({
         "sessions": ids,
         "roots": roots,
-        "audit": mime_rs::safety::audit_enabled(),
+        "audit": crate::safety::audit_enabled(),
     })
     .to_string())
 }
