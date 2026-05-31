@@ -15,7 +15,7 @@ pub mod store;
 pub mod strings;
 
 pub use buffer::Buffer;
-pub use engine::run_program;
+pub use engine::{Workspace, run_program};
 pub use quire::Quire;
 pub use result::RunReport;
 pub use store::TextStore;

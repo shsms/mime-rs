@@ -1,7 +1,9 @@
 //! Run a tulisp program against a buffer, returning a structured result.
 //!
-//! M0 runs cold (a fresh `TulispContext` per program). Warm buffers + warm
-//! definitions across programs (the daemon) arrive in M3.
+//! A [`Workspace`] is the *warm* unit: it owns one `TulispContext` plus the
+//! shared [`Session`] and survives many programs, so buffer/checkpoint/kill-ring
+//! state and agent-defined `defun`s persist across `run` calls. [`run_program`]
+//! is the cold one-shot built on top of it (`Workspace::new(buffer).run(prog)`).
 use crate::result::{RunReport, unified_diff};
 use crate::store::TextStore;
 use std::cell::RefCell;
@@ -45,41 +47,83 @@ pub struct Session {
 
 pub type SharedSession = Rc<RefCell<Session>>;
 
-/// Evaluate `program` (Emacs Lisp / tulisp) against `buffer`; return the diff,
-/// reports, and final state. The error string is the formatted tulisp error.
+/// A warm editing session: a long-lived `TulispContext` over a shared
+/// [`Session`]. The daemon keeps one of these per session id; each
+/// [`Workspace::run`] evaluates a program against the accumulated state.
+///
+/// Because the context is reused, a `defun` defined by one program is callable
+/// by the next, and buffer/checkpoint/kill-ring mutations carry over. The
+/// context is *not* `Send`/`Sync` (tulisp is single-threaded), so the daemon
+/// confines each `Workspace` behind a `Mutex` and a session is a single writer.
+pub struct Workspace {
+    ctx: TulispContext,
+    session: SharedSession,
+}
+
+impl Workspace {
+    /// Build the session + context and register the editor builtins and string
+    /// library ONCE. Subsequent `run` calls reuse them — the warm path.
+    pub fn new(buffer: Box<dyn TextStore>) -> Workspace {
+        let session: SharedSession = Rc::new(RefCell::new(Session {
+            buffer,
+            checkpoints: Vec::new(),
+            kill_ring: Vec::new(),
+            reports: Vec::new(),
+            log: Vec::new(),
+        }));
+
+        let mut ctx = TulispContext::new();
+        crate::builtins::register(&mut ctx, &session);
+        crate::strings::register(&mut ctx);
+
+        Workspace { ctx, session }
+    }
+
+    /// Evaluate `program` against the warm state and return a per-program
+    /// report. `reports`/`log` are cleared first so the report reflects only
+    /// this run; the diff is "buffer at run start → buffer at run end" (warm,
+    /// not against the original file). The error string is the formatted tulisp
+    /// error.
+    pub fn run(&mut self, program: &str) -> Result<RunReport, String> {
+        let (before, name) = {
+            let mut s = self.session.borrow_mut();
+            s.reports.clear();
+            s.log.clear();
+            (s.buffer.text().to_string(), s.buffer.name().to_string())
+        };
+        let len_before = before.chars().count();
+
+        self.ctx
+            .eval_string(program)
+            .map_err(|e| e.format(&self.ctx))?;
+
+        let s = self.session.borrow();
+        let after = s.buffer.text().to_string();
+        let len_after = after.chars().count();
+        Ok(RunReport {
+            buffer_name: name,
+            dirty: after != before,
+            diff: unified_diff(&before, &after),
+            point: s.buffer.point(),
+            len_before,
+            len_after,
+            reports: s.reports.clone(),
+            log: s.log.clone(),
+            final_text: after,
+        })
+    }
+
+    /// The current buffer text — used by the daemon's `save` op.
+    pub fn text(&self) -> String {
+        self.session.borrow().buffer.text().to_string()
+    }
+}
+
+/// Evaluate `program` (Emacs Lisp / tulisp) against `buffer` once, cold; return
+/// the diff, reports, and final state. A thin wrapper over [`Workspace`] — the
+/// `mimectl --local` one-shot path.
 pub fn run_program(buffer: Box<dyn TextStore>, program: &str) -> Result<RunReport, String> {
-    let before = buffer.text().to_string();
-    let len_before = before.chars().count();
-    let name = buffer.name().to_string();
-
-    let session: SharedSession = Rc::new(RefCell::new(Session {
-        buffer,
-        checkpoints: Vec::new(),
-        kill_ring: Vec::new(),
-        reports: Vec::new(),
-        log: Vec::new(),
-    }));
-
-    let mut ctx = TulispContext::new();
-    crate::builtins::register(&mut ctx, &session);
-    crate::strings::register(&mut ctx);
-
-    ctx.eval_string(program).map_err(|e| e.format(&ctx))?;
-
-    let s = session.borrow();
-    let after = s.buffer.text().to_string();
-    let len_after = after.chars().count();
-    Ok(RunReport {
-        buffer_name: name,
-        dirty: after != before,
-        diff: unified_diff(&before, &after),
-        point: s.buffer.point(),
-        len_before,
-        len_after,
-        reports: s.reports.clone(),
-        log: s.log.clone(),
-        final_text: after,
-    })
+    Workspace::new(buffer).run(program)
 }
 
 #[cfg(test)]
@@ -89,6 +133,50 @@ mod tests {
 
     fn run(text: &str, program: &str) -> RunReport {
         run_program(Box::new(Buffer::from_string("t", text)), program).expect("program should run")
+    }
+
+    #[test]
+    fn warm_buffer_edits_persist_across_runs() {
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "hello")));
+        let r1 = ws
+            .run(r#"(goto-char (point-max)) (insert " world")"#)
+            .unwrap();
+        assert_eq!(r1.final_text, "hello world");
+        // The 2nd run sees the 1st's edit and diffs against it (not the original).
+        let r2 = ws.run(r#"(upcase-region 1 6)"#).unwrap();
+        assert_eq!(r2.final_text, "HELLO world");
+        assert_eq!(r2.len_before, 11);
+        assert!(r2.diff.contains("-hello world"));
+        assert!(r2.diff.contains("+HELLO world"));
+    }
+
+    #[test]
+    fn warm_defun_is_callable_in_a_later_run() {
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "abc")));
+        // 1st run only defines a helper — no buffer change.
+        let r1 = ws.run(r#"(defun shout (s) (insert (upcase s)))"#).unwrap();
+        assert!(!r1.dirty);
+        // 2nd run calls the warm defun.
+        let r2 = ws.run(r#"(goto-char (point-max)) (shout "xyz")"#).unwrap();
+        assert_eq!(r2.final_text, "abcXYZ");
+    }
+
+    #[test]
+    fn warm_reports_and_log_reset_each_run() {
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "x")));
+        let r1 = ws.run(r#"(report "a" 1)"#).unwrap();
+        assert_eq!(r1.reports.len(), 1);
+        // 2nd run reports nothing — the report list is per-program, not cumulative.
+        let r2 = ws.run(r#"(goto-char 1)"#).unwrap();
+        assert!(r2.reports.is_empty());
+    }
+
+    #[test]
+    fn warm_kill_ring_carries_over() {
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "hello world")));
+        ws.run(r#"(kill-region 1 7)"#).unwrap(); // "hello " into the kill-ring
+        let r2 = ws.run(r#"(goto-char (point-max)) (yank)"#).unwrap();
+        assert_eq!(r2.final_text, "worldhello ");
     }
 
     #[test]
