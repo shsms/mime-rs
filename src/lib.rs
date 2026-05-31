@@ -9,11 +9,13 @@
 pub mod buffer;
 pub mod builtins;
 pub mod engine;
+pub mod quire;
 pub mod result;
 pub mod store;
 pub mod strings;
 
 pub use buffer::Buffer;
 pub use engine::run_program;
+pub use quire::Quire;
 pub use result::RunReport;
 pub use store::TextStore;
