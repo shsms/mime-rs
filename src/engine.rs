@@ -39,10 +39,95 @@ impl Checkpoint {
 
 pub struct Session {
     pub buffer: Box<dyn TextStore>,
+    /// The non-current buffers, in creation order. `buffer` is always *the
+    /// current buffer*; switching (`set_buffer`) swaps one of these into it and
+    /// stashes the previous current one back here. A `Vec` + linear scan by
+    /// `.name()` is plenty — buffer counts are tiny — and it gives `buffer-list`
+    /// a stable order. Only the trusted (orchestration) tier ever grows this;
+    /// the sandboxed tier always sees exactly one buffer.
+    pub inactive: Vec<Box<dyn TextStore>>,
     pub checkpoints: Vec<Checkpoint>,
     pub kill_ring: Vec<String>,
     pub reports: Vec<(String, String)>,
     pub log: Vec<String>,
+}
+
+impl Session {
+    /// `true` if any buffer (current or inactive) already has this name.
+    pub fn has_buffer(&self, name: &str) -> bool {
+        self.buffer.name() == name || self.inactive.iter().any(|b| b.name() == name)
+    }
+
+    /// The current buffer's name.
+    pub fn current_buffer_name(&self) -> String {
+        self.buffer.name().to_string()
+    }
+
+    /// All buffer names: the current buffer first, then the inactive buffers in
+    /// creation order (the stable order `buffer-list` reports).
+    pub fn buffer_names(&self) -> Vec<String> {
+        std::iter::once(self.buffer.name().to_string())
+            .chain(self.inactive.iter().map(|b| b.name().to_string()))
+            .collect()
+    }
+
+    /// Make the buffer named `name` current. A no-op if it is already current;
+    /// otherwise the present current buffer is stashed into `inactive` and the
+    /// named one is swapped in (carrying its own point/mark/narrowing, since
+    /// those live in the store). `Err` if no such buffer exists.
+    pub fn set_buffer(&mut self, name: &str) -> Result<(), String> {
+        if self.buffer.name() == name {
+            return Ok(());
+        }
+        let idx = self
+            .inactive
+            .iter()
+            .position(|b| b.name() == name)
+            .ok_or_else(|| format!("no buffer named {name}"))?;
+        // Swap the target out of `inactive` and the old current in its place,
+        // then exchange that slot with the current buffer.
+        std::mem::swap(&mut self.buffer, &mut self.inactive[idx]);
+        Ok(())
+    }
+
+    /// Create an empty in-memory buffer named `name` and register it as
+    /// inactive, returning the *actual* name used. If `name` is already taken
+    /// (current or inactive), it is uniquified Emacs-style — `name<2>`,
+    /// `name<3>`, … — until free. Does NOT switch to it (like Emacs
+    /// `generate-new-buffer`).
+    pub fn generate_new_buffer(&mut self, name: &str) -> String {
+        let actual = self.unique_buffer_name(name);
+        self.inactive
+            .push(Box::new(crate::Buffer::from_string(actual.clone(), "")));
+        actual
+    }
+
+    /// `name` if free, else the first available `name<N>` (N ≥ 2), Emacs-style.
+    fn unique_buffer_name(&self, name: &str) -> String {
+        if !self.has_buffer(name) {
+            return name.to_string();
+        }
+        (2..)
+            .map(|n| format!("{name}<{n}>"))
+            .find(|candidate| !self.has_buffer(candidate))
+            .expect("an unbounded search always finds a free name")
+    }
+
+    /// Remove the inactive buffer named `name`. Killing the *current* buffer is
+    /// an error for now (there is no policy yet for choosing its replacement);
+    /// `Err` too if no such buffer exists.
+    pub fn kill_buffer(&mut self, name: &str) -> Result<(), String> {
+        if self.buffer.name() == name {
+            return Err(format!("cannot kill the current buffer {name}"));
+        }
+        let idx = self
+            .inactive
+            .iter()
+            .position(|b| b.name() == name)
+            .ok_or_else(|| format!("no buffer named {name}"))?;
+        self.inactive.remove(idx);
+        Ok(())
+    }
 }
 
 pub type SharedSession = Rc<RefCell<Session>>;
@@ -109,6 +194,7 @@ impl Workspace {
     ) -> Workspace {
         let session: SharedSession = Rc::new(RefCell::new(Session {
             buffer,
+            inactive: Vec::new(),
             checkpoints: Vec::new(),
             kill_ring: Vec::new(),
             reports: Vec::new(),
