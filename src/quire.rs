@@ -293,6 +293,25 @@ impl Quire {
         }
     }
 
+    /// An O(1)/O(log n) snapshot: clone the tree root and both backing `Arc`s
+    /// (no document bytes copied) and copy only the cursor/narrowing/match state.
+    /// The result is an independent `Quire` whose future edits path-copy from the
+    /// shared root and copy-on-write the add buffer, so neither version disturbs
+    /// the other. This is the basis for ~KB workspace checkpoints over GB files.
+    pub fn snapshot(&self) -> Quire {
+        Quire {
+            name: self.name.clone(),
+            original: Arc::clone(&self.original),
+            add: Arc::clone(&self.add),
+            root: Arc::clone(&self.root),
+            point: self.point,
+            mark: self.mark,
+            narrowing: self.narrowing,
+            last_match: self.last_match.clone(),
+            text_cache: RefCell::new(None),
+        }
+    }
+
     /// Bytes of the backing store a piece points into.
     fn backing(&self, source: Source) -> &[u8] {
         match source {
@@ -1299,6 +1318,76 @@ mod tests {
             Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- snapshots: cheap + independent (the persistent-tree payoff) ----
+
+    #[test]
+    fn snapshot_is_independent_of_later_edits() {
+        let mut q = Quire::from_string("t", "hello world");
+        let snap = q.snapshot();
+        // Mutate the original after snapshotting.
+        let pmax = TextStore::point_max(&q);
+        TextStore::goto_char(&mut q, pmax);
+        TextStore::insert(&mut q, "!!!");
+        TextStore::goto_char(&mut q, 1);
+        TextStore::delete_region(&mut q, 1, 6); // drop "hello"
+        // The snapshot still reads the original document.
+        assert_eq!(TextStore::text(&snap), "hello world");
+        assert_eq!(TextStore::text(&q), " world!!!");
+    }
+
+    #[test]
+    fn editing_snapshot_does_not_disturb_original() {
+        let mut q = Quire::from_string("t", "alpha beta");
+        let mut snap = q.snapshot();
+        // Mutate the snapshot; the original is untouched.
+        TextStore::goto_char(&mut snap, 1);
+        TextStore::insert(&mut snap, ">>");
+        assert_eq!(TextStore::text(&snap), ">>alpha beta");
+        assert_eq!(TextStore::text(&q), "alpha beta");
+        // And the original can still be edited independently afterwards.
+        let pmax = TextStore::point_max(&q);
+        TextStore::goto_char(&mut q, pmax);
+        TextStore::insert(&mut q, "!");
+        assert_eq!(TextStore::text(&q), "alpha beta!");
+        assert_eq!(TextStore::text(&snap), ">>alpha beta");
+    }
+
+    #[test]
+    fn snapshot_shares_backings_and_spine_without_deep_copy() {
+        let mut q = Quire::from_string("t", "shared original text");
+        // Edit so there is a non-trivial add buffer and tree to share.
+        TextStore::goto_char(&mut q, 7);
+        TextStore::insert(&mut q, "INSERTED ");
+        let orig_ptr = Arc::as_ptr(&q.original);
+        let add_ptr = Arc::as_ptr(&q.add);
+        let root_ptr = Arc::as_ptr(&q.root);
+        let snap = q.snapshot();
+        // Snapshot points at the very same backing + spine allocations.
+        assert_eq!(Arc::as_ptr(&snap.original), orig_ptr, "original not shared");
+        assert_eq!(Arc::as_ptr(&snap.add), add_ptr, "add buffer not shared");
+        assert_eq!(Arc::as_ptr(&snap.root), root_ptr, "tree spine not shared");
+        // All three backings are now multiply-owned (proof: no deep copy).
+        assert!(Arc::strong_count(&q.original) >= 2);
+        assert!(Arc::strong_count(&q.add) >= 2);
+        assert!(Arc::strong_count(&q.root) >= 2);
+    }
+
+    #[test]
+    fn snapshot_chain_each_independent() {
+        // A sequence of snapshots, each edited, all observable independently —
+        // the workspace-checkpoint pattern.
+        let mut q = Quire::from_string("t", "v0");
+        let s0 = q.snapshot();
+        let pmax = TextStore::point_max(&q);
+        TextStore::goto_char(&mut q, pmax);
+        TextStore::insert(&mut q, "-v1");
+        let s1 = q.snapshot();
+        TextStore::insert(&mut q, "-v2");
+        assert_eq!(TextStore::text(&s0), "v0");
+        assert_eq!(TextStore::text(&s1), "v0-v1");
+        assert_eq!(TextStore::text(&q), "v0-v1-v2");
     }
 
     // ---- the key deliverable: a seeded differential test vs the Buffer oracle ----
