@@ -104,7 +104,8 @@ fn handle_line(line: &str, sessions: &Mutex<HashMap<String, Workspace>>) -> Valu
     };
     match op {
         "open" => op_open(&req, sessions),
-        "run" => op_run(&req, sessions),
+        "run" => op_run(&req, sessions, false),
+        "rehearse" => op_run(&req, sessions, true),
         "status" => op_status(sessions),
         "save" => op_save(&req, sessions),
         "close" => op_close(&req, sessions),
@@ -159,8 +160,10 @@ fn op_open(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
 }
 
 /// `{"op":"run","session":"S","program":"..."}` — eval against the warm
-/// workspace and return the per-program `RunReport`.
-fn op_run(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
+/// workspace and return the per-program `RunReport`. With `rehearse = true`
+/// (the `rehearse` op) the program is dry-run and rolled back, so the report
+/// shows what *would* happen but nothing persists.
+fn op_run(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>, rehearse: bool) -> Value {
     let session = match str_field(req, "session") {
         Ok(s) => s,
         Err(e) => return e,
@@ -175,13 +178,20 @@ fn op_run(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
     };
     // TODO: resource limits (needs tulisp eval interruption) — a per-program
     // wall-clock/CPU bound can't be enforced until tulisp eval is cancellable.
-    match ws.run(&program) {
+    let result = if rehearse {
+        ws.rehearse(&program)
+    } else {
+        ws.run(&program)
+    };
+    match result {
         Ok(report) => {
+            // A rehearsal persists nothing, so it is reported as a non-mutating
+            // event (dirty=false) regardless of the hypothetical edit.
             mime_rs::safety::audit(
                 "mimed",
                 &session,
                 &program,
-                report.dirty,
+                report.dirty && !rehearse,
                 report.len_before,
                 report.len_after,
             );

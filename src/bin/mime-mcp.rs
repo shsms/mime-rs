@@ -153,7 +153,8 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
     let outcome: Result<String, String> = match name {
         "open_file" => tool_open_file(&args, sessions),
         "open_text" => tool_open_text(&args, sessions),
-        "run_program" => tool_run_program(&args, sessions),
+        "run_program" => tool_run_program(&args, sessions, false),
+        "rehearse" => tool_run_program(&args, sessions, true),
         "read_region" => tool_read_region(&args, sessions),
         "view" => tool_view(&args, sessions),
         "insert_text" => tool_insert_text(&args, sessions),
@@ -215,16 +216,33 @@ fn make_workspace(store: Box<dyn TextStore>, read_only: bool) -> Workspace {
 }
 
 /// Run a program against an existing session and return the resulting
-/// `RunReport`; an engine error becomes `Err(message)`.
+/// `RunReport`; an engine error becomes `Err(message)`. The internal tools that
+/// build on this (read_region, view, search, …) only read, so they always
+/// `run`; see [`run_or_rehearse`] for the user-facing rehearse path.
 fn run_in_session(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
     program: &str,
 ) -> Result<mime_rs::RunReport, String> {
+    run_or_rehearse(sessions, session, program, false)
+}
+
+/// Like [`run_in_session`], but `rehearse` selects a dry-run that rolls the
+/// session back afterwards (the `rehearse` tool) instead of a persisting `run`.
+fn run_or_rehearse(
+    sessions: &mut HashMap<String, Workspace>,
+    session: &str,
+    program: &str,
+    rehearse: bool,
+) -> Result<mime_rs::RunReport, String> {
     let ws = sessions
         .get_mut(session)
         .ok_or_else(|| format!("no such session: {session} (open_file/open_text first)"))?;
-    ws.run(program)
+    if rehearse {
+        ws.rehearse(program)
+    } else {
+        ws.run(program)
+    }
 }
 
 /// Pull the value a `(report KEY ...)` recorded, by key.
@@ -289,20 +307,28 @@ fn tool_open_text(
 
 /// `run_program {program, session?}` — the core tool. Evaluate a tulisp edit
 /// program against the warm session and return the full `RunReport` JSON.
+///
+/// With `rehearse = true` (the `rehearse` tool) the program is dry-run: the same
+/// `RunReport` comes back (diff/reports/len of the hypothetical edit, with
+/// `rehearsed: true`), but the buffer — and the kill-ring/checkpoints — are
+/// rolled back, so nothing persists. The two share one body since they differ
+/// only in whether the effects stick.
 fn tool_run_program(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
+    rehearse: bool,
 ) -> Result<String, String> {
     let session = session_arg(args);
     let program = str_arg(args, "program")?;
     // TODO: resource limits (needs tulisp eval interruption) — a per-program
     // wall-clock/CPU bound can't be enforced until tulisp eval is cancellable.
-    let report = run_in_session(sessions, &session, &program)?;
+    let report = run_or_rehearse(sessions, &session, &program, rehearse)?;
+    // A rehearsal persists nothing, so it audits as a non-mutating event.
     mime_rs::safety::audit(
         "mime-mcp",
         &session,
         &program,
-        report.dirty,
+        report.dirty && !rehearse,
         report.len_before,
         report.len_after,
     );
@@ -550,6 +576,18 @@ fn tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "program": { "type": "string", "description": "Emacs-Lisp program, e.g. (while (re-search-forward \"foo\" nil t) (replace-match \"bar\"))." },
+                    "session": session,
+                },
+                "required": ["program"],
+            },
+        }),
+        json!({
+            "name": "rehearse",
+            "description": "Dry-run an Emacs-Lisp (tulisp) edit program and return the same RunReport run_program would (unified diff, length before/after, reports), showing what WOULD happen — then roll the session back so nothing persists: the buffer, point/mark/narrowing, kill-ring, and checkpoints are all left exactly as before (the report carries rehearsed=true). The 'try before you commit' preview; follow up with run_program to actually apply it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "program": { "type": "string", "description": "Emacs-Lisp program to rehearse (run then roll back)." },
                     "session": session,
                 },
                 "required": ["program"],

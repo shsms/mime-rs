@@ -12,6 +12,11 @@ pub struct RunReport {
     pub len_after: usize,
     pub reports: Vec<(String, String)>,
     pub log: Vec<String>,
+    /// True when this report came from a *rehearsal* — the program ran and the
+    /// diff/reports below describe what *would* have happened, but the live
+    /// buffer (and kill-ring/checkpoints) were rolled back, so nothing persisted.
+    /// `false` for a normal `run`.
+    pub rehearsed: bool,
     /// Final buffer text — not serialized into the JSON; used by `--write`.
     pub final_text: String,
 }
@@ -27,6 +32,7 @@ impl RunReport {
             "ok": true,
             "buffer": self.buffer_name,
             "dirty": self.dirty,
+            "rehearsed": self.rehearsed,
             "point": self.point,
             "len_before": self.len_before,
             "len_after": self.len_after,

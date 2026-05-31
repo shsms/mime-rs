@@ -141,6 +141,7 @@ fn full_session_round_trip_over_stdio() {
         "open_file",
         "open_text",
         "run_program",
+        "rehearse",
         "read_region",
         "search",
         "checkpoint",
@@ -220,6 +221,48 @@ fn full_session_round_trip_over_stdio() {
     assert_eq!(confirm["reports"]["text"], "\"hello mime\"");
     assert_eq!(confirm["dirty"], false);
     assert_eq!(confirm["len_after"], 10);
+}
+
+#[test]
+fn rehearse_previews_an_edit_then_rolls_back_over_stdio() {
+    let mut s = Server::spawn();
+    s.request(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }));
+    s.call_ok(2, "open_text", json!({ "text": "hello world" }));
+
+    // rehearse the same replace the run_program round-trip does — but it must
+    // NOT stick.
+    let report_text = s.call_ok(
+        3,
+        "rehearse",
+        json!({ "program": r#"(while (re-search-forward "world" nil t) (replace-match "mime")) (report "done" 1)"# }),
+    );
+    let report: Value = serde_json::from_str(&report_text).expect("RunReport is JSON");
+    // The report shows the hypothetical edit, flagged as a rehearsal.
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["rehearsed"], true);
+    assert_eq!(report["dirty"], true);
+    assert!(
+        report["diff"].as_str().unwrap().contains("+hello mime"),
+        "diff was: {}",
+        report["diff"]
+    );
+    assert_eq!(report["reports"]["done"], "1");
+
+    // But the live buffer is untouched: a follow-up read still sees "hello world".
+    let region = s.call_ok(4, "read_region", json!({ "start": 1, "end": 12 }));
+    assert_eq!(region, "hello world");
+
+    // And a real run_program afterwards persists normally, proving rehearse left
+    // the session fully usable.
+    let applied = s.call_ok(
+        5,
+        "run_program",
+        json!({ "program": r#"(while (re-search-forward "world" nil t) (replace-match "mime"))"# }),
+    );
+    let applied: Value = serde_json::from_str(&applied).unwrap();
+    assert_eq!(applied["rehearsed"], false);
+    let confirm = s.call_ok(6, "read_region", json!({ "start": 1, "end": 11 }));
+    assert_eq!(confirm, "hello mime");
 }
 
 #[test]
