@@ -523,9 +523,9 @@ counts) and gives an immediate real-world acceptance test.
 
 * Roadmap / milestones
 
-/Status: M0 ✓, M1 first cut ✓ (B-tree upgrade in progress), M2 partly ✓ (checkpoints
-+ transactions; cheap snapshots & dry-run pending). 46 tests, clippy clean; M3–M8 not
-started./
+/Status: M0 ✓, M1 ✓ (persistent measured B-tree, O(log n) seeks, O(1) snapshots), M2
+partly ✓ (checkpoints + transactions; wiring cheap snapshots into checkpoints + dry-run
+pending). 51 tests, clippy clean; M3–M8 not started./
 
 ** DONE M0 — Editor core + tulisp API (replace a mime batch) [#A]
    In-memory ~TextStore~ (bring-up + differential-test *oracle* only — not the real
@@ -545,8 +545,9 @@ started./
    multi-GB file at flat memory; oracle and piece tree agree under property tests./
    /Done: first cut is a piece-table (~Vec<Piece>~ over the mmapped original + add
    buffer), all 30 ~TextStore~ methods, differential-tested ~24k random ops vs the
-   oracle. The ~Vec~ → persistent measured B-tree upgrade (cheap snapshots/anchors) is
-   in progress (subagent)./
+   oracle. The ~Vec~ → persistent measured B-tree upgrade is *done*: ~Arc~-node
+   persistent tree, O(log n) seeks via ~{bytes,chars,lines}~ summaries, and
+   ~Quire::snapshot~ in O(1) with shared backings — the basis for ~KB checkpoints./
 ** TODO M2 — Checkpoints, transactions, dry-run [#A] (partly done)
    Workspace COW snapshots (clone the piece-tree spine, ~KB); checkpoint tree;
    auto-transaction per program; ~with-transaction~; ~rehearse~; ~checkpoint-diff~.

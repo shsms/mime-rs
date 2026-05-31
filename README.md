@@ -14,12 +14,12 @@ and roadmap.
 ## Status
 
 Early. **M0** (the editor core) and a first cut of **M2** (checkpoints /
-transactions) work end to end; 45 tests, `clippy` clean.
+transactions) work end to end; 51 tests, `clippy` clean.
 
 - **`TextStore`** trait with two implementations: an in-memory `Buffer` (the
-  differential-test oracle) and **`Quire`**, a piece-table store over an
-  *mmapped* original + append-only add buffer (so multi-GB files never go fully
-  resident).
+  differential-test oracle) and **`Quire`**, a persistent measured-B-tree piece store
+  over an *mmapped* original + append-only add buffer (so multi-GB files never go
+  fully resident; O(log n) seeks, O(1) structural-sharing snapshots).
 - ~60 Emacs-Lisp editor primitives + a `regex`-backed string library, all on the
   [`tulisp`](../tulisp) interpreter.
 - `checkpoint` / `restore-checkpoint` / `with-transaction` — workspace snapshots
@@ -79,7 +79,7 @@ cargo test
 
 - `src/store.rs` — the `TextStore` trait (the buffer seam).
 - `src/buffer.rs` — in-memory `Buffer` (oracle).
-- `src/quire.rs` — `Quire`, the mmap-backed piece-table store.
+- `src/quire.rs` — `Quire`, the mmap-backed persistent-B-tree piece store.
 - `src/builtins.rs` — editor primitives registered on a `tulisp` context.
 - `src/strings.rs` — the RE2-backed string library.
 - `src/engine.rs` — `run_program`, the session, checkpoints.
