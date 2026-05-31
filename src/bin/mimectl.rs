@@ -39,17 +39,25 @@ fn main() {
     };
 
     let program = read_or_die(&prog_path, "program");
-    let (name, text) = match &file_path {
-        Some(f) => (f.clone(), read_or_die(f, "file")),
+
+    // A file is opened through Quire — the mmap-backed piece-table store (the
+    // production path, GB-capable); stdin uses the in-memory Buffer.
+    let store: Box<dyn mime_rs::TextStore> = match &file_path {
+        Some(f) => match mime_rs::Quire::open(std::path::Path::new(f)) {
+            Ok(q) => Box::new(q),
+            Err(e) => {
+                eprintln!("cannot open file {f}: {e}");
+                exit(2);
+            }
+        },
         None => {
             let mut s = String::new();
             std::io::stdin().read_to_string(&mut s).ok();
-            ("*stdin*".to_string(), s)
+            Box::new(mime_rs::Buffer::from_string("*stdin*", s))
         }
     };
 
-    let buffer = mime_rs::Buffer::from_string(name, text);
-    match mime_rs::run_program(Box::new(buffer), &program) {
+    match mime_rs::run_program(store, &program) {
         Ok(report) => {
             println!(
                 "{}",
