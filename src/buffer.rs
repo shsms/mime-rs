@@ -296,6 +296,9 @@ impl crate::store::TextStore for Buffer {
     fn last_match(&self) -> Option<&MatchData> {
         self.last_match.as_ref()
     }
+    fn snapshot(&self) -> Box<dyn crate::store::TextStore> {
+        Box::new(self.clone())
+    }
     fn text(&self) -> &str {
         Buffer::text(self)
     }

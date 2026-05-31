@@ -6,6 +6,9 @@ pub trait TextStore {
     fn name(&self) -> &str;
     /// The most recent search's match data (whole-match span + group texts).
     fn last_match(&self) -> Option<&crate::buffer::MatchData>;
+    /// A cheap, independent copy of this store (structural sharing for Quire,
+    /// a full clone for the in-memory Buffer). Backs checkpoints/transactions.
+    fn snapshot(&self) -> Box<dyn TextStore>;
     fn text(&self) -> &str;
     fn char_len(&self) -> usize;
 

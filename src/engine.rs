@@ -11,34 +11,24 @@ use tulisp::TulispContext;
 /// State shared between a running program and the editor builtins. The editor
 /// primitives close over an `Rc<RefCell<Session>>` (tulisp is single-threaded,
 /// so interior mutability via `RefCell` is sound for these leaf operations).
-/// A saved workspace snapshot. M0 stores the full text; the persistent B-tree
-/// (Quire upgrade) will make these ~KB via structural sharing.
-#[derive(Clone)]
+/// A saved workspace snapshot, backed by `TextStore::snapshot` — O(1)/O(log n)
+/// and ~KB for Quire (structural sharing); a full clone for the in-memory Buffer.
 pub struct Checkpoint {
     pub label: String,
-    text: String,
-    point: usize,
-    mark: Option<usize>,
-    narrowing: Option<(usize, usize)>,
+    snap: Box<dyn TextStore>,
 }
 
 impl Checkpoint {
     pub fn capture(label: String, store: &dyn TextStore) -> Self {
         Checkpoint {
             label,
-            text: store.text().to_string(),
-            point: store.point(),
-            mark: store.mark(),
-            narrowing: store.narrowing(),
+            snap: store.snapshot(),
         }
     }
-    /// Rebuild a store from this checkpoint (M0: an in-memory Buffer).
-    pub fn restore(&self, name: &str) -> Box<dyn TextStore> {
-        let mut b = crate::buffer::Buffer::from_string(name, self.text.clone());
-        b.set_restriction(self.narrowing);
-        b.goto_char(self.point);
-        b.set_mark_opt(self.mark);
-        Box::new(b)
+    /// A fresh, independent store restored from this checkpoint; the checkpoint
+    /// stays reusable.
+    pub fn restore(&self) -> Box<dyn TextStore> {
+        self.snap.snapshot()
     }
 }
 

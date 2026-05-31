@@ -715,13 +715,11 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defspecial("with-transaction", move |ctx, args| {
             let snapshot = {
                 let sess = s.borrow();
-                Checkpoint::capture(String::new(), &*sess.buffer)
+                sess.buffer.snapshot()
             };
             let res = ctx.eval_progn(args);
             if res.is_err() {
-                let mut sess = s.borrow_mut();
-                let name = sess.buffer.name().to_string();
-                sess.buffer = snapshot.restore(&name);
+                s.borrow_mut().buffer = snapshot;
             }
             res
         });
@@ -827,16 +825,15 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             "restore-checkpoint",
             move |label: String| -> Result<TulispObject, Error> {
                 let mut sess = s.borrow_mut();
-                let cp = sess
+                let restored = sess
                     .checkpoints
                     .iter()
                     .rev()
                     .find(|c| c.label == label)
-                    .cloned();
-                match cp {
-                    Some(c) => {
-                        let name = sess.buffer.name().to_string();
-                        sess.buffer = c.restore(&name);
+                    .map(|c| c.restore());
+                match restored {
+                    Some(store) => {
+                        sess.buffer = store;
                         Ok(TulispObject::t())
                     }
                     None => Err(err(&format!("No checkpoint named {label}"))),

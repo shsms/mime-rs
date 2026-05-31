@@ -1112,6 +1112,9 @@ impl TextStore for Quire {
     fn last_match(&self) -> Option<&MatchData> {
         self.last_match.as_ref()
     }
+    fn snapshot(&self) -> Box<dyn TextStore> {
+        Box::new(Quire::snapshot(self))
+    }
     fn text(&self) -> &str {
         self.full_text()
     }
