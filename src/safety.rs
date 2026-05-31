@@ -1,10 +1,13 @@
-//! Path allowlisting — the M5 "safer than shell" seam.
+//! Path allowlisting + an append-only audit journal — the M5 "safer than shell"
+//! seam.
 //!
 //! mime-rs exposes no shell, no process spawn, and no network; the only ambient
 //! authority it has is the filesystem, through the two buffer-file call sites
 //! (`open_file` / `save_buffer`). [`check_path`] is the chokepoint that confines
 //! those to a set of allowed roots so an autonomous agent cannot read or write
-//! outside the workspace it was granted.
+//! outside the workspace it was granted. [`audit`] records one JSON line per
+//! program run when `$MIME_AUDIT` names a log file, giving the "what did the
+//! agent change, and why" replay trail.
 use std::path::{Path, PathBuf};
 
 /// The allowed filesystem roots: the colon-separated absolute paths in
@@ -92,6 +95,58 @@ fn canonicalize_target(path: &Path) -> Result<PathBuf, String> {
         },
         _ => Err(format!("cannot resolve path {}", path.display())),
     }
+}
+
+/// One audit record, appended as a single JSON line to `$MIME_AUDIT` per
+/// program run. Best-effort: a log failure is reported on stderr but never
+/// fails the run (the edit already happened; losing the journal line must not
+/// look like the edit failed).
+///
+/// `client` distinguishes the daemon from the MCP server; `session` and
+/// `program` identify the run; `dirty`/`len_before`/`len_after` summarize its
+/// effect so the journal is useful without re-reading the buffer.
+pub fn audit(
+    client: &str,
+    session: &str,
+    program: &str,
+    dirty: bool,
+    len_before: usize,
+    len_after: usize,
+) {
+    let Some(path) = std::env::var_os("MIME_AUDIT") else {
+        return;
+    };
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = serde_json::json!({
+        "time": time,
+        "client": client,
+        "session": session,
+        "program": program,
+        "dirty": dirty,
+        "len_before": len_before,
+        "len_after": len_after,
+    });
+    if let Err(e) = append_line(Path::new(&path), &line.to_string()) {
+        eprintln!(
+            "mime-rs: audit log write to {} failed: {e}",
+            path.to_string_lossy()
+        );
+    }
+}
+
+/// Append one line (plus a trailing newline) to the audit file, creating it if
+/// absent. Opened in append mode every call — simple and robust to the file
+/// being rotated underneath us; this is not a hot path.
+fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(f, "{line}")
 }
 
 #[cfg(test)]

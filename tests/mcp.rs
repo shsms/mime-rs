@@ -357,3 +357,78 @@ fn save_buffer_writes_inside_root() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn read_only_session_rejects_mutation_over_stdio() {
+    let mut s = Server::spawn();
+    s.request(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }));
+
+    // Attach reference material unwritable.
+    let opened = s.call_ok(
+        2,
+        "open_text",
+        json!({ "text": "reference", "read_only": true }),
+    );
+    assert!(opened.contains("read-only"), "open_text said: {opened}");
+
+    // A mutating program is rejected as a tool-level error...
+    let err = s.call_err(
+        3,
+        "run_program",
+        json!({ "program": r#"(goto-char (point-max)) (insert "!")"# }),
+    );
+    assert!(err.contains("read-only"), "run_program error was: {err}");
+
+    // ...and the buffer is untouched (a read-only report still works).
+    let region = s.call_ok(4, "read_region", json!({ "start": 1, "end": 10 }));
+    assert_eq!(region, "reference");
+}
+
+#[test]
+fn audit_journal_records_one_line_per_run() {
+    // With MIME_AUDIT set, each run_program appends one JSON line.
+    let root = temp_dir("audit");
+    let log = root.join("audit.jsonl");
+    let mut s = Server::spawn_with_env(&[
+        ("MIME_ROOTS", root.as_path()),
+        ("MIME_AUDIT", log.as_path()),
+    ]);
+    s.request(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }));
+
+    s.call_ok(
+        2,
+        "open_text",
+        json!({ "text": "abc", "session": "audited" }),
+    );
+    s.call_ok(
+        3,
+        "run_program",
+        json!({ "program": r#"(goto-char (point-max)) (insert "d")"#, "session": "audited" }),
+    );
+    s.call_ok(
+        4,
+        "run_program",
+        json!({ "program": r#"(goto-char (point-min))"#, "session": "audited" }),
+    );
+
+    let contents = std::fs::read_to_string(&log).expect("audit log exists");
+    let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 2, "expected one line per run, got: {contents}");
+
+    let first: Value = serde_json::from_str(lines[0]).expect("audit line is JSON");
+    assert_eq!(first["session"], "audited");
+    assert_eq!(first["dirty"], true);
+    assert_eq!(first["len_before"], 3);
+    assert_eq!(first["len_after"], 4);
+    assert!(
+        first["time"].as_u64().is_some(),
+        "time should be a unix secs int"
+    );
+    assert!(first["program"].as_str().unwrap().contains("insert"));
+
+    // The second run was a pure navigation — not dirty.
+    let second: Value = serde_json::from_str(lines[1]).expect("audit line is JSON");
+    assert_eq!(second["dirty"], false);
+
+    let _ = std::fs::remove_dir_all(&root);
+}

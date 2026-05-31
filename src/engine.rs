@@ -58,12 +58,26 @@ pub type SharedSession = Rc<RefCell<Session>>;
 pub struct Workspace {
     ctx: TulispContext,
     session: SharedSession,
+    /// Read-only sessions reject any program that would change the buffer (the
+    /// "reference material attached unwritable" case). The edit is rolled back
+    /// from a pre-run snapshot and `run` returns an error instead of a report.
+    read_only: bool,
 }
 
 impl Workspace {
     /// Build the session + context and register the editor builtins and string
     /// library ONCE. Subsequent `run` calls reuse them — the warm path.
     pub fn new(buffer: Box<dyn TextStore>) -> Workspace {
+        Workspace::with_mode(buffer, false)
+    }
+
+    /// A read-only workspace: programs may navigate, search, and `report`, but
+    /// any program that leaves the buffer modified is rolled back and rejected.
+    pub fn new_read_only(buffer: Box<dyn TextStore>) -> Workspace {
+        Workspace::with_mode(buffer, true)
+    }
+
+    fn with_mode(buffer: Box<dyn TextStore>, read_only: bool) -> Workspace {
         let session: SharedSession = Rc::new(RefCell::new(Session {
             buffer,
             checkpoints: Vec::new(),
@@ -76,7 +90,16 @@ impl Workspace {
         crate::builtins::register(&mut ctx, &session);
         crate::strings::register(&mut ctx);
 
-        Workspace { ctx, session }
+        Workspace {
+            ctx,
+            session,
+            read_only,
+        }
+    }
+
+    /// Whether this session refuses buffer mutations.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Evaluate `program` against the warm state and return a per-program
@@ -92,10 +115,25 @@ impl Workspace {
             (s.buffer.text().to_string(), s.buffer.name().to_string())
         };
         let len_before = before.chars().count();
+        // For a read-only session, keep a cheap pre-run snapshot (structural
+        // sharing for Quire) so a mutating program can be rolled back.
+        let guard = self
+            .read_only
+            .then(|| self.session.borrow().buffer.snapshot());
 
         self.ctx
             .eval_string(program)
             .map_err(|e| e.format(&self.ctx))?;
+
+        // Enforce read-only after the fact: if the program left the buffer
+        // changed, restore the snapshot and reject it. (Programs that only
+        // navigate/search/report are unaffected.)
+        if let Some(snap) = guard
+            && self.session.borrow().buffer.text() != before
+        {
+            self.session.borrow_mut().buffer = snap;
+            return Err("session is read-only: program modified the buffer".to_string());
+        }
 
         let s = self.session.borrow();
         let after = s.buffer.text().to_string();
@@ -133,6 +171,30 @@ mod tests {
 
     fn run(text: &str, program: &str) -> RunReport {
         run_program(Box::new(Buffer::from_string("t", text)), program).expect("program should run")
+    }
+
+    #[test]
+    fn read_only_rejects_mutation_and_preserves_buffer() {
+        let mut ws = Workspace::new_read_only(Box::new(Buffer::from_string("ref", "keep me")));
+        assert!(ws.is_read_only());
+        // A mutating program is rejected...
+        match ws.run(r#"(goto-char (point-max)) (insert " EDITED")"#) {
+            Err(e) => assert!(e.contains("read-only"), "got: {e}"),
+            Ok(_) => panic!("read-only session should reject a mutating program"),
+        }
+        // ...and the buffer is rolled back to its original text.
+        assert_eq!(ws.text(), "keep me");
+    }
+
+    #[test]
+    fn read_only_allows_navigation_and_report() {
+        let mut ws = Workspace::new_read_only(Box::new(Buffer::from_string("ref", "hello world")));
+        // Pure navigation/search/report does not mutate, so it is permitted.
+        let r = ws
+            .run(r#"(goto-char 1) (report "found" (if (search-forward "world" nil t) 1 0))"#)
+            .expect("read-only allows non-mutating programs");
+        assert!(!r.dirty);
+        assert_eq!(r.reports, vec![("found".to_string(), "1".to_string())]);
     }
 
     #[test]

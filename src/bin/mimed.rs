@@ -114,7 +114,9 @@ fn handle_line(line: &str, sessions: &Mutex<HashMap<String, Workspace>>) -> Valu
 }
 
 /// `{"op":"open","session":"S","file":"PATH"}` or `{"op":"open","session":"S","text":"..."}`
-/// — create or replace session `S` with a fresh warm workspace.
+/// — create or replace session `S` with a fresh warm workspace. An optional
+/// `"read_only": true` attaches the buffer unwritable (mutating programs are
+/// rejected).
 fn op_open(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
     let session = match str_field(req, "session") {
         Ok(s) => s,
@@ -143,11 +145,17 @@ fn op_open(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
         (None, None) => return err("open requires \"file\" or \"text\""),
     };
     let name = store.name().to_string();
-    sessions
-        .lock()
-        .unwrap()
-        .insert(session.clone(), Workspace::new(store));
-    json!({ "ok": true, "session": session, "buffer": name })
+    let read_only = req
+        .get("read_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let workspace = if read_only {
+        Workspace::new_read_only(store)
+    } else {
+        Workspace::new(store)
+    };
+    sessions.lock().unwrap().insert(session.clone(), workspace);
+    json!({ "ok": true, "session": session, "buffer": name, "read_only": read_only })
 }
 
 /// `{"op":"run","session":"S","program":"..."}` — eval against the warm
@@ -165,8 +173,20 @@ fn op_run(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
     let Some(ws) = map.get_mut(&session) else {
         return err(&format!("no such session: {session}"));
     };
+    // TODO: resource limits (needs tulisp eval interruption) — a per-program
+    // wall-clock/CPU bound can't be enforced until tulisp eval is cancellable.
     match ws.run(&program) {
-        Ok(report) => report.to_json(),
+        Ok(report) => {
+            mime_rs::safety::audit(
+                "mimed",
+                &session,
+                &program,
+                report.dirty,
+                report.len_before,
+                report.len_after,
+            );
+            report.to_json()
+        }
         Err(e) => json!({ "ok": false, "error": e }),
     }
 }

@@ -198,6 +198,20 @@ fn int_arg(args: &Value, key: &str) -> Result<i64, String> {
         .ok_or_else(|| format!("missing or non-integer argument \"{key}\""))
 }
 
+/// An optional boolean argument, defaulting to `false` when absent or non-bool.
+fn bool_arg(args: &Value, key: &str) -> bool {
+    args.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Build a warm [`Workspace`], read-only when requested.
+fn make_workspace(store: Box<dyn TextStore>, read_only: bool) -> Workspace {
+    if read_only {
+        Workspace::new_read_only(store)
+    } else {
+        Workspace::new(store)
+    }
+}
+
 /// Run a program against an existing session and return the resulting
 /// `RunReport`; an engine error becomes `Err(message)`.
 fn run_in_session(
@@ -237,13 +251,15 @@ fn tool_open_file(
 ) -> Result<String, String> {
     let session = session_arg(args);
     let path = str_arg(args, "path")?;
+    let read_only = bool_arg(args, "read_only");
     let checked = mime_rs::safety::check_path(Path::new(&path))?;
     let quire = Quire::open(&checked).map_err(|e| format!("cannot open file {path}: {e}"))?;
     let name = quire.name().to_string();
     let len = quire.char_len();
-    sessions.insert(session.clone(), Workspace::new(Box::new(quire)));
+    sessions.insert(session.clone(), make_workspace(Box::new(quire), read_only));
     Ok(format!(
-        "opened file {path} as buffer \"{name}\" ({len} chars) in session \"{session}\""
+        "opened file {path} as buffer \"{name}\" ({len} chars{mode}) in session \"{session}\"",
+        mode = if read_only { ", read-only" } else { "" }
     ))
 }
 
@@ -254,6 +270,7 @@ fn tool_open_text(
 ) -> Result<String, String> {
     let session = session_arg(args);
     let text = str_arg(args, "text")?;
+    let read_only = bool_arg(args, "read_only");
     let name = args
         .get("name")
         .and_then(Value::as_str)
@@ -261,9 +278,10 @@ fn tool_open_text(
         .to_string();
     let buffer = Buffer::from_string(name.clone(), text.clone());
     let len = text.chars().count();
-    sessions.insert(session.clone(), Workspace::new(Box::new(buffer)));
+    sessions.insert(session.clone(), make_workspace(Box::new(buffer), read_only));
     Ok(format!(
-        "opened in-memory buffer \"{name}\" ({len} chars) in session \"{session}\""
+        "opened in-memory buffer \"{name}\" ({len} chars{mode}) in session \"{session}\"",
+        mode = if read_only { ", read-only" } else { "" }
     ))
 }
 
@@ -275,7 +293,17 @@ fn tool_run_program(
 ) -> Result<String, String> {
     let session = session_arg(args);
     let program = str_arg(args, "program")?;
+    // TODO: resource limits (needs tulisp eval interruption) — a per-program
+    // wall-clock/CPU bound can't be enforced until tulisp eval is cancellable.
     let report = run_in_session(sessions, &session, &program)?;
+    mime_rs::safety::audit(
+        "mime-mcp",
+        &session,
+        &program,
+        report.dirty,
+        report.len_before,
+        report.len_after,
+    );
     Ok(pretty(&report.to_json()))
 }
 
@@ -438,6 +466,7 @@ fn tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Filesystem path to open." },
+                    "read_only": { "type": "boolean", "description": "Attach the buffer unwritable; mutating programs are rejected. Default false." },
                     "session": session,
                 },
                 "required": ["path"],
@@ -451,6 +480,7 @@ fn tool_schemas() -> Vec<Value> {
                 "properties": {
                     "text": { "type": "string", "description": "Initial buffer contents." },
                     "name": { "type": "string", "description": "Optional buffer name." },
+                    "read_only": { "type": "boolean", "description": "Attach the buffer unwritable; mutating programs are rejected. Default false." },
                     "session": session,
                 },
                 "required": ["text"],
