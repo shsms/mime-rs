@@ -680,6 +680,12 @@ Findings from editing mime-rs *through mime-rs* (the agent's-eye view); appended
   instrument for "add an arm to this match" / "add a field to this struct", so I used a
   plain editor for those. This is the argument for AST-aware ops (M7 tree-sitter):
   mime-rs shines at prose and find/replace transforms, less so at structural code.
+- MCP path is live: ~open_file → search/view → insert_text/run_program → save_buffer~ as
+  native tools — this very bullet was written through ~insert_text~ (no Lisp/JSON escaping).
+  Onboarding friction: ~claude mcp add~ defaults to *local* scope bound to the cwd's project,
+  so registering from ~/vagrant/mime-rs~ hid the server from the ~/vagrant~ session and the
+  first resume saw no tools; ~-s user~ (or adding from the session root) fixes it. An agent
+  can't self-register reliably without knowing this — the installer should pick scope on purpose.
 
 * Open questions & risks (decide deliberately)
 1. *Why not ~emacsclient~ + elisp?* It already has buffers/markers/narrowing/regexp
