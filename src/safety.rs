@@ -92,6 +92,43 @@ pub fn check_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Write `contents` to `path` atomically: write a sibling temp file, fsync it,
+/// then rename it over `path`. This NEVER mutates `path`'s bytes in place —
+/// essential because a `Quire` may have `path` mmapped as its immutable original,
+/// so an in-place overwrite would change those bytes under the live piece tree and
+/// later reads through the mmap would return shifted garbage. The rename leaves the
+/// old inode (and any mapping of it) intact while swapping the directory entry to
+/// the new content; it is also crash-atomic (a reader sees the whole old file or
+/// the whole new one). `path` should already be vetted by [`check_path`].
+pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "buffer".to_string());
+    let tmp = dir.join(format!(".{stem}.tmp.{}", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    // Match the destination's permissions when it already exists.
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 /// Canonicalize `path` whether or not it exists yet. An existing path is
 /// canonicalized directly; for a missing one we canonicalize the parent (which
 /// must exist) and re-attach the file name, so a new file under a real,
@@ -331,5 +368,26 @@ mod tests {
         assert!(audit_enabled());
         unsafe { std::env::remove_var("MIME_AUDIT") };
         assert!(!audit_enabled());
+    }
+
+    #[test]
+    fn write_atomic_replaces_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("mime-wa-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("buf.txt");
+        write_atomic(&f, b"first").unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"first");
+        // Overwriting replaces the directory entry (a new inode) rather than
+        // mutating the old file's bytes in place — the property a live mmap relies on.
+        write_atomic(&f, b"second, longer contents").unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"second, longer contents");
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().contains(".tmp."))
+            .collect();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(strays.is_empty(), "left temp files behind: {strays:?}");
     }
 }
