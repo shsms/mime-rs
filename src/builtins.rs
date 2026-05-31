@@ -3,6 +3,7 @@
 //! `Session`). M0 subset: navigation, edit, regex search/replace, reporting.
 //! Subagents extend this with region/mark, kill-ring, markers, and narrowing.
 use crate::engine::{Checkpoint, SharedSession};
+use crate::syntax::Syntax;
 use tulisp::{Error, Shared, TulispContext, TulispConvertible, TulispObject, TulispValue};
 
 fn bad_regex(e: regex::Error) -> Error {
@@ -1068,5 +1069,76 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                 Ok(crate::result::unified_diff(&ta, &tb))
             },
         );
+    }
+
+    // ---- structural / AST-aware editing (M7, tree-sitter Markdown) ----
+    // Every call re-parses the buffer fresh (incremental re-parse is a TODO in
+    // syntax.rs). Node spans are reported in 1-based char positions, like the
+    // rest of the builtins.
+    {
+        let s = session.clone();
+        // (treesit-root-type) — report and return the parse-tree root kind
+        // ("document" for Markdown). Proves the buffer parses.
+        ctx.defun("treesit-root-type", move || -> String {
+            let mut sess = s.borrow_mut();
+            let kind = Syntax::parse(sess.buffer.text()).root_kind();
+            sess.reports
+                .push(("treesit-root-type".to_string(), kind.clone()));
+            kind
+        });
+    }
+    {
+        let s = session.clone();
+        // (treesit-node-at &optional POS) — the smallest NAMED node covering POS
+        // (default point). Reports its type and 1-based char start/end; returns
+        // the type string (nil if the tree is empty).
+        ctx.defun(
+            "treesit-node-at",
+            move |pos: Option<i64>| -> Result<TulispObject, Error> {
+                let mut sess = s.borrow_mut();
+                let p = pos.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
+                let node = Syntax::parse(sess.buffer.text()).named_node_at(p);
+                Ok(match node {
+                    Some(n) => {
+                        sess.reports
+                            .push(("treesit-node-type".to_string(), n.kind.clone()));
+                        sess.reports
+                            .push(("treesit-node-start".to_string(), n.start.to_string()));
+                        sess.reports
+                            .push(("treesit-node-end".to_string(), n.end.to_string()));
+                        TulispValue::from(n.kind).into_ref(None)
+                    }
+                    None => TulispObject::nil(),
+                })
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (treesit-beginning-of-defun) — move point to the start of the enclosing
+        // top-level construct (a Markdown `section`) and return the new point. If
+        // point is in no section, leave it put and return it unchanged.
+        ctx.defun("treesit-beginning-of-defun", move || -> i64 {
+            let mut sess = s.borrow_mut();
+            let p = sess.buffer.point();
+            if let Some(sec) = Syntax::parse(sess.buffer.text()).enclosing_section(p) {
+                sess.buffer.goto_char(sec.start);
+            }
+            sess.buffer.point() as i64
+        });
+    }
+    {
+        let s = session.clone();
+        // (treesit-end-of-defun) — move point to the end of the enclosing
+        // top-level construct (a Markdown `section`) and return the new point. If
+        // point is in no section, leave it put and return it unchanged.
+        ctx.defun("treesit-end-of-defun", move || -> i64 {
+            let mut sess = s.borrow_mut();
+            let p = sess.buffer.point();
+            if let Some(sec) = Syntax::parse(sess.buffer.text()).enclosing_section(p) {
+                sess.buffer.goto_char(sec.end);
+            }
+            sess.buffer.point() as i64
+        });
     }
 }

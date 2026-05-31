@@ -9,3 +9,10 @@ regex = "1.12.3"
 serde_json = "1.0.150"
 similar = "3.1.1"
 tulisp = { version = "0.28.0", path = "../tulisp", features = ["big_functions"] }
+# M7 structural editing. tree-sitter-md (Markdown) over tree-sitter-rust because
+# mime-rs edits prose/markdown/org documents, not source; it tracks the latest
+# tree-sitter (0.26) and its block tree exposes `section`/`heading` nodes — the
+# natural top-level "defun" analog for prose navigation. The `parser` feature
+# pulls in the C runtime (compiled by `cc`, needs a host C toolchain).
+tree-sitter = "0.26"
+tree-sitter-md = { version = "0.5", features = ["parser"] }

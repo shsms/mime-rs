@@ -14,6 +14,7 @@ pub mod result;
 pub mod safety;
 pub mod store;
 pub mod strings;
+pub mod syntax;
 
 pub use buffer::Buffer;
 pub use engine::{Workspace, run_program};

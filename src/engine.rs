@@ -711,4 +711,66 @@ mod tests {
         );
         assert_eq!(r.reports[0], ("p".to_string(), "18".to_string()));
     }
+
+    // A small Markdown document the M7 (tree-sitter) builtin tests parse.
+    const MD: &str = "# Title\n\nHello para.\n\n## Sub\n\nMore text here.\n";
+
+    #[test]
+    fn treesit_root_type_is_document() {
+        let r = run(MD, "(report \"root\" (treesit-root-type))");
+        // `report` stringifies the returned tulisp value, so a string return
+        // renders quoted; the builtin's own self-report (a raw key/value) does not.
+        assert_eq!(report(&r, "root"), "\"document\"");
+        assert_eq!(report(&r, "treesit-root-type"), "document");
+    }
+
+    #[test]
+    fn treesit_node_at_reports_type_and_char_span() {
+        // Point inside "Title" (char 4) → the heading's inline content,
+        // char span [3, 8).
+        let r = run(MD, "(goto-char 4) (treesit-node-at)");
+        assert_eq!(report(&r, "treesit-node-type"), "inline");
+        assert_eq!(report(&r, "treesit-node-start"), "3");
+        assert_eq!(report(&r, "treesit-node-end"), "8");
+    }
+
+    #[test]
+    fn treesit_node_at_accepts_explicit_pos() {
+        // Explicit POS argument inside the H2 body paragraph.
+        let p = MD.find("More").unwrap() + 1;
+        let r = run(MD, &format!("(report \"t\" (treesit-node-at {p}))"));
+        // Returns the node type (here the paragraph's inline content); reported
+        // through `report` it renders as a quoted tulisp string.
+        assert_eq!(report(&r, "t"), "\"inline\"");
+        assert_eq!(report(&r, "treesit-node-type"), "inline");
+    }
+
+    #[test]
+    fn treesit_beginning_and_end_of_defun_move_point() {
+        // Point in the H2 body → its enclosing section is "## Sub\n\nMore text
+        // here.\n", char [23, 47).
+        let p = MD.find("More").unwrap() + 1;
+        let r = run(
+            MD,
+            &format!(
+                "(goto-char {p})
+                 (report \"beg\" (treesit-beginning-of-defun))
+                 (goto-char {p})
+                 (report \"end\" (treesit-end-of-defun))"
+            ),
+        );
+        assert_eq!(report(&r, "beg"), "23");
+        assert_eq!(report(&r, "end"), "47");
+    }
+
+    #[test]
+    fn treesit_beginning_of_defun_outside_section_keeps_point() {
+        // A buffer that opens with blank lines: point 1 is before any section, so
+        // navigation is a no-op and returns point unchanged.
+        let r = run(
+            "\n\n# H\n\nbody\n",
+            "(goto-char 1) (treesit-beginning-of-defun)",
+        );
+        assert_eq!(r.point, 1);
+    }
 }
