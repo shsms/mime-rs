@@ -570,72 +570,22 @@ counts) and gives an immediate real-world acceptance test.
 
 * Roadmap / milestones
 
-/Status: M0 ✓, M1 ✓ (persistent B-tree, O(log n) seeks, O(1) snapshots), M2 ✓
-(checkpoints + transactions + cheap snapshots), M3 ✓ (~mimed~ daemon + warm sessions),
-M4 ✓ (~mime-mcp~ — MCP server, 13 tools over JSON-RPC/stdio). 123 tests, clippy clean;
-the agent-facing surface works end to end. M5 ✓, rehearse ✓, M7 scaffold ✓, M8 ✓ (repl/guide/examples), M6 partly ✓ (parallel index + rebase-on-save); saves are atomic + rebasing./
+/Status: M0–M5 ✓; M6 partly (parallel index, rebase-on-save, streaming saves); M7 scaffold; M8 ✓; M9 ✓ (one ~mime~ binary); M10 in progress (multi-buffer ✓). 132 tests, clippy clean./
 
-** DONE M0 — Editor core + tulisp API (replace a mime batch) [#A]
-   In-memory ~TextStore~ (bring-up + differential-test *oracle* only — not the real
-   buffer); point/mark/markers/narrowing; the §6 vocabulary (exact + regex + fuzzy
-   search, region/regexp replace, insert/delete, narrowing, excursion);
-   ~mimectl run prog.tl --file x --local~ one-shot; UTF-8-safe; structured result with
-   auto diff + ~report~. /Exit: re-run a real mime transform./
-   /Done: ~60 Emacs-Lisp builtins (motion, mark/region, search incl. ~search-fuzzy~,
-   ~replace-string~/~replace-regexp~, kill-ring, narrowing, ~save-excursion~/
-   ~save-restriction~) + the RE2 string library; ~mimectl run --local~ opens files via
-   Quire; 46 tests./
+** DONE M0 — Editor core + tulisp API [#A]
+   ~60 core editor builtins over the in-memory ~Buffer~ (the diff-test oracle); ~mime run --local~; structured diff + ~report~.
 ** DONE M1 — Quire: the piece-tree ~TextStore~ (multi-GB) [#A]
-   *Quire*, the real buffer — a persistent measured B-tree of pieces over a ~Backing~ trait
-   (mmap + paged-LRU) + append-only add buffer; ~Arc~ nodes (snapshots ~Send + Sync~);
-   lazy/background char-line index; anchors. Becomes the default ~TextStore~; the
-   in-memory impl stays as the differential-test oracle. /Exit: open + edit a
-   multi-GB file at flat memory; oracle and piece tree agree under property tests./
-   /Done: first cut is a piece-table (~Vec<Piece>~ over the mmapped original + add
-   buffer), all 30 ~TextStore~ methods, differential-tested ~24k random ops vs the
-   oracle. The ~Vec~ → persistent measured B-tree upgrade is *done*: ~Arc~-node
-   persistent tree, O(log n) seeks via ~{bytes,chars,lines}~ summaries, and
-   ~Quire::snapshot~ in O(1) with shared backings — the basis for ~KB checkpoints./
+   Persistent measured B-tree over an mmapped original + add buffer; O(log n) seeks via ~{bytes,chars,lines}~ summaries; O(1) ~snapshot~; differential-tested vs the in-memory oracle. The default store. /Exit ✓: edit a multi-GB file at flat memory./
 ** DONE M2 — Checkpoints, transactions, dry-run [#A]
-   Workspace COW snapshots (clone the piece-tree spine, ~KB); checkpoint tree;
-   auto-transaction per program; ~with-transaction~; ~rehearse~; ~checkpoint-diff~.
-   /Exit: rewind + dry-run on multi-buffer edits; property tests green./
-   /Done: ~checkpoint~ / ~restore-checkpoint~ / ~with-transaction~ (full-text snapshot
-   MVP in ~Session.checkpoints~). Pending: ~KB structural-sharing snapshots (needs the
-   Quire B-tree + a ~snapshot~ trait method), ~rehearse~ dry-run (daemon-level), and
-   ~checkpoint-diff~./
-** DONE M3 — Daemon (~mimed~), ~mimectl~, sessions, warm state [#A]
-   ~mimed~ + ~mimectl~ client; session isolation + lifecycle + limits; warm buffers
-   and warm defs across programs; control API (HTTP/JSON over a unix socket); WAL
-   journaling. /Exit: two sessions edit in parallel; buffers persist across programs./
-   /Done: ~Workspace~ holds a warm ~TulispContext~ + ~Session~ across programs; ~mimed~
-   serves a JSON-lines control API over a unix socket (~open~/~run~/~status~/~save~/
-   ~close~/~ping~) with a session map; ~mimectl~ gained daemon verbs (~--local~ one-shot
-   unchanged). Single-threaded loop (the ~Rc~ ctx is ~!Send~); the
-   ~Mutex<HashMap<Workspace>>~ seam is kept for future per-session sharding + WAL./
+   ~checkpoint~ / ~restore-checkpoint~ / ~with-transaction~ (snapshot-backed, ~KB via the B-tree); ~rehearse~ dry-run; ~checkpoint-diff~.
+** DONE M3 — Daemon, sessions, warm state [#A]
+   Warm ~Workspace~ (persistent ctx + session across programs) over a unix-socket JSON-lines API; single-threaded (the ~Rc~ ctx is ~!Send~).
 ** DONE M4 — MCP server + agent ergonomics [#A]
-   MCP tools (§11); structured results tuned for token budget; ~read_region~
-   on-demand context; permission-friendly tool schemas. /Exit: an agent edits a repo
-   end-to-end over MCP with no file re-reads./
-   /Done: ~mime-mcp~ — JSON-RPC 2.0 over stdio, embeds the engine, 10 tools
-   (~open_file~/~open_text~/~run_program~/~read_region~/~search~/~checkpoint~/
-   ~restore_checkpoint~/~list_checkpoints~/~save_buffer~/~session_status~) with JSON
-   Schemas; warm per-session ~Workspace~ map; full handshake. FS tools carry a
-   ~// TODO: path allowlist~ (M5)./
+   JSON-RPC 2.0 / stdio embedding the engine; 13 tools (~open_file~/~run_program~/~rehearse~/~read_region~/~view~/~insert_text~/~search~/~checkpoint~/…/~save_buffer~/~session_status~); warm per-session map.
 ** DONE M5 — Safety & audit [#B]
-   Path allowlists, read-only buffers, resource limits, interruptible eval,
-   append-only audit journal + replay. /Exit: safe to grant to an autonomous agent./
-** DOING M6 — Parallelism & performance [#B] (parallel index ✓, rebase-on-save ✓; parallel search/replace remain)
-   Lock-free parallel reads over immutable snapshots (search / count / index /
-   anchor-resolve fanned across cores); parallel bulk replace (divide-and-conquer
-   rebuild + ~concat~); parallel initial line index (~memchr~ + prefix sum);
-   rebase-on-save compaction *[done]* (after a save, re-mmap the new file, collapse to one ~Original~ piece, release the pinned pre-save inode + reset the add buffer); bytecode-compile hot programs; dirty-span diffs; benchmark suite. /Exit: search +
-   global-replace a multi-GB file scale across cores; ulysses bench beats mime./
-   /Open follow-ups: the M6 bench used to pull in ~criterion~ (which dragged ~serde~/~syn~ into the *test*
-   build); now *[done]* — swapped for a ~std::time~ ~#[ignore]~d bench, ~criterion~ and its serde/syn tree dropped. Save still
-   materializes the whole ~text()~ to write it (O(filesize) RAM) — streaming the pieces straight
-   to the temp file is done — ~write_to~ + ~write_atomic_with~ stream the pieces straight to disk, no full materialization. No external-change detection yet — re-~open_file~ to
-   pick up on-disk edits an agent did not make (an Emacs-style mtime/inode check is a future touch)./
+   Path allowlist (~MIME_ROOTS~ / ~check_path~), read-only buffers, atomic saves, audit journal (~MIME_AUDIT~). /Exit ✓: safe to grant to an autonomous agent./
+** DOING M6 — Parallelism & performance [#B]
+   Done: parallel initial char/line index (~std::thread::scope~, ~4.8×); rebase-on-save compaction; streaming atomic saves (no full ~text()~ materialization). Remaining: parallel search/replace (needs a resumable streaming DFA — regex-automata — for cross-chunk matches); bytecode-compile hot programs; dirty-span diffs; external-change (mtime/inode) detection. /Exit: global-replace a multi-GB file across cores; ulysses bench beats ~mime~./
 ** DOING M7 — Structural / syntax-aware editing [#C] (navigation scaffold landed)
 
    /Done (scaffold):/ tree-sitter + ~tree-sitter-md~ (Markdown); ~src/syntax.rs~ re-parses
@@ -670,14 +620,14 @@ the agent-facing surface works end to end. M5 ✓, rehearse ✓, M7 scaffold ✓
    ~mimectl repl~; mime→mime-rs porting guide; docs; example library of helpers;
    ~cargo~ workspace + crate publish.
 
-** TODO M9 — One ~mime~ binary + capability tiers [#A]
+** DONE M9 — One ~mime~ binary + capability tiers [#A]
    Merge ~mimectl~/~mimed~/~mime-mcp~ into a single ~mime~ (modes: default local /
    ~--daemon~ / ~--mcp~ / ~--connect~). Move the three ~main~ bodies into the lib
    (~cli::run~ / ~daemon::run~ / ~mcp::run~); one ~src/main.rs~ dispatches on the mode.
    A ~Capabilities~ tier (trusted vs sandboxed) chosen by the mode gates which builtin
    groups register. Drop the old binary names (no deprecation). /Exit: ~mime~,
    ~mime --daemon~, ~mime --mcp~ all work; one binary; tests green./
-** TODO M10 — Orchestration group: multi-buffer + file I/O + args [#B]
+** DOING M10 — Orchestration group: multi-buffer ✓, file I/O + args in flight [#B]
    The trusted-tier Emacs-runtime primitives: a buffer registry + ~set-buffer~ /
    ~with-current-buffer~ / ~find-file~ / ~generate-new-buffer~; ~insert-file-contents~ /
    ~write-region~ / ~directory-files~ (~check_path~-gated); program-argument binding;
@@ -763,44 +713,22 @@ function for both.
 
 * Dogfooding friction log
 
-Findings from editing mime-rs *through mime-rs* (the agent's-eye view); appended as we go.
-
-- Allowlist gotcha (M5): the first cross-repo edit failed until ~MIME_ROOTS~ was set to
-  touch a file outside cwd. Correct + a clear error, but an agent hits it immediately;
-  the daemon/MCP should advertise the allowed roots up front.
-- Viewing was indirect: ~(message (window ...))~ then digging the string out of the JSON
-  ~log~ is clunky; ~view~ wants to be a first-class MCP tool returning the text. [done: the view tool]
-- No durable markers yet: multiple viewports work via ~(window N pos)~ + vars, but a saved
-  position does not survive edits; Emacs markers on Quire anchors are the fix. [done: make-marker/point-marker/copy-marker/set-marker/marker-position/markerp, and goto-char takes a marker]
-- Inserting big literal blocks is awkward: tulisp-string escaping of newlines is
-  error-prone (this very section was a long escaped ~insert~); want an ~insert_text~ MCP
-  tool that takes the text as a JSON string, no tulisp escaping. [done: insert_text]
-- Structural code edits are hard: adding the ~view~ MCP tool meant three separate
-  sites (a handler fn, a dispatch arm, a schema entry). Search/replace is the wrong
-  instrument for "add an arm to this match" / "add a field to this struct", so I used a
-  plain editor for those. This is the argument for AST-aware ops (M7 tree-sitter):
-  mime-rs shines at prose and find/replace transforms, less so at structural code.
-- MCP path is live: ~open_file → search/view → insert_text/run_program → save_buffer~ as
-  native tools — this very bullet was written through ~insert_text~ (no Lisp/JSON escaping).
-  Onboarding friction: ~claude mcp add~ defaults to *local* scope bound to the cwd's project,
-  so registering from ~/vagrant/mime-rs~ hid the server from the ~/vagrant~ session and the
-  first resume saw no tools; ~-s user~ (or adding from the session root) fixes it. An agent
-  can't self-register reliably without knowing this — the installer should pick scope on purpose.
-- Markers shipped: ~make-marker/point-marker/copy-marker/set-marker/marker-position/markerp~, and
-  ~goto-char~ takes a marker. Demoed two durable cursors over Section B/C that survived a
-  top-of-buffer insert (the multi-viewport feature). Implemented as a per-store registry that
-  auto-adjusts on insert/delete/replace; ~TulispConvertible~ makes ~Marker~ a first-class value.
-- Warm server is frozen at spawn: new *builtins* (like new *tools*) do not appear in a running
-  mime-mcp/mimed until it restarts — ~point-marker~ was void through MCP right after I added it,
-  though tests and ~mimectl --local~ (fresh process per call) had it. So ~mimectl --local~ is the
-  fast dev-iteration path; the MCP/daemon path needs a ~claude --resume~ to pick up new vocabulary.
-- BUG (save-safe, intermittent): editing a large real file through the *warm* MCP session,
-  ~buffer-substring~/~read_region~ sometimes return the wrong window (mid-document content as the
-  apparent tail) after several edits with snapshots between them. The spine is fine —
-  ~full_text~/~save_buffer~ wrote correct content every time and ~point-max~ matched the real
-  length — so no data loss, but ~view~/~read_region~ can mislead. Not reproduced on synthetic text
-  yet (six variations pass); RESOLVED — FIXED. The root Summary is correct *by construction* (every node constructor recomputes it) and ~collect_range~ matches the oracle across 64k+ snapshot-bracketed, mmap-backed, multibyte ops — the core is provably sound; the *B-tree itself was correct all along*. The actual fault: ~save_buffer~ overwrote the same file ~Quire~ had mmapped as its immutable original, mutating those bytes under the live pieces, so mmap-backed reads (~collect_range~ behind ~buffer-substring~/~read_region~/search) returned shifted content while ~full_text~/save (cache) stayed correct. FIX: saves now go through ~safety::write_atomic~ (temp file + atomic rename), leaving the mmapped inode intact. Regression-tested end to end (open → edit → in-place save → reads stay byte-correct; the guard fails with a plain in-place write). Workaround: a
-  fresh ~open_file~ (or ~mimectl --local~) reads correctly.
+Lessons from editing mime-rs *through mime-rs*. Most early findings drove features and
+are now resolved:
+- *Viewing / big literal inserts / durable positions* → the ~view~ + ~insert_text~ MCP
+  tools, and Emacs *markers* (~make-marker~/~set-marker~/… ; ~goto-char~ takes a marker).
+- *In-place save corrupted mmap reads* (the worst, now fixed): ~save_buffer~ had overwritten
+  the very file ~Quire~ mmapped as its immutable original, so reads through the mmap
+  (~collect_range~ behind ~buffer-substring~/~read_region~/search) returned shifted bytes
+  while ~full_text~/save stayed correct — the B-tree was sound all along. Fix: atomic save
+  (temp + rename) leaves the mmapped inode intact; regression-tested.
+Still-open lessons:
+- *Structural code edits* are awkward via search/replace ("add an arm to this match") — the
+  case for AST-aware ops (M7); mime-rs shines at prose + find/replace, less at code.
+- *MCP onboarding*: ~claude mcp add~ defaults to *local* scope bound to the cwd's project;
+  use ~-s user~ (or add from the session root), else a resume sees no tools.
+- *Warm server is frozen at spawn*: new builtins/tools need a restart (~claude --resume~);
+  ~mime run --local~ (fresh process per call) is the fast dev-iteration path.
 
 * Open questions & risks (decide deliberately)
 1. *Why not ~emacsclient~ + elisp?* It already has buffers/markers/narrowing/regexp
