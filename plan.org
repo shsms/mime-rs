@@ -524,9 +524,9 @@ counts) and gives an immediate real-world acceptance test.
 * Roadmap / milestones
 
 /Status: M0 ✓, M1 ✓ (persistent B-tree, O(log n) seeks, O(1) snapshots), M2 ✓
-(checkpoints + transactions + cheap snapshots; only daemon-level ~rehearse~ left), M3 ✓
-(~mimed~ daemon + warm sessions over a unix socket). 59 tests, clippy clean; M4–M8 not
-started./
+(checkpoints + transactions + cheap snapshots), M3 ✓ (~mimed~ daemon + warm sessions),
+M4 ✓ (~mime-mcp~ — MCP server, 10 tools over JSON-RPC/stdio). 62 tests, clippy clean;
+the agent-facing surface works end to end. M5–M8 not started; only ~rehearse~ left in M2./
 
 ** DONE M0 — Editor core + tulisp API (replace a mime batch) [#A]
    In-memory ~TextStore~ (bring-up + differential-test *oracle* only — not the real
@@ -566,10 +566,15 @@ started./
    ~close~/~ping~) with a session map; ~mimectl~ gained daemon verbs (~--local~ one-shot
    unchanged). Single-threaded loop (the ~Rc~ ctx is ~!Send~); the
    ~Mutex<HashMap<Workspace>>~ seam is kept for future per-session sharding + WAL./
-** TODO M4 — MCP server + agent ergonomics [#A]
+** DONE M4 — MCP server + agent ergonomics [#A]
    MCP tools (§11); structured results tuned for token budget; ~read_region~
    on-demand context; permission-friendly tool schemas. /Exit: an agent edits a repo
    end-to-end over MCP with no file re-reads./
+   /Done: ~mime-mcp~ — JSON-RPC 2.0 over stdio, embeds the engine, 10 tools
+   (~open_file~/~open_text~/~run_program~/~read_region~/~search~/~checkpoint~/
+   ~restore_checkpoint~/~list_checkpoints~/~save_buffer~/~session_status~) with JSON
+   Schemas; warm per-session ~Workspace~ map; full handshake. FS tools carry a
+   ~// TODO: path allowlist~ (M5)./
 ** TODO M5 — Safety & audit [#B]
    Path allowlists, read-only buffers, resource limits, interruptible eval,
    append-only audit journal + replay. /Exit: safe to grant to an autonomous agent./

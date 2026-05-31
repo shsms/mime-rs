@@ -13,8 +13,9 @@ and roadmap.
 
 ## Status
 
-Early. **M0** (the editor core) and a first cut of **M2** (checkpoints /
-transactions) work end to end; 51 tests, `clippy` clean.
+Early but real: **M0–M4 work end to end** — the editor core, the `Quire` store,
+checkpoints/transactions, the `mimed` daemon (warm sessions), and **`mime-mcp`** (the
+MCP server). 62 tests, `clippy` clean.
 
 - **`TextStore`** trait with two implementations: an in-memory `Buffer` (the
   differential-test oracle) and **`Quire`**, a persistent measured-B-tree piece store
@@ -24,6 +25,9 @@ transactions) work end to end; 51 tests, `clippy` clean.
   [`tulisp`](../tulisp) interpreter.
 - `checkpoint` / `restore-checkpoint` / `with-transaction` — workspace snapshots
   and atomic, roll-back-on-error edits.
+- **`mimed`** — a daemon serving warm sessions over a unix socket (JSON-lines); and
+  **`mime-mcp`** — an MCP server (JSON-RPC over stdio) exposing the engine as 10 tools
+  (`open_file`, `run_program`, `read_region`, `search`, `checkpoint`, …) for agents.
 
 Regex is **RE2** (the `regex` crate) — linear-time and streamable; Emacs
 *function names*, RE2 *syntax* (no in-pattern backreferences).
@@ -83,6 +87,8 @@ cargo test
 - `src/builtins.rs` — editor primitives registered on a `tulisp` context.
 - `src/strings.rs` — the RE2-backed string library.
 - `src/engine.rs` — `run_program`, the session, checkpoints.
-- `src/bin/mimectl.rs` — the CLI client.
+- `src/bin/mimectl.rs` — the CLI client (`--local` one-shot + daemon verbs).
+- `src/bin/mimed.rs` — the warm-session daemon (unix socket, JSON-lines).
+- `src/bin/mime-mcp.rs` — the MCP server (JSON-RPC over stdio).
 
 GPL-3.0 (via `tulisp`).
