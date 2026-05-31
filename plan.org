@@ -671,7 +671,7 @@ Findings from editing mime-rs *through mime-rs* (the agent's-eye view); appended
 - Viewing was indirect: ~(message (window ...))~ then digging the string out of the JSON
   ~log~ is clunky; ~view~ wants to be a first-class MCP tool returning the text. [done: the view tool]
 - No durable markers yet: multiple viewports work via ~(window N pos)~ + vars, but a saved
-  position does not survive edits; Emacs markers on Quire anchors are the fix. [next]
+  position does not survive edits; Emacs markers on Quire anchors are the fix. [done: make-marker/point-marker/copy-marker/set-marker/marker-position/markerp, and goto-char takes a marker]
 - Inserting big literal blocks is awkward: tulisp-string escaping of newlines is
   error-prone (this very section was a long escaped ~insert~); want an ~insert_text~ MCP
   tool that takes the text as a JSON string, no tulisp escaping. [done: insert_text]
@@ -686,6 +686,21 @@ Findings from editing mime-rs *through mime-rs* (the agent's-eye view); appended
   so registering from ~/vagrant/mime-rs~ hid the server from the ~/vagrant~ session and the
   first resume saw no tools; ~-s user~ (or adding from the session root) fixes it. An agent
   can't self-register reliably without knowing this — the installer should pick scope on purpose.
+- Markers shipped: ~make-marker/point-marker/copy-marker/set-marker/marker-position/markerp~, and
+  ~goto-char~ takes a marker. Demoed two durable cursors over Section B/C that survived a
+  top-of-buffer insert (the multi-viewport feature). Implemented as a per-store registry that
+  auto-adjusts on insert/delete/replace; ~TulispConvertible~ makes ~Marker~ a first-class value.
+- Warm server is frozen at spawn: new *builtins* (like new *tools*) do not appear in a running
+  mime-mcp/mimed until it restarts — ~point-marker~ was void through MCP right after I added it,
+  though tests and ~mimectl --local~ (fresh process per call) had it. So ~mimectl --local~ is the
+  fast dev-iteration path; the MCP/daemon path needs a ~claude --resume~ to pick up new vocabulary.
+- BUG (save-safe, intermittent): editing a large real file through the *warm* MCP session,
+  ~buffer-substring~/~read_region~ sometimes return the wrong window (mid-document content as the
+  apparent tail) after several edits with snapshots between them. The spine is fine —
+  ~full_text~/~save_buffer~ wrote correct content every time and ~point-max~ matched the real
+  length — so no data loss, but ~view~/~read_region~ can mislead. Not reproduced on synthetic text
+  yet (six variations pass); needs a focused look at Quire ~collect_range~/snapshot. Workaround: a
+  fresh ~open_file~ (or ~mimectl --local~) reads correctly.
 
 * Open questions & risks (decide deliberately)
 1. *Why not ~emacsclient~ + elisp?* It already has buffers/markers/narrowing/regexp
