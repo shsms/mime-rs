@@ -124,11 +124,7 @@ const PARALLEL_INDEX_THRESHOLD: usize = 1024 * 1024;
 /// — which equals `bytes.chars().count()` but works directly on `&[u8]`. This
 /// is a *pure* helper so the parallel driver and the unit tests can compare it
 /// against the sequential count. O(bytes).
-///
-/// `#[doc(hidden)] pub` only so `benches/parallel_index.rs` can time it against
-/// the parallel driver; it is not part of the supported API.
-#[doc(hidden)]
-pub fn count_chars_lines(bytes: &[u8]) -> (usize, usize) {
+fn count_chars_lines(bytes: &[u8]) -> (usize, usize) {
     let mut chars = 0;
     let mut lines = 0;
     for &b in bytes {
@@ -160,11 +156,7 @@ fn next_char_boundary(bytes: &[u8], mut i: usize) -> usize {
 /// additive over a partition, the result is **bit-for-bit identical** to the
 /// sequential `count_chars_lines(bytes)`. Uses [`std::thread::scope`] so the
 /// threads borrow `bytes` directly — no copy, no `'static` bound, no new crate.
-///
-/// `#[doc(hidden)] pub` only so `benches/parallel_index.rs` can time it against
-/// the sequential helper; it is not part of the supported API.
-#[doc(hidden)]
-pub fn count_chars_lines_parallel(bytes: &[u8]) -> (usize, usize) {
+fn count_chars_lines_parallel(bytes: &[u8]) -> (usize, usize) {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
@@ -1555,6 +1547,38 @@ mod tests {
             "total line count drifted for the parallel index"
         );
         assert_eq!(TextStore::char_len(&q), text.chars().count());
+    }
+
+    #[test]
+    #[ignore = "timing only; run: cargo test --lib bench_parallel_index -- --ignored --nocapture"]
+    fn bench_parallel_index() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        // A large multibyte input so the parallel split has real work to do.
+        let unit = "the quick brown fox — naïve café ジャンプ here\n";
+        let bytes = unit.repeat((64 * 1024 * 1024) / unit.len()).into_bytes();
+        assert_eq!(
+            count_chars_lines(&bytes),
+            count_chars_lines_parallel(&bytes),
+            "parallel count must equal sequential"
+        );
+        let runs = 5u32;
+        let t0 = Instant::now();
+        for _ in 0..runs {
+            black_box(count_chars_lines(black_box(&bytes)));
+        }
+        let seq = t0.elapsed() / runs;
+        let t1 = Instant::now();
+        for _ in 0..runs {
+            black_box(count_chars_lines_parallel(black_box(&bytes)));
+        }
+        let par = t1.elapsed() / runs;
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        eprintln!(
+            "index {} MiB  seq {seq:?}  par {par:?}  speedup {:.1}x  ({cores} cores)",
+            bytes.len() / (1024 * 1024),
+            seq.as_secs_f64() / par.as_secs_f64().max(f64::MIN_POSITIVE),
+        );
     }
 
     #[test]
