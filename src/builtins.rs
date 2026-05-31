@@ -896,6 +896,17 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun("regexp-quote", |s: String| -> String { regex::escape(&s) });
     }
 
+    // (float-time) — seconds since the epoch as a float (Emacs `float-time`),
+    // for coarse in-script profiling.
+    {
+        ctx.defun("float-time", |_t: Option<TulispObject>| -> f64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0)
+        });
+    }
+
     // ---- region case + match counting ----
     {
         let s = session.clone();

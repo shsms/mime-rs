@@ -14,6 +14,13 @@ pub struct MatchData {
 #[derive(Debug, Clone)]
 pub struct Buffer {
     text: String,
+    /// Cached `text.chars().count()`, maintained across every edit so position
+    /// math (point-max, clamping) is O(1) instead of rescanning the string.
+    char_len: usize,
+    /// A known-good (1-based char position, byte offset) pair used to seed the
+    /// next char↔byte conversion: sequential access (search/replace loops) then
+    /// walks a small delta from here rather than from the buffer start.
+    byte_hint: std::cell::Cell<(usize, usize)>,
     /// Point: 1-based char position in `1..=point_max()`.
     point: usize,
     /// Mark: the other end of the region, if set (1-based char position).
@@ -30,8 +37,12 @@ pub struct Buffer {
 
 impl Buffer {
     pub fn from_string(name: impl Into<String>, text: impl Into<String>) -> Self {
+        let text = text.into();
+        let char_len = text.chars().count();
         Buffer {
-            text: text.into(),
+            text,
+            char_len,
+            byte_hint: std::cell::Cell::new((1, 0)),
             point: 1,
             mark: None,
             narrowing: None,
@@ -45,7 +56,7 @@ impl Buffer {
         &self.text
     }
     pub fn char_len(&self) -> usize {
-        self.text.chars().count()
+        self.char_len
     }
     pub fn point(&self) -> usize {
         self.point
@@ -57,20 +68,51 @@ impl Buffer {
         self.narrowing.map_or(self.char_len() + 1, |(_, hi)| hi)
     }
 
-    /// Byte offset of 1-based char position `p` (clamped into the buffer).
+    /// Byte offset of 1-based char position `p` (clamped into the buffer). Seeds
+    /// from `byte_hint` so sequential conversions cost O(distance), not O(p).
+    /// Boundary answers (start/end) are O(1) and deliberately leave the hint
+    /// untouched, so a `point_max` lookup mid-search doesn't reset it.
     fn byte_of(&self, p: usize) -> usize {
-        // Positions are absolute (narrowing-independent); clamp to the full text.
-        let p = p.clamp(1, self.char_len() + 1);
-        self.text
-            .char_indices()
-            .nth(p - 1)
-            .map_or(self.text.len(), |(b, _)| b)
+        let p = p.clamp(1, self.char_len + 1);
+        if p == 1 {
+            return 0;
+        }
+        if p == self.char_len + 1 {
+            return self.text.len();
+        }
+        let (hc, hb) = self.byte_hint.get();
+        let byte = if p >= hc {
+            hb + self.text[hb..]
+                .char_indices()
+                .nth(p - hc)
+                .map_or(self.text.len() - hb, |(rb, _)| rb)
+        } else {
+            self.text
+                .char_indices()
+                .nth(p - 1)
+                .map_or(self.text.len(), |(b, _)| b)
+        };
+        self.byte_hint.set((p, byte));
+        byte
     }
 
-    /// 1-based char position of byte offset `byte`.
+    /// 1-based char position of byte offset `byte`. Hint-seeded like `byte_of`.
     fn char_of(&self, byte: usize) -> usize {
         let byte = byte.min(self.text.len());
-        self.text[..byte].chars().count() + 1
+        if byte == 0 {
+            return 1;
+        }
+        if byte == self.text.len() {
+            return self.char_len + 1;
+        }
+        let (hc, hb) = self.byte_hint.get();
+        let ch = if byte >= hb {
+            hc + self.text[hb..byte].chars().count()
+        } else {
+            self.text[..byte].chars().count() + 1
+        };
+        self.byte_hint.set((ch, byte));
+        ch
     }
 
     pub fn goto_char(&mut self, p: usize) {
@@ -83,6 +125,8 @@ impl Buffer {
         let at = self.byte_of(self.point);
         self.text.insert_str(at, s);
         self.point += n;
+        self.char_len += n;
+        self.byte_hint.set((self.point, at + s.len()));
         if let Some((_, hi)) = self.narrowing.as_mut() {
             *hi += n; // inserted text falls inside the accessible region
         }
@@ -94,6 +138,8 @@ impl Buffer {
         let (lo, hi) = (a.min(b), a.max(b));
         let (lb, hb) = (self.byte_of(lo), self.byte_of(hi));
         self.text.replace_range(lb..hb, "");
+        self.char_len -= hi - lo;
+        self.byte_hint.set((lo, lb));
         if self.point >= hi {
             self.point -= hi - lo;
         } else if self.point > lo {
@@ -150,6 +196,8 @@ impl Buffer {
         let (lb, hb) = (self.byte_of(md.start), self.byte_of(md.end));
         self.text.replace_range(lb..hb, &expanded);
         self.point = md.start + new_len;
+        self.char_len = self.char_len + new_len - old_len;
+        self.byte_hint.set((self.point, lb + expanded.len()));
         // The narrowing's upper bound must track the net length change (the
         // replaced span lies inside the region), exactly as insert/delete_region
         // do — otherwise a length-changing replace leaves a stale restriction.
@@ -494,6 +542,30 @@ mod tests {
         }
         assert_eq!(n, 2);
         assert_eq!(b.text(), "WORLD WORLD");
+    }
+
+    #[test]
+    fn multibyte_positions_survive_hint_walks_and_length_changes() {
+        // Accents/em-dashes are multi-byte (char≠byte), so the cached char_len
+        // and the byte_hint cursor must stay correct walking forward, jumping
+        // back, and across length-changing replaces.
+        let mut b = Buffer::from_string("t", "café — náïve — déjà — fin");
+        assert_eq!(b.char_len(), "café — náïve — déjà — fin".chars().count());
+        let re = regex::Regex::new("—").unwrap(); // em-dash: 3 bytes, 1 char
+        b.goto_char(1);
+        let mut n = 0;
+        while b.re_search_forward(&re, None).is_some() {
+            b.replace_match("-").unwrap(); // 3 bytes -> 1
+            n += 1;
+        }
+        assert_eq!(n, 3);
+        assert_eq!(b.text(), "café - náïve - déjà - fin");
+        assert_eq!(b.char_len(), b.text().chars().count());
+        // substring forward, near the end, then a backward jump (hint was at end)
+        let cl = b.char_len();
+        assert_eq!(b.substring(1, 5), "café");
+        assert_eq!(b.substring(cl - 2, cl + 1), "fin");
+        assert_eq!(b.substring(1, 5), "café");
     }
 
     #[test]
