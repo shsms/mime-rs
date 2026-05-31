@@ -503,7 +503,8 @@ fn tool_save_buffer(
         .ok_or_else(|| format!("no such session: {session}"))?
         .text();
     let checked = mime_rs::safety::check_path(Path::new(&path))?;
-    std::fs::write(&checked, &text).map_err(|e| format!("cannot write {path}: {e}"))?;
+    mime_rs::safety::write_atomic(&checked, text.as_bytes())
+        .map_err(|e| format!("cannot write {path}: {e}"))?;
     Ok(format!("wrote {} bytes to {path}", text.len()))
 }
 

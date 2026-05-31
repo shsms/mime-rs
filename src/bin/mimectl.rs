@@ -162,7 +162,9 @@ fn run_local(args: &Args, verb: &str) {
                                 exit(1);
                             }
                         };
-                        if let Err(e) = std::fs::write(&path, &report.final_text) {
+                        if let Err(e) =
+                            mime_rs::safety::write_atomic(&path, report.final_text.as_bytes())
+                        {
                             eprintln!("cannot write {f}: {e}");
                             exit(1);
                         }

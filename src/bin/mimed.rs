@@ -242,7 +242,7 @@ fn op_save(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
         Ok(p) => p,
         Err(e) => return err(&e),
     };
-    match std::fs::write(&checked, &text) {
+    match mime_rs::safety::write_atomic(&checked, text.as_bytes()) {
         Ok(()) => json!({ "ok": true, "session": session, "path": path, "bytes": text.len() }),
         Err(e) => err(&format!("cannot write {path}: {e}")),
     }

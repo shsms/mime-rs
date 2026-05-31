@@ -1716,6 +1716,45 @@ mod tests {
         run_diff(99, 3000, "αβγδ\n世界へようこそ\nfoo bar baz\n");
     }
 
+    #[test]
+    fn save_to_open_path_keeps_mmap_reads_correct() {
+        // Regression for the mmap-aliasing bug. `save_buffer` once overwrote the
+        // very file `Quire` had mmapped as its immutable original, mutating those
+        // bytes under the live pieces — so mmap-backed reads (collect_range, behind
+        // substring/read_region/search) returned shifted garbage while full_text
+        // (served from the text cache) still looked fine. `safety::write_atomic`
+        // (temp + rename) leaves the mmapped inode intact. Open a file, edit so the
+        // content shifts, save IN PLACE to the same path, and confirm windowed reads
+        // stay byte-correct.
+        let initial = format!(
+            "αβγ HEAD line — start\n{}UNIQUE-TAIL café naïve\n",
+            "filler — line ~tilde~ ‸ here\n".repeat(300)
+        );
+        let tmp = std::env::temp_dir().join(format!("mime-atomic-{}.txt", std::process::id()));
+        std::fs::write(&tmp, &initial).unwrap();
+        let mut q = Quire::open(&tmp).unwrap();
+        // Insert near the front so every Original byte after it shifts position.
+        q.goto_char(1);
+        q.re_search_forward(&regex::Regex::new("HEAD line").unwrap(), None);
+        q.insert(" <INSERTED so everything after shifts> ");
+        let saved = q.full_text().to_string();
+
+        // Save IN PLACE to the path the mmap maps — the aliasing case.
+        crate::safety::write_atomic(&tmp, saved.as_bytes()).unwrap();
+
+        // Reads through the mmap must still match full_text after the save.
+        let flen = saved.chars().count();
+        let cl = q.char_len();
+        assert_eq!(cl, flen, "char_len drifted after in-place save");
+        let tail = q.substring(cl + 1 - 40, cl + 1);
+        let tail_ref: String = saved.chars().skip(flen - 40).collect();
+        let mid = q.substring(500, 560);
+        let mid_ref: String = saved.chars().skip(499).take(60).collect();
+        std::fs::remove_file(&tmp).ok();
+        assert_eq!(tail, tail_ref, "tail read corrupted after in-place save");
+        assert_eq!(mid, mid_ref, "interior read corrupted after in-place save");
+    }
+
     /// Windowed reads (the `collect_range` path behind `substring`/`read_region`)
     /// must match the oracle for many ranges, not just the whole text.
     fn assert_reads_in_sync(b: &Buffer, q: &Quire, step: usize) {
