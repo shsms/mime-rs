@@ -1390,6 +1390,57 @@ mod tests {
         assert_eq!(TextStore::text(&q), "v0-v1-v2");
     }
 
+    #[test]
+    fn deep_tree_grows_and_stays_correct() {
+        // Force a genuinely multi-level tree so the internal-node insert/split/
+        // root-growth paths (not just the single-leaf fast path) are exercised,
+        // then check the summaries answer seeks correctly and a deep-tree
+        // snapshot is independent. Each insert at the front splits the straddled
+        // piece, so the piece count climbs well past one leaf's worth.
+        let mut q = Quire::from_string("t", "");
+        for i in 0..400 {
+            TextStore::goto_char(&mut q, 1 + (i % 7)); // scatter the insertions
+            TextStore::insert(&mut q, "ab\n");
+        }
+        assert!(
+            q.root.height() >= 2,
+            "expected a multi-level tree, got height {}",
+            q.root.height()
+        );
+        let full = TextStore::text(&q).to_string();
+        assert_eq!(full.chars().count(), TextStore::char_len(&q));
+        // O(log n) seeks must agree with a linear oracle over the same text.
+        let oracle = Buffer::from_string("t", full.clone());
+        for p in [
+            1usize,
+            2,
+            50,
+            123,
+            400,
+            full.chars().count(),
+            full.chars().count() + 1,
+        ] {
+            assert_eq!(
+                TextStore::line_number_at_pos(&q, p),
+                TextStore::line_number_at_pos(&oracle, p),
+                "line_number_at_pos({p}) on deep tree"
+            );
+            assert_eq!(
+                TextStore::char_after(&q, p),
+                TextStore::char_after(&oracle, p),
+                "char_after({p}) on deep tree"
+            );
+        }
+        // A snapshot of the deep tree shares the root and is edit-independent.
+        let snap = q.snapshot();
+        assert_eq!(Arc::as_ptr(&snap.root), Arc::as_ptr(&q.root));
+        TextStore::goto_char(&mut q, 1);
+        let end = TextStore::char_len(&q) + 1;
+        TextStore::delete_region(&mut q, 1, end); // erase
+        assert_eq!(TextStore::text(&q), "");
+        assert_eq!(TextStore::text(&snap), full); // snapshot untouched
+    }
+
     // ---- the key deliverable: a seeded differential test vs the Buffer oracle ----
 
     /// Minimal seeded LCG (Numerical Recipes constants) — deterministic, no deps.
