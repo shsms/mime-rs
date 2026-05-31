@@ -767,6 +767,42 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         );
     }
 
+    // match-beginning / match-end: the bounds of the last search's whole match
+    // (1-based char positions). Sub-group bounds are not tracked, so a non-zero
+    // subexp argument yields nil.
+    {
+        let s = session.clone();
+        ctx.defun(
+            "match-beginning",
+            move |n: Option<i64>| -> Result<TulispObject, Error> {
+                let pos = match n.unwrap_or(0) {
+                    0 => s.borrow().buffer.last_match().map(|md| md.start as i64),
+                    _ => None,
+                };
+                Ok(match pos {
+                    Some(p) => TulispValue::from(p).into_ref(None),
+                    None => TulispObject::nil(),
+                })
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        ctx.defun(
+            "match-end",
+            move |n: Option<i64>| -> Result<TulispObject, Error> {
+                let pos = match n.unwrap_or(0) {
+                    0 => s.borrow().buffer.last_match().map(|md| md.end as i64),
+                    _ => None,
+                };
+                Ok(match pos {
+                    Some(p) => TulispValue::from(p).into_ref(None),
+                    None => TulispObject::nil(),
+                })
+            },
+        );
+    }
+
     // ---- buffer-level replace commands (map-shaped bulk edits) ----
     {
         let s = session.clone();
@@ -1395,6 +1431,27 @@ mod tests {
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.clone())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn match_beginning_and_end_bracket_the_whole_match() {
+        let mut ws = trusted("hello WORLD hello");
+        let r = ws
+            .run(
+                r#"(search-forward "WORLD")
+                   (report "beg" (match-beginning))
+                   (report "end" (match-end))
+                   (report "str" (match-string 0))"#,
+            )
+            .unwrap();
+        // match-beginning is the start, match-end one past the end (point lands
+        // there after a forward search), and they bracket exactly the match.
+        assert_eq!(report(&r, "beg"), "7");
+        assert_eq!(report(&r, "end"), "12");
+        assert_eq!(report(&r, "str"), "\"WORLD\"");
+        // A non-zero subexp is not tracked -> nil.
+        let r = ws.run(r#"(report "g1" (match-beginning 1))"#).unwrap();
+        assert_eq!(report(&r, "g1"), "nil");
     }
 
     #[test]
