@@ -525,8 +525,8 @@ counts) and gives an immediate real-world acceptance test.
 
 /Status: M0 ✓, M1 ✓ (persistent B-tree, O(log n) seeks, O(1) snapshots), M2 ✓
 (checkpoints + transactions + cheap snapshots), M3 ✓ (~mimed~ daemon + warm sessions),
-M4 ✓ (~mime-mcp~ — MCP server, 12 tools over JSON-RPC/stdio). 107 tests, clippy clean;
-the agent-facing surface works end to end. M5 ✓ (safety/audit), rehearse ✓, M7 scaffold ✓ (tree-sitter Markdown). M6/M8 remain./
+M4 ✓ (~mime-mcp~ — MCP server, 13 tools over JSON-RPC/stdio). 123 tests, clippy clean;
+the agent-facing surface works end to end. M5 ✓, rehearse ✓, M7 scaffold ✓, M8 ✓ (repl/guide/examples), M6 partly ✓ (parallel index + rebase-on-save); saves are atomic + rebasing./
 
 ** DONE M0 — Editor core + tulisp API (replace a mime batch) [#A]
    In-memory ~TextStore~ (bring-up + differential-test *oracle* only — not the real
@@ -578,11 +578,11 @@ the agent-facing surface works end to end. M5 ✓ (safety/audit), rehearse ✓, 
 ** DONE M5 — Safety & audit [#B]
    Path allowlists, read-only buffers, resource limits, interruptible eval,
    append-only audit journal + replay. /Exit: safe to grant to an autonomous agent./
-** TODO M6 — Parallelism & performance [#B]
+** DOING M6 — Parallelism & performance [#B] (parallel index ✓, rebase-on-save ✓; parallel search/replace remain)
    Lock-free parallel reads over immutable snapshots (search / count / index /
    anchor-resolve fanned across cores); parallel bulk replace (divide-and-conquer
    rebuild + ~concat~); parallel initial line index (~memchr~ + prefix sum);
-   rebase-on-save compaction (after a save, re-mmap the new file, collapse to one ~Original~ piece, release the pinned pre-save inode + reset the add buffer); bytecode-compile hot programs; dirty-span diffs; benchmark suite. /Exit: search +
+   rebase-on-save compaction *[done]* (after a save, re-mmap the new file, collapse to one ~Original~ piece, release the pinned pre-save inode + reset the add buffer); bytecode-compile hot programs; dirty-span diffs; benchmark suite. /Exit: search +
    global-replace a multi-GB file scale across cores; ulysses bench beats mime./
 ** DOING M7 — Structural / syntax-aware editing [#C] (scaffold landed)
    Tree-sitter integration; node search/replace; narrow-to-defun. /Exit: AST-scoped
