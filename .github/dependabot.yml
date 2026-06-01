@@ -1,12 +1,19 @@
 version: 2
+# Each ecosystem opens one grouped PR per month.
 updates:
-  # Keep the SHA-pinned GitHub Actions current: Dependabot bumps the pin and its
-  # `# vX.Y.Z` comment together, grouped into a single monthly PR. (A `cargo`
-  # entry could be added the same way to track Rust dependencies.)
+  # GitHub Actions: bump the pinned SHA and its `# vX.Y.Z` comment together.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "monthly"
     groups:
       actions:
+        patterns: ["*"]
+  # Rust dependencies (regex, serde_json, tree-sitter, tulisp, …).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      cargo:
         patterns: ["*"]
