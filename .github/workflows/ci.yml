@@ -32,3 +32,17 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
+
+  msrv:
+    name: MSRV (Rust 1.88.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # Verify the crate compiles on its declared minimum (keep this in sync with
+      # Cargo.toml's `rust-version`).
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal && rustup default 1.88.0
+      - name: Install the C toolchain
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+      - name: Check
+        run: cargo check --locked
