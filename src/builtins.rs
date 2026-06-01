@@ -1323,21 +1323,25 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
         // basename in different dirs collide (the second aliases the first).
         // Fix: key buffers by visited path; uniquify the name (Emacs `doc.txt<2>`).
         // Same limitation in `find-file` above.
-        ctx.defun("find-file-noselect", move |path: String| -> Result<String, Error> {
-            let p = std::path::Path::new(&path);
-            let name = p
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.clone());
-            let mut sess = s.borrow_mut();
-            if sess.has_buffer(&name) {
-                return Ok(name);
-            }
-            let store: Box<dyn crate::store::TextStore> = Box::new(
-                crate::Quire::open(p).map_err(|e| err(&format!("find-file-noselect {path}: {e}")))?,
-            );
-            Ok(sess.install_buffer(store, false))
-        });
+        ctx.defun(
+            "find-file-noselect",
+            move |path: String| -> Result<String, Error> {
+                let p = std::path::Path::new(&path);
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                let mut sess = s.borrow_mut();
+                if sess.has_buffer(&name) {
+                    return Ok(name);
+                }
+                let store: Box<dyn crate::store::TextStore> = Box::new(
+                    crate::Quire::open(p)
+                        .map_err(|e| err(&format!("find-file-noselect {path}: {e}")))?,
+                );
+                Ok(sess.install_buffer(store, false))
+            },
+        );
     }
     {
         let s = session.clone();

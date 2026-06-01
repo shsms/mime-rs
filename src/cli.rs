@@ -529,13 +529,34 @@ fn require_session(args: &Args) -> String {
 
 fn usage() {
     let rows = [
-        ("mime [run] PROG.tl [--file FILE] [--write]", "embedded one-shot (default); --write saves back to FILE"),
-        ("mime rehearse PROG.tl [--file FILE]", "embedded dry-run; never writes"),
-        ("mime repl [--file FILE]", "interactive warm session; never writes"),
-        ("mime --session S run PROG.tl", "daemon: run in a warm session"),
-        ("mime --session S rehearse PROG.tl", "daemon dry-run; nothing persists"),
-        ("mime --session S open --file FILE | --text STR", "daemon: load a buffer"),
-        ("mime --session S save --path PATH", "daemon: save the session's buffer"),
+        (
+            "mime [run] PROG.tl [--file FILE] [--write]",
+            "embedded one-shot (default); --write saves back to FILE",
+        ),
+        (
+            "mime rehearse PROG.tl [--file FILE]",
+            "embedded dry-run; never writes",
+        ),
+        (
+            "mime repl [--file FILE]",
+            "interactive warm session; never writes",
+        ),
+        (
+            "mime --session S run PROG.tl",
+            "daemon: run in a warm session",
+        ),
+        (
+            "mime --session S rehearse PROG.tl",
+            "daemon dry-run; nothing persists",
+        ),
+        (
+            "mime --session S open --file FILE | --text STR",
+            "daemon: load a buffer",
+        ),
+        (
+            "mime --session S save --path PATH",
+            "daemon: save the session's buffer",
+        ),
         ("mime --session S close", "daemon: end the session"),
         ("mime status", "daemon: sessions, allowed roots, audit"),
     ];
