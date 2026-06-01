@@ -9,9 +9,7 @@ It serves two audiences from the same core:
 - **Scripting & automation** — run whole Emacs-Lisp programs against files for
   batch editing and build pipelines, the way you'd reach for `emacs --batch` or
   `sed`/`awk`, but with real buffers, multi-file orchestration, structured
-  results, and rollback. For example,
-  [ulysses-annotated](https://github.com/shsms/ulysses-annotated) builds an
-  annotated *Ulysses* EPUB by running mime-rs programs over the Gutenberg text.
+  results, and rollback.
 - **AI agents** — a bounded, auditable editing surface between brittle
   single-string "replace this exact text" edits and arbitrary code execution:
   warm buffers, cheap rollback, an allowlisted filesystem, and an MCP front door.
@@ -32,10 +30,9 @@ decides how much power a caller gets. The full design and roadmap are in
 
 ## Status
 
-Real and dogfooded — the canonical end-to-end test is the ulysses-annotated EPUB
-pipeline. The editor core, the `Quire` store, checkpoints / transactions /
-rehearse, the warm-session daemon, the MCP server, the trusted orchestration
-group, and a path-allowlist + audit safety layer all work. **145 tests,
+Real and dogfooded. The editor core, the `Quire` store, checkpoints /
+transactions / rehearse, the warm-session daemon, the MCP server, the trusted
+orchestration group, and a path-allowlist + audit safety layer all work. **145 tests,
 `clippy` clean.**
 
 - **`TextStore`** trait with two implementations: an in-memory `Buffer` (the
