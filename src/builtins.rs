@@ -10,6 +10,29 @@ fn bad_regex(e: regex::Error) -> Error {
     Error::lisp_error(format!("Invalid regexp: {e}"))
 }
 
+/// Compile a regex, caching by pattern string. The search builtins are commonly
+/// called many times with a small set of repeated patterns, where `Regex::new`
+/// would otherwise dominate those calls. `Regex` is `Arc`-backed, so the cached
+/// clone is cheap. The session is single-threaded.
+pub(crate) fn cached_regex(re: &str) -> Result<regex::Regex, Error> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<String, regex::Regex>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    CACHE.with(|c| {
+        if let Some(rx) = c.borrow().get(re) {
+            return Ok(rx.clone());
+        }
+        let rx = regex::Regex::new(re).map_err(bad_regex)?;
+        let mut m = c.borrow_mut();
+        if m.len() >= 16384 {
+            m.clear(); // bound memory for long-lived daemons; rare in practice
+        }
+        m.insert(re.to_string(), rx.clone());
+        Ok(rx)
+    })
+}
+
 fn err(msg: &str) -> Error {
     Error::lisp_error(msg.to_string())
 }
@@ -161,7 +184,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                   bound: Option<i64>,
                   noerror: Option<TulispObject>|
                   -> Result<TulispObject, Error> {
-                let rx = regex::Regex::new(&re).map_err(bad_regex)?;
+                let rx = cached_regex(&re)?;
                 let bound = bound.map(|b| b.max(1) as usize);
                 let hit = s.borrow_mut().buffer.re_search_forward(&rx, bound);
                 match hit {
@@ -190,7 +213,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun(
             "looking-at",
             move |re: String| -> Result<TulispObject, Error> {
-                let rx = regex::Regex::new(&re).map_err(bad_regex)?;
+                let rx = cached_regex(&re)?;
                 Ok(if s.borrow().buffer.looking_at(&rx) {
                     TulispObject::t()
                 } else {
@@ -791,7 +814,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun(
             "replace-regexp",
             move |re: String, to: String| -> Result<TulispObject, Error> {
-                let rx = regex::Regex::new(&re).map_err(bad_regex)?;
+                let rx = cached_regex(&re)?;
                 let mut sess = s.borrow_mut();
                 let mut count = 0i64;
                 loop {
@@ -952,7 +975,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun(
             "count-matches",
             move |re: String, start: Option<i64>, end: Option<i64>| -> Result<i64, Error> {
-                let rx = regex::Regex::new(&re).map_err(bad_regex)?;
+                let rx = cached_regex(&re)?;
                 let mut sess = s.borrow_mut();
                 let saved = sess.buffer.point();
                 if let Some(st) = start {
@@ -1423,6 +1446,15 @@ mod tests {
     use crate::Workspace;
     use crate::buffer::Buffer;
     use crate::result::RunReport;
+
+    #[test]
+    fn cached_regex_reuses_compiles_and_propagates_errors() {
+        let a = super::cached_regex("a+b").unwrap();
+        let b = super::cached_regex("a+b").unwrap(); // served from the cache
+        assert!(a.is_match("aaab"));
+        assert!(b.is_match("ab"));
+        assert!(super::cached_regex("(unclosed").is_err());
+    }
 
     /// A trusted workspace (so `register_orchestration` runs) over a "main"
     /// buffer with the given text.
