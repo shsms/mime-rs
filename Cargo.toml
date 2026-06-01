@@ -1,7 +1,15 @@
 [package]
 name = "mime-rs"
+description = "A scriptable, transactional text-editing engine for AI agents, driven by Emacs-Lisp (tulisp) programs."
 version = "0.1.0"
+repository = "https://github.com/shsms/mime-rs"
+license = "GPL-3.0-only"
 edition = "2024"
+rust-version = "1.88.0"
+readme = "README.md"
+keywords = ["text-editor", "lisp", "tulisp", "agent", "mcp"]
+categories = ["text-editors", "command-line-utilities", "text-processing"]
+exclude = ["plan.org"]
 
 [dependencies]
 memmap2 = "0.9.10"
