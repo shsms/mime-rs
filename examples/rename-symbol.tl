@@ -1,6 +1,6 @@
 ;; rename-symbol.tl — rename one identifier everywhere, whole-word only.
 ;;
-;; Run:  mimectl run --local examples/rename-symbol.tl --file SOMEFILE
+;; Run:  mime run --local examples/rename-symbol.tl --file SOMEFILE
 ;;
 ;; Renames the symbol `oldName` to `newName`. The `\b` word boundaries are what
 ;; make this a *symbol* rename rather than a blind substring replace: `oldName`

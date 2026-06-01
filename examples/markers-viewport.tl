@@ -1,6 +1,6 @@
 ;; markers-viewport.tl — durable positions + multiple viewports.
 ;;
-;; Run:  mimectl run --local examples/markers-viewport.tl --file SOMEFILE
+;; Run:  mime run --local examples/markers-viewport.tl --file SOMEFILE
 ;;
 ;; A *marker* is a position that rides edits: insert text before it and the
 ;; marker's position shifts to stay on the same character. This is the

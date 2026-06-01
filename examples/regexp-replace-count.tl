@@ -1,6 +1,6 @@
 ;; regexp-replace-count.tl — bulk regexp replace, reporting how many hits.
 ;;
-;; Run:  mimectl run --local examples/regexp-replace-count.tl --file SOMEFILE
+;; Run:  mime run --local examples/regexp-replace-count.tl --file SOMEFILE
 ;;
 ;; Replaces every run of digits with "#" and reports the count. `replace-regexp`
 ;; (the buffer-level bulk command) does the whole pass from point to end of
