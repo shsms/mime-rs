@@ -1,6 +1,6 @@
 ;; transactional-edit.tl — several edits that all land, or none do.
 ;;
-;; Run:  mime run --local examples/transactional-edit.tl --file SOMEFILE
+;; Run:  mime run examples/transactional-edit.tl --file SOMEFILE
 ;;
 ;; `with-transaction` snapshots the buffer, runs its body, and — if the body
 ;; signals an error — restores the snapshot, so a multi-step edit is atomic:

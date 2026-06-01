@@ -49,7 +49,7 @@ orchestration group, and a path-allowlist + audit safety layer all work. **145 t
 - `checkpoint` / `restore-checkpoint` / `with-transaction` — workspace snapshots
   and atomic, roll-back-on-error edits — and **`rehearse`**, a dry-run that
   returns a program's diff then rolls the buffer back so nothing persists.
-- **One binary, three modes**: `mime run --local PROG.tl` (trusted one-shot),
+- **One binary, three modes**: `mime run PROG.tl` (trusted one-shot),
   `mime --daemon` (warm sessions over a unix socket, JSON-lines), and
   `mime --mcp` (an MCP server, JSON-RPC over stdio, exposing the engine as tools
   like `open_file` / `run_program` / `rehearse` / `view` / `search` /
@@ -65,15 +65,17 @@ Regex is **RE2** (the `regex` crate) — linear-time and streamable; Emacs
 
 ```sh
 # pipe text in — stdin uses the in-memory Buffer, so no filesystem access:
-printf 'hello world, brave world\n' | cargo run --bin mime -- run --local examples/uppercase.tl
+printf 'hello world, brave world\n' | cargo run --bin mime -- run examples/uppercase.tl
 ```
 
 `mime` prints a JSON result with the unified diff and any `(report …)` values —
-here, `world` → `WORLD` twice. To edit a file in place, point `--file` at a path
-under the cwd (or `$MIME_ROOTS`) and add `--write`:
+here, `world` → `WORLD` twice. `run` is the default verb, so `mime
+examples/uppercase.tl` works as shorthand. This embedded one-shot runs
+in-process at the trusted tier (no daemon); to edit a file in place, point
+`--file` at a path under the cwd (or `$MIME_ROOTS`) and add `--write`:
 
 ```sh
-mime run --local examples/uppercase.tl --file ./in.txt --write
+mime run examples/uppercase.tl --file ./in.txt --write
 ```
 
 A file is opened through `Quire` (mmap-backed). The example is the map-shaped

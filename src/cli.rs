@@ -2,10 +2,11 @@
 //!
 //! Three modes share one parser:
 //!
-//! * One-shot, embedded (no daemon):
-//!   `mime run --local PROG.tl [--file FILE] [--write]` runs a tulisp edit
-//!   program against FILE (or stdin) in-process and prints the structured JSON
-//!   result; `--write` saves the edited text back to FILE.
+//! * One-shot, embedded (no daemon) — the default for `run`/`rehearse`:
+//!   `mime run PROG.tl [--file FILE] [--write]` — or just `mime PROG.tl` — runs
+//!   a tulisp edit program against FILE (or stdin) in-process and prints the
+//!   structured JSON result; `--write` saves the edited text back to FILE.
+//!   `mime rehearse PROG.tl` is the dry-run twin (never writes).
 //!
 //! * Interactive, embedded (no daemon):
 //!   `mime repl [--file FILE]` opens a warm in-process session and reads
@@ -13,16 +14,19 @@
 //!   each. State (buffer, kill-ring, checkpoints, `defun`s) persists across
 //!   lines; nothing is ever written back to disk.
 //!
-//! * Daemon-backed (talks to `mime --daemon` over its unix socket —
-//!   `$MIME_SOCKET` or `/tmp/mimed.sock`):
+//! * Daemon-backed — opt in with `--session S` (or `$MIME_SESSION`), which talks
+//!   to `mime --daemon` over its unix socket (`$MIME_SOCKET` or
+//!   `/tmp/mimed.sock`):
 //!     - `mime --session S open --file FILE` / `--text STR`
 //!     - `mime --session S run PROG.tl`
 //!     - `mime --session S save --path PATH`
 //!     - `mime --session S close`
 //!     - `mime status` — live sessions, the allowed roots, and audit state
 //!
-//! The session comes from `--session` or `$MIME_SESSION`. Each verb is sent as
-//! one JSON request line; the daemon's JSON response line is printed verbatim.
+//! `run`/`rehearse` use the daemon only when a session is given (and `--local`
+//! is not — `--local` forces the embedded path even if `$MIME_SESSION` is set).
+//! Each daemon verb is sent as one JSON request line; the daemon's JSON response
+//! line is printed verbatim.
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::exit;
@@ -50,20 +54,31 @@ pub fn run() {
     let argv: Vec<String> = std::env::args().collect();
     let args = parse(&argv);
 
-    let Some(verb) = args.verb.clone() else {
-        usage();
-        exit(2);
+    // A bare program path with no verb is shorthand for a one-shot `run`
+    // (`mime PROG.tl` == `mime run PROG.tl`).
+    let verb = match args.verb.clone() {
+        Some(v) => v,
+        None if args.prog_path.is_some() => "run".to_string(),
+        None => {
+            usage();
+            exit(2);
+        }
     };
 
-    // `repl` is its own thing: an interactive, warm, in-process session that
-    // reads tulisp from stdin (no daemon, no `--local` needed).
-    if verb == "repl" {
-        run_repl(&args);
-    } else if args.local {
-        run_local(&args, &verb);
-    } else {
-        run_daemon(&args, &verb);
+    // `run`/`rehearse` default to the embedded, in-process one-shot; the daemon
+    // is opt-in (`--session` or `$MIME_SESSION`). `repl` is always embedded;
+    // `open`/`save`/`close`/`status` are daemon-only.
+    match verb.as_str() {
+        "repl" => run_repl(&args),
+        "run" | "rehearse" if !uses_daemon(&args) => run_local(&args, &verb),
+        _ => run_daemon(&args, &verb),
     }
+}
+
+/// Should a `run`/`rehearse` go to the daemon? Only when the caller opts in with
+/// `--session` or `$MIME_SESSION`, and `--local` has not forced the embedded path.
+fn uses_daemon(args: &Args) -> bool {
+    !args.local && (args.session.is_some() || std::env::var("MIME_SESSION").is_ok())
 }
 
 /// Parse argv into [`Args`]. The verb is the first bare word among the known
@@ -121,15 +136,15 @@ fn parse(argv: &[String]) -> Args {
     a
 }
 
-/// The embedded one-shot path (`--local`). Supports `run` (persisting, honours
-/// `--write`) and `rehearse` (dry-run: report only, NEVER writes — even if a
-/// stray `--write` is passed).
+/// The embedded one-shot path — the default for `run`/`rehearse` (and forced by
+/// `--local`). `run` persists and honours `--write`; `rehearse` is a dry-run
+/// (report only, NEVER writes — even if a stray `--write` is passed).
 fn run_local(args: &Args, verb: &str) {
     let rehearse = match verb {
         "run" => false,
         "rehearse" => true,
         _ => {
-            eprintln!("--local supports only `run` and `rehearse` (got `{verb}`)");
+            eprintln!("the embedded path supports only `run` and `rehearse` (got `{verb}`)");
             exit(2);
         }
     };
@@ -226,7 +241,7 @@ fn run_local(args: &Args, verb: &str) {
 /// `--file FILE` loads FILE into the session first (via Quire, the production
 /// store); without it the session starts on an empty in-memory buffer. The REPL
 /// never writes anything back to disk — it is a scratchpad for *trying* edits;
-/// use `mime --session … save` (daemon) or `run --local … --write` to persist.
+/// use `mime --session … save` (daemon) or `mime run … --write` to persist.
 fn run_repl(args: &Args) {
     let store: Box<dyn crate::TextStore> = match &args.file {
         Some(f) => {
@@ -513,18 +528,23 @@ fn require_session(args: &Args) -> String {
 }
 
 fn usage() {
-    eprintln!(
-        "usage:\n  \
-         mime run --local PROG.tl [--file FILE] [--write]      (embedded one-shot)\n  \
-         mime rehearse --local PROG.tl [--file FILE]           (embedded dry-run; never writes)\n  \
-         mime repl [--file FILE]                               (interactive warm session; never writes)\n  \
-         mime --session S open --file FILE | --text STR        (daemon)\n  \
-         mime --session S run PROG.tl                          (daemon)\n  \
-         mime --session S rehearse PROG.tl                     (daemon dry-run; nothing persists)\n  \
-         mime --session S save --path PATH                     (daemon)\n  \
-         mime --session S close                                (daemon)\n  \
-         mime status                                           (daemon)"
-    );
+    let rows = [
+        ("mime [run] PROG.tl [--file FILE] [--write]", "embedded one-shot (default); --write saves back to FILE"),
+        ("mime rehearse PROG.tl [--file FILE]", "embedded dry-run; never writes"),
+        ("mime repl [--file FILE]", "interactive warm session; never writes"),
+        ("mime --session S run PROG.tl", "daemon: run in a warm session"),
+        ("mime --session S rehearse PROG.tl", "daemon dry-run; nothing persists"),
+        ("mime --session S open --file FILE | --text STR", "daemon: load a buffer"),
+        ("mime --session S save --path PATH", "daemon: save the session's buffer"),
+        ("mime --session S close", "daemon: end the session"),
+        ("mime status", "daemon: sessions, allowed roots, audit"),
+    ];
+    eprintln!("usage:");
+    for (form, desc) in rows {
+        eprintln!("  {form:<48}{desc}");
+    }
+    eprintln!("\n  the daemon needs a running `mime --daemon`; `--session S` (or $MIME_SESSION)");
+    eprintln!("  selects it. `--local` forces the embedded path even if $MIME_SESSION is set.");
 }
 
 fn read_or_die(path: &str, what: &str) -> String {
@@ -552,6 +572,31 @@ mod tests {
         std::iter::once("mime".to_string())
             .chain(rest.iter().map(|s| s.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn bare_program_path_parses_with_no_verb() {
+        // `mime PROG.tl` (no verb): the path is captured as the program, and
+        // run() then treats a verbless program path as a one-shot `run`.
+        let a = parse(&argv(&["examples/uppercase.tl"]));
+        assert_eq!(a.verb, None);
+        assert_eq!(a.prog_path.as_deref(), Some("examples/uppercase.tl"));
+    }
+
+    #[test]
+    fn run_uses_the_daemon_only_when_a_session_opts_in() {
+        // run/rehearse default to embedded; --session opts into the daemon;
+        // --local forces embedded even with a session. (These cases don't depend
+        // on $MIME_SESSION: the && / || short-circuit before reading the env.)
+        let mut a = Args {
+            session: Some("s".to_string()),
+            ..Args::default()
+        };
+        assert!(uses_daemon(&a)); // --session → daemon
+        a.local = true;
+        assert!(!uses_daemon(&a)); // --local forces embedded, even with a session
+        a.session = None;
+        assert!(!uses_daemon(&a)); // --local, no session → embedded
     }
 
     #[test]

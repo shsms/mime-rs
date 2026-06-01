@@ -1,7 +1,7 @@
 //! `mime` — the single mime-rs binary. One executable, three front-ends, the
 //! mode picked by a flag:
 //!
-//! * `mime …` — the CLI (one-shot `run --local`, the `repl`, and the
+//! * `mime …` — the CLI (the embedded one-shot `run`, the `repl`, and the
 //!   daemon-client verbs). The default when no mode flag is present.
 //! * `mime --daemon` — the long-lived warm-session daemon (JSON-lines over
 //!   `$MIME_SOCKET`).

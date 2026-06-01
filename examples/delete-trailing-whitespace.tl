@@ -1,6 +1,6 @@
 ;; delete-trailing-whitespace.tl — strip trailing spaces/tabs from every line.
 ;;
-;; Run:  mime run --local examples/delete-trailing-whitespace.tl --file SOMEFILE
+;; Run:  mime run examples/delete-trailing-whitespace.tl --file SOMEFILE
 ;;
 ;; `delete-trailing-whitespace` is a builtin that scans the whole buffer and
 ;; removes any [ \t]+ before each line end. We also count what we cleaned first
