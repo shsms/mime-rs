@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Cancel an in-progress run when a newer commit is pushed to the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # ubuntu-latest ships rustup + a stable toolchain; ensure the latest stable
+      # plus the clippy and rustfmt components.
+      - name: Set up the latest stable Rust
+        run: rustup update stable && rustup default stable && rustup component add clippy rustfmt
+      # tree-sitter-md's `parser` feature compiles C via the cc crate.
+      - name: Install the C toolchain
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --locked
