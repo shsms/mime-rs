@@ -1,6 +1,6 @@
 [package]
 name = "mime-rs"
-description = "A scriptable, transactional text-editing engine for AI agents, driven by Emacs-Lisp (tulisp) programs."
+description = "A scriptable, transactional text-editing engine driven by Emacs-Lisp (tulisp) programs — for automation and AI agents."
 version = "0.1.0"
 repository = "https://github.com/shsms/mime-rs"
 license = "GPL-3.0-only"
