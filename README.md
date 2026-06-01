@@ -1,9 +1,8 @@
 # mime-rs
 
-A scriptable, transactional text-editing engine — the Rust/tulisp heir to
-shsms's `mime`. You drive it by submitting small **Emacs-Lisp** programs that
-edit an implicit current buffer; it returns a structured diff plus
-machine-readable reports, and it can rewind to checkpoints.
+A scriptable, transactional text-editing engine. You drive it by submitting
+small **Emacs-Lisp** programs that edit an implicit current buffer; it returns a
+structured diff plus machine-readable reports, and it can rewind to checkpoints.
 
 It serves two audiences from the same core:
 
