@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # Keep the SHA-pinned GitHub Actions current: Dependabot bumps the pin and its
+  # `# vX.Y.Z` comment together, grouped into a single monthly PR. (A `cargo`
+  # entry could be added the same way to track Rust dependencies.)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      actions:
+        patterns: ["*"]
