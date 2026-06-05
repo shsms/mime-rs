@@ -1288,13 +1288,16 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         // (conflict-hunks) — rendered overview: one line per hunk with its
-        // number, char position + line, labels, and side sizes.
+        // number, char position + line, labels, and side sizes; appends a
+        // warning when marker-shaped lines were left unparsed (malformed or
+        // nested conflicts), so "no conflicts" is never silently wrong.
         let s = session.clone();
         ctx.defun("conflict-hunks", move || -> String {
             let mut sess = s.borrow_mut();
             let b = sess.buffer.as_mut();
             let hunks = crate::conflict::scan(b);
-            crate::conflict::render(&*b, &hunks)
+            let strays = crate::conflict::stray_opener_lines(b, &hunks);
+            crate::conflict::render(&*b, &hunks, strays)
         });
     }
     {

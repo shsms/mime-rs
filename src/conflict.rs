@@ -16,8 +16,13 @@
 //! Scanning is stateless — every call re-scans the accessible region (so it
 //! composes with narrowing, and there is no cached hunk list to invalidate
 //! after an edit). Malformed or unterminated marker runs are not hunks; they
-//! stay plain text for the ordinary editing vocabulary. CRLF lines are
-//! tolerated (the `\r` stays inside the side spans, content-faithful).
+//! stay plain text for the ordinary editing vocabulary, and the overview
+//! reports them as stray opener lines so they are never silent. A *nested*
+//! conflict of the same marker size surfaces innermost-first: the outer parse
+//! is rejected (its separator/closer would be ambiguous), the inner hunk is
+//! well-formed in isolation, and once it is resolved a re-scan sees the
+//! outer. CRLF lines are tolerated (the `\r` stays inside the side spans,
+//! content-faithful).
 
 use crate::store::TextStore;
 
@@ -116,6 +121,17 @@ fn parse_hunk_at(b: &mut dyn TextStore, start: usize) -> Option<Hunk> {
         let line_pos = pos;
         let (line, next) = line_at(b, line_pos);
         pos = next;
+        // A nested opener of the SAME run length (zdiff3 criss-cross merges)
+        // would make this hunk's separator/closer ambiguous — reject the outer
+        // parse. The scan then resumes past this opener and surfaces the
+        // *inner* conflict, which is well-formed in isolation: nested hunks
+        // resolve innermost-first, and re-scanning sees the outer once its
+        // inside is clean. (A nested opener of a *different* length is plain
+        // content — its separator/closer can't match `mlen` — so it parses
+        // through correctly without this guard.)
+        if marker_label(&line, '<', mlen).is_some() {
+            return None;
+        }
         if let Some(ts) = theirs_start {
             // In theirs: only the closer ends the hunk.
             if let Some(theirs_label) = marker_label(&line, '>', mlen) {
@@ -184,19 +200,49 @@ pub fn side_text(b: &dyn TextStore, h: &Hunk, side: &str) -> Result<String, Stri
     }
 }
 
-/// Render the `conflict-hunks` overview: one line per hunk with its number,
-/// char position + line (goto-char-able), labels, and side sizes.
-pub fn render(b: &dyn TextStore, hunks: &[Hunk]) -> String {
-    let name = b.name();
-    if hunks.is_empty() {
-        return format!("— no conflicts in {name} —\n");
+/// Count opener-shaped lines (a `<<<<<<<` run of ≥ 7 at a line start, in
+/// marker form) that lie OUTSIDE every parsed hunk — the leftovers of
+/// malformed, unterminated, or nested conflicts. The overview surfaces the
+/// count so an agent never mistakes "0 parsed hunks" for "nothing
+/// conflict-shaped present". Point preserved; match data clobbered.
+pub fn stray_opener_lines(b: &mut dyn TextStore, hunks: &[Hunk]) -> usize {
+    let saved = b.point();
+    let mut strays = 0;
+    b.goto_char(b.point_min());
+    while let Some(after) = b.search_forward("<<<<<<<", None) {
+        let start = after - 7;
+        if start > b.point_min() && b.char_before(start) != Some('\n') {
+            continue;
+        }
+        if hunks.iter().any(|h| h.start <= start && start < h.end) {
+            continue;
+        }
+        let (line, next) = line_at(b, start);
+        let mlen = run_len(line.strip_suffix('\r').unwrap_or(&line), '<');
+        if marker_label(&line, '<', mlen).is_some() {
+            strays += 1;
+        }
+        b.goto_char(next.max(after));
     }
+    b.goto_char(saved);
+    strays
+}
+
+/// Render the `conflict-hunks` overview: one line per hunk with its number,
+/// char position + line (goto-char-able), labels, and side sizes; plus a
+/// trailing warning when `strays` opener lines were left unparsed.
+pub fn render(b: &dyn TextStore, hunks: &[Hunk], strays: usize) -> String {
+    let name = b.name();
     let lines_of = |span: (usize, usize)| b.substring(span.0, span.1).lines().count();
-    let mut out = format!(
-        "— {} conflict{} in {name} —\n",
-        hunks.len(),
-        if hunks.len() == 1 { "" } else { "s" },
-    );
+    let mut out = if hunks.is_empty() {
+        format!("— no conflicts in {name} —\n")
+    } else {
+        format!(
+            "— {} conflict{} in {name} —\n",
+            hunks.len(),
+            if hunks.len() == 1 { "" } else { "s" },
+        )
+    };
     for (i, h) in hunks.iter().enumerate() {
         let sides = match h.base {
             Some(span) => format!(
@@ -215,6 +261,14 @@ pub fn render(b: &dyn TextStore, hunks: &[Hunk]) -> String {
             h.ours_label,
             h.theirs_label,
             sides,
+        ));
+    }
+    if strays > 0 {
+        out.push_str(&format!(
+            "  ! {strays} unparsed '<<<<<<<' marker line{} — malformed or nested \
+             conflict text; resolve the hunks above and re-list, or inspect \
+             with (occur \"^<<<<<<<\")\n",
+            if strays == 1 { "" } else { "s" }
         ));
     }
     out
@@ -307,6 +361,62 @@ mod tests {
         assert_eq!(
             b.substring(hunks[0].ours.0, hunks[0].ours.1),
             "ours\n======= not a separator\n"
+        );
+    }
+
+    #[test]
+    fn nested_same_size_conflicts_surface_innermost_first() {
+        // zdiff3 criss-cross shape: an inner conflict inside the outer ours.
+        let text = "<<<<<<< A\nout-ours\n<<<<<<< inner\nin-ours\n=======\nin-theirs\n\
+                    >>>>>>> inner\n=======\nout-theirs\n>>>>>>> B\n";
+        let (hunks, mut b) = hunks_of(text);
+        // The outer parse is rejected (ambiguous); the inner hunk surfaces.
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].ours_label, "inner");
+        assert_eq!(b.substring(hunks[0].ours.0, hunks[0].ours.1), "in-ours\n");
+        // The outer opener is reported as a stray, not silently dropped.
+        assert_eq!(stray_opener_lines(&mut b, &hunks), 1);
+        // Resolving the inner hunk makes the outer well-formed on re-scan.
+        b.delete_region(hunks[0].start, hunks[0].end);
+        b.goto_char(hunks[0].start);
+        b.insert("in-resolved\n");
+        let hunks = scan(&mut b);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].ours_label, "A");
+        assert_eq!(
+            b.substring(hunks[0].ours.0, hunks[0].ours.1),
+            "out-ours\nin-resolved\n"
+        );
+        assert_eq!(stray_opener_lines(&mut b, &hunks), 0);
+    }
+
+    #[test]
+    fn nested_different_size_markers_parse_as_outer_content() {
+        // A 9-char inner marker block inside a 7-char hunk is plain content:
+        // its separator/closer can't match the outer run length.
+        let text = "<<<<<<< A\no1\n<<<<<<<<< X\nfixture\n=========\nfix2\n>>>>>>>>> Y\n\
+                    =======\nt1\n>>>>>>> B\n";
+        let (hunks, b) = hunks_of(text);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].ours_label, "A");
+        assert!(
+            b.substring(hunks[0].ours.0, hunks[0].ours.1)
+                .contains("<<<<<<<<< X"),
+            "the size-9 block stays inside ours"
+        );
+    }
+
+    #[test]
+    fn stray_openers_counted_for_malformed_runs() {
+        // An unterminated conflict is no hunk, but its opener is not silent.
+        let (hunks, mut b) = hunks_of("<<<<<<< A\nours\n=======\ntheirs, no closer\n");
+        assert_eq!(hunks.len(), 0);
+        assert_eq!(stray_opener_lines(&mut b, &hunks), 1);
+        let out = render(&b, &hunks, 1);
+        assert!(out.contains("no conflicts"), "got: {out}");
+        assert!(
+            out.contains("1 unparsed '<<<<<<<' marker line"),
+            "got: {out}"
         );
     }
 
