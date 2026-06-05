@@ -66,6 +66,24 @@ impl TulispConvertible for Marker {
     }
 }
 
+/// Clamp one occur output line to ~240 chars, keeping a window around the
+/// match column (`col`, 0-based chars from line start); `…` marks elision.
+/// Keeps a single minified/log line from flooding an occur result.
+fn clamp_occur_line(text: &str, col: usize) -> String {
+    const MAX: usize = 240;
+    let len = text.chars().count();
+    if len <= MAX {
+        return text.to_string();
+    }
+    let lo = col.saturating_sub(MAX / 3).min(len - MAX);
+    let windowed: String = text.chars().skip(lo).take(MAX).collect();
+    format!(
+        "{}{windowed}{}",
+        if lo > 0 { "…" } else { "" },
+        if lo + MAX < len { "…" } else { "" }
+    )
+}
+
 pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     // ---- navigation ----
     {
@@ -297,6 +315,123 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         );
     }
 
+    {
+        // (occur REGEXP &optional NLINES LIMIT) — a buffer-wide match overview:
+        // one rendered line per matching line of the accessible region (so it
+        // composes with narrowing), grep-style, each with its line number and
+        // the char position of the line's first match for a direct goto-char
+        // follow-up. NLINES (default 0) adds context lines around each hit,
+        // overlapping blocks merged, "--" between blocks; LIMIT (default 100)
+        // caps the rendered matching lines ("… N more" tail), and very long
+        // lines are clamped around the match — token discipline for
+        // minified/log content. Orientation, not motion: point is preserved
+        // (match data is not). Shares the windowed-search perf profile of
+        // replace-regexp on a huge Quire: fine at code scale.
+        let s = session.clone();
+        ctx.defun(
+            "occur",
+            move |re: String,
+                  nlines: Option<i64>,
+                  limit: Option<i64>|
+                  -> Result<String, Error> {
+                let rx = cached_regex(&re)?;
+                let nlines = nlines.unwrap_or(0).max(0) as usize;
+                let limit = limit.unwrap_or(100).max(1) as usize;
+                let mut sess = s.borrow_mut();
+                let saved = sess.buffer.point();
+                let pmin = sess.buffer.point_min();
+                let pmax = sess.buffer.point_max();
+                let min_line = sess.buffer.line_number_at_pos(pmin);
+                let max_line = sess.buffer.line_number_at_pos(pmax);
+                // Pass 1: collect (line, first-match pos, per-line count) for
+                // the first LIMIT matching lines, counting the rest only for
+                // the header totals.
+                let mut hits: Vec<(usize, usize, usize)> = Vec::new();
+                let (mut total_matches, mut total_lines, mut prev_line) = (0usize, 0usize, 0usize);
+                sess.buffer.goto_char(pmin);
+                while let Some(end) = sess.buffer.re_search_forward(&rx, None) {
+                    let start = sess.buffer.last_match().map_or(end, |m| m.start);
+                    total_matches += 1;
+                    let line = sess.buffer.line_number_at_pos(start);
+                    if line != prev_line {
+                        prev_line = line;
+                        total_lines += 1;
+                        if hits.len() < limit {
+                            hits.push((line, start, 1));
+                        }
+                    } else if let Some(last) = hits.last_mut().filter(|h| h.0 == line) {
+                        last.2 += 1;
+                    }
+                    // An empty match leaves point in place — step over it.
+                    if end == start {
+                        if end >= pmax {
+                            break;
+                        }
+                        sess.buffer.goto_char(end + 1);
+                    }
+                }
+                let name = sess.buffer.name().to_string();
+                if total_matches == 0 {
+                    sess.buffer.goto_char(saved);
+                    return Ok(format!("\u{2014} occur \"{re}\" in {name}: no matches \u{2014}\n"));
+                }
+                let mut out = format!(
+                    "\u{2014} occur \"{re}\" in {name}: {total_matches} match{} on {total_lines} line{} \u{2014}\n",
+                    if total_matches == 1 { "" } else { "es" },
+                    if total_lines == 1 { "" } else { "s" },
+                );
+                // Pass 2: render the hit lines (plus NLINES of context, with
+                // overlapping blocks merged so no line prints twice).
+                let mut blocks: Vec<(usize, usize)> = Vec::new();
+                for &(line, _, _) in &hits {
+                    let lo = line.saturating_sub(nlines).max(min_line);
+                    let hi = (line + nlines).min(max_line);
+                    match blocks.last_mut() {
+                        Some((_, bhi)) if lo <= *bhi + 1 => *bhi = (*bhi).max(hi),
+                        _ => blocks.push((lo, hi)),
+                    }
+                }
+                for (bi, &(lo, hi)) in blocks.iter().enumerate() {
+                    if nlines > 0 && bi > 0 {
+                        out.push_str("   --\n");
+                    }
+                    sess.buffer.goto_char(pmin);
+                    sess.buffer.forward_line((lo - min_line) as i64);
+                    for line_no in lo..=hi {
+                        let start = sess.buffer.point();
+                        sess.buffer.end_of_line();
+                        let end = sess.buffer.point();
+                        let text = sess.buffer.substring(start, end);
+                        match hits.binary_search_by_key(&line_no, |h| h.0) {
+                            Ok(i) => {
+                                let (_, pos, n) = hits[i];
+                                let times =
+                                    if n > 1 { format!(" \u{d7}{n}") } else { String::new() };
+                                let text = clamp_occur_line(&text, pos - start);
+                                out.push_str(&format!("{line_no:>5} @{pos}{times}: {text}\n"));
+                            }
+                            Err(_) => {
+                                let text = clamp_occur_line(&text, 0);
+                                out.push_str(&format!("{line_no:>5} - {text}\n"));
+                            }
+                        }
+                        if line_no < hi {
+                            sess.buffer.goto_char(end);
+                            sess.buffer.forward_line(1);
+                        }
+                    }
+                }
+                if total_lines > hits.len() {
+                    out.push_str(&format!(
+                        "  \u{2026} and {} more matching lines\n",
+                        total_lines - hits.len()
+                    ));
+                }
+                sess.buffer.goto_char(saved);
+                Ok(out)
+            },
+        );
+    }
     {
         // (buffer-file-name) — the visited file's path as recorded at open/rebase
         // time, or nil for a buffer with no backing file (Emacs parity).
@@ -1966,6 +2101,68 @@ mod tests {
         assert!(stale.contains("modified"), "got: {stale}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn occur_renders_hits_with_line_pos_counts_and_preserves_point() {
+        // "beta" hits: line 1 @7, line 2 @12 (twice), line 4 @28.
+        let mut ws = trusted("alpha beta\nbeta beta\ngamma\nbeta\n");
+        let r = ws
+            .run(r#"(goto-char 5) (message (occur "beta")) (report "point" (point))"#)
+            .unwrap();
+        let out = &r.log[0];
+        assert!(
+            out.contains("4 matches on 3 lines"),
+            "header totals, got: {out}"
+        );
+        assert!(out.contains("    1 @7: alpha beta"), "got: {out}");
+        assert!(
+            out.contains("    2 @12 ×2: beta beta"),
+            "per-line count, got: {out}"
+        );
+        assert!(out.contains("    4 @28: beta"), "got: {out}");
+        assert!(!out.contains("gamma"), "non-matching line leaked: {out}");
+        // Orientation, not motion: point is back where the program left it.
+        assert_eq!(report(&r, "point"), "5");
+
+        // No matches → a one-line header, point still preserved.
+        let r = ws.run(r#"(message (occur "zeta"))"#).unwrap();
+        assert!(r.log[0].contains("no matches"), "got: {}", r.log[0]);
+    }
+
+    #[test]
+    fn occur_respects_narrowing_limit_and_context() {
+        let mut ws = trusted("alpha beta\nbeta beta\ngamma\nbeta\n");
+        // Narrowed to line 2 only, occur sees just that line's matches.
+        let r = ws
+            .run(r#"(save-restriction (narrow-to-region 12 22) (message (occur "beta")))"#)
+            .unwrap();
+        assert!(
+            r.log[0].contains("2 matches on 1 line —"),
+            "narrowing scope, got: {}",
+            r.log[0]
+        );
+        assert!(!r.log[0].contains("alpha"), "got: {}", r.log[0]);
+
+        // LIMIT 1 renders one matching line and counts the rest in the tail.
+        let r = ws.run(r#"(message (occur "beta" 0 1))"#).unwrap();
+        assert!(
+            r.log[0].contains("… and 2 more matching lines"),
+            "limit tail, got: {}",
+            r.log[0]
+        );
+
+        // NLINES 1 around the line-4 hit pulls in line 3 as "-" context, and
+        // the two blocks (lines 1-3 merged, then nothing left) never repeat a
+        // line; a context-only line shows the "-" gutter.
+        let r = ws.run(r#"(message (occur "gamma" 1))"#).unwrap();
+        let out = &r.log[0];
+        assert!(
+            out.contains("    2 - beta beta"),
+            "context above, got: {out}"
+        );
+        assert!(out.contains("    3 @22: gamma"), "hit line, got: {out}");
+        assert!(out.contains("    4 - beta"), "context below, got: {out}");
     }
 
     #[test]
