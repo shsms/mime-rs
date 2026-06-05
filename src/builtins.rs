@@ -1167,6 +1167,19 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         let s = session.clone();
+        // (treesit-has-error) — t if the buffer fails to parse cleanly for its
+        // language (any ERROR/missing node). The cheap "did my edit break the
+        // syntax?" check an agent runs after editing code.
+        ctx.defun("treesit-has-error", move || -> bool {
+            let mut sess = s.borrow_mut();
+            let broken = syntax_of(&sess).has_error();
+            sess.reports
+                .push(("treesit-has-error".to_string(), broken.to_string()));
+            broken
+        });
+    }
+    {
+        let s = session.clone();
         // (treesit-node-at &optional POS) — the smallest NAMED node covering POS
         // (default point). Reports its type and 1-based char start/end; returns
         // the type string (nil if the tree is empty).
@@ -1218,6 +1231,114 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             }
             sess.buffer.point() as i64
         });
+    }
+    {
+        let s = session.clone();
+        // (treesit-defun-name &optional POS) — the name of the enclosing defun
+        // at POS (default point): function/class/type name, Markdown heading
+        // text. Reports and returns it; nil if no enclosing defun or anonymous.
+        ctx.defun(
+            "treesit-defun-name",
+            move |pos: Option<i64>| -> TulispObject {
+                let mut sess = s.borrow_mut();
+                let p = pos.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
+                match syntax_of(&sess).enclosing_defun_name(p) {
+                    Some(name) => {
+                        sess.reports
+                            .push(("treesit-defun-name".to_string(), name.clone()));
+                        TulispValue::from(name).into_ref(None)
+                    }
+                    None => TulispObject::nil(),
+                }
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (treesit-narrow-to-defun &optional POS) — narrow the buffer to the
+        // enclosing defun at POS (default point), scoping every subsequent
+        // edit/search to that one function/class/section (compose with
+        // save-restriction / widen). Returns t, or nil (no narrowing) if POS
+        // is inside no defun.
+        ctx.defun("treesit-narrow-to-defun", move |pos: Option<i64>| -> bool {
+            let mut sess = s.borrow_mut();
+            let p = pos.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
+            match syntax_of(&sess).enclosing_defun(p) {
+                Some(d) => {
+                    sess.buffer.narrow_to_region(d.start, d.end);
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+    {
+        let s = session.clone();
+        // (treesit-list-defuns) — the buffer outline: report every defun in
+        // document order (nested ones included) as "KIND START END NAME" and
+        // return the list of names. How an agent surveys a source file
+        // without reading it whole.
+        ctx.defun("treesit-list-defuns", move || -> Vec<String> {
+            let mut sess = s.borrow_mut();
+            let defuns = syntax_of(&sess).defuns();
+            let mut names = Vec::with_capacity(defuns.len());
+            for d in defuns {
+                sess.reports.push((
+                    "defun".to_string(),
+                    format!("{} {} {} {}", d.kind, d.start, d.end, d.name),
+                ));
+                names.push(d.name);
+            }
+            names
+        });
+    }
+    {
+        let s = session.clone();
+        // (treesit-goto-defun NAME) — move point to the start of the first
+        // defun (document order) named NAME — "go to fn parse_args" without
+        // knowing where it is. Reports its span and returns the new point;
+        // nil (point unmoved) if no defun has that name.
+        ctx.defun("treesit-goto-defun", move |name: String| -> TulispObject {
+            let mut sess = s.borrow_mut();
+            match syntax_of(&sess).find_defun(&name) {
+                Some(d) => {
+                    sess.reports.push((
+                        "treesit-defun".to_string(),
+                        format!("{} {} {} {}", d.kind, d.start, d.end, d.name),
+                    ));
+                    sess.buffer.goto_char(d.start);
+                    TulispValue::from(sess.buffer.point() as i64).into_ref(None)
+                }
+                None => TulispObject::nil(),
+            }
+        });
+    }
+    {
+        let s = session.clone();
+        // (treesit-query PATTERN) — run a tree-sitter query (.scm pattern
+        // syntax) over the buffer: structural search ("every call to foo",
+        // "all pub fns") instead of regex. Reports each capture as
+        // "@CAPTURE KIND START END" and returns the matching list of
+        // "START END" strings (split-string to consume). Errors if the
+        // pattern does not compile for the buffer's language.
+        ctx.defun(
+            "treesit-query",
+            move |pattern: String| -> Result<Vec<String>, Error> {
+                let mut sess = s.borrow_mut();
+                let caps = syntax_of(&sess)
+                    .query(&pattern)
+                    .map_err(|e| err(&format!("treesit-query: {e}")))?;
+                let mut spans = Vec::with_capacity(caps.len());
+                for (name, n) in caps {
+                    sess.reports.push((
+                        "capture".to_string(),
+                        format!("@{name} {} {} {}", n.kind, n.start, n.end),
+                    ));
+                    spans.push(format!("{} {}", n.start, n.end));
+                }
+                Ok(spans)
+            },
+        );
     }
 }
 

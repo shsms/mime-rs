@@ -1066,4 +1066,78 @@ mod tests {
         );
         assert!(e.is_err(), "unknown language must error");
     }
+
+    #[test]
+    fn treesit_goto_defun_and_defun_name() {
+        let r = run_named(
+            "lib.rs",
+            RS_SRC,
+            r#"(report "p" (treesit-goto-defun "beta")) (report "name" (treesit-defun-name))
+               (report "missing" (treesit-goto-defun "gamma"))"#,
+        );
+        // "fn alpha() -> i64 {\n    1\n}\n\n" is 29 chars; beta starts at 30.
+        assert_eq!(report(&r, "p"), "30");
+        assert_eq!(report(&r, "name"), "\"beta\"");
+        assert_eq!(report(&r, "missing"), "nil");
+        assert_eq!(r.point, 30); // the missing lookup left point alone
+    }
+
+    #[test]
+    fn treesit_narrow_to_defun_scopes_an_edit() {
+        // Replace inside `alpha` only: beta's literal `1` is outside the
+        // narrowing and must survive.
+        let r = run_named(
+            "lib.rs",
+            RS_SRC,
+            r#"(treesit-goto-defun "alpha") (treesit-narrow-to-defun)
+               (replace-string "1" "42") (widen)"#,
+        );
+        assert_eq!(
+            r.final_text,
+            "fn alpha() -> i64 {\n    42\n}\n\nfn beta() -> i64 {\n    alpha() + 1\n}\n"
+        );
+    }
+
+    #[test]
+    fn treesit_list_defuns_outlines_the_buffer() {
+        let r = run_named(
+            "app.py",
+            PY_SRC,
+            r#"(report "names" (string-join (treesit-list-defuns) ","))"#,
+        );
+        assert_eq!(report(&r, "names"), "\"f,g\"");
+        // Each defun also self-reports its kind and span.
+        assert_eq!(report(&r, "defun"), "function_definition 1 22 f");
+    }
+
+    #[test]
+    fn treesit_has_error_flags_a_breaking_edit() {
+        let r = run_named(
+            "lib.rs",
+            "fn ok() {}\n",
+            r#"(report "before" (if (treesit-has-error) "y" "n"))
+               (end-of-buffer) (insert "fn broken(")
+               (report "after" (if (treesit-has-error) "y" "n"))"#,
+        );
+        assert_eq!(report(&r, "before"), "\"n\"");
+        assert_eq!(report(&r, "after"), "\"y\"");
+    }
+
+    #[test]
+    fn treesit_query_runs_structural_search() {
+        let r = run_named(
+            "app.py",
+            PY_SRC,
+            r#"(report "n" (length (treesit-query "(function_definition name: (identifier) @fn)")))"#,
+        );
+        assert_eq!(report(&r, "n"), "2");
+        // Captures self-report as "@CAPTURE KIND START END"; `f` is char [5, 6).
+        assert_eq!(report(&r, "capture"), "@fn identifier 5 6");
+        // A bad pattern is a lisp error, not a panic.
+        let e = run_program(
+            Box::new(Buffer::from_string("app.py", PY_SRC)),
+            r#"(treesit-query "(unbalanced")"#,
+        );
+        assert!(e.is_err());
+    }
 }
