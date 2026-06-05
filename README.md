@@ -129,6 +129,19 @@ cargo test
 `tree-sitter-rust`, `tree-sitter-python`) compile C, so a host C toolchain
 (`cc`) is required.
 
+## Claude Code
+
+```sh
+make claude    # cargo install + register `mime --mcp` as a user-scope MCP server
+```
+
+Every Claude Code session then picks the tools up automatically. The sandboxed
+tier's filesystem is confined to `MIME_ROOTS`, which defaults to this repo's
+parent directory (where your projects presumably live); override with
+`make claude MIME_ROOTS=/a:/b`, or set it empty to confine each session to its
+own working directory. `make uninstall-mcp` deregisters; `make test` runs the
+same fmt/clippy/test gate as CI.
+
 ## Dogfooding feedback
 
 mime-rs is used by AI agents (Claude Code drives it over MCP) as well as by
