@@ -570,7 +570,7 @@ counts) and gives an immediate real-world acceptance test.
 
 * Roadmap / milestones
 
-/Status: M0–M5 ✓; M6 partly (parallel index, rebase-on-save, streaming saves); M7 scaffold; M8 ✓; M9 ✓ (one ~mime~ binary); M10 ✓ (multi-buffer + file I/O + args). 142 tests, clippy clean./
+/Status: M0–M5 ✓; M6 partly (parallel index, rebase-on-save, streaming saves); M7 grammars+query ✓ (Rust/Python/Markdown; persistent tree + AST-edit ops remain); M8 ✓; M9 ✓ (one ~mime~ binary); M10 ✓ (multi-buffer + file I/O + args). 165 tests, clippy clean./
 
 ** DONE M0 — Editor core + tulisp API [#A]
    ~60 core editor builtins over the in-memory ~Buffer~ (the diff-test oracle); ~mime run --local~; structured diff + ~report~.
@@ -586,31 +586,34 @@ counts) and gives an immediate real-world acceptance test.
    Path allowlist (~MIME_ROOTS~ / ~check_path~), read-only buffers, atomic saves, audit journal (~MIME_AUDIT~). /Exit ✓: safe to grant to an autonomous agent./
 ** DOING M6 — Parallelism & performance [#B]
    Done: parallel initial char/line index (~std::thread::scope~, ~4.8×); rebase-on-save compaction; streaming atomic saves (no full ~text()~ materialization). Remaining: parallel search/replace (needs a resumable streaming DFA — regex-automata — for cross-chunk matches); bytecode-compile hot programs; dirty-span diffs; external-change (mtime/inode) detection. /Exit: global-replace a multi-GB file across cores; ulysses bench beats ~mime~./
-** DOING M7 — Structural / syntax-aware editing [#C] (navigation scaffold landed)
+** DOING M7 — Structural / syntax-aware editing [#C] (grammars + query landed)
 
-   /Done (scaffold):/ tree-sitter + ~tree-sitter-md~ (Markdown); ~src/syntax.rs~ re-parses
-   ~buffer.text()~ fresh each call (byte↔1-based-char mapping, multibyte-safe); builtins
-   ~treesit-root-type~, ~treesit-node-at~ (smallest named node at point → type + char span),
-   ~treesit-beginning-of-defun~/~treesit-end-of-defun~ (enclosing Markdown ~section~). This is
-   read-only *navigation* on prose — a proof of concept.
-   /For an agent to edit CODE structurally (prioritized):/
-   1. *Code grammars + language detection* — Markdown-only today, so it cannot touch code at
-      all. Add ~tree-sitter-rust~/~-python~/~-js~/… ; dispatch by extension / buffer name;
-      generalize "top-level construct" (~section~ → ~function_item~ / ~function_definition~).
-   2. *Structural query — the keystone.* Agents locate code by structure ("the function
-      ~parse_args~", "every call to ~foo~"), not char positions. Expose tree-sitter *queries*
-      (~.scm~ patterns + captures): ~treesit-query~ / ~treesit-search-forward~ by node type or
-      query. No query builtin exists yet; this is what makes it more than a fancier ~point~.
-   3. *Persistent per-~Session~ tree (the lever).* Keep the parse on the ~Session~ instead of
+   /Done:/ tree-sitter + ~tree-sitter-md~/~-rust~/~-python~; ~src/syntax.rs~ re-parses
+   ~buffer.text()~ fresh each call (byte↔1-based-char mapping, multibyte-safe); language
+   detected from the buffer name's extension (~Lang::from_buffer_name~), per-buffer override
+   ~treesit-set-language~ (~Session.lang_overrides~), Markdown fallback. "Defun" generalized
+   per language (~section~ / ~function_item~+~impl_item~+type items / ~function_definition~+
+   ~class_definition~; innermost wins). Builtins: ~treesit-language~, ~treesit-root-type~,
+   ~treesit-node-at~, ~treesit-beginning-of-defun~/~treesit-end-of-defun~,
+   ~treesit-defun-name~, ~treesit-list-defuns~ (outline: kind+span+name reports, names
+   returned), ~treesit-goto-defun NAME~ (address code by name, not position),
+   ~treesit-narrow-to-defun~ (scope edits to one defun), ~treesit-query~ (.scm patterns +
+   captures — structural search), ~treesit-has-error~ (post-edit syntax check).
+   /Remaining (prioritized):/
+   1. *Persistent per-~Session~ tree (the lever).* Keep the parse on the ~Session~ instead of
       re-parsing every call. Unlocks at once: relational navigation + fields (~node-parent~/
       ~child~/~next-sibling~/~child-by-field-name~ — body vs. name vs. params), which needs
-      *nodes as first-class values* (a live tree to reference, like markers); *incremental
-      re-parse* (feed ~InputEdit~s, not O(buffer) per call); and *error-tree handling*
-      (~treesit-has-error~ — code mid-edit is usually syntactically broken).
-   4. *AST-edit ops* — ~replace-node~/~wrap-node~/~raise-node~/~kill-node~/insert-sibling. The
+      *nodes as first-class values* (a live tree to reference, like markers); and *incremental
+      re-parse* (feed ~InputEdit~s, not O(buffer) per call).
+   2. *AST-edit ops* — ~replace-node~/~wrap-node~/~raise-node~/~kill-node~/insert-sibling. The
       smaller part: ~treesit-node-at~ already gives a char range, so "replace the node at point"
-      is reachable today via ~delete-region~ + ~insert~; these wrap the common cases once #2/#3
-      land.
+      is reachable today via ~delete-region~ + ~insert~; these wrap the common cases once #1
+      lands.
+   3. *More languages* — JS/TS, Go, … : a ~Lang~ variant + extension row + ~defun_kinds~ row
+      each. Python ~decorated_definition~ handling (span should include decorators).
+   (Fixed along the way: the JSON result's ~reports~ map used to collapse duplicate keys —
+   per-item report streams like ~defun~/~capture~ lines lost all but the last entry; repeated
+   keys now aggregate into an array. Found by Claude dogfooding ~treesit-list-defuns~.)
    Adjacencies: structural code editing wants a *formatter* (~rustfmt~, via ~call-process~ in
    the trusted tier) and *project context* (sibling files, via file I/O / orchestration), so
    M7-for-code and M10 reinforce each other. Sequence: grammars → query → persistent tree →

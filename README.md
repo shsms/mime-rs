@@ -32,7 +32,7 @@ decides how much power a caller gets. The full design and roadmap are in
 
 Real and dogfooded. The editor core, the `Quire` store, checkpoints /
 transactions / rehearse, the warm-session daemon, the MCP server, the trusted
-orchestration group, and a path-allowlist + audit safety layer all work. **145 tests,
+orchestration group, and a path-allowlist + audit safety layer all work. **165 tests,
 `clippy` clean.**
 
 - **`TextStore`** trait with two implementations: an in-memory `Buffer` (the
@@ -43,9 +43,16 @@ orchestration group, and a path-allowlist + audit safety layer all work. **145 t
   the live mmap.
 - The **Emacs-Lisp editor vocabulary** — motion, mark/region, regex search/
   replace, kill-ring, narrowing, **markers** (durable positions), a `window`
-  viewport, and an M7 `treesit-*` (tree-sitter) scaffold — plus a `regex`-backed
-  string library, all on the [`tulisp`](https://github.com/shsms/tulisp)
-  interpreter.
+  viewport, and M7 `treesit-*` (tree-sitter) structural editing — plus a
+  `regex`-backed string library, all on the
+  [`tulisp`](https://github.com/shsms/tulisp) interpreter.
+- **Structural editing (M7)** over **Markdown, Rust, and Python** — the
+  language detected from the buffer name (`.rs`, `.py`, `.md`, …, overridable
+  with `treesit-set-language`): outline a file (`treesit-list-defuns`), jump to
+  a function/class/section *by name* (`treesit-goto-defun`), scope edits to one
+  defun (`treesit-narrow-to-defun`), run tree-sitter **queries** (`.scm`
+  patterns, `treesit-query`) for structural search, and syntax-check after an
+  edit (`treesit-has-error`).
 - `checkpoint` / `restore-checkpoint` / `with-transaction` — workspace snapshots
   and atomic, roll-back-on-error edits — and **`rehearse`**, a dry-run that
   returns a program's diff then rolls the buffer back so nothing persists.
@@ -106,7 +113,7 @@ Programs are Emacs Lisp on `tulisp` (control flow, `let`, `lambda`, `dolist`,
 | Search & replace | `re-search-forward` `search-forward` `search-backward` `replace-match` `match-string` `match-beginning` `match-end` `replace-string` `replace-regexp` `count-matches` `regexp-quote` |
 | Narrowing & scope | `narrow-to-region` `widen` `save-excursion` `save-restriction` |
 | Time travel | `checkpoint` `restore-checkpoint` `with-transaction` |
-| Structural (M7) | `treesit-root-type` `treesit-node-at` `treesit-beginning-of-defun` `treesit-end-of-defun` (tree-sitter; Markdown) |
+| Structural (M7) | `treesit-language` `treesit-set-language` `treesit-root-type` `treesit-has-error` `treesit-node-at` `treesit-beginning-of-defun` `treesit-end-of-defun` `treesit-defun-name` `treesit-narrow-to-defun` `treesit-list-defuns` `treesit-goto-defun` `treesit-query` (tree-sitter; Markdown, Rust, Python) |
 | Observability | `report` `message` `window` |
 | Orchestration (trusted tier) | `find-file` `find-file-noselect` `insert-file-contents` `write-file` `write-region` `directory-files` `generate-new-buffer` `set-buffer` `with-current-buffer` `current-buffer` `buffer-name` `buffer-list` `get-buffer` `kill-buffer` `arg` |
 | String library | `replace-regexp-in-string` `substring` `split-string` `string-trim`(`-left`/`-right`) `string-prefix-p` `string-suffix-p` `string-search` `string-replace` `string-join` `string-empty-p` `number-to-string` `string-to-number` `upcase` `downcase` `capitalize` `char-to-string` `string-to-char` |
@@ -118,8 +125,18 @@ cargo build
 cargo test
 ```
 
-`tulisp` comes from crates.io; the `tree-sitter-md` parser compiles C, so a host
-C toolchain (`cc`) is required.
+`tulisp` comes from crates.io; the tree-sitter grammars (`tree-sitter-md`,
+`tree-sitter-rust`, `tree-sitter-python`) compile C, so a host C toolchain
+(`cc`) is required.
+
+## Dogfooding feedback
+
+mime-rs is used by AI agents (Claude Code drives it over MCP) as well as by
+hand. Agents using it are asked to flag friction as they hit it — a missing
+builtin, a confusing report, a query that should have been expressible — and
+suggest the improvement instead of silently working around it. If you are an
+agent reading this: when something here slows you down, say so in your summary
+and propose the fix (`plan.org` is the roadmap to extend).
 
 ## Layout
 
@@ -128,7 +145,8 @@ C toolchain (`cc`) is required.
 - `src/quire.rs` — `Quire`, the mmap-backed persistent-B-tree piece store.
 - `src/builtins.rs` — editor primitives registered on a `tulisp` context.
 - `src/strings.rs` — the RE2-backed string library.
-- `src/syntax.rs` — the tree-sitter scaffold behind the `treesit-*` builtins (M7).
+- `src/syntax.rs` — the tree-sitter layer behind the `treesit-*` builtins (M7):
+  language detection, defun outline/lookup, structural queries.
 - `src/engine.rs` — `run_program` / `rehearse`, sessions, checkpoints, capability tiers.
 - `src/safety.rs` — path allowlisting (`$MIME_ROOTS`), atomic saves, audit journal.
 - `src/cli.rs` — local one-shot + daemon-client verbs (`run`, `open`, `save`, `status`, `rehearse`, `repl`, `close`).
