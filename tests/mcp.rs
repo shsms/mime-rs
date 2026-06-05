@@ -145,6 +145,7 @@ fn full_session_round_trip_over_stdio() {
         "rehearse",
         "read_region",
         "search",
+        "occur",
         "checkpoint",
         "restore_checkpoint",
         "list_checkpoints",
@@ -343,6 +344,32 @@ fn sessions_are_isolated_and_warm() {
 }
 
 /// A unique temp directory for one safety test, used as the `MIME_ROOTS` root.
+#[test]
+fn occur_overviews_matches_without_moving_point() {
+    let mut s = Server::spawn();
+    s.call_ok(
+        1,
+        "open_text",
+        json!({ "text": "alpha beta\nbeta beta\ngamma\nbeta\n" }),
+    );
+
+    // Exact mode: every matching line, with line number, position, and a
+    // per-line count for the double hit.
+    let out = s.call_ok(2, "occur", json!({ "pattern": "beta" }));
+    assert!(out.contains("4 matches on 3 lines"), "got: {out}");
+    assert!(out.contains("    2 @12 ×2: beta beta"), "got: {out}");
+
+    // Point did not move: an exact search still finds "alpha" ahead of point.
+    let found = s.call_ok(3, "search", json!({ "pattern": "alpha" }));
+    assert!(found.contains("point is now 6"), "got: {found}");
+
+    // Regex mode and the limit tail both pass through to the builtin.
+    let out = s.call_ok(4, "occur", json!({ "pattern": "g.mma", "mode": "regex" }));
+    assert!(out.contains("1 match on 1 line"), "got: {out}");
+    let out = s.call_ok(5, "occur", json!({ "pattern": "beta", "limit": 1 }));
+    assert!(out.contains("… and 2 more matching lines"), "got: {out}");
+}
+
 fn temp_dir(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!("mime-mcp-it-{tag}-{}", std::process::id()));

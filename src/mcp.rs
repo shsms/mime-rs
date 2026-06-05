@@ -159,6 +159,7 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         "view" => tool_view(&args, sessions),
         "insert_text" => tool_insert_text(&args, sessions),
         "search" => tool_search(&args, sessions),
+        "occur" => tool_occur(&args, sessions),
         "checkpoint" => tool_checkpoint(&args, sessions),
         "restore_checkpoint" => tool_restore_checkpoint(&args, sessions),
         "list_checkpoints" => tool_list_checkpoints(&args, sessions),
@@ -448,6 +449,33 @@ fn tool_search(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Resul
     }
 }
 
+/// `occur {session?, pattern, mode?, nlines?, limit?}` — every line in the
+/// accessible region matching the pattern, rendered with line numbers + char
+/// positions (and `nlines` of context), via the `occur` builtin. Read-only
+/// orientation: point does not move. `exact` mode (the default) matches the
+/// pattern literally.
+fn tool_occur(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result<String, String> {
+    let session = session_arg(args);
+    let pattern = str_arg(args, "pattern")?;
+    let mode = args.get("mode").and_then(Value::as_str).unwrap_or("exact");
+    let needle = lisp_escape(&pattern);
+    let pat_expr = match mode {
+        "exact" => format!("(regexp-quote \"{needle}\")"),
+        "regex" => format!("\"{needle}\""),
+        other => return Err(format!("unknown occur mode: {other} (exact|regex)")),
+    };
+    let nlines = args.get("nlines").and_then(Value::as_i64).unwrap_or(0);
+    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(100);
+    // `message` hands the rendered overview back verbatim (see read_region).
+    let program = format!("(message (occur {pat_expr} {nlines} {limit}))");
+    let report = run_in_session(sessions, &session, &program)?;
+    report
+        .log
+        .into_iter()
+        .next()
+        .ok_or_else(|| "occur: no output returned".to_string())
+}
+
 /// `checkpoint {session?, label?}` — capture a restore point. Returns the label
 /// the engine assigned (auto-generated when omitted).
 fn tool_checkpoint(
@@ -659,6 +687,25 @@ fn tool_schemas() -> Vec<Value> {
                         "enum": ["exact", "regex"],
                         "description": "exact (literal) or regex (RE2). Defaults to exact. (For whitespace/case-insensitive matching, pass a regex.)",
                     },
+                    "session": session,
+                },
+                "required": ["pattern"],
+            },
+        }),
+        json!({
+            "name": "occur",
+            "description": "Overview of every line matching a pattern in the whole accessible region (composes with narrowing): line number + char position per hit (goto-char-able), optional context lines, long lines clamped. Read-only; point does not move. Your 'grep the buffer' for orientation before editing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "What to list matches for." },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["exact", "regex"],
+                        "description": "exact (literal) or regex (RE2). Defaults to exact.",
+                    },
+                    "nlines": { "type": "integer", "description": "Context lines around each hit (default 0)." },
+                    "limit": { "type": "integer", "description": "Max matching lines rendered (default 100); the rest are summarized in a tail line." },
                     "session": session,
                 },
                 "required": ["pattern"],
