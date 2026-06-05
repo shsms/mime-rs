@@ -187,15 +187,21 @@ pub fn pick(hunks: &[Hunk], n: Option<i64>, point: usize) -> Result<&Hunk, Strin
 /// (smerge has no name for it); `all` keeps ours, base, theirs in order
 /// (`smerge-keep-all`).
 pub fn side_text(b: &dyn TextStore, h: &Hunk, side: &str) -> Result<String, String> {
-    let ours = b.substring(h.ours.0, h.ours.1);
-    let theirs = b.substring(h.theirs.0, h.theirs.1);
-    let base = h.base.map(|(s, e)| b.substring(s, e));
+    // Lazy per side: only the sections the request names are materialized.
+    let ours = || b.substring(h.ours.0, h.ours.1);
+    let theirs = || b.substring(h.theirs.0, h.theirs.1);
+    let base = || h.base.map(|(s, e)| b.substring(s, e));
     match side {
-        "ours" => Ok(ours),
-        "theirs" => Ok(theirs),
-        "base" => base.ok_or_else(|| "no base section (not a diff3 conflict)".to_string()),
-        "both" => Ok(format!("{ours}{theirs}")),
-        "all" => Ok(format!("{ours}{}{theirs}", base.unwrap_or_default())),
+        "ours" => Ok(ours()),
+        "theirs" => Ok(theirs()),
+        "base" => base().ok_or_else(|| "no base section (not a diff3 conflict)".to_string()),
+        "both" => Ok(format!("{}{}", ours(), theirs())),
+        "all" => Ok(format!(
+            "{}{}{}",
+            ours(),
+            base().unwrap_or_default(),
+            theirs()
+        )),
         other => Err(format!("unknown side: {other} (ours|theirs|base|both|all)")),
     }
 }

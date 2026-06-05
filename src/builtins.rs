@@ -84,6 +84,27 @@ fn clamp_occur_line(text: &str, col: usize) -> String {
     )
 }
 
+/// Shared body of `conflict-keep` / `conflict-replace`: pick the addressed
+/// hunk, compute its replacement via `text` (a side's content, or a literal),
+/// splice it in place of the whole hunk, and return the REMAINING conflict
+/// count. The re-scan keeps that count honest even when a replacement itself
+/// contains marker-shaped lines.
+fn conflict_splice<F>(s: &SharedSession, n: Option<i64>, text: F) -> Result<i64, Error>
+where
+    F: FnOnce(&dyn crate::store::TextStore, &crate::conflict::Hunk) -> Result<String, String>,
+{
+    let mut sess = s.borrow_mut();
+    let b = sess.buffer.as_mut();
+    let hunks = crate::conflict::scan(b);
+    let h = crate::conflict::pick(&hunks, n, b.point()).map_err(|e| err(&e))?;
+    let text = text(&*b, h).map_err(|e| err(&e))?;
+    let (start, end) = (h.start, h.end);
+    b.delete_region(start, end);
+    b.goto_char(start);
+    b.insert(&text);
+    Ok(crate::conflict::scan(b).len() as i64)
+}
+
 pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     // ---- navigation ----
     {
@@ -1376,16 +1397,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun(
             "conflict-keep",
             move |side: String, n: Option<i64>| -> Result<i64, Error> {
-                let mut sess = s.borrow_mut();
-                let b = sess.buffer.as_mut();
-                let hunks = crate::conflict::scan(b);
-                let h = crate::conflict::pick(&hunks, n, b.point()).map_err(|e| err(&e))?;
-                let text = crate::conflict::side_text(&*b, h, &side).map_err(|e| err(&e))?;
-                let (start, end) = (h.start, h.end);
-                b.delete_region(start, end);
-                b.goto_char(start);
-                b.insert(&text);
-                Ok(crate::conflict::scan(b).len() as i64)
+                conflict_splice(&s, n, |b, h| crate::conflict::side_text(b, h, &side))
             },
         );
     }
@@ -1397,15 +1409,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun(
             "conflict-replace",
             move |text: String, n: Option<i64>| -> Result<i64, Error> {
-                let mut sess = s.borrow_mut();
-                let b = sess.buffer.as_mut();
-                let hunks = crate::conflict::scan(b);
-                let h = crate::conflict::pick(&hunks, n, b.point()).map_err(|e| err(&e))?;
-                let (start, end) = (h.start, h.end);
-                b.delete_region(start, end);
-                b.goto_char(start);
-                b.insert(&text);
-                Ok(crate::conflict::scan(b).len() as i64)
+                conflict_splice(&s, n, |_, _| Ok(text.clone()))
             },
         );
     }
@@ -2406,6 +2410,70 @@ mod tests {
             Ok(_) => panic!("N=0 must error: indices are 1-based"),
         };
         assert!(e.contains("no conflict 0"), "got: {e}");
+    }
+
+    #[test]
+    fn conflict_combination_sides_and_line_ending_fidelity() {
+        // diff3 hunk: the combination sides read and keep correctly.
+        let mut ws = trusted("<<<<<<< A\no\n||||||| base\nb\n=======\nt\n>>>>>>> B\ntail\n");
+        let r = ws
+            .run(
+                r#"(report "both" (conflict-text "both" 1))
+                   (report "all" (conflict-text "all" 1))
+                   (report "left" (conflict-keep "all" 1))
+                   (message (buffer-string))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "both"), "\"o\\nt\\n\"");
+        assert_eq!(report(&r, "all"), "\"o\\nb\\nt\\n\"");
+        assert_eq!(report(&r, "left"), "0");
+        assert_eq!(r.log[0], "o\nb\nt\ntail\n");
+
+        // On a two-way hunk with an empty ours, both/all degrade to theirs.
+        let mut ws = trusted("<<<<<<< A\n=======\nt\n>>>>>>> B\n");
+        let r = ws
+            .run(r#"(report "both" (conflict-text "both" 1)) (report "all" (conflict-text "all" 1))"#)
+            .unwrap();
+        assert_eq!(report(&r, "both"), "\"t\\n\"");
+        assert_eq!(report(&r, "all"), "\"t\\n\"");
+
+        // Mixed line endings: ours CRLF, theirs LF — "both" keeps each side's
+        // endings verbatim (content-faithful, no normalization).
+        let mut ws = trusted("<<<<<<< A\no\r\n=======\nt\n>>>>>>> B\n");
+        let r = ws
+            .run(r#"(report "left" (conflict-keep "both" 1)) (message (buffer-string))"#)
+            .unwrap();
+        assert_eq!(report(&r, "left"), "0");
+        assert_eq!(r.log[0], "o\r\nt\n");
+    }
+
+    #[test]
+    fn conflict_keep_adjusts_markers_and_replace_empty_deletes() {
+        // Markers around the hunk survive a keep with adjusted positions.
+        let mut ws = trusted("ab\n<<<<<<< A\no\n=======\nt\n>>>>>>> B\nyz\n");
+        let r = ws
+            .run(
+                r#"(setq m1 (copy-marker 2))
+                   (setq m2 (copy-marker 36))
+                   (conflict-keep "ours" 1)
+                   (report "m1" (marker-position m1))
+                   (report "m2" (marker-position m2))
+                   (report "at-m2" (buffer-substring (marker-position m2) (+ (marker-position m2) 1)))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "m1"), "2", "marker before the hunk is untouched");
+        // The after-hunk marker collapses to the hunk start on delete, then —
+        // Emacs insertion-type nil — stays BEFORE the kept text on insert.
+        assert_eq!(report(&r, "m2"), "4");
+        assert_eq!(report(&r, "at-m2"), "\"o\"");
+
+        // conflict-replace with "" removes the hunk entirely.
+        let mut ws = trusted("pre\n<<<<<<< A\no\n=======\nt\n>>>>>>> B\npost\n");
+        let r = ws
+            .run(r#"(report "left" (conflict-replace "" 1)) (message (buffer-string))"#)
+            .unwrap();
+        assert_eq!(report(&r, "left"), "0");
+        assert_eq!(r.log[0], "pre\npost\n");
     }
 
     #[test]
