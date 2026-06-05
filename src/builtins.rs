@@ -297,6 +297,34 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         );
     }
 
+    {
+        // (buffer-file-name) — the visited file's path as recorded at open/rebase
+        // time, or nil for a buffer with no backing file (Emacs parity).
+        let s = session.clone();
+        ctx.defun("buffer-file-name", move || -> TulispObject {
+            s.borrow()
+                .buffer
+                .file_stamp()
+                .map(|st| st.path.to_string_lossy().into_owned())
+                .into()
+        });
+    }
+    {
+        // (buffer-stale-p) — non-nil if the visited file changed on disk since it
+        // was opened/saved (external writer: modified, replaced, or deleted); nil
+        // for a clean stamp or a buffer with no backing file. The value is the
+        // drift description string. Lets a program detect the stale-read race
+        // up front instead of discovering it when the save is refused.
+        let s = session.clone();
+        ctx.defun("buffer-stale-p", move || -> TulispObject {
+            s.borrow()
+                .buffer
+                .file_stamp()
+                .and_then(|st| st.check())
+                .into()
+        });
+    }
+
     // ---- mark & region ----
     {
         let s = session.clone();
@@ -1903,6 +1931,39 @@ mod tests {
         assert_eq!(report(&r, "name"), "\"doc.txt\"");
         assert_eq!(report(&r, "cur"), "\"doc.txt\"");
         assert_eq!(report(&r, "list"), "(\"doc.txt\" \"main\")");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn buffer_file_name_and_stale_p_track_the_visited_file() {
+        let dir = temp_dir("stale-p");
+        let file = dir.join("doc.txt");
+        std::fs::write(&file, "v1").unwrap();
+        let path = file.to_string_lossy().into_owned();
+
+        let mut ws = trusted("main-body");
+        // A file-less buffer has no visited file and is never stale; right after
+        // find-file the visited file is recorded and clean.
+        let r = ws
+            .run(&format!(
+                r#"(report "no-file" (buffer-file-name))
+                   (report "no-stale" (buffer-stale-p))
+                   (find-file "{path}")
+                   (report "name" (buffer-file-name))
+                   (report "fresh" (buffer-stale-p))"#
+            ))
+            .unwrap();
+        assert_eq!(report(&r, "no-file"), "nil");
+        assert_eq!(report(&r, "no-stale"), "nil");
+        assert_eq!(report(&r, "name"), format!("\"{path}\""));
+        assert_eq!(report(&r, "fresh"), "nil");
+
+        // An external in-place write flips buffer-stale-p to the drift reason.
+        std::fs::write(&file, "v2, externally modified").unwrap();
+        let r = ws.run(r#"(report "stale" (buffer-stale-p))"#).unwrap();
+        let stale = report(&r, "stale");
+        assert!(stale.contains("modified"), "got: {stale}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
