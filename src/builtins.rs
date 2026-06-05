@@ -1302,8 +1302,12 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         // (conflict-goto &optional N) — move point to hunk N's start; with nil,
-        // to the next conflict after point (smerge-next). Returns the position,
-        // or nil when there is no next conflict.
+        // to the next conflict at or after point (smerge-next). The nil form
+        // lands point just past the opener line — *inside* the hunk, so the
+        // at-point commands address it and the next call advances to the
+        // following hunk (a hunk starting exactly at point, e.g. at point-min,
+        // is found rather than skipped). Returns the new position, or nil when
+        // there is no next conflict.
         let s = session.clone();
         ctx.defun(
             "conflict-goto",
@@ -1319,7 +1323,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                     ),
                     None => {
                         let p = b.point();
-                        hunks.iter().map(|h| h.start).find(|&st| st > p)
+                        hunks.iter().find(|h| h.start >= p).map(|h| h.ours.0)
                     }
                 };
                 if let Some(p) = target {
@@ -2355,11 +2359,12 @@ mod tests {
             overview.contains("1 @7 L2: HEAD ↔ branch"),
             "got: {overview}"
         );
-        // conflict-goto with nil steps to the next hunk, then nil at the end;
+        // conflict-goto with nil lands just past the next hunk's opener (so
+        // point is INSIDE it), then advances, then nil at the end;
         // conflict-text with nil N reads the hunk at point.
-        assert_eq!(report(&r, "g1"), "7");
+        assert_eq!(report(&r, "g1"), "20"); // after "intro\n<<<<<<< HEAD\n"
         assert_eq!(report(&r, "ours"), "\"ours-1\\n\"");
-        assert!(report(&r, "g2").parse::<i64>().unwrap() > 7);
+        assert!(report(&r, "g2").parse::<i64>().unwrap() > 20);
         assert_eq!(report(&r, "g3"), "nil");
         // The decision view: a real difference diffs, identical sides don't.
         assert!(r.log[1].contains("-ours-1") && r.log[1].contains("+theirs-1"));
@@ -2370,6 +2375,37 @@ mod tests {
             Ok(_) => panic!("base on a two-way hunk must error"),
         };
         assert!(e.contains("no base section"), "got: {e}");
+    }
+
+    #[test]
+    fn conflict_goto_finds_a_hunk_at_point_min_and_iterates() {
+        // A file that BEGINS with a conflict: the nil form must find it (not
+        // skip past), land inside it for at-point addressing, and a second
+        // call must advance — the iteration idiom visits every hunk once.
+        let mut ws = trusted(
+            "<<<<<<< A\nfirst\n=======\nf2\n>>>>>>> B\nmid\n<<<<<<< A\nsecond\n=======\ns2\n>>>>>>> B\n",
+        );
+        let r = ws
+            .run(
+                r#"(goto-char (point-min))
+                   (report "g1" (conflict-goto))
+                   (report "in1" (conflict-text "ours"))
+                   (report "g2" (conflict-goto))
+                   (report "in2" (conflict-text "ours"))
+                   (report "g3" (conflict-goto))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "g1"), "11"); // past "<<<<<<< A\n"
+        assert_eq!(report(&r, "in1"), "\"first\\n\"");
+        assert!(report(&r, "g2").parse::<i64>().unwrap() > 11);
+        assert_eq!(report(&r, "in2"), "\"second\\n\"");
+        assert_eq!(report(&r, "g3"), "nil");
+        // Explicit N=0 is a proper 1-based-index error, not a silent nil.
+        let e = match ws.run(r#"(conflict-goto 0)"#) {
+            Err(e) => e,
+            Ok(_) => panic!("N=0 must error: indices are 1-based"),
+        };
+        assert!(e.contains("no conflict 0"), "got: {e}");
     }
 
     #[test]
