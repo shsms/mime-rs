@@ -114,7 +114,7 @@ Programs are Emacs Lisp on `tulisp` (control flow, `let`, `lambda`, `dolist`,
 | Narrowing & scope | `narrow-to-region` `widen` `save-excursion` `save-restriction` |
 | Time travel | `checkpoint` `restore-checkpoint` `with-transaction` |
 | Structural (M7) | `treesit-language` `treesit-set-language` `treesit-root-type` `treesit-has-error` `treesit-node-at` `treesit-beginning-of-defun` `treesit-end-of-defun` `treesit-defun-name` `treesit-narrow-to-defun` `treesit-list-defuns` `treesit-goto-defun` `treesit-query` (tree-sitter; Markdown, Rust, Python) |
-| Observability | `report` `message` `window` `buffer-file-name` `buffer-stale-p` |
+| Observability | `report` `message` `window` `occur` `buffer-file-name` `buffer-stale-p` |
 | Orchestration (trusted tier) | `find-file` `find-file-noselect` `insert-file-contents` `write-file` `write-region` `directory-files` `generate-new-buffer` `set-buffer` `with-current-buffer` `current-buffer` `buffer-name` `buffer-list` `get-buffer` `kill-buffer` `arg` |
 | String library | `replace-regexp-in-string` `substring` `split-string` `string-trim`(`-left`/`-right`) `string-prefix-p` `string-suffix-p` `string-search` `string-replace` `string-join` `string-empty-p` `number-to-string` `string-to-number` `upcase` `downcase` `capitalize` `char-to-string` `string-to-char` |
 

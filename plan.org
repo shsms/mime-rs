@@ -581,7 +581,7 @@ counts) and gives an immediate real-world acceptance test.
 ** DONE M3 — Daemon, sessions, warm state [#A]
    Warm ~Workspace~ (persistent ctx + session across programs) over a unix-socket JSON-lines API; single-threaded (the ~Rc~ ctx is ~!Send~).
 ** DONE M4 — MCP server + agent ergonomics [#A]
-   JSON-RPC 2.0 / stdio embedding the engine; 13 tools (~open_file~/~run_program~/~rehearse~/~read_region~/~view~/~insert_text~/~search~/~checkpoint~/…/~save_buffer~/~session_status~); warm per-session map.
+   JSON-RPC 2.0 / stdio embedding the engine; 14 tools (~open_file~/~run_program~/~rehearse~/~read_region~/~view~/~insert_text~/~search~/~occur~/~checkpoint~/…/~save_buffer~/~session_status~); warm per-session map.
 ** DONE M5 — Safety & audit [#B]
    Path allowlist (~MIME_ROOTS~ / ~check_path~), read-only buffers, atomic saves, audit journal (~MIME_AUDIT~). /Exit ✓: safe to grant to an autonomous agent./
 ** DOING M6 — Parallelism & performance [#B]
@@ -733,6 +733,9 @@ are now resolved:
   (~collect_range~ behind ~buffer-substring~/~read_region~/search) returned shifted bytes
   while ~full_text~/save stayed correct — the B-tree was sound all along. Fix: atomic save
   (temp + rename) leaves the mmapped inode intact; regression-tested.
+- *No buffer-wide match overview* → the ~occur~ builtin + MCP tool: every matching
+  line with line number + char position (goto-char-able), optional context, narrowing-
+  scoped, long lines clamped, capped with an "… N more" tail.
 Still-open lessons:
 - *Structural code edits* are awkward via search/replace ("add an arm to this match") — the
   case for AST-aware ops (M7); mime-rs shines at prose + find/replace, less at code.
@@ -740,10 +743,6 @@ Still-open lessons:
   use ~-s user~ (or add from the session root), else a resume sees no tools.
 - *Warm server is frozen at spawn*: new builtins/tools need a restart (~claude --resume~);
   ~mime run --local~ (fresh process per call) is the fast dev-iteration path.
-- *No buffer-wide match overview*: ~search~ moves point one hit at a time, so
-  orientation ("where are all the X / outline this file") still leaks out to external
-  ~grep~. An ~occur~-style tool — pattern in, all matches with line numbers + context
-  out — would keep that in-session.
 - *Quote-heavy code edits through run_program*: replacing Rust that itself contains
   escaped strings means double-escaping inside the elisp literal — workable but
   error-prone. ~insert_text~ already solves the insert half; an analogous literal
