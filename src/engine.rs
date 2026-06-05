@@ -389,9 +389,24 @@ impl Workspace {
     /// add buffer are reclaimed (a no-op for the in-memory `Buffer`). Returns the
     /// byte count written. The rebase is best-effort: if re-opening the saved file
     /// fails, the (still correct) pre-save backing is kept and the save stands.
+    /// Refuses (`Err`) if `path` is the visited file and it changed externally
+    /// since open/rebase — see [`stale_visit`]. A failed rebase also leaves the
+    /// stamp unrefreshed, so a later save to the same path is conservatively
+    /// refused too.
     pub fn save_to(&mut self, path: &std::path::Path) -> std::io::Result<usize> {
         let bytes = {
             let s = self.session.borrow();
+            // The stale-read guard: refuse to overwrite the visited file if it
+            // drifted under us (an external writer landed since open/rebase).
+            // Saving to a *different* path overwrites nothing of theirs — fine.
+            if let Some(reason) = stale_visit(s.buffer.as_ref(), path) {
+                return Err(std::io::Error::other(format!(
+                    "refusing to save: {} was {reason} after it was opened; \
+                     re-open the file to pick up the external change, or save \
+                     to a different path",
+                    path.display()
+                )));
+            }
             let mut written = 0usize;
             crate::safety::write_atomic_with(path, |w| {
                 written = s.buffer.write_to(w)?;
@@ -402,6 +417,20 @@ impl Workspace {
         let _ = self.session.borrow_mut().buffer.rebase_to_file(path);
         Ok(bytes)
     }
+}
+
+/// `Some(reason)` when `store` visits `path` and the file on disk has drifted
+/// from the stamp recorded at open/rebase — saving there would overwrite an
+/// external writer's work. Compared canonically when both sides resolve (the
+/// stamp's path is as-given at open time); when either side no longer exists
+/// (e.g. the visited file was deleted) an exact path match still counts.
+fn stale_visit(store: &dyn TextStore, path: &std::path::Path) -> Option<String> {
+    let stamp = store.file_stamp()?;
+    let same = match (path.canonicalize(), stamp.path.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => path == stamp.path,
+    };
+    if same { stamp.check() } else { None }
 }
 
 /// Evaluate `program` (Emacs Lisp / tulisp) against `buffer` once, cold; return
@@ -535,6 +564,41 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&tmp).unwrap(), want2);
         assert_eq!(ws.text(), want2);
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn save_to_refuses_an_externally_changed_visited_file() {
+        // The stale-read guard: an external writer lands between open and save;
+        // saving over the visited file must fail and leave their bytes intact.
+        let tmp = std::env::temp_dir().join(format!("mime-stale-{}.txt", std::process::id()));
+        std::fs::write(&tmp, "theirs v1\n").unwrap();
+        let mut ws = Workspace::new(Box::new(Quire::open(&tmp).unwrap()));
+        ws.run(r#"(goto-char (point-max)) (insert "ours\n")"#)
+            .unwrap();
+
+        std::fs::write(&tmp, "theirs v2 (external writer)\n").unwrap();
+        let err = ws
+            .save_to(&tmp)
+            .expect_err("saving over a drifted file must fail");
+        assert!(err.to_string().contains("refusing to save"), "got: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&tmp).unwrap(),
+            "theirs v2 (external writer)\n"
+        );
+
+        // Saving the same buffer elsewhere is fine — nothing of theirs is lost.
+        let other = std::env::temp_dir().join(format!("mime-stale-b-{}.txt", std::process::id()));
+        ws.save_to(&other)
+            .expect("saving to a different path is allowed");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), ws.text());
+
+        // After a clean save+rebase cycle the guard re-arms on the new stamp.
+        std::fs::remove_file(&tmp).ok();
+        std::fs::remove_file(&other).ok();
+        let err = ws
+            .save_to(&other)
+            .expect_err("deleting the now-visited file is drift");
+        assert!(err.to_string().contains("deleted"), "got: {err}");
     }
 
     #[test]
