@@ -339,6 +339,25 @@ fn tool_run_program(
     Ok(pretty(&report.to_json()))
 }
 
+/// Evaluate `(message EXPR)` in the session and hand back the logged string
+/// verbatim. `message` stores its argument *raw* in the log, so rendered text
+/// comes back without tulisp's string re-quoting (`report` would print
+/// \"hello\" rather than hello). The read-only convenience tools —
+/// read_region, view, occur, conflicts — all ride this channel.
+fn run_message(
+    sessions: &mut HashMap<String, Workspace>,
+    session: &str,
+    expr: &str,
+    what: &str,
+) -> Result<String, String> {
+    let report = run_in_session(sessions, session, &format!("(message {expr})"))?;
+    report
+        .log
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("{what}: no text returned"))
+}
+
 /// `read_region {session?, start, end}` — the substring `[start, end)`, fetched
 /// on demand via `(buffer-substring START END)` so the agent never has to dump
 /// the whole buffer. Reading does not change the buffer text.
@@ -349,16 +368,12 @@ fn tool_read_region(
     let session = session_arg(args);
     let start = int_arg(args, "start")?;
     let end = int_arg(args, "end")?;
-    // `message` takes the substring *as a string* and stores it verbatim in the
-    // log, so we get the raw text back; going through `report` would re-quote it
-    // with tulisp's string printer (\"hello\" rather than hello).
-    let program = format!("(message (buffer-substring {start} {end}))");
-    let report = run_in_session(sessions, &session, &program)?;
-    report
-        .log
-        .into_iter()
-        .next()
-        .ok_or_else(|| "read_region: no text returned".to_string())
+    run_message(
+        sessions,
+        &session,
+        &format!("(buffer-substring {start} {end})"),
+        "read_region",
+    )
 }
 
 /// `view {session?, lines?, pos?}` — a rendered viewport: `lines` rows of context
@@ -378,14 +393,7 @@ fn tool_view(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result<
         (None, Some(p)) => format!("(window 4 {p})"),
         (None, None) => "(window)".to_string(),
     };
-    // `message` stashes the rendered viewport verbatim in the log (no re-quoting),
-    // same trick as `read_region`.
-    let report = run_in_session(sessions, &session, &format!("(message {call})"))?;
-    report
-        .log
-        .into_iter()
-        .next()
-        .ok_or_else(|| "view: no text returned".to_string())
+    run_message(sessions, &session, &call, "view")
 }
 
 /// `insert_text {session?, text, pos?}` — insert literal `text` at point (or at
@@ -466,14 +474,12 @@ fn tool_occur(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result
     };
     let nlines = args.get("nlines").and_then(Value::as_i64).unwrap_or(0);
     let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(100);
-    // `message` hands the rendered overview back verbatim (see read_region).
-    let program = format!("(message (occur {pat_expr} {nlines} {limit}))");
-    let report = run_in_session(sessions, &session, &program)?;
-    report
-        .log
-        .into_iter()
-        .next()
-        .ok_or_else(|| "occur: no output returned".to_string())
+    run_message(
+        sessions,
+        &session,
+        &format!("(occur {pat_expr} {nlines} {limit})"),
+        "occur",
+    )
 }
 
 /// `conflicts {session?}` — the rendered merge-conflict overview (hunk
@@ -485,13 +491,7 @@ fn tool_conflicts(
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
     let session = session_arg(args);
-    // `message` hands the rendered overview back verbatim (see read_region).
-    let report = run_in_session(sessions, &session, "(message (conflict-hunks))")?;
-    report
-        .log
-        .into_iter()
-        .next()
-        .ok_or_else(|| "conflicts: no output returned".to_string())
+    run_message(sessions, &session, "(conflict-hunks)", "conflicts")
 }
 
 /// `checkpoint {session?, label?}` — capture a restore point. Returns the label
@@ -731,7 +731,7 @@ fn tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "conflicts",
-            "description": "Overview of the merge-conflict hunks in the buffer: number, position + line, branch labels, side sizes. Read-only. Resolve via run_program: (conflict-keep SIDE &optional N) with ours|theirs|base|both|all, (conflict-replace TEXT &optional N) for a hand-crafted merge, (conflict-resolve-trivial) to sweep the safe ones, (conflict-diff &optional N) to see what differs, (conflict-text SIDE &optional N) to read one side; mutating calls return the remaining count. N is 1-based and refreshes after each edit; nil N = the hunk at point.",
+            "description": "Overview of the merge-conflict hunks in the buffer: number, position + line, branch labels, side sizes; warns about marker lines it could not parse (malformed/nested). Read-only. Resolve via run_program: (conflict-keep SIDE &optional N) with ours|theirs|both, or base|all on diff3 hunks only; (conflict-replace TEXT &optional N) for a hand-crafted merge; (conflict-resolve-trivial) to sweep the safe ones; (conflict-diff &optional N) to see what differs; (conflict-text SIDE &optional N) to read one side. Mutating calls return the remaining count — wrap them in (report \"left\" …) to see it in run_program's JSON. N is 1-based and refreshes after each edit; nil N = the hunk at point.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
