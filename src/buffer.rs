@@ -258,16 +258,25 @@ impl Buffer {
     }
 
     // ---- line navigation ----
-    /// Move point to the first char of its line (just after the previous newline).
+    // Line motion honors the narrowing, like Emacs: newline scans run over the
+    // accessible region only, so point never escapes [point_min, point_max)
+    // even when the restriction starts or ends mid-line.
+    /// Move point to the first char of its line (just after the previous
+    /// newline), clamped to `point_min`.
     pub fn beginning_of_line(&mut self) {
-        let b = self.byte_of(self.point);
-        let start = self.text[..b].rfind('\n').map_or(0, |i| i + 1);
+        let min_b = self.byte_of(self.point_min());
+        let b = self.byte_of(self.point).max(min_b);
+        let start = self.text[min_b..b]
+            .rfind('\n')
+            .map_or(min_b, |i| min_b + i + 1);
         self.point = self.char_of(start);
     }
-    /// Move point to the end of its line (just before the next newline, or eob).
+    /// Move point to the end of its line (just before the next newline),
+    /// clamped to `point_max`.
     pub fn end_of_line(&mut self) {
-        let b = self.byte_of(self.point);
-        let end = self.text[b..].find('\n').map_or(self.text.len(), |i| b + i);
+        let limit = self.byte_of(self.point_max());
+        let b = self.byte_of(self.point).min(limit);
+        let end = self.text[b..limit].find('\n').map_or(limit, |i| b + i);
         self.point = self.char_of(end);
     }
     /// Move point `n` lines forward, to a line beginning. Returns the count of
@@ -275,10 +284,12 @@ impl Buffer {
     pub fn forward_line(&mut self, n: i64) -> i64 {
         self.beginning_of_line();
         let mut left = n.abs();
+        let min_b = self.byte_of(self.point_min());
+        let limit = self.byte_of(self.point_max());
         while left > 0 {
-            let b = self.byte_of(self.point);
+            let b = self.byte_of(self.point).clamp(min_b, limit);
             if n >= 0 {
-                match self.text[b..].find('\n') {
+                match self.text[b..limit].find('\n') {
                     Some(i) => self.point = self.char_of(b + i + 1),
                     None => {
                         self.point = self.point_max();
@@ -286,8 +297,8 @@ impl Buffer {
                     }
                 }
             } else {
-                match self.text[..b.saturating_sub(1)].rfind('\n') {
-                    Some(i) => self.point = self.char_of(i + 1),
+                match self.text[min_b..b.saturating_sub(1).max(min_b)].rfind('\n') {
+                    Some(i) => self.point = self.char_of(min_b + i + 1),
                     None => {
                         self.point = self.point_min();
                         return left;
@@ -520,6 +531,39 @@ fn expand_backrefs(rep: &str, groups: &[Option<String>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_motion_clamps_to_the_narrowing() {
+        // "abc\ndef\nghi": narrow to "c\nde" (mid-line on both ends). Line
+        // motion must not escape the accessible region (Emacs semantics).
+        let mut b = Buffer::from_string("t", "abc\ndef\nghi");
+        b.narrow_to_region(3, 7); // chars 3..7 = "c\nde"
+        b.goto_char(5); // on 'd'
+        b.end_of_line();
+        assert_eq!(b.point(), 7, "end-of-line stops at point-max, not at \\n");
+        b.beginning_of_line();
+        assert_eq!(
+            b.point(),
+            5,
+            "beginning-of-line stops at the line start within"
+        );
+        b.goto_char(3);
+        b.beginning_of_line();
+        assert_eq!(
+            b.point(),
+            3,
+            "beginning-of-line stops at point-min, not line start"
+        );
+        // forward_line: one newline is accessible; the second move clamps.
+        b.goto_char(3);
+        assert_eq!(b.forward_line(1), 0);
+        assert_eq!(b.point(), 5);
+        assert_eq!(b.forward_line(1), 1, "no newline left before point-max");
+        assert_eq!(b.point(), 7);
+        // ...and backward past point-min clamps too.
+        assert_eq!(b.forward_line(-2), 2, "no line beginnings above point-min");
+        assert_eq!(b.point(), 3);
+    }
 
     #[test]
     fn insert_at_end() {

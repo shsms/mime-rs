@@ -1132,13 +1132,21 @@ impl Quire {
         self.point = self.point.clamp(lo, hi);
     }
 
-    /// Move point to the first char of its line (just after the previous newline).
+    // Line motion honors the narrowing, like Emacs (and the oracle): newline
+    // scans run over the accessible region only, so point never escapes
+    // [point_min, point_max) even when the restriction starts or ends mid-line.
+    /// Move point to the first char of its line (just after the previous
+    /// newline), clamped to `point_min`.
     fn beginning_of_line(&mut self) {
-        // Walk back from point over non-newline chars. O(line length). The
-        // oracle's `byte_of` clamps point into the buffer first, so we do too —
-        // point may sit at point-max even when that exceeds char_len+1.
-        let mut p = self.point.min(self.total_chars() + 1);
-        while p > 1 {
+        // Walk back from point over non-newline chars. O(line length). Bounds
+        // mirror the oracle's byte math exactly: document-clamped (a stale
+        // narrowing can outlive deletions that shrank the text), and point is
+        // raised to point-min but not lowered to point-max — out-of-narrowing
+        // point states degrade identically in both stores.
+        let doc_max = self.total_chars() + 1;
+        let min = self.point_min().min(doc_max);
+        let mut p = self.point.clamp(min, doc_max);
+        while p > min {
             if self.char_at(p - 1) == Some('\n') {
                 break;
             }
@@ -1146,10 +1154,12 @@ impl Quire {
         }
         self.point = p;
     }
-    /// Move point to the end of its line (just before the next newline, or eob).
+    /// Move point to the end of its line (just before the next newline),
+    /// clamped to `point_max`.
     fn end_of_line(&mut self) {
-        let max = self.total_chars() + 1;
-        let mut p = self.point.min(max); // clamp like the oracle's `byte_of`
+        // Mirrors the oracle: lowered to point-max, never raised to point-min.
+        let max = self.point_max().min(self.total_chars() + 1);
+        let mut p = self.point.min(max);
         while p < max {
             if self.char_at(p) == Some('\n') {
                 break;
@@ -1163,17 +1173,20 @@ impl Quire {
     fn forward_line(&mut self, n: i64) -> i64 {
         self.beginning_of_line();
         let mut left = n.abs();
-        // Like the oracle, newline scanning runs over the *full* document; only
-        // the terminal "ran off the end" case clamps to point_min/point_max.
+        // Like the oracle, newline scanning covers the accessible region only
+        // (clamped into the document — a stale narrowing can exceed it);
+        // running off either end clamps to point_min/point_max.
         let doc_max = self.total_chars() + 1;
+        let max = self.point_max().min(doc_max);
+        let min = self.point_min().min(max);
         while left > 0 {
             if n >= 0 {
                 // advance to just past the next newline at/after point
-                let mut p = self.point;
-                while p < doc_max && self.char_at(p) != Some('\n') {
+                let mut p = self.point.clamp(min, max);
+                while p < max && self.char_at(p) != Some('\n') {
                     p += 1;
                 }
-                if p < doc_max {
+                if p < max {
                     self.point = p + 1; // just past the newline
                 } else {
                     self.point = self.point_max();
@@ -1189,10 +1202,10 @@ impl Quire {
                 // `start_line - 1`.) If there is no such newline, point goes to
                 // point_min and the move is not counted — Emacs's partial-move
                 // quirk — so we return `left`.
-                let start_line = self.point;
+                let start_line = self.point.clamp(min, max);
                 let mut j = start_line.saturating_sub(2); // last excluded pos - 1
                 let mut found = None;
-                while j >= 1 {
+                while j >= min {
                     if self.char_at(j) == Some('\n') {
                         found = Some(j + 1); // previous line begins after the '\n'
                         break;
@@ -1449,6 +1462,32 @@ mod tests {
     use crate::buffer::Buffer;
 
     // ---- focused unit tests (mirror buffer.rs so failures localize) ----
+
+    #[test]
+    fn line_motion_clamps_to_the_narrowing() {
+        // Mirrors buffer.rs: line motion never escapes a mid-line narrowing.
+        let mut q = Quire::from_string("t", "abc\ndef\nghi");
+        TextStore::narrow_to_region(&mut q, 3, 7); // "c\nde"
+        TextStore::goto_char(&mut q, 5);
+        TextStore::end_of_line(&mut q);
+        assert_eq!(TextStore::point(&q), 7, "end-of-line stops at point-max");
+        TextStore::beginning_of_line(&mut q);
+        assert_eq!(TextStore::point(&q), 5);
+        TextStore::goto_char(&mut q, 3);
+        TextStore::beginning_of_line(&mut q);
+        assert_eq!(
+            TextStore::point(&q),
+            3,
+            "stops at point-min, not line start"
+        );
+        TextStore::goto_char(&mut q, 3);
+        assert_eq!(TextStore::forward_line(&mut q, 1), 0);
+        assert_eq!(TextStore::point(&q), 5);
+        assert_eq!(TextStore::forward_line(&mut q, 1), 1);
+        assert_eq!(TextStore::point(&q), 7);
+        assert_eq!(TextStore::forward_line(&mut q, -2), 2);
+        assert_eq!(TextStore::point(&q), 3);
+    }
 
     #[test]
     fn insert_at_end() {
