@@ -312,6 +312,10 @@ pub struct Quire {
     markers: Vec<Option<usize>>,
     /// Most recent successful search, in 1-based char positions.
     last_match: Option<MatchData>,
+    /// Identity (dev/ino/mtime/size) of the visited file, captured at
+    /// open/rebase time; `None` for an in-memory Quire. Save paths check it to
+    /// detect an external writer before overwriting their work.
+    stamp: Option<crate::safety::FileStamp>,
 
     /// Lazy fallback cache for [`TextStore::text`] only (see module docs).
     /// `None` after any mutation; refilled on demand by [`Quire::full_text`].
@@ -337,7 +341,12 @@ impl Quire {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        Ok(Quire::with_original(name, Original::Mapped(mmap)))
+        let mut quire = Quire::with_original(name, Original::Mapped(mmap));
+        // Stamp the visited file so save paths can detect external changes.
+        // Stat-by-path right after the open; the open→stat window is tiny and
+        // a writer landing inside it still differs from the *saved* stamp later.
+        quire.stamp = Some(crate::safety::FileStamp::capture(path)?);
+        Ok(quire)
     }
 
     /// Build a Quire whose "original" is owned `text` (no file). Mirrors
@@ -381,6 +390,7 @@ impl Quire {
             narrowing: None,
             markers: Vec::new(),
             last_match: None,
+            stamp: None,
             text_cache: RefCell::new(None),
         }
     }
@@ -401,6 +411,7 @@ impl Quire {
             narrowing: self.narrowing,
             markers: self.markers.clone(),
             last_match: self.last_match.clone(),
+            stamp: self.stamp.clone(),
             text_cache: RefCell::new(None),
         }
     }
@@ -411,6 +422,7 @@ impl Quire {
     /// are kept. The saved file is byte-identical to the current content, so the
     /// char/line totals are reused from the live summary — no re-scan. O(1) + mmap.
     pub fn rebase_to(&mut self, path: &Path) -> std::io::Result<()> {
+        let stamp = crate::safety::FileStamp::capture(path)?;
         let file = std::fs::File::open(path)?;
         // SAFETY: same immutable-mapping contract as `Quire::open`.
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
@@ -435,6 +447,7 @@ impl Quire {
         self.original = Arc::new(Original::Mapped(mmap));
         self.add = Arc::new(Vec::new());
         self.root = root;
+        self.stamp = Some(stamp);
         self.invalidate();
         Ok(())
     }
@@ -1370,6 +1383,9 @@ impl TextStore for Quire {
     fn marker_set(&mut self, id: usize, pos: Option<usize>) {
         Quire::marker_set(self, id, pos)
     }
+    fn file_stamp(&self) -> Option<&crate::safety::FileStamp> {
+        self.stamp.as_ref()
+    }
     fn rebase_to_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         Quire::rebase_to(self, path)
     }
@@ -2035,6 +2051,34 @@ mod tests {
         std::fs::remove_file(&tmp).ok();
         assert_eq!(tail, tail_ref, "tail read corrupted after in-place save");
         assert_eq!(mid, mid_ref, "interior read corrupted after in-place save");
+    }
+
+    #[test]
+    fn stamp_tracks_open_external_change_and_rebase() {
+        let tmp = std::env::temp_dir().join(format!("mime-stamp-q-{}.txt", std::process::id()));
+        std::fs::write(&tmp, "hello stamp\n").unwrap();
+
+        // Opening from a file records a clean stamp; from_string records none.
+        let mut q = Quire::open(&tmp).unwrap();
+        assert_eq!(q.stamp.as_ref().unwrap().check(), None);
+        assert!(Quire::from_string("s", "x").stamp.is_none());
+
+        // A snapshot carries the same stamp.
+        assert_eq!(q.snapshot().stamp, q.stamp);
+
+        // An external in-place write drifts the stamp...
+        std::fs::write(&tmp, "hello stamp, externally grown\n").unwrap();
+        assert!(q.stamp.as_ref().unwrap().check().is_some());
+
+        // ...and rebasing onto a fresh save re-stamps it clean.
+        q.delete_region(1, q.char_len() + 1);
+        q.insert("rebased content\n");
+        std::fs::write(&tmp, q.full_text()).unwrap();
+        q.rebase_to(&tmp).unwrap();
+        let stamp = q.stamp.as_ref().unwrap();
+        assert_eq!(stamp.check(), None);
+        std::fs::remove_file(&tmp).ok();
+        assert!(stamp.check().is_some(), "deletion must drift the new stamp");
     }
 
     #[test]

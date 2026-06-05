@@ -58,6 +58,13 @@ pub trait TextStore {
     /// the in-memory `Buffer`. Content and point/mark/narrowing are unchanged.
     fn rebase_to_file(&mut self, path: &std::path::Path) -> std::io::Result<()>;
 
+    /// The identity stamp of the visited file, captured at open/rebase time —
+    /// the basis for external-change detection. `None` (the default) for a
+    /// store with no backing file, like the in-memory `Buffer`.
+    fn file_stamp(&self) -> Option<&crate::safety::FileStamp> {
+        None
+    }
+
     /// Stream the buffer's bytes into `w` and return the byte count written. The
     /// streaming atomic save uses this so a multi-GB `Quire` is written piece by
     /// piece, never materialized into one allocation; `Buffer` writes its string.
