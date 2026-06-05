@@ -1,0 +1,33 @@
+#+title: Surface reports and the log on failed runs
+
+* Problem
+
+When a program signals an error, the CLI's whole output is the error string:
+
+: {"error":"ERR LispError: ...","ok":false}
+
+The reports map and the message log accumulated before the error are dropped.
+So any diagnostics a program wants an operator to see on failure must be packed
+into the error string itself.  ulysses-annotated's =upd-epub-to-jp.tl= does
+exactly that — the miss count and the first unmatched reconciliation are
+concatenated into the =(error ...)= message — duplicating what its
+=(report ...)= and =(message ...)= calls had already captured.
+
+* Suggestion
+
+Emit the partial results in the failure JSON, mirroring the success shape:
+
+: {"error":"...","ok":false,"reports":{...},"log":[...]}
+
+The data already exists in the workspace at the point the error propagates;
+the failure path just discards it.  Check whether the daemon and MCP
+front-ends share the discard and fix them the same way.
+
+* Notes
+
+- Additive fields only: ="ok": false= stays the discriminator, so consumers
+  that key on =ok= / =error= are unaffected.
+- Reports and the log are the valuable part on failure; a buffer =diff= is
+  not (the run's edits were not persisted).
+- Once shipped, =upd-epub-to-jp.tl='s enriched error message can shrink back
+  to a plain =(error ...)=, with the diagnostics living in reports/log again.

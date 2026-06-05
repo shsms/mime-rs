@@ -9,7 +9,7 @@ rust-version = "1.88.0"
 readme = "README.md"
 keywords = ["text-editor", "lisp", "tulisp", "agent", "mcp"]
 categories = ["text-editors", "command-line-utilities", "text-processing"]
-exclude = ["plan.org"]
+exclude = ["*.org"]
 
 [dependencies]
 memmap2 = "0.9.10"
