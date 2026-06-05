@@ -25,6 +25,10 @@ the unbounded windowed search re-materializes point→end per match (a 43 MB
 
 ** TODO Parallel search/replace [#C]
 Needs a resumable streaming DFA (~regex-automata~) for cross-chunk matches.
+Related: bounded/streaming search would also fix the conflict builtins'
+full-buffer ~scan~ cost on a huge Quire (each unbounded ~search_forward~ miss
+materializes point→point-max; every ~conflict-*~ call re-scans, and
+~conflict-keep~ scans twice — find + remaining count).
 /Exit: global-replace a multi-GB file across cores; ulysses bench beats
 legacy ~mime~./
 
