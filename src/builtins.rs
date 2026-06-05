@@ -3,7 +3,7 @@
 //! `Session`). M0 subset: navigation, edit, regex search/replace, reporting.
 //! Subagents extend this with region/mark, kill-ring, markers, and narrowing.
 use crate::engine::{Checkpoint, SharedSession};
-use crate::syntax::Syntax;
+use crate::syntax::{Lang, Syntax};
 use tulisp::{Error, Shared, TulispContext, TulispConvertible, TulispObject, TulispValue};
 
 fn bad_regex(e: regex::Error) -> Error {
@@ -1110,17 +1110,56 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         );
     }
 
-    // ---- structural / AST-aware editing (M7, tree-sitter Markdown) ----
-    // Every call re-parses the buffer fresh (incremental re-parse is a TODO in
+    // ---- structural / AST-aware editing (M7, tree-sitter) ----
+    // Markdown, Rust, and Python; the language comes from the buffer name's
+    // extension (`Lang::from_buffer_name`), overridable per buffer with
+    // `treesit-set-language`, falling back to Markdown (`syntax_of`). Every
+    // call re-parses the buffer fresh (incremental re-parse is a TODO in
     // syntax.rs). Node spans are reported in 1-based char positions, like the
-    // rest of the builtins.
+    // rest of the builtins. A "defun" is the language's enclosing construct:
+    // a Markdown `section`, a Rust `function_item`/`impl_item`/type item, a
+    // Python `function_definition`/`class_definition`.
+    {
+        let s = session.clone();
+        // (treesit-language) — report and return the language the current
+        // buffer parses as ("markdown" / "rust" / "python").
+        ctx.defun("treesit-language", move || -> String {
+            let mut sess = s.borrow_mut();
+            let name = lang_of(&sess).name().to_string();
+            sess.reports
+                .push(("treesit-language".to_string(), name.clone()));
+            name
+        });
+    }
+    {
+        let s = session.clone();
+        // (treesit-set-language LANG) — override the current buffer's language
+        // (a name or extension: "rust"/"rs", "python"/"py", "markdown"/"md").
+        // For buffers whose name carries no extension — stdin pipes, scratch
+        // buffers. Returns the canonical name; errors on an unknown language.
+        ctx.defun(
+            "treesit-set-language",
+            move |token: String| -> Result<String, Error> {
+                let lang = Lang::from_token(&token)
+                    .ok_or_else(|| err(&format!("Unknown treesit language: {token}")))?;
+                let mut sess = s.borrow_mut();
+                let name = sess.buffer.name().to_string();
+                if let Some(slot) = sess.lang_overrides.iter_mut().find(|(n, _)| *n == name) {
+                    slot.1 = lang;
+                } else {
+                    sess.lang_overrides.push((name, lang));
+                }
+                Ok(lang.name().to_string())
+            },
+        );
+    }
     {
         let s = session.clone();
         // (treesit-root-type) — report and return the parse-tree root kind
-        // ("document" for Markdown). Proves the buffer parses.
+        // ("document" / "source_file" / "module"). Proves the buffer parses.
         ctx.defun("treesit-root-type", move || -> String {
             let mut sess = s.borrow_mut();
-            let kind = Syntax::parse(sess.buffer.text()).root_kind();
+            let kind = syntax_of(&sess).root_kind();
             sess.reports
                 .push(("treesit-root-type".to_string(), kind.clone()));
             kind
@@ -1136,7 +1175,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             move |pos: Option<i64>| -> Result<TulispObject, Error> {
                 let mut sess = s.borrow_mut();
                 let p = pos.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
-                let node = Syntax::parse(sess.buffer.text()).named_node_at(p);
+                let node = syntax_of(&sess).named_node_at(p);
                 Ok(match node {
                     Some(n) => {
                         sess.reports
@@ -1154,14 +1193,14 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         let s = session.clone();
-        // (treesit-beginning-of-defun) — move point to the start of the enclosing
-        // top-level construct (a Markdown `section`) and return the new point. If
-        // point is in no section, leave it put and return it unchanged.
+        // (treesit-beginning-of-defun) — move point to the start of the
+        // enclosing defun and return the new point. If point is in no defun,
+        // leave it put and return it unchanged.
         ctx.defun("treesit-beginning-of-defun", move || -> i64 {
             let mut sess = s.borrow_mut();
             let p = sess.buffer.point();
-            if let Some(sec) = Syntax::parse(sess.buffer.text()).enclosing_section(p) {
-                sess.buffer.goto_char(sec.start);
+            if let Some(d) = syntax_of(&sess).enclosing_defun(p) {
+                sess.buffer.goto_char(d.start);
             }
             sess.buffer.point() as i64
         });
@@ -1169,17 +1208,36 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     {
         let s = session.clone();
         // (treesit-end-of-defun) — move point to the end of the enclosing
-        // top-level construct (a Markdown `section`) and return the new point. If
-        // point is in no section, leave it put and return it unchanged.
+        // defun and return the new point. If point is in no defun, leave it
+        // put and return it unchanged.
         ctx.defun("treesit-end-of-defun", move || -> i64 {
             let mut sess = s.borrow_mut();
             let p = sess.buffer.point();
-            if let Some(sec) = Syntax::parse(sess.buffer.text()).enclosing_section(p) {
-                sess.buffer.goto_char(sec.end);
+            if let Some(d) = syntax_of(&sess).enclosing_defun(p) {
+                sess.buffer.goto_char(d.end);
             }
             sess.buffer.point() as i64
         });
     }
+}
+
+/// The language the current buffer parses as: the buffer's
+/// `treesit-set-language` override if present, else extension detection on the
+/// buffer name, else Markdown (mime-rs's home turf — and the scaffold's
+/// historical behavior for nameless buffers).
+fn lang_of(sess: &crate::engine::Session) -> Lang {
+    let name = sess.buffer.name();
+    sess.lang_overrides
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, l)| *l)
+        .or_else(|| Lang::from_buffer_name(name))
+        .unwrap_or(Lang::Markdown)
+}
+
+/// Parse the current buffer for the `treesit-*` builtins (fresh each call).
+fn syntax_of(sess: &crate::engine::Session) -> Syntax {
+    Syntax::parse(sess.buffer.text(), lang_of(sess))
 }
 
 /// Register the *orchestration* builtin group — multiple buffers, file I/O,
@@ -1614,6 +1672,27 @@ mod tests {
             Err(e) => assert!(e.contains("no buffer named nope"), "got: {e}"),
             Ok(_) => panic!("set-buffer on an unknown name should error"),
         }
+    }
+
+    #[test]
+    fn kill_buffer_drops_the_buffers_language_override() {
+        let mut ws = trusted("MAIN");
+        // Override an inactive buffer's language, kill it, then reuse the name:
+        // the fresh buffer must get default detection, not the dead buffer's
+        // override.
+        ws.run(
+            r#"(generate-new-buffer "scratch") (set-buffer "scratch")
+               (treesit-set-language "rust") (set-buffer "main")
+               (kill-buffer "scratch")"#,
+        )
+        .unwrap();
+        let r = ws
+            .run(
+                r#"(generate-new-buffer "scratch") (set-buffer "scratch")
+                   (treesit-language)"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "treesit-language"), "markdown");
     }
 
     #[test]

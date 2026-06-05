@@ -56,6 +56,11 @@ pub struct Session {
     /// these; the sandboxed agent-facing tier leaves them empty and has no `arg`
     /// builtin to reach them anyway.
     pub args: Vec<(String, String)>,
+    /// Per-buffer language overrides for the `treesit-*` builtins, keyed by
+    /// buffer name — set by `(treesit-set-language LANG)`, consulted before
+    /// extension detection. A `Vec` + linear scan, like `inactive`: buffer
+    /// counts are tiny.
+    pub lang_overrides: Vec<(String, crate::syntax::Lang)>,
 }
 
 impl Session {
@@ -150,6 +155,9 @@ impl Session {
             .position(|b| b.name() == name)
             .ok_or_else(|| format!("no buffer named {name}"))?;
         self.inactive.remove(idx);
+        // The override dies with the buffer — a later buffer reusing the name
+        // must get fresh extension detection, not the dead buffer's language.
+        self.lang_overrides.retain(|(n, _)| n != name);
         Ok(())
     }
 }
@@ -233,6 +241,7 @@ impl Workspace {
             reports: Vec::new(),
             log: Vec::new(),
             args: Vec::new(),
+            lang_overrides: Vec::new(),
         }));
 
         let mut ctx = TulispContext::new();
@@ -1021,5 +1030,40 @@ mod tests {
             "(goto-char 1) (treesit-beginning-of-defun)",
         );
         assert_eq!(r.point, 1);
+    }
+
+    /// Like [`run`] but with a chosen buffer name — the treesit language tests
+    /// need an extension for `Lang::from_buffer_name` to see.
+    fn run_named(name: &str, text: &str, program: &str) -> RunReport {
+        run_program(Box::new(Buffer::from_string(name, text)), program).expect("program should run")
+    }
+
+    // Two tiny code sources for the language-aware M7 builtin tests.
+    const RS_SRC: &str =
+        "fn alpha() -> i64 {\n    1\n}\n\nfn beta() -> i64 {\n    alpha() + 1\n}\n";
+    const PY_SRC: &str = "def f():\n    return 1\n\ndef g():\n    return 2\n";
+
+    #[test]
+    fn treesit_language_detected_from_buffer_name() {
+        let r = run_named("lib.rs", RS_SRC, "(treesit-language) (treesit-root-type)");
+        assert_eq!(report(&r, "treesit-language"), "rust");
+        assert_eq!(report(&r, "treesit-root-type"), "source_file");
+    }
+
+    #[test]
+    fn treesit_set_language_overrides_a_nameless_buffer() {
+        // Buffer "t" has no extension → Markdown by default; the override
+        // re-parses it as Python.
+        let r = run(
+            PY_SRC,
+            r#"(treesit-set-language "py") (treesit-language) (treesit-root-type)"#,
+        );
+        assert_eq!(report(&r, "treesit-language"), "python");
+        assert_eq!(report(&r, "treesit-root-type"), "module");
+        let e = run_program(
+            Box::new(Buffer::from_string("t", "x")),
+            r#"(treesit-set-language "cobol")"#,
+        );
+        assert!(e.is_err(), "unknown language must error");
     }
 }
