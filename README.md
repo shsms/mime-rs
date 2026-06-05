@@ -15,8 +15,8 @@ It serves two audiences from the same core:
   warm buffers, cheap rollback, an allowlisted filesystem, and an MCP front door.
 
 The launch mode picks both the protocol *and* the capability tier, so the host
-decides how much power a caller gets. The full design and roadmap are in
-[`plan.org`](plan.org).
+decides how much power a caller gets. Pending work is tracked in
+[`todo.org`](todo.org).
 
 ## Capability tiers
 
@@ -149,7 +149,7 @@ hand. Agents using it are asked to flag friction as they hit it — a missing
 builtin, a confusing report, a query that should have been expressible — and
 suggest the improvement instead of silently working around it. If you are an
 agent reading this: when something here slows you down, say so in your summary
-and propose the fix (`plan.org` is the roadmap to extend).
+and propose the fix (`todo.org` is the list to extend).
 
 ## Layout
 

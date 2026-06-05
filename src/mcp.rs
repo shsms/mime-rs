@@ -263,8 +263,7 @@ fn report_value(report: &crate::RunReport, key: &str) -> Option<String> {
 // open_file/save_buffer are the only FS-touching tools; both run their path
 // through `safety::check_path`, which confines them to the configured workspace
 // roots ($MIME_ROOTS, default cwd) and rejects `..`/symlink/absolute escapes.
-// No shell, process spawn, or network is ever exposed — see plan.org §"Safety,
-// sandboxing, permissioning".
+// No shell, process spawn, or network is ever exposed.
 
 /// `open_file {path, session?}` — open a file via `Quire` into `session`,
 /// replacing any existing session of that name. The path must resolve inside an

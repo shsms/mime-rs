@@ -188,7 +188,7 @@ pub struct Workspace {
 /// (not by the program). `Sandboxed` (the agent-facing MCP / daemon) registers
 /// only the core editing vocabulary; `Trusted` (the local `mime` CLI) also
 /// registers the *orchestration* group — multiple buffers, file I/O, directory
-/// listing, program arguments. See plan.org §"Single binary & capability tiers".
+/// listing, program arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capabilities {
     Sandboxed,

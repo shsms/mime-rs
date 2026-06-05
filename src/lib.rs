@@ -4,7 +4,7 @@
 //! `Quire` — the piece-tree-over-mmap store — will later replace behind the same
 //! surface) driven by Emacs-Lisp editor primitives over tulisp. The language is
 //! Emacs Lisp: an implicit current buffer with point/mark, `re-search-forward` +
-//! `replace-match`, etc. See `plan.org` for the full design.
+//! `replace-match`, etc. Pending work is tracked in `todo.org`.
 
 pub mod buffer;
 pub mod builtins;

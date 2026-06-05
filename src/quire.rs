@@ -19,8 +19,7 @@
 //! in the number of pieces instead of a linear scan of a piece vector. Edits
 //! (`insert`, `delete_region`, `replace_match`) rebuild only the root→leaf path
 //! they touch ([path-copying]); every prior version stays intact, so the tree is
-//! **persistent** and a snapshot is just a clone of the root `Arc`. See
-//! `plan.org` §"The editor core" and §"Performance".
+//! **persistent** and a snapshot is just a clone of the root `Arc`.
 //!
 //! ## Shared, immutable backings → O(1) snapshots
 //! Both backing stores are `Arc`-shared. The original (mmap or owned string) is

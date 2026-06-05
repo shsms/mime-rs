@@ -1,0 +1,95 @@
+#+title: mime-rs — pending work
+
+* Engine
+
+** TODO Merge-conflict resolution [#B]
+Detect conflict markers (~<<<<<<<~ / ~=======~ / ~>>>>>>>~), expose the hunks
+as structured objects (ours/theirs/base spans) to programs and the MCP
+surface, with take-ours / take-theirs / splice-per-hunk edits. Builds on the
+~FileStamp~ stale-save guard — a conflicted checkout is exactly the "file
+changed under you" case it surfaces. /Exit: an agent resolves a real rebase
+conflict through mime alone./
+
+** TODO Surface reports + log on failed runs [#B]
+A failed run returns only the error string, so programs pack diagnostics into
+the ~(error ...)~ message itself (ulysses-annotated's ~upd-epub-to-jp.tl~
+does). Emit the accumulated reports and log in the failure JSON, mirroring the
+success shape: ~{"error":…, "ok":false, "reports":{…}, "log":[…]}~. Additive
+only (~ok~ stays the discriminator); no ~diff~ (failed edits aren't
+persisted). Check the CLI, daemon, and MCP front-ends share the discard and
+fix all three. Then ~upd-epub-to-jp.tl~'s enriched error shrinks back to a
+plain ~(error ...)~.
+
+** TODO Literal replace_text MCP tool [#B]
+~insert_text~'s counterpart: exact pattern in, literal replacement in, no
+elisp — removes the double-escaping risk in ~run_program~ for quote-heavy
+content (tulisp string literals also reject Rust's ~\u{…}~ escapes).
+
+** TODO O(n) buffer-level replace [#B]
+~replace-string~ / ~replace-regexp~ on a large Quire are effectively O(n²):
+the unbounded windowed search re-materializes point→end per match (a 43 MB
+~replace-regexp~ hung minutes). Make them a single streaming rewrite, like
+~replace-regexp-in-string~ already is.
+
+** TODO Parallel search/replace [#C]
+Needs a resumable streaming DFA (~regex-automata~) for cross-chunk matches.
+/Exit: global-replace a multi-GB file across cores; ulysses bench beats
+legacy ~mime~./
+
+** TODO Bytecode-compile hot programs [#C]
+
+** TODO Dirty-span diffs [#C]
+
+** TODO find-file dedup by path, not basename
+Two files sharing a basename collide (the second aliases the first). Key
+buffers by visited path and uniquify the name Emacs-style (~doc.txt<2>~);
+~unique_buffer_name~ already exists in engine.rs. Same fix for
+~find-file-noselect~.
+
+** TODO replace-match FIXEDCASE/LITERAL args
+It always expands backrefs; the optional Emacs arguments are unimplemented.
+
+** TODO Per-program resource limits
+A wall-clock/CPU bound per program — blocked on tulisp cooperative
+cancellation (eval interruption), see the wishlist below.
+
+* Structural editing
+
+** TODO Persistent per-Session tree (the lever) [#B]
+Keep the parse on the ~Session~ instead of re-parsing every call. Unlocks:
+nodes as first-class values (a live tree to reference, like markers),
+relational navigation + fields (~node-parent~ / ~child~ / ~next-sibling~ /
+~child-by-field-name~), and incremental re-parse (~InputEdit~s, not O(buffer)
+per call).
+
+** TODO AST-edit ops [#C]
+~replace-node~ / ~wrap-node~ / ~raise-node~ / ~kill-node~ / insert-sibling —
+thin wrappers over delete+insert once the persistent tree lands.
+
+** TODO More languages [#C]
+JS/TS, Go, …: a ~Lang~ variant + extension row + ~defun_kinds~ row each. Fix
+Python ~decorated_definition~ spans (include the decorators). Adjacent: a
+formatter for code edits (~rustfmt~ via ~call-process~, trusted tier only).
+
+* Release / integration
+
+** TODO Publish the crate
+~cargo~ workspace + crates.io publish; the CI tag-release workflow is in
+place.
+
+** TODO ulysses-annotated: switch CI + pipeline to the .tl scripts
+The add-anno port is done on that repo's ~mime-rs~ branch (byte-identical,
+~5.1 s vs legacy mime's 6.9 s head-to-head); remaining: merge it and point
+CI / the pipeline at ~mime run~.
+
+* tulisp wishlist
+
+** TODO ~format~ conversions ~%x %o %c %e %g~
+** TODO Obarray introspection
+Enumerate defined symbols / arity / docs, so MCP can advertise the live
+vocabulary and tooling can reflect on a session.
+** TODO Cooperative cancellation
+A ~thread-signal~-style interrupt — unblocks per-program resource limits
+above.
+** TODO Parity odds & ends
+~assq plist-put pop remhash mapc elt~ / vectors.
