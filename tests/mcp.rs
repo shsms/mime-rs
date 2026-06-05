@@ -146,6 +146,7 @@ fn full_session_round_trip_over_stdio() {
         "read_region",
         "search",
         "occur",
+        "conflicts",
         "checkpoint",
         "restore_checkpoint",
         "list_checkpoints",
@@ -344,6 +345,35 @@ fn sessions_are_isolated_and_warm() {
 }
 
 /// A unique temp directory for one safety test, used as the `MIME_ROOTS` root.
+#[test]
+fn conflicts_overview_and_resolution_round_trip() {
+    let mut s = Server::spawn();
+    s.call_ok(
+        1,
+        "open_text",
+        json!({ "text": "intro\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\ntail\n" }),
+    );
+
+    // The read-only overview names the hunk and its labels.
+    let out = s.call_ok(2, "conflicts", json!({}));
+    assert!(out.contains("1 conflict"), "got: {out}");
+    assert!(out.contains("HEAD ↔ branch"), "got: {out}");
+
+    // Resolution through run_program; the report carries the remaining count.
+    let report = s.call_ok(
+        3,
+        "run_program",
+        json!({ "program": r#"(report "left" (conflict-keep "theirs" 1))"# }),
+    );
+    let report: Value = serde_json::from_str(&report).expect("RunReport is JSON");
+    assert_eq!(report["reports"]["left"], "0");
+
+    let out = s.call_ok(4, "conflicts", json!({}));
+    assert!(out.contains("no conflicts"), "got: {out}");
+    let text = s.call_ok(5, "read_region", json!({ "start": 1, "end": 19 }));
+    assert_eq!(text, "intro\ntheirs\ntail\n");
+}
+
 #[test]
 fn occur_overviews_matches_without_moving_point() {
     let mut s = Server::spawn();

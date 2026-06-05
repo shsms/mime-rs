@@ -160,6 +160,7 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         "insert_text" => tool_insert_text(&args, sessions),
         "search" => tool_search(&args, sessions),
         "occur" => tool_occur(&args, sessions),
+        "conflicts" => tool_conflicts(&args, sessions),
         "checkpoint" => tool_checkpoint(&args, sessions),
         "restore_checkpoint" => tool_restore_checkpoint(&args, sessions),
         "list_checkpoints" => tool_list_checkpoints(&args, sessions),
@@ -475,6 +476,24 @@ fn tool_occur(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result
         .ok_or_else(|| "occur: no output returned".to_string())
 }
 
+/// `conflicts {session?}` — the rendered merge-conflict overview (hunk
+/// numbers, positions, labels, side sizes) via the `conflict-hunks` builtin.
+/// Read-only; resolution runs through `run_program` (`conflict-keep` /
+/// `conflict-replace` / `conflict-resolve-trivial`).
+fn tool_conflicts(
+    args: &Value,
+    sessions: &mut HashMap<String, Workspace>,
+) -> Result<String, String> {
+    let session = session_arg(args);
+    // `message` hands the rendered overview back verbatim (see read_region).
+    let report = run_in_session(sessions, &session, "(message (conflict-hunks))")?;
+    report
+        .log
+        .into_iter()
+        .next()
+        .ok_or_else(|| "conflicts: no output returned".to_string())
+}
+
 /// `checkpoint {session?, label?}` — capture a restore point. Returns the label
 /// the engine assigned (auto-generated when omitted).
 fn tool_checkpoint(
@@ -708,6 +727,17 @@ fn tool_schemas() -> Vec<Value> {
                     "session": session,
                 },
                 "required": ["pattern"],
+            },
+        }),
+        json!({
+            "name": "conflicts",
+            "description": "Overview of the merge-conflict hunks in the buffer: number, position + line, branch labels, side sizes. Read-only. Resolve via run_program: (conflict-keep SIDE &optional N) with ours|theirs|base|both|all, (conflict-replace TEXT &optional N) for a hand-crafted merge, (conflict-resolve-trivial) to sweep the safe ones, (conflict-diff &optional N) to see what differs, (conflict-text SIDE &optional N) to read one side; mutating calls return the remaining count. N is 1-based and refreshes after each edit; nil N = the hunk at point.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": session,
+                },
+                "required": [],
             },
         }),
         json!({
