@@ -585,7 +585,7 @@ counts) and gives an immediate real-world acceptance test.
 ** DONE M5 — Safety & audit [#B]
    Path allowlist (~MIME_ROOTS~ / ~check_path~), read-only buffers, atomic saves, audit journal (~MIME_AUDIT~). /Exit ✓: safe to grant to an autonomous agent./
 ** DOING M6 — Parallelism & performance [#B]
-   Done: parallel initial char/line index (~std::thread::scope~, ~4.8×); rebase-on-save compaction; streaming atomic saves (no full ~text()~ materialization). Remaining: parallel search/replace (needs a resumable streaming DFA — regex-automata — for cross-chunk matches); bytecode-compile hot programs; dirty-span diffs; external-change (mtime/inode) detection. /Exit: global-replace a multi-GB file across cores; ulysses bench beats ~mime~./
+   Done: parallel initial char/line index (~std::thread::scope~, ~4.8×); rebase-on-save compaction; streaming atomic saves (no full ~text()~ materialization). Done also: external-change (mtime/inode) detection — ~FileStamp~ captured at open/rebase, save refuses over a drifted visited file, ~buffer-stale-p~ / ~buffer-file-name~ builtins. Remaining: parallel search/replace (needs a resumable streaming DFA — regex-automata — for cross-chunk matches); bytecode-compile hot programs; dirty-span diffs. /Exit: global-replace a multi-GB file across cores; ulysses bench beats ~mime~./
 ** DOING M7 — Structural / syntax-aware editing [#C] (grammars + query landed)
 
    /Done:/ tree-sitter + ~tree-sitter-md~/~-rust~/~-python~; ~src/syntax.rs~ re-parses
@@ -643,6 +643,14 @@ counts) and gives an immediate real-world acceptance test.
    multi-buffer aggregation), editing in the core vocabulary. The canonical
    integration test the plan has pointed at from the start. /Exit: the pipeline
    reproduces the annotated EPUB; the ulysses bench beats ~mime~./
+** TODO M12 — Merge-conflict resolution [#B]
+   First-class support for resolving VCS merge conflicts: detect conflict
+   markers (~<<<<<<<~ / ~=======~ / ~>>>>>>>~), expose the hunks as structured
+   objects (ours/theirs/base spans) to programs and the MCP surface, with
+   take-ours / take-theirs / splice-per-hunk edits. Builds on M6's
+   external-change detection — a conflicted checkout is exactly the "file
+   changed under you" case the ~FileStamp~ guard now surfaces. /Exit: an agent
+   resolves a real rebase conflict through mime alone./
 
 * tulisp substrate — what mime-rs relies on
 
@@ -732,6 +740,14 @@ Still-open lessons:
   use ~-s user~ (or add from the session root), else a resume sees no tools.
 - *Warm server is frozen at spawn*: new builtins/tools need a restart (~claude --resume~);
   ~mime run --local~ (fresh process per call) is the fast dev-iteration path.
+- *No buffer-wide match overview*: ~search~ moves point one hit at a time, so
+  orientation ("where are all the X / outline this file") still leaks out to external
+  ~grep~. An ~occur~-style tool — pattern in, all matches with line numbers + context
+  out — would keep that in-session.
+- *Quote-heavy code edits through run_program*: replacing Rust that itself contains
+  escaped strings means double-escaping inside the elisp literal — workable but
+  error-prone. ~insert_text~ already solves the insert half; an analogous literal
+  ~replace_text~ (exact pattern in, literal replacement in, no elisp) would cover the rest.
 
 * Open questions & risks (decide deliberately)
 1. *Why not ~emacsclient~ + elisp?* It already has buffers/markers/narrowing/regexp
