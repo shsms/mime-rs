@@ -23,11 +23,23 @@ pub struct RunReport {
 
 impl RunReport {
     pub fn to_json(&self) -> Value {
-        let reports: serde_json::Map<String, Value> = self
-            .reports
-            .iter()
-            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-            .collect();
+        // A repeated key (a per-item report stream — `treesit-list-defuns`
+        // emits one "defun" line per function) aggregates into an array;
+        // a key reported once stays a plain string.
+        let mut reports = serde_json::Map::new();
+        for (k, v) in &self.reports {
+            let v = Value::String(v.clone());
+            match reports.get_mut(k) {
+                None => {
+                    reports.insert(k.clone(), v);
+                }
+                Some(Value::Array(items)) => items.push(v),
+                Some(first) => {
+                    let first = first.take();
+                    reports.insert(k.clone(), Value::Array(vec![first, v]));
+                }
+            }
+        }
         json!({
             "ok": true,
             "buffer": self.buffer_name,
@@ -49,4 +61,33 @@ pub fn unified_diff(before: &str, after: &str) -> String {
         "{}",
         similar::TextDiff::from_lines(before, after).unified_diff()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_report_keys_aggregate_into_an_array() {
+        let r = RunReport {
+            buffer_name: "t".into(),
+            diff: String::new(),
+            dirty: false,
+            point: 1,
+            len_before: 0,
+            len_after: 0,
+            reports: vec![
+                ("once".into(), "a".into()),
+                ("many".into(), "1".into()),
+                ("many".into(), "2".into()),
+                ("many".into(), "3".into()),
+            ],
+            log: vec![],
+            rehearsed: false,
+            final_text: String::new(),
+        };
+        let j = r.to_json();
+        assert_eq!(j["reports"]["once"], "a");
+        assert_eq!(j["reports"]["many"], serde_json::json!(["1", "2", "3"]));
+    }
 }
