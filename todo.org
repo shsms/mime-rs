@@ -2,14 +2,6 @@
 
 * Engine
 
-** TODO Merge-conflict resolution [#B]
-Detect conflict markers (~<<<<<<<~ / ~=======~ / ~>>>>>>>~), expose the hunks
-as structured objects (ours/theirs/base spans) to programs and the MCP
-surface, with take-ours / take-theirs / splice-per-hunk edits. Builds on the
-~FileStamp~ stale-save guard — a conflicted checkout is exactly the "file
-changed under you" case it surfaces. /Exit: an agent resolves a real rebase
-conflict through mime alone./
-
 ** TODO Surface reports + log on failed runs [#B]
 A failed run returns only the error string, so programs pack diagnostics into
 the ~(error ...)~ message itself (ulysses-annotated's ~upd-epub-to-jp.tl~

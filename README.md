@@ -113,6 +113,7 @@ Programs are Emacs Lisp on `tulisp` (control flow, `let`, `lambda`, `dolist`,
 | Search & replace | `re-search-forward` `search-forward` `search-backward` `replace-match` `match-string` `match-beginning` `match-end` `replace-string` `replace-regexp` `count-matches` `regexp-quote` |
 | Narrowing & scope | `narrow-to-region` `widen` `save-excursion` `save-restriction` |
 | Time travel | `checkpoint` `restore-checkpoint` `with-transaction` |
+| Merge conflicts | `conflict-count` `conflict-hunks` `conflict-goto` `conflict-text` `conflict-diff` `conflict-keep` `conflict-replace` `conflict-resolve-trivial` (git/diff3 markers; smerge-flavored) |
 | Structural (M7) | `treesit-language` `treesit-set-language` `treesit-root-type` `treesit-has-error` `treesit-node-at` `treesit-beginning-of-defun` `treesit-end-of-defun` `treesit-defun-name` `treesit-narrow-to-defun` `treesit-list-defuns` `treesit-goto-defun` `treesit-query` (tree-sitter; Markdown, Rust, Python) |
 | Observability | `report` `message` `window` `occur` `buffer-file-name` `buffer-stale-p` |
 | Orchestration (trusted tier) | `find-file` `find-file-noselect` `insert-file-contents` `write-file` `write-region` `directory-files` `generate-new-buffer` `set-buffer` `with-current-buffer` `current-buffer` `buffer-name` `buffer-list` `get-buffer` `kill-buffer` `arg` |
