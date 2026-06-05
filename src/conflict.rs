@@ -149,6 +149,77 @@ fn parse_hunk_at(b: &mut dyn TextStore, start: usize) -> Option<Hunk> {
     None // unterminated
 }
 
+/// The hunk a program addressed: 1-based index `n`, or — with `None` — the
+/// hunk containing `point` (how `smerge-keep-current` addresses). The `Err`
+/// is a ready error message.
+pub fn pick(hunks: &[Hunk], n: Option<i64>, point: usize) -> Result<&Hunk, String> {
+    match n {
+        Some(n) => usize::try_from(n)
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|i| hunks.get(i))
+            .ok_or_else(|| format!("no conflict {n} ({} in the buffer)", hunks.len())),
+        None => hunks
+            .iter()
+            .find(|h| h.start <= point && point < h.end)
+            .ok_or_else(|| "point is not inside a conflict".to_string()),
+    }
+}
+
+/// The text a resolution side denotes. `ours`/`theirs`/`base` are the plain
+/// sections (`base` errs on a non-diff3 hunk); `both` keeps ours then theirs
+/// (smerge has no name for it); `all` keeps ours, base, theirs in order
+/// (`smerge-keep-all`).
+pub fn side_text(b: &dyn TextStore, h: &Hunk, side: &str) -> Result<String, String> {
+    let ours = b.substring(h.ours.0, h.ours.1);
+    let theirs = b.substring(h.theirs.0, h.theirs.1);
+    let base = h.base.map(|(s, e)| b.substring(s, e));
+    match side {
+        "ours" => Ok(ours),
+        "theirs" => Ok(theirs),
+        "base" => base.ok_or_else(|| "no base section (not a diff3 conflict)".to_string()),
+        "both" => Ok(format!("{ours}{theirs}")),
+        "all" => Ok(format!("{ours}{}{theirs}", base.unwrap_or_default())),
+        other => Err(format!("unknown side: {other} (ours|theirs|base|both|all)")),
+    }
+}
+
+/// Render the `conflict-hunks` overview: one line per hunk with its number,
+/// char position + line (goto-char-able), labels, and side sizes.
+pub fn render(b: &dyn TextStore, hunks: &[Hunk]) -> String {
+    let name = b.name();
+    if hunks.is_empty() {
+        return format!("— no conflicts in {name} —\n");
+    }
+    let lines_of = |span: (usize, usize)| b.substring(span.0, span.1).lines().count();
+    let mut out = format!(
+        "— {} conflict{} in {name} —\n",
+        hunks.len(),
+        if hunks.len() == 1 { "" } else { "s" },
+    );
+    for (i, h) in hunks.iter().enumerate() {
+        let sides = match h.base {
+            Some(span) => format!(
+                "ours {} / base {} / theirs {}",
+                lines_of(h.ours),
+                lines_of(span),
+                lines_of(h.theirs)
+            ),
+            None => format!("ours {} / theirs {}", lines_of(h.ours), lines_of(h.theirs)),
+        };
+        out.push_str(&format!(
+            "{:>5} @{} L{}: {} ↔ {} ({} lines)\n",
+            i + 1,
+            h.start,
+            b.line_number_at_pos(h.start),
+            h.ours_label,
+            h.theirs_label,
+            sides,
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

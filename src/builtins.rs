@@ -1273,6 +1273,168 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         );
     }
 
+    // ---- merge conflicts (smerge-flavored; see src/conflict.rs) ----
+    // Stateless: every command re-scans the accessible region, so hunk
+    // numbers refresh after each edit (resolve top-down, or re-list). All
+    // mutating commands return the REMAINING conflict count — the loop
+    // condition and the "am I done" signal in one. Addressing: a 1-based
+    // hunk index, or nil for the hunk containing point (smerge-keep-current).
+    {
+        // (conflict-count) — the number of well-formed conflict hunks.
+        let s = session.clone();
+        ctx.defun("conflict-count", move || -> i64 {
+            crate::conflict::scan(s.borrow_mut().buffer.as_mut()).len() as i64
+        });
+    }
+    {
+        // (conflict-hunks) — rendered overview: one line per hunk with its
+        // number, char position + line, labels, and side sizes.
+        let s = session.clone();
+        ctx.defun("conflict-hunks", move || -> String {
+            let mut sess = s.borrow_mut();
+            let b = sess.buffer.as_mut();
+            let hunks = crate::conflict::scan(b);
+            crate::conflict::render(&*b, &hunks)
+        });
+    }
+    {
+        // (conflict-goto &optional N) — move point to hunk N's start; with nil,
+        // to the next conflict after point (smerge-next). Returns the position,
+        // or nil when there is no next conflict.
+        let s = session.clone();
+        ctx.defun(
+            "conflict-goto",
+            move |n: Option<i64>| -> Result<TulispObject, Error> {
+                let mut sess = s.borrow_mut();
+                let b = sess.buffer.as_mut();
+                let hunks = crate::conflict::scan(b);
+                let target = match n {
+                    Some(_) => Some(
+                        crate::conflict::pick(&hunks, n, b.point())
+                            .map_err(|e| err(&e))?
+                            .start,
+                    ),
+                    None => {
+                        let p = b.point();
+                        hunks.iter().map(|h| h.start).find(|&st| st > p)
+                    }
+                };
+                if let Some(p) = target {
+                    b.goto_char(p);
+                }
+                Ok(target.map(|p| p as i64).into())
+            },
+        );
+    }
+    {
+        // (conflict-text SIDE &optional N) — the text of one side of hunk N
+        // (or the hunk at point): "ours" | "theirs" | "base" (diff3 only), plus
+        // the combinations "both" / "all" (what conflict-keep would insert).
+        let s = session.clone();
+        ctx.defun(
+            "conflict-text",
+            move |side: String, n: Option<i64>| -> Result<String, Error> {
+                let mut sess = s.borrow_mut();
+                let b = sess.buffer.as_mut();
+                let hunks = crate::conflict::scan(b);
+                let h = crate::conflict::pick(&hunks, n, b.point()).map_err(|e| err(&e))?;
+                crate::conflict::side_text(&*b, h, &side).map_err(|e| err(&e))
+            },
+        );
+    }
+    {
+        // (conflict-diff &optional N) — unified diff ours → theirs for hunk N
+        // (or the hunk at point): what actually differs, without reading both
+        // sides in full (smerge-refine's idea, token-lean). "" = identical.
+        let s = session.clone();
+        ctx.defun(
+            "conflict-diff",
+            move |n: Option<i64>| -> Result<String, Error> {
+                let mut sess = s.borrow_mut();
+                let b = sess.buffer.as_mut();
+                let hunks = crate::conflict::scan(b);
+                let h = crate::conflict::pick(&hunks, n, b.point()).map_err(|e| err(&e))?;
+                let ours = b.substring(h.ours.0, h.ours.1);
+                let theirs = b.substring(h.theirs.0, h.theirs.1);
+                Ok(crate::result::unified_diff(&ours, &theirs))
+            },
+        );
+    }
+    {
+        // (conflict-keep SIDE &optional N) — resolve hunk N (or the hunk at
+        // point) by replacing the whole hunk with SIDE: "ours" | "theirs" |
+        // "base" | "both" (ours then theirs) | "all" (ours, base, theirs —
+        // smerge-keep-all). Returns the remaining conflict count.
+        let s = session.clone();
+        ctx.defun(
+            "conflict-keep",
+            move |side: String, n: Option<i64>| -> Result<i64, Error> {
+                let mut sess = s.borrow_mut();
+                let b = sess.buffer.as_mut();
+                let hunks = crate::conflict::scan(b);
+                let h = crate::conflict::pick(&hunks, n, b.point()).map_err(|e| err(&e))?;
+                let text = crate::conflict::side_text(&*b, h, &side).map_err(|e| err(&e))?;
+                let (start, end) = (h.start, h.end);
+                b.delete_region(start, end);
+                b.goto_char(start);
+                b.insert(&text);
+                Ok(crate::conflict::scan(b).len() as i64)
+            },
+        );
+    }
+    {
+        // (conflict-replace TEXT &optional N) — resolve hunk N (or the hunk at
+        // point) by splicing TEXT verbatim in place of the whole hunk — the
+        // hand-crafted resolution. Returns the remaining conflict count.
+        let s = session.clone();
+        ctx.defun(
+            "conflict-replace",
+            move |text: String, n: Option<i64>| -> Result<i64, Error> {
+                let mut sess = s.borrow_mut();
+                let b = sess.buffer.as_mut();
+                let hunks = crate::conflict::scan(b);
+                let h = crate::conflict::pick(&hunks, n, b.point()).map_err(|e| err(&e))?;
+                let (start, end) = (h.start, h.end);
+                b.delete_region(start, end);
+                b.goto_char(start);
+                b.insert(&text);
+                Ok(crate::conflict::scan(b).len() as i64)
+            },
+        );
+    }
+    {
+        // (conflict-resolve-trivial) — sweep every hunk and resolve the safe
+        // cases (the conservative core of smerge-resolve): sides identical →
+        // either; ours == base → theirs; theirs == base → ours. Edits run
+        // bottom-up so earlier spans stay valid. Returns the remaining count.
+        let s = session.clone();
+        ctx.defun("conflict-resolve-trivial", move || -> i64 {
+            let mut sess = s.borrow_mut();
+            let b = sess.buffer.as_mut();
+            let hunks = crate::conflict::scan(b);
+            for h in hunks.iter().rev() {
+                let ours = b.substring(h.ours.0, h.ours.1);
+                let theirs = b.substring(h.theirs.0, h.theirs.1);
+                let base = h.base.map(|(s, e)| b.substring(s, e));
+                let keep = if ours == theirs {
+                    Some(ours)
+                } else if base.as_deref() == Some(ours.as_str()) {
+                    Some(theirs)
+                } else if base.as_deref() == Some(theirs.as_str()) {
+                    Some(ours)
+                } else {
+                    None
+                };
+                if let Some(text) = keep {
+                    b.delete_region(h.start, h.end);
+                    b.goto_char(h.start);
+                    b.insert(&text);
+                }
+            }
+            crate::conflict::scan(b).len() as i64
+        });
+    }
+
     // ---- structural / AST-aware editing (M7, tree-sitter) ----
     // Markdown, Rust, and Python; the language comes from the buffer name's
     // extension (`Lang::from_buffer_name`), overridable per buffer with
@@ -2163,6 +2325,100 @@ mod tests {
         );
         assert!(out.contains("    3 @22: gamma"), "hit line, got: {out}");
         assert!(out.contains("    4 - beta"), "context below, got: {out}");
+    }
+
+    #[test]
+    fn conflict_overview_navigation_and_inspection() {
+        let mut ws = trusted(
+            "intro\n<<<<<<< HEAD\nours-1\n=======\ntheirs-1\n>>>>>>> branch\nmid\n\
+             <<<<<<< HEAD\nsame\n=======\nsame\n>>>>>>> branch\ntail\n",
+        );
+        let r = ws
+            .run(
+                r#"(report "count" (conflict-count))
+                   (message (conflict-hunks))
+                   (report "g1" (conflict-goto))
+                   (report "ours" (conflict-text "ours"))
+                   (report "g2" (conflict-goto))
+                   (report "g3" (conflict-goto))
+                   (message (conflict-diff 1))
+                   (message (conflict-diff 2))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "count"), "2");
+        let overview = &r.log[0];
+        assert!(overview.contains("2 conflicts"), "got: {overview}");
+        assert!(
+            overview.contains("1 @7 L2: HEAD ↔ branch"),
+            "got: {overview}"
+        );
+        // conflict-goto with nil steps to the next hunk, then nil at the end;
+        // conflict-text with nil N reads the hunk at point.
+        assert_eq!(report(&r, "g1"), "7");
+        assert_eq!(report(&r, "ours"), "\"ours-1\\n\"");
+        assert!(report(&r, "g2").parse::<i64>().unwrap() > 7);
+        assert_eq!(report(&r, "g3"), "nil");
+        // The decision view: a real difference diffs, identical sides don't.
+        assert!(r.log[1].contains("-ours-1") && r.log[1].contains("+theirs-1"));
+        assert_eq!(r.log[2], "");
+        // base on a two-way hunk is a proper error.
+        let e = match ws.run(r#"(conflict-text "base" 1)"#) {
+            Err(e) => e,
+            Ok(_) => panic!("base on a two-way hunk must error"),
+        };
+        assert!(e.contains("no base section"), "got: {e}");
+    }
+
+    #[test]
+    fn conflict_keep_and_replace_resolve_and_count_down() {
+        let mut ws = trusted(
+            "intro\n<<<<<<< HEAD\nours-1\n=======\ntheirs-1\n>>>>>>> branch\nmid\n\
+             <<<<<<< HEAD\nours-2\n=======\ntheirs-2\n>>>>>>> branch\ntail\n",
+        );
+        let r = ws
+            .run(
+                r#"(report "left" (conflict-keep "theirs" 1))
+                   (report "done" (conflict-replace "merged\n" 1))
+                   (report "txt" (buffer-string))"#,
+            )
+            .unwrap();
+        // Each resolution returns the remaining count; hunk numbers refresh,
+        // so the second hunk is addressed as 1 after the first resolves.
+        assert_eq!(report(&r, "left"), "1");
+        assert_eq!(report(&r, "done"), "0");
+        assert_eq!(
+            report(&r, "txt"),
+            "\"intro\\ntheirs-1\\nmid\\nmerged\\ntail\\n\""
+        );
+
+        // At-point addressing: keep "both" on the hunk containing point.
+        let mut ws = trusted("<<<<<<< A\no\n=======\nt\n>>>>>>> B\n");
+        let r = ws
+            .run(r#"(goto-char 12) (report "left" (conflict-keep "both")) (report "txt" (buffer-string))"#)
+            .unwrap();
+        assert_eq!(report(&r, "left"), "0");
+        assert_eq!(report(&r, "txt"), "\"o\\nt\\n\"");
+    }
+
+    #[test]
+    fn conflict_resolve_trivial_sweeps_only_the_safe_hunks() {
+        let mut ws = trusted(
+            "<<<<<<< A\nx\n=======\nx\n>>>>>>> B\n\
+             <<<<<<< A\no\n||||||| base\no\n=======\nt\n>>>>>>> B\n\
+             <<<<<<< A\no2\n||||||| base\nb2\n=======\nb2\n>>>>>>> B\n\
+             <<<<<<< A\nreal\n=======\nconflict\n>>>>>>> B\n",
+        );
+        let r = ws
+            .run(r#"(report "left" (conflict-resolve-trivial)) (report "txt" (buffer-string))"#)
+            .unwrap();
+        // Identical sides → x; ours==base → theirs (t); theirs==base → ours
+        // (o2); the genuine conflict survives untouched.
+        assert_eq!(report(&r, "left"), "1");
+        let txt = report(&r, "txt");
+        assert!(
+            txt.starts_with("\"x\\nt\\no2\\n<<<<<<< A\\nreal\\n"),
+            "got: {txt}"
+        );
     }
 
     #[test]
