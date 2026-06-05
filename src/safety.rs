@@ -143,6 +143,60 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     write_atomic_with(path, |w| w.write_all(contents))
 }
 
+/// Identity stamp of a visited file, captured when a buffer is opened from (or
+/// re-based onto) it: device + inode say *which file*, mtime + size say *which
+/// content*. [`FileStamp::check`] re-reads the metadata and reports drift — an
+/// external writer modified the file in place (mtime/size moved), replaced it
+/// (new inode: the temp+rename pattern, including our own
+/// [`write_atomic_with`]), or deleted it. This is the stale-read guard: saving
+/// over a drifted file would silently discard the other writer's work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStamp {
+    /// The visited path, as given at open/save time.
+    pub path: PathBuf,
+    mtime: std::time::SystemTime,
+    dev: u64,
+    ino: u64,
+    size: u64,
+}
+
+impl FileStamp {
+    /// Capture `path`'s current identity; `path` must exist (the caller just
+    /// opened or saved it).
+    pub fn capture(path: &Path) -> std::io::Result<FileStamp> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path)?;
+        Ok(FileStamp {
+            path: path.to_path_buf(),
+            mtime: meta.modified()?,
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.len(),
+        })
+    }
+
+    /// `None` while the file on disk still matches this stamp; otherwise a
+    /// short human-readable description of the drift, ready for an error
+    /// message.
+    pub fn check(&self) -> Option<String> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = match std::fs::metadata(&self.path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Some("deleted on disk".to_string());
+            }
+            Err(e) => return Some(format!("metadata unreadable: {e}")),
+        };
+        if (meta.dev(), meta.ino()) != (self.dev, self.ino) {
+            return Some("replaced on disk (new inode)".to_string());
+        }
+        if meta.modified().ok() != Some(self.mtime) || meta.len() != self.size {
+            return Some("modified on disk (mtime/size changed)".to_string());
+        }
+        None
+    }
+}
+
 /// Canonicalize `path` whether or not it exists yet. An existing path is
 /// canonicalized directly; for a missing one we canonicalize the parent (which
 /// must exist) and re-attach the file name, so a new file under a real,
@@ -403,5 +457,32 @@ mod tests {
             .collect();
         std::fs::remove_dir_all(&dir).ok();
         assert!(strays.is_empty(), "left temp files behind: {strays:?}");
+    }
+
+    #[test]
+    fn file_stamp_clean_modified_replaced_deleted() {
+        let dir = std::env::temp_dir().join(format!("mime-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("doc.txt");
+        std::fs::write(&f, "original").unwrap();
+
+        // Untouched file → clean.
+        let stamp = FileStamp::capture(&f).unwrap();
+        assert_eq!(stamp.check(), None);
+
+        // In-place modification (same inode, new size/mtime) → drift.
+        std::fs::write(&f, "modified in place, longer").unwrap();
+        assert!(stamp.check().unwrap().contains("modified"));
+
+        // Replacement via temp+rename (our own atomic save) → new inode → drift.
+        let stamp = FileStamp::capture(&f).unwrap();
+        write_atomic(&f, b"replaced by rename").unwrap();
+        assert!(stamp.check().unwrap().contains("replaced"));
+
+        // Deletion → drift.
+        let stamp = FileStamp::capture(&f).unwrap();
+        std::fs::remove_file(&f).unwrap();
+        assert!(stamp.check().unwrap().contains("deleted"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
