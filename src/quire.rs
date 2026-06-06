@@ -1181,8 +1181,11 @@ impl Quire {
         let min = self.point_min().min(max);
         while left > 0 {
             if n >= 0 {
-                // advance to just past the next newline at/after point
-                let mut p = self.point.clamp(min, max);
+                // Advance to just past the next newline at/after point. The
+                // scan starts at point itself, even when a stale narrowing has
+                // left point outside [min, max] — the oracle scans from the
+                // unclamped point and only clamps the *target*.
+                let mut p = self.point;
                 while p < max && self.char_at(p) != Some('\n') {
                     p += 1;
                 }
@@ -1202,7 +1205,10 @@ impl Quire {
                 // `start_line - 1`.) If there is no such newline, point goes to
                 // point_min and the move is not counted — Emacs's partial-move
                 // quirk — so we return `left`.
-                let start_line = self.point.clamp(min, max);
+                // Like the forward arm, the scan starts at the unclamped point
+                // (a stale narrowing can leave point outside [min, max]); only
+                // the target is clamped.
+                let start_line = self.point;
                 let mut j = start_line.saturating_sub(2); // last excluded pos - 1
                 let mut found = None;
                 while j >= min {
@@ -1527,6 +1533,30 @@ mod tests {
         }
         assert_eq!(n, 2);
         assert_eq!(TextStore::text(&q), "WORLD WORLD");
+    }
+
+    #[test]
+    fn forward_line_from_a_point_outside_a_stale_narrowing_matches_oracle() {
+        // A delete after the restriction shrinks its upper bound (the bound
+        // tracks every length change) without touching point, leaving point
+        // outside [min, max]. The line scans must then start from the real
+        // point, like the oracle — clamping it into the stale restriction
+        // under-counts the backward moves.
+        let mut b = crate::Buffer::from_string("t", "l Z\nZ\nfXX");
+        let mut q = Quire::from_string("t", "l Z\nZ\nfXX");
+        for s in [&mut b as &mut dyn TextStore, &mut q as &mut dyn TextStore] {
+            s.narrow_to_region(4, 7);
+            s.goto_char(7);
+            s.delete_region(8, 10); // after the narrowing: hi 7→5, point stays 7
+            assert_eq!(s.narrowing(), Some((4, 5)));
+            assert_eq!(s.point(), 7, "point escaped the restriction");
+        }
+        assert_eq!(
+            TextStore::forward_line(&mut b, -3),
+            TextStore::forward_line(&mut q, -3),
+            "shortfall must match the oracle"
+        );
+        assert_eq!(TextStore::point(&b), TextStore::point(&q));
     }
 
     #[test]
