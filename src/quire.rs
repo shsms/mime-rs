@@ -1224,9 +1224,13 @@ impl Quire {
         }
         0
     }
-    /// 1-based line number containing 1-based char position `p`.
+    /// 1-based line number containing 1-based char position `p`, counted from
+    /// the start of the accessible region (Emacs `line-number-at-pos`
+    /// semantics — see the oracle). Two O(log n) tree queries.
     fn line_number_at_pos(&self, p: usize) -> usize {
-        self.newlines_before(p) + 1
+        let before_p = self.newlines_before(p);
+        let min = self.point_min().min(p);
+        before_p - self.newlines_before(min) + 1
     }
 
     fn char_after(&self, p: usize) -> Option<char> {

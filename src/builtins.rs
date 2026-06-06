@@ -2339,6 +2339,41 @@ mod tests {
     }
 
     #[test]
+    fn line_labels_are_narrowing_relative_and_goto_line_round_trips() {
+        // Five lines; narrow to lines 3-4. Line numbers count from the
+        // accessible region's start (Emacs line-number-at-pos semantics), so
+        // the labels window/occur display feed straight back into goto-line.
+        let mut ws = trusted("l1\nl2\nl3\nl4\nl5\n");
+        let r = ws
+            .run(
+                r#"(narrow-to-region 7 13)
+                   (goto-char 10)
+                   (report "ln" (line-number-at-pos (point)))
+                   (report "back" (progn (goto-line 2) (point)))
+                   (message (window 0))
+                   (message (occur "l4"))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "ln"), "2");
+        assert_eq!(report(&r, "back"), "10", "goto-line 2 = start of l4");
+        let win = &r.log[0];
+        assert!(win.contains("line 2"), "window header relative, got: {win}");
+        assert!(
+            win.contains("    2 > "),
+            "window renders THE line, got: {win}"
+        );
+        assert!(
+            !win.contains("l5"),
+            "window stays inside the narrowing: {win}"
+        );
+        assert!(
+            r.log[1].contains("    2 @10: l4"),
+            "occur label, got: {}",
+            r.log[1]
+        );
+    }
+
+    #[test]
     fn conflict_overview_navigation_and_inspection() {
         let mut ws = trusted(
             "intro\n<<<<<<< HEAD\nours-1\n=======\ntheirs-1\n>>>>>>> branch\nmid\n\

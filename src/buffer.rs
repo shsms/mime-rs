@@ -327,9 +327,14 @@ impl Buffer {
         }
         0
     }
-    /// 1-based line number containing 1-based char position `p`.
+    /// 1-based line number containing 1-based char position `p`, counted from
+    /// the start of the accessible region — Emacs's `line-number-at-pos`
+    /// default, so the numbers that `window`/`occur`/conflict overviews
+    /// display round-trip through `goto-line` under narrowing.
     pub fn line_number_at_pos(&self, p: usize) -> usize {
-        self.text[..self.byte_of(p)].matches('\n').count() + 1
+        let b = self.byte_of(p);
+        let min_b = self.byte_of(self.point_min()).min(b);
+        self.text[min_b..b].matches('\n').count() + 1
     }
 
     // ---- char access (returns Unicode code points, like Emacs characters) ----

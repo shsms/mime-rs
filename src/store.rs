@@ -31,9 +31,21 @@ pub trait TextStore {
     fn replace_match(&mut self, replacement: &str) -> Result<(), String>;
     fn looking_at(&self, re: &regex::Regex) -> bool;
 
+    // Line motion honors the narrowing, like Emacs: results clamp into
+    // [point_min, point_max], so point never escapes the accessible region
+    // even when the restriction starts or ends mid-line.
+    /// Move point to the first char of its line, raised to `point_min`.
     fn beginning_of_line(&mut self);
+    /// Move point to the end of its line, lowered to `point_max`.
     fn end_of_line(&mut self);
+    /// Move point `n` lines forward, to a line beginning; returns the count of
+    /// lines that could not be moved (0 on full success), like Emacs. A line
+    /// beginning outside the narrowing is unreachable: point clamps to the
+    /// boundary and the move counts as short.
     fn forward_line(&mut self, n: i64) -> i64;
+    /// 1-based line number of position `p`, counted from the start of the
+    /// accessible region (Emacs `line-number-at-pos` default) — so displayed
+    /// line labels round-trip through `goto-line` under narrowing.
     fn line_number_at_pos(&self, p: usize) -> usize;
     fn char_after(&self, p: usize) -> Option<char>;
     fn char_before(&self, p: usize) -> Option<char>;
