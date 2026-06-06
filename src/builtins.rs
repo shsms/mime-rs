@@ -178,9 +178,13 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
 
     // ---- text ----
     {
+        // (buffer-string) — the ACCESSIBLE portion, like Emacs: a narrowing
+        // scopes it. (`write-file` still persists the whole buffer.)
         let s = session.clone();
         ctx.defun("buffer-string", move || -> String {
-            s.borrow().buffer.text().to_string()
+            let sess = s.borrow();
+            sess.buffer
+                .substring(sess.buffer.point_min(), sess.buffer.point_max())
         });
     }
     {
@@ -1322,12 +1326,14 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         // (conflict-goto &optional N) — move point to hunk N's start; with nil,
-        // to the next conflict at or after point (smerge-next). The nil form
-        // lands point just past the opener line — *inside* the hunk, so the
-        // at-point commands address it and the next call advances to the
-        // following hunk (a hunk starting exactly at point, e.g. at point-min,
-        // is found rather than skipped). Returns the new position, or nil when
-        // there is no next conflict.
+        // to the next conflict at or after point (smerge-next). NOTE the two
+        // forms land at different spots: explicit N at the opener line's
+        // start, nil just past the opener — *inside* the hunk, so the at-point
+        // commands address it and the next call advances to the following
+        // hunk (a hunk starting exactly at point, e.g. at point-min, is found
+        // rather than skipped). Both positions are inside the hunk for
+        // at-point addressing. Returns the new position, or nil when there is
+        // no next conflict.
         let s = session.clone();
         ctx.defun(
             "conflict-goto",
@@ -2444,6 +2450,86 @@ mod tests {
             Ok(_) => panic!("N=0 must error: indices are 1-based"),
         };
         assert!(e.contains("no conflict 0"), "got: {e}");
+    }
+
+    #[test]
+    fn conflict_goto_explicit_n_lands_on_the_opener() {
+        // Explicit N addresses by index and lands at the hunk START (the
+        // opener line) — unlike nil, which lands just past it; both are
+        // inside the hunk for the at-point commands.
+        let mut ws = trusted("pre\n<<<<<<< A\no\n=======\nt\n>>>>>>> B\n");
+        let r = ws
+            .run(
+                r#"(report "g" (conflict-goto 1))
+                   (report "p" (point))
+                   (report "ours" (conflict-text "ours"))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "g"), "5"); // start of "<<<<<<< A"
+        assert_eq!(report(&r, "p"), "5");
+        assert_eq!(report(&r, "ours"), "\"o\\n\"");
+    }
+
+    #[test]
+    fn conflict_ops_compose_with_narrowing() {
+        let text =
+            "<<<<<<< A\no1\n=======\nt1\n>>>>>>> B\nmid\n<<<<<<< A\no2\n=======\nt2\n>>>>>>> B\n";
+        let mut ws = trusted(text);
+        // Narrowed to the second hunk: it is the only one visible, addressed
+        // as N=1, and resolving it leaves the first hunk untouched outside.
+        let r = ws
+            .run(
+                r#"(narrow-to-region 39 73)
+                   (report "count" (conflict-count))
+                   (report "left" (conflict-keep "theirs" 1))
+                   (widen)
+                   (report "all" (conflict-count))
+                   (message (buffer-string))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "count"), "1");
+        assert_eq!(
+            report(&r, "left"),
+            "0",
+            "no conflicts left in the narrowing"
+        );
+        assert_eq!(report(&r, "all"), "1", "the first hunk is still there");
+        assert!(r.log[0].contains("mid\nt2\n"), "got: {}", r.log[0]);
+
+        // Narrowing into the MIDDLE of a hunk hides it entirely: the opener
+        // is outside, so neither a hunk nor a stray is reported (documented).
+        let mut ws = trusted("<<<<<<< A\no1\n=======\nt1\n>>>>>>> B\n");
+        let r = ws
+            .run(
+                r#"(narrow-to-region 11 24)
+                   (report "count" (conflict-count))
+                   (message (conflict-hunks))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "count"), "0");
+        assert!(r.log[0].contains("no conflicts"), "got: {}", r.log[0]);
+        assert!(!r.log[0].contains("unparsed"), "got: {}", r.log[0]);
+    }
+
+    #[test]
+    fn kill_line_stops_at_the_narrowing_boundary() {
+        // "abc\ndef\n" narrowed to "bc\nde": kill-line from 'd' kills exactly
+        // to point-max (mid-line), and at point-max it is a no-op.
+        let mut ws = trusted("abc\ndef\n");
+        let r = ws
+            .run(
+                r#"(narrow-to-region 2 7)
+                   (goto-char 5)
+                   (kill-line)
+                   (report "txt" (buffer-string))
+                   (report "p" (point))
+                   (kill-line)
+                   (report "txt2" (buffer-string))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "txt"), "\"bc\\n\"", "killed de up to point-max");
+        assert_eq!(report(&r, "p"), "5");
+        assert_eq!(report(&r, "txt2"), "\"bc\\n\"", "no-op at point-max");
     }
 
     #[test]

@@ -589,6 +589,19 @@ mod tests {
     }
 
     #[test]
+    fn char_access_stops_at_the_narrowing_boundaries() {
+        // char-after(point_max) and char-before(point_min) are None — the
+        // chars just outside a mid-line narrowing never leak through.
+        let mut b = Buffer::from_string("t", "abcdef");
+        b.narrow_to_region(3, 5); // "cd"
+        assert_eq!(b.char_after(3), Some('c'));
+        assert_eq!(b.char_after(4), Some('d'));
+        assert_eq!(b.char_after(5), None, "'e' is outside the narrowing");
+        assert_eq!(b.char_before(4), Some('c'));
+        assert_eq!(b.char_before(3), None, "'b' is outside the narrowing");
+    }
+
+    #[test]
     fn insert_at_end() {
         let mut b = Buffer::from_string("t", "hello");
         b.goto_char(b.point_max());

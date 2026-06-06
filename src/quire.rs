@@ -1468,6 +1468,17 @@ mod tests {
     // ---- focused unit tests (mirror buffer.rs so failures localize) ----
 
     #[test]
+    fn char_access_stops_at_the_narrowing_boundaries() {
+        // Mirrors buffer.rs: boundary chars never leak through a narrowing.
+        let mut q = Quire::from_string("t", "abcdef");
+        TextStore::narrow_to_region(&mut q, 3, 5); // "cd"
+        assert_eq!(TextStore::char_after(&q, 3), Some('c'));
+        assert_eq!(TextStore::char_after(&q, 5), None);
+        assert_eq!(TextStore::char_before(&q, 4), Some('c'));
+        assert_eq!(TextStore::char_before(&q, 3), None);
+    }
+
+    #[test]
     fn line_motion_clamps_to_the_narrowing() {
         // Mirrors buffer.rs: line motion never escapes a mid-line narrowing.
         let mut q = Quire::from_string("t", "abc\ndef\nghi");

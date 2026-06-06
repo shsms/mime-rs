@@ -22,7 +22,10 @@
 //! is rejected (its separator/closer would be ambiguous), the inner hunk is
 //! well-formed in isolation, and once it is resolved a re-scan sees the
 //! outer. CRLF lines are tolerated (the `\r` stays inside the side spans,
-//! content-faithful).
+//! content-faithful). A narrowing that cuts through a hunk hides it: only
+//! opener lines inside the accessible region are seen at all (a visible
+//! separator/closer whose opener lies outside is plain text, and not counted
+//! as a stray) — widen before resolving if the overview looks short.
 
 use crate::store::TextStore;
 
