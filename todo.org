@@ -37,6 +37,17 @@ legacy ~mime~./
 
 ** TODO Dirty-span diffs [#C]
 
+** TODO Reads from a warm Quire can serve corrupted bytes after an external IN-PLACE overwrite
+Found by live-firing the MCP server: the warm buffer mmaps the file, so an
+external in-place truncate+rewrite mutates the mapped bytes under the piece
+tree — ~read_region~ returned the new content padded with NULs, and a
+subsequent replace failed with a misleading "no match". Rename-based writers
+(editors, git, our own atomic save) are safe — the old inode survives. The
+stale guard protects SAVES only; reads stay silent even though
+~session_status~ already knows ~stale:true~. Options: surface staleness on
+the read path (cheap warning), snapshot at open, or the long-planned
+paged-LRU reader replacing mmap (also removes the SIGBUS-on-truncate risk).
+
 ** TODO Stale-save escape hatch
 When the ~FileStamp~ guard refuses a save (visited file changed externally),
 the only outs are re-opening — which discards the warm buffer's edits — or
