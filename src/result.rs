@@ -23,23 +23,6 @@ pub struct RunReport {
 
 impl RunReport {
     pub fn to_json(&self) -> Value {
-        // A repeated key (a per-item report stream — `treesit-list-defuns`
-        // emits one "defun" line per function) aggregates into an array;
-        // a key reported once stays a plain string.
-        let mut reports = serde_json::Map::new();
-        for (k, v) in &self.reports {
-            let v = Value::String(v.clone());
-            match reports.get_mut(k) {
-                None => {
-                    reports.insert(k.clone(), v);
-                }
-                Some(Value::Array(items)) => items.push(v),
-                Some(first) => {
-                    let first = first.take();
-                    reports.insert(k.clone(), Value::Array(vec![first, v]));
-                }
-            }
-        }
         json!({
             "ok": true,
             "buffer": self.buffer_name,
@@ -49,10 +32,46 @@ impl RunReport {
             "len_before": self.len_before,
             "len_after": self.len_after,
             "diff": self.diff,
-            "reports": reports,
+            "reports": reports_to_json(&self.reports),
             "log": self.log,
         })
     }
+}
+
+/// The `reports` map as JSON. A repeated key (a per-item report stream —
+/// `treesit-list-defuns` emits one "defun" line per function) aggregates into
+/// an array; a key reported once stays a plain string.
+pub fn reports_to_json(reports: &[(String, String)]) -> Value {
+    let mut map = serde_json::Map::new();
+    for (k, v) in reports {
+        let v = Value::String(v.clone());
+        match map.get_mut(k) {
+            None => {
+                map.insert(k.clone(), v);
+            }
+            Some(Value::Array(items)) => items.push(v),
+            Some(first) => {
+                let first = first.take();
+                map.insert(k.clone(), Value::Array(vec![first, v]));
+            }
+        }
+    }
+    Value::Object(map)
+}
+
+/// The failure shape every front-end emits for a program that signaled an
+/// error: `ok:false` + the error string, PLUS the `reports`/`log` the program
+/// accumulated before it died — the diagnostics callers used to pack into the
+/// error message itself. Additive: `ok` stays the discriminator, and there is
+/// deliberately no `diff` (what a failed run left behind is the *next* run's
+/// concern, not a result).
+pub fn failure_json(error: &str, reports: &[(String, String)], log: &[String]) -> Value {
+    json!({
+        "ok": false,
+        "error": error,
+        "reports": reports_to_json(reports),
+        "log": log,
+    })
 }
 
 /// A unified (line-based) diff of the buffer before/after the program.

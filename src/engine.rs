@@ -379,6 +379,16 @@ impl Workspace {
         Ok((report, value))
     }
 
+    /// The reports and log the most recent program accumulated — read after a
+    /// FAILED run, where they hold everything the program said before it died
+    /// (they are cleared at the start of every run, so they always belong to
+    /// the last one; an error does not clear them). The failure JSONs carry
+    /// these so diagnostics need not be packed into the error string.
+    pub fn failure_context(&self) -> (Vec<(String, String)>, Vec<String>) {
+        let s = self.session.borrow();
+        (s.reports.clone(), s.log.clone())
+    }
+
     /// The current buffer text — used by the daemon's `save` op.
     pub fn text(&self) -> String {
         self.session.borrow().buffer.text().to_string()
@@ -599,6 +609,24 @@ mod tests {
             .save_to(&other)
             .expect_err("deleting the now-visited file is drift");
         assert!(err.to_string().contains("deleted"), "got: {err}");
+    }
+
+    #[test]
+    fn failure_context_keeps_a_failed_runs_reports_and_log() {
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("main", "x")));
+        let e = match ws.run(r#"(report "step" 1) (message "got here") (error "boom")"#) {
+            Err(e) => e,
+            Ok(_) => panic!("program must fail"),
+        };
+        assert!(e.contains("boom"), "got: {e}");
+        // The diagnostics the program emitted before dying survive the error...
+        let (reports, log) = ws.failure_context();
+        assert_eq!(reports, vec![("step".to_string(), "1".to_string())]);
+        assert_eq!(log, vec!["got here".to_string()]);
+        // ...and the next run owns the slate again.
+        ws.run("(point)").unwrap();
+        let (reports, log) = ws.failure_context();
+        assert!(reports.is_empty() && log.is_empty());
     }
 
     #[test]

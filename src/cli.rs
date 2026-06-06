@@ -226,7 +226,10 @@ fn run_local(args: &Args, verb: &str) {
             }
         }
         Err(err) => {
-            eprintln!("{}", serde_json::json!({ "ok": false, "error": err }));
+            // Carry the reports/log the program accumulated before it died —
+            // its own diagnostics — instead of just the bare error string.
+            let (reports, log) = ws.failure_context();
+            eprintln!("{}", crate::result::failure_json(&err, &reports, &log));
             exit(1);
         }
     }

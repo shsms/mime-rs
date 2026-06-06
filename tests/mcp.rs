@@ -375,6 +375,27 @@ fn conflicts_overview_and_resolution_round_trip() {
 }
 
 #[test]
+fn failed_run_carries_the_programs_reports_and_log() {
+    let mut s = Server::spawn();
+    s.call_ok(1, "open_text", json!({ "text": "hello" }));
+    // The error content is the failure JSON: the program's own diagnostics
+    // (reports + log) ride along with the error string.
+    let err = s.call_err(
+        2,
+        "run_program",
+        json!({ "program": r#"(report "saw" (point-max)) (message "diag") (error "boom")"# }),
+    );
+    let failure: Value = serde_json::from_str(&err).expect("failure content is JSON");
+    assert_eq!(failure["ok"], false);
+    assert!(
+        failure["error"].as_str().unwrap().contains("boom"),
+        "got: {failure}"
+    );
+    assert_eq!(failure["reports"]["saw"], "6");
+    assert_eq!(failure["log"][0], "diag");
+}
+
+#[test]
 fn occur_overviews_matches_without_moving_point() {
     let mut s = Server::spawn();
     s.call_ok(

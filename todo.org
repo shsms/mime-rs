@@ -2,15 +2,10 @@
 
 * Engine
 
-** TODO Surface reports + log on failed runs [#B]
-A failed run returns only the error string, so programs pack diagnostics into
-the ~(error ...)~ message itself (ulysses-annotated's ~upd-epub-to-jp.tl~
-does). Emit the accumulated reports and log in the failure JSON, mirroring the
-success shape: ~{"error":…, "ok":false, "reports":{…}, "log":[…]}~. Additive
-only (~ok~ stays the discriminator); no ~diff~ (failed edits aren't
-persisted). Check the CLI, daemon, and MCP front-ends share the discard and
-fix all three. Then ~upd-epub-to-jp.tl~'s enriched error shrinks back to a
-plain ~(error ...)~.
+** TODO Shrink upd-epub-to-jp.tl's packed error message
+Failure JSONs now carry the failed run's ~reports~/~log~ across all three
+front-ends, so the script can go back to a plain ~(error ...)~ with the
+diagnostics living in reports/log again.
 
 ** TODO One-shot closing diff: track the primary buffer [#B]
 The run's closing ~diff~/~len_*~ compare the *initial primary* buffer against

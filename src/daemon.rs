@@ -200,7 +200,12 @@ fn op_run(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>, rehearse: b
             );
             report.to_json()
         }
-        Err(e) => json!({ "ok": false, "error": e }),
+        Err(e) => {
+            // Failure shape: the reports/log the program accumulated before it
+            // died ride along, so diagnostics survive the error.
+            let (reports, log) = ws.failure_context();
+            crate::result::failure_json(&e, &reports, &log)
+        }
     }
 }
 

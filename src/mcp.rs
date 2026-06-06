@@ -326,7 +326,19 @@ fn tool_run_program(
     let program = str_arg(args, "program")?;
     // TODO: resource limits (needs tulisp eval interruption) — a per-program
     // wall-clock/CPU bound can't be enforced until tulisp eval is cancellable.
-    let report = run_or_rehearse(sessions, &session, &program, rehearse)?;
+    let report = match run_or_rehearse(sessions, &session, &program, rehearse) {
+        Ok(report) => report,
+        // A failed program still said things before it died: the error
+        // content is the failure JSON carrying its reports/log, not just the
+        // bare error string.
+        Err(e) => {
+            let (reports, log) = sessions
+                .get(&session)
+                .map(|ws| ws.failure_context())
+                .unwrap_or_default();
+            return Err(pretty(&crate::result::failure_json(&e, &reports, &log)));
+        }
+    };
     // A rehearsal persists nothing, so it audits as a non-mutating event.
     crate::safety::audit(
         "mime-mcp",
