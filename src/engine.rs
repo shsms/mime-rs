@@ -938,6 +938,60 @@ mod tests {
     }
 
     #[test]
+    fn regex_line_anchors_mean_line_boundaries() {
+        // Emacs `^` / `$` anchor LINES; the searches must find every line
+        // start/end, not just the search window's own ends, and a mid-line
+        // point must not pass for a line beginning.
+        let r = run(
+            "alpha\nbeta\ngamma\n",
+            r#"(goto-char 3) ; mid "alpha"
+               (report "starts" (count-matches "^[a-z]"))
+               (report "ends" (count-matches "[a-z]$"))
+               (goto-char 3)
+               (report "at-line-start" (if (looking-at "^") 1 0))
+               (goto-char 7) ; start of "beta"
+               (report "beta-start" (if (looking-at "^beta") 1 0))"#,
+        );
+        assert_eq!(report(&r, "starts"), "2"); // beta, gamma (from point)
+        assert_eq!(report(&r, "ends"), "3"); // a, a, a — every line end
+        assert_eq!(report(&r, "at-line-start"), "0");
+        assert_eq!(report(&r, "beta-start"), "1");
+    }
+
+    #[test]
+    fn restriction_edges_are_line_boundaries_and_empty_matches_count_once() {
+        // Emacs: point-min counts as a line beginning even mid-line, and a
+        // zero-width anchor match counts once per position (no truncation,
+        // no double count).
+        let r = run(
+            "xxfoo\nfoo bar\n",
+            r#"(narrow-to-region 3 11)
+               (goto-char (point-min))
+               (report "bol" (if (looking-at "^foo") 1 0))
+               (report "n" (replace-regexp "^foo" "F"))
+               (widen)
+               (report "starts" (count-matches "^" 1))
+               (report "ends" (count-matches "$" 1))"#,
+        );
+        assert_eq!(report(&r, "bol"), "1", "point-min is a line beginning");
+        // Both the restriction-start "foo" and the real line-start one.
+        assert_eq!(report(&r, "n"), "2");
+        assert_eq!(r.final_text, "xxF\nF bar\n");
+        // Three ^ positions (two line starts + the position after the final
+        // newline), three $ positions — each zero-width match counted once.
+        assert_eq!(report(&r, "starts"), "3");
+        assert_eq!(report(&r, "ends"), "3");
+    }
+
+    #[test]
+    fn count_matches_with_an_end_beyond_point_max_terminates() {
+        // The zero-width step limit must clamp to point-max — an oversized
+        // END used to make `(count-matches "$" 1 BIG)` loop forever.
+        let r = run("abc", r#"(report "n" (count-matches "$" 1 100))"#);
+        assert_eq!(report(&r, "n"), "1");
+    }
+
+    #[test]
     fn mark_and_region() {
         let r = run(
             "hello world",

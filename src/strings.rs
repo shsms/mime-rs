@@ -7,12 +7,13 @@ use tulisp::{Error, TulispContext, TulispObject};
 
 pub fn register(ctx: &mut TulispContext) {
     // (replace-regexp-in-string REGEXP REP STRING) — REP is a template with
-    // `\N` (group) / `\&` (whole match) backrefs.
+    // `\N` (group) / `\&` (whole match) backrefs. Compiled via `cached_regex`,
+    // so `^` / `$` anchor lines (Emacs semantics), here as in the buffer
+    // searches.
     ctx.defun(
         "replace-regexp-in-string",
         |regexp: String, rep: String, s: String| -> Result<String, Error> {
-            let rx = regex::Regex::new(&regexp)
-                .map_err(|e| Error::lisp_error(format!("Invalid regexp: {e}")))?;
+            let rx = crate::builtins::cached_regex(&regexp)?;
             Ok(rx
                 .replace_all(&s, |caps: &regex::Captures| expand(&rep, caps))
                 .into_owned())
@@ -41,7 +42,7 @@ pub fn register(ctx: &mut TulispContext) {
         "split-string",
         |s: String, sep: Option<String>| -> Vec<String> {
             match sep {
-                Some(re) => match regex::Regex::new(&re) {
+                Some(re) => match crate::builtins::cached_regex(&re) {
                     Ok(rx) => rx.split(&s).map(str::to_string).collect(),
                     Err(_) => vec![s],
                 },

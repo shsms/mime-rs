@@ -1027,16 +1027,29 @@ impl Quire {
         if from > to {
             return None;
         }
-        let window = self.collect_range(from, to);
-        let caps = re.captures(&window)?;
+        // Materialize one char of context BEFORE the search start (when one
+        // exists inside the accessible region — point-min counts as a real
+        // line beginning, so context never crosses it) and run the regex from
+        // the offset past it (`captures_at`), so `^`/`\b` judge the real
+        // boundary at a mid-line point. The window hard-truncates at the
+        // bound, like the oracle (see its doc comment for the `$`-at-bound
+        // divergence this accepts).
+        let ctx_from = from.saturating_sub(1).max(self.point_min().min(from));
+        let window = self.collect_range(ctx_from, to);
+        let skip = if ctx_from < from {
+            window.chars().next().map_or(0, char::len_utf8)
+        } else {
+            0
+        };
+        let caps = re.captures_at(&window, skip)?;
         let whole = caps.get(0)?;
         let groups: Vec<Option<String>> = caps
             .iter()
             .map(|g| g.map(|m| m.as_str().to_string()))
             .collect();
         // Byte offsets in `window` → char offsets → absolute 1-based positions.
-        let start = from + window[..whole.start()].chars().count();
-        let end = from + window[..whole.end()].chars().count();
+        let start = ctx_from + window[..whole.start()].chars().count();
+        let end = ctx_from + window[..whole.end()].chars().count();
         self.last_match = Some(MatchData { start, end, groups });
         self.point = end;
         Some(end)
@@ -1091,11 +1104,23 @@ impl Quire {
     fn looking_at(&self, re: &regex::Regex) -> bool {
         // Anchor a regex at point. Like the oracle, the scan window runs from
         // point to the *document* end (narrowing is ignored here), so a match
-        // that needs to read past point-max still sees the bytes. TODO: replace
-        // the materialized tail with an incremental DFA reading a piece cursor so
-        // this never copies past the match.
-        let window = self.collect_range(self.point, self.total_chars() + 1);
-        re.find(&window).is_some_and(|m| m.start() == 0)
+        // that needs to read past point-max still sees the bytes; one char of
+        // context before point rides along so `^`/`\b` judge the real boundary
+        // — but never from before point-min, which counts as a real line
+        // beginning (see re_search_forward). TODO: replace the materialized
+        // tail with an incremental DFA reading a piece cursor so this never
+        // copies past the match.
+        let ctx_from = self
+            .point
+            .saturating_sub(1)
+            .max(self.point_min().min(self.point));
+        let window = self.collect_range(ctx_from, self.total_chars() + 1);
+        let skip = if ctx_from < self.point {
+            window.chars().next().map_or(0, char::len_utf8)
+        } else {
+            0
+        };
+        re.find_at(&window, skip).is_some_and(|m| m.start() == skip)
     }
 
     fn mark(&self) -> Option<usize> {
@@ -1560,6 +1585,47 @@ mod tests {
     }
 
     #[test]
+    fn line_anchor_sees_real_boundaries_not_the_search_window() {
+        // Mirror of the Buffer test: the materialized window carries one char
+        // of context before point, so `^`/`\b` judge the real boundary there.
+        let mut q = Quire::from_string("t", "one\ntwo\nthree");
+        let re = regex::RegexBuilder::new("^t")
+            .multi_line(true)
+            .build()
+            .unwrap();
+        TextStore::goto_char(&mut q, 2); // mid "one" — not a line beginning
+        assert_eq!(
+            TextStore::re_search_forward(&mut q, &re, None),
+            Some(6),
+            "start of 'two'"
+        );
+        assert!(!TextStore::looking_at(&q, &re));
+        TextStore::goto_char(&mut q, 5); // start of "two"
+        assert!(TextStore::looking_at(&q, &re));
+        let word = regex::Regex::new(r"\bne\b").unwrap();
+        TextStore::goto_char(&mut q, 2); // "o|ne" — 'n' is not word-start
+        assert_eq!(TextStore::re_search_forward(&mut q, &word, None), None);
+    }
+
+    #[test]
+    fn bounded_search_fits_quantifiers_and_point_max_is_a_line_end() {
+        // Mirror of the Buffer test: a greedy match backtracks to fit the
+        // bound; `$` matches at point-max.
+        let mut q = Quire::from_string("t", "aaa");
+        let re = regex::Regex::new("a+").unwrap();
+        TextStore::goto_char(&mut q, 1);
+        assert_eq!(TextStore::re_search_forward(&mut q, &re, Some(3)), Some(3));
+        let mut q = Quire::from_string("t", "foobar\n");
+        TextStore::narrow_to_region(&mut q, 1, 4); // accessible region is "foo"
+        TextStore::goto_char(&mut q, 1);
+        let re2 = regex::RegexBuilder::new("o$")
+            .multi_line(true)
+            .build()
+            .unwrap();
+        assert_eq!(TextStore::re_search_forward(&mut q, &re2, None), Some(4));
+    }
+
+    #[test]
     fn backref_expansion() {
         let mut q = Quire::from_string("t", "Doe, John");
         let re = regex::Regex::new(r"(\w+), (\w+)").unwrap();
@@ -1936,6 +2002,17 @@ mod tests {
             regex::Regex::new(r"\d").unwrap(),
             regex::Regex::new(r".").unwrap(),
             regex::Regex::new(r"foo|bar").unwrap(),
+            // Boundary assertions exercise the one-char context window the
+            // Quire search materializes (the oracle sees its whole text).
+            regex::RegexBuilder::new(r"^\w")
+                .multi_line(true)
+                .build()
+                .unwrap(),
+            regex::RegexBuilder::new(r"\w$")
+                .multi_line(true)
+                .build()
+                .unwrap(),
+            regex::Regex::new(r"\bfoo").unwrap(),
         ];
         let replacements = ["", "Q", "<\\&>", "ab", "\\1!"];
 

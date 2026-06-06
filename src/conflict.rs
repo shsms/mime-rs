@@ -264,13 +264,10 @@ pub fn render(b: &dyn TextStore, hunks: &[Hunk], strays: usize) -> String {
         ));
     }
     if strays > 0 {
-        // No `^` anchor in the suggestion: the engine's windowed search treats
-        // `^` as a haystack anchor, not a line anchor, so an anchored pattern
-        // would miss these very lines.
         out.push_str(&format!(
             "  ! {strays} unparsed '<<<<<<<' marker line{} — malformed or nested \
              conflict text; resolve the hunks above and re-list, or inspect \
-             with (occur \"<<<<<<<\")\n",
+             with (occur \"^<<<<<<<\")\n",
             if strays == 1 { "" } else { "s" }
         ));
     }

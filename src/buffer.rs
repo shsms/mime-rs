@@ -159,22 +159,35 @@ impl Buffer {
 
     /// Regex search forward from point (bounded by `bound` or point-max). On a
     /// hit: record match-data, move point past the match, return the new point.
+    ///
+    /// The haystack's LEFT edge is Emacs's: it starts at point-min (the
+    /// accessible region's beginning counts as a real line/word boundary, so
+    /// `^` matches there) and `captures_at` keeps the pre-point text as
+    /// context, so a mid-line point doesn't pass for a line beginning. The
+    /// RIGHT edge hard-truncates at the bound: `$`/`\b` treat an explicit
+    /// mid-line BOUND as a boundary where Emacs would consult the real buffer
+    /// — a known divergence, accepted because the high-level regex API cannot
+    /// both backtrack a quantifier to fit the bound AND evaluate assertions
+    /// past it (a span-bounded search is a todo). At point-max the cut is
+    /// correct: Emacs's `$` matches at the end of the accessible region.
     pub fn re_search_forward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize> {
         let start_b = self.byte_of(self.point);
         let end_b = self.byte_of(bound.unwrap_or_else(|| self.point_max()));
         if start_b > end_b {
             return None;
         }
+        let hay_off = self.byte_of(self.point_min()).min(start_b);
+        let hay = &self.text[hay_off..end_b];
         // Pull owned data out of the match so the borrow on `self.text` ends
         // before we mutate `self` below.
         let (ms_b, me_b, groups) = {
-            let caps = re.captures(&self.text[start_b..end_b])?;
+            let caps = re.captures_at(hay, start_b - hay_off)?;
             let whole = caps.get(0)?;
             let groups: Vec<Option<String>> = caps
                 .iter()
                 .map(|g| g.map(|m| m.as_str().to_string()))
                 .collect();
-            (start_b + whole.start(), start_b + whole.end(), groups)
+            (hay_off + whole.start(), hay_off + whole.end(), groups)
         };
         let start = self.char_of(ms_b);
         let end = self.char_of(me_b);
@@ -215,8 +228,15 @@ impl Buffer {
     }
 
     pub fn looking_at(&self, re: &regex::Regex) -> bool {
+        // `find_at` keeps the pre-point text back to point-min as boundary
+        // context for `^`/`\b` (see re_search_forward — the restriction's
+        // start is a real line beginning); a match counts only if it starts
+        // AT point. The right side deliberately runs to the document end,
+        // matching the Quire scan window.
         let b = self.byte_of(self.point);
-        re.find(&self.text[b..]).is_some_and(|m| m.start() == 0)
+        let min_b = self.byte_of(self.point_min()).min(b);
+        re.find_at(&self.text[min_b..], b - min_b)
+            .is_some_and(|m| m.start() == b - min_b)
     }
 
     // ---- mark & region ----
@@ -622,6 +642,51 @@ mod tests {
         }
         assert_eq!(n, 2);
         assert_eq!(b.text(), "WORLD WORLD");
+    }
+
+    #[test]
+    fn line_anchor_sees_real_boundaries_not_the_search_window() {
+        // A multi-line `^` must match true line starts after point, and must
+        // NOT match at a mid-line point (the pre-point text is context).
+        let mut b = Buffer::from_string("t", "one\ntwo\nthree");
+        let re = regex::RegexBuilder::new("^t")
+            .multi_line(true)
+            .build()
+            .unwrap();
+        b.goto_char(2); // mid "one" — not a line beginning
+        assert_eq!(b.re_search_forward(&re, None), Some(6), "start of 'two'");
+        assert!(!b.looking_at(&re), "'wo\\n...' is not at a line start");
+        b.goto_char(5); // start of "two" — a real line beginning
+        assert!(b.looking_at(&re));
+        // \b at the window edge: point mid-word must not fake a boundary.
+        let word = regex::Regex::new(r"\bne\b").unwrap();
+        b.goto_char(2); // "o|ne" — 'n' is not word-start
+        assert_eq!(b.re_search_forward(&word, None), None);
+    }
+
+    #[test]
+    fn bounded_search_fits_quantifiers_and_point_max_is_a_line_end() {
+        // A bound shortens the haystack, so a greedy match backtracks to fit
+        // (Emacs parity); at point-max `$` matches (Emacs: the accessible
+        // region's end is a line end). `$` at an explicit mid-line bound
+        // also matches the cut — a documented divergence from Emacs (see
+        // re_search_forward).
+        let mut b = Buffer::from_string("t", "aaa");
+        let re = regex::Regex::new("a+").unwrap();
+        b.goto_char(1);
+        assert_eq!(b.re_search_forward(&re, Some(3)), Some(3), "\"aa\" fits");
+        let mut b = Buffer::from_string("t", "foobar\n");
+        b.narrow_to_region(1, 4); // accessible region is "foo"
+        b.goto_char(1);
+        let re2 = regex::RegexBuilder::new("o$")
+            .multi_line(true)
+            .build()
+            .unwrap();
+        assert_eq!(
+            b.re_search_forward(&re2, None),
+            Some(4),
+            "point-max IS a line end"
+        );
     }
 
     #[test]

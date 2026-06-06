@@ -14,6 +14,10 @@ fn bad_regex(e: regex::Error) -> Error {
 /// called many times with a small set of repeated patterns, where `Regex::new`
 /// would otherwise dominate those calls. `Regex` is `Arc`-backed, so the cached
 /// clone is cheap. The session is single-threaded.
+///
+/// Compiled multi-line: `^` / `$` match at line boundaries, like Emacs regexes
+/// (where they always mean beginning/end of line), not just at the ends of the
+/// searched text. Absolute ends remain addressable as `\A` / `\z`.
 pub(crate) fn cached_regex(re: &str) -> Result<regex::Regex, Error> {
     thread_local! {
         static CACHE: std::cell::RefCell<std::collections::HashMap<String, regex::Regex>> =
@@ -23,7 +27,10 @@ pub(crate) fn cached_regex(re: &str) -> Result<regex::Regex, Error> {
         if let Some(rx) = c.borrow().get(re) {
             return Ok(rx.clone());
         }
-        let rx = regex::Regex::new(re).map_err(bad_regex)?;
+        let rx = regex::RegexBuilder::new(re)
+            .multi_line(true)
+            .build()
+            .map_err(bad_regex)?;
         let mut m = c.borrow_mut();
         if m.len() >= 16384 {
             m.clear(); // bound memory for long-lived daemons; rare in practice
@@ -1180,14 +1187,24 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                 }
                 let bound = end.map(|e| e.max(1) as usize);
                 let mut count = 0i64;
-                loop {
-                    let p0 = sess.buffer.point();
-                    if sess.buffer.re_search_forward(&rx, bound).is_none() {
-                        break;
-                    }
+                while let Some(end) = sess.buffer.re_search_forward(&rx, bound) {
                     count += 1;
-                    if sess.buffer.point() <= p0 {
-                        break;
+                    let start = sess.buffer.last_match().map_or(end, |m| m.start);
+                    // A zero-width match (the line anchors) leaves point in
+                    // place — step over it so each empty match counts exactly
+                    // once and the scan continues: the same stepping occur
+                    // and the streaming replace use.
+                    if end == start {
+                        // Clamp the step limit into the accessible region: an
+                        // END beyond point-max would otherwise never satisfy
+                        // `end >= limit` while goto_char clamps the step back
+                        // — an infinite loop on `(count-matches "$" 1 BIG)`.
+                        let pmax = sess.buffer.point_max();
+                        let limit = bound.map_or(pmax, |b| b.min(pmax));
+                        if end >= limit {
+                            break;
+                        }
+                        sess.buffer.goto_char(end + 1);
                     }
                 }
                 sess.buffer.goto_char(saved);
