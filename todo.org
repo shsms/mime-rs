@@ -115,17 +115,6 @@ JS/TS, Go, …: a ~Lang~ variant + extension row + ~defun_kinds~ row each. Fix
 Python ~decorated_definition~ spans (include the decorators). Adjacent: a
 formatter for code edits (~rustfmt~ via ~call-process~, trusted tier only).
 
-* Release / integration
-
-** TODO Publish the crate
-~cargo~ workspace + crates.io publish; the CI tag-release workflow is in
-place.
-
-** TODO ulysses-annotated: switch CI + pipeline to the .tl scripts
-The add-anno port is done on that repo's ~mime-rs~ branch (byte-identical,
-~5.1 s vs legacy mime's 6.9 s head-to-head); remaining: merge it and point
-CI / the pipeline at ~mime run~.
-
 * tulisp wishlist
 
 ** TODO ~format~ conversions ~%x %o %c %e %g~
