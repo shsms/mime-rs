@@ -216,13 +216,28 @@ fn op_status(sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
     let map = sessions.lock().unwrap();
     let mut ids: Vec<&String> = map.keys().collect();
     ids.sort();
+    // Per-session visibility, the same shape the MCP session_status reports:
+    // buffer, visited file, narrowing, staleness.
+    let entries: Vec<Value> = ids
+        .into_iter()
+        .map(|id| {
+            let ws = &map[id];
+            json!({
+                "id": id,
+                "buffer": ws.buffer_name(),
+                "file": ws.visited_path().map(|p| p.display().to_string()),
+                "narrowed": ws.is_narrowed(),
+                "stale": ws.is_stale(),
+            })
+        })
+        .collect();
     let roots: Vec<String> = crate::safety::roots()
         .iter()
         .map(|r| r.display().to_string())
         .collect();
     json!({
         "ok": true,
-        "sessions": ids,
+        "sessions": entries,
         "roots": roots,
         "audit": crate::safety::audit_enabled(),
     })

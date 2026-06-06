@@ -326,8 +326,13 @@ fn sessions_are_isolated_and_warm() {
     let status = s.call_ok(6, "session_status", json!({}));
     let status: Value = serde_json::from_str(&status).unwrap();
     let ids = status["sessions"].as_array().unwrap();
-    assert!(ids.iter().any(|v| v == "one"));
-    assert!(ids.iter().any(|v| v == "two"));
+    assert!(ids.iter().any(|v| v["id"] == "one"));
+    assert!(ids.iter().any(|v| v["id"] == "two"));
+    // Per-session visibility: buffer, visited file, narrowing, staleness.
+    let one = ids.iter().find(|v| v["id"] == "one").unwrap();
+    assert_eq!(one["file"], Value::Null, "open_text buffers visit no file");
+    assert_eq!(one["narrowed"], false);
+    assert_eq!(one["stale"], false);
     let roots = status["roots"].as_array().expect("roots array");
     assert!(!roots.is_empty(), "expected at least one root: {status}");
     assert!(roots.iter().all(|r| r.is_string()), "roots are strings");
@@ -523,6 +528,158 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).expect("create temp dir");
     p
+}
+
+#[test]
+fn path_reuses_a_session_already_visiting_the_file() {
+    let dir = temp_dir("one-copy");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+
+    // Open under a custom name, then address by path: ONE warm buffer, not a
+    // divergent second copy of the same document.
+    s.call_ok(1, "open_file", json!({ "path": p, "session": "custom" }));
+    s.call_ok(
+        2,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "beta" }),
+    );
+    let status = s.call_ok(3, "session_status", json!({}));
+    let status: Value = serde_json::from_str(&status).unwrap();
+    assert_eq!(
+        status["sessions"].as_array().unwrap().len(),
+        1,
+        "one warm copy: {status}"
+    );
+    let txt = s.call_ok(
+        4,
+        "read_region",
+        json!({ "session": "custom", "start": 1, "end": 5 }),
+    );
+    assert_eq!(
+        txt, "beta",
+        "the custom session sees the path-addressed edit"
+    );
+
+    // TWO sessions deliberately visiting the same file: {path} addressing
+    // refuses to guess between divergent copies.
+    s.call_ok(6, "open_file", json!({ "path": p, "session": "second" }));
+    let err = s.call_err(
+        7,
+        "replace_text",
+        json!({ "path": p, "pattern": "x", "replacement": "y" }),
+    );
+    assert!(err.contains("ambiguous"), "got: {err}");
+    assert!(
+        err.contains("custom") && err.contains("second"),
+        "names both sessions: {err}"
+    );
+
+    // A refused (stale) save names the warm session that still holds the edit.
+    std::fs::write(&file, "external change\n").unwrap();
+    let err = s.call_err(
+        8,
+        "replace_text",
+        json!({ "session": "custom", "pattern": "beta", "replacement": "gamma", "save": true }),
+    );
+    assert!(
+        err.contains("preserved in warm session \"custom\""),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn one_call_editing_with_path_save_and_batches() {
+    let dir = temp_dir("one-call");
+    let file = dir.join("prog.rs");
+    std::fs::write(&file, "fn main() {\n    let a = 1;\n    let b = 1;\n}\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+
+    // ONE call: open by path, replace, save back to disk atomically.
+    let out = s.call_ok(
+        1,
+        "replace_text",
+        json!({ "path": p, "pattern": "let a = 1;", "replacement": "let a = 2;", "save": true }),
+    );
+    assert!(out.contains("replaced 1 occurrence"), "got: {out}");
+    assert!(out.contains("saved"), "got: {out}");
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("let a = 2;")
+    );
+
+    // The session is warm, keyed by the canonical path, and visible.
+    let status = s.call_ok(2, "session_status", json!({}));
+    let status: Value = serde_json::from_str(&status).unwrap();
+    let sess = &status["sessions"][0];
+    assert!(
+        sess["file"].as_str().unwrap().contains("prog.rs"),
+        "got: {status}"
+    );
+    assert_eq!(sess["stale"], false);
+
+    // Batch edits are transactional: the second misses, the first rolls back.
+    let err = s.call_err(
+        3,
+        "replace_text",
+        json!({ "path": p, "edits": [
+            { "pattern": "let b = 1;", "replacement": "let b = 2;" },
+            { "pattern": "absent", "replacement": "x" },
+        ] }),
+    );
+    assert!(err.contains("edit 2"), "the error names the edit: {err}");
+    assert!(err.contains("absent"), "got: {err}");
+    let out = s.call_ok(4, "occur", json!({ "path": p, "pattern": "let b = 1;" }));
+    assert!(out.contains("1 match"), "rollback kept b = 1, got: {out}");
+
+    // A good batch applies in order and saves in the same call.
+    let out = s.call_ok(
+        5,
+        "replace_text",
+        json!({ "path": p, "save": true, "edits": [
+            { "pattern": "let a = 2;", "replacement": "let a = 3;" },
+            { "pattern": "let b = 1;", "replacement": "let b = 3;" },
+        ] }),
+    );
+    assert!(
+        out.contains("applied 2 edit(s), 2 replacement(s)"),
+        "got: {out}"
+    );
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("let b = 3;")
+    );
+
+    // Saving a .rs buffer that no longer parses warns (never blocks).
+    let out = s.call_ok(
+        6,
+        "replace_text",
+        json!({ "path": p, "pattern": "}", "replacement": "", "save": true }),
+    );
+    assert!(out.contains("WARNING"), "got: {out}");
+    assert!(out.contains("saved"), "warns but still saves: {out}");
+
+    // path + session together is ambiguous and rejected.
+    let err = s.call_err(
+        7,
+        "replace_text",
+        json!({ "path": p, "session": "x", "pattern": "a", "replacement": "b" }),
+    );
+    assert!(err.contains("not both"), "got: {err}");
+
+    // save:true on a no-file buffer is a clear error.
+    s.call_ok(8, "open_text", json!({ "text": "scratch" }));
+    let err = s.call_err(
+        9,
+        "replace_text",
+        json!({ "pattern": "scratch", "replacement": "x", "save": true }),
+    );
+    assert!(err.contains("no visited file"), "got: {err}");
 }
 
 #[test]

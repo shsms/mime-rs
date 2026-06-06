@@ -37,33 +37,6 @@ legacy ~mime~./
 
 ** TODO Dirty-span diffs [#C]
 
-** TODO One-call editing over MCP [#A]
-Kill the open → edit → save triple round-trip. Two orthogonal params on the
-existing tools, plus batching:
-- ~path~ on ~run_program~/~rehearse~/~insert_text~/~replace_text~ and the
-  read-only ~occur~/~view~/~read_region~/~conflicts~: auto-open the file into
-  a session KEYED BY CANONICAL PATH if not already warm (also fixes the
-  basename-collision class for MCP use). Passing both ~path~ and ~session~ is
-  an error.
-- ~save: true~ on the mutating tools: atomic save back to the visited file
-  after a successful edit — the ~FileStamp~ stale guard, audit, and rebase
-  all still apply; an unvisited buffer (open_text) errors.
-- ~edits: [{pattern, replacement, all?}, …]~ on ~replace_text~: sequential
-  edits in ONE ~with-transaction~ — all-or-nothing, error names the edit
-  that missed.
-Result: ~replace_text {path, pattern, replacement, save:true}~ is Claude
-Code Edit-tool parity in one call, plus the guard/audit/atomicity Edit lacks.
-
-** TODO Session visibility in session_status
-Per session report ~{buffer, visited file, narrowed?, stale?}~ instead of
-bare ids — a resumed agent shouldn't need probe programs to learn a
-narrowing is active or the file drifted.
-
-** TODO Parse warning on save for code buffers
-When saving a buffer whose language tree-sitter knows (~.rs~ / ~.py~), append
-a warning to the save result if ~treesit-has-error~ — the free syntax check
-Edit-style tools don't have. Warn, never block.
-
 ** TODO Stale-save escape hatch
 When the ~FileStamp~ guard refuses a save (visited file changed externally),
 the only outs are re-opening — which discards the warm buffer's edits — or

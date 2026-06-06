@@ -425,6 +425,35 @@ impl Workspace {
         )
     }
 
+    /// The current buffer's name.
+    pub fn buffer_name(&self) -> String {
+        self.session.borrow().buffer.name().to_string()
+    }
+
+    /// The current buffer's visited file (its `FileStamp` path), if any.
+    pub fn visited_path(&self) -> Option<std::path::PathBuf> {
+        self.session
+            .borrow()
+            .buffer
+            .file_stamp()
+            .map(|st| st.path.clone())
+    }
+
+    /// Whether a narrowing restricts the current buffer.
+    pub fn is_narrowed(&self) -> bool {
+        self.session.borrow().buffer.narrowing().is_some()
+    }
+
+    /// Whether the visited file changed on disk since open/rebase (the
+    /// stale-read guard's view); `false` for an unvisited buffer.
+    pub fn is_stale(&self) -> bool {
+        self.session
+            .borrow()
+            .buffer
+            .file_stamp()
+            .is_some_and(|st| st.check().is_some())
+    }
+
     /// The current buffer text — used by the daemon's `save` op.
     pub fn text(&self) -> String {
         self.session.borrow().buffer.text().to_string()

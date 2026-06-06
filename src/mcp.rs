@@ -209,6 +209,101 @@ fn bool_arg(args: &Value, key: &str) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// Resolve which session a tool call addresses. With `path`, the file is
+/// auto-opened (`check_path`-confined) into a session KEYED BY ITS CANONICAL
+/// PATH unless already warm — the one-call alternative to a separate
+/// `open_file`, and immune to basename collisions since the path is the key.
+/// Passing both `path` and `session` is ambiguous and rejected.
+fn resolve_session(
+    args: &Value,
+    sessions: &mut HashMap<String, Workspace>,
+) -> Result<String, String> {
+    let path = args.get("path").and_then(Value::as_str);
+    let session = args.get("session").and_then(Value::as_str);
+    match (path, session) {
+        (Some(_), Some(_)) => Err("pass either \"path\" or \"session\", not both".to_string()),
+        (None, s) => Ok(s.unwrap_or(DEFAULT_SESSION).to_string()),
+        (Some(p), None) => {
+            let checked = crate::safety::check_path(Path::new(p))?;
+            let id = checked.to_string_lossy().into_owned();
+            if sessions.contains_key(&id) {
+                return Ok(id);
+            }
+            // One warm copy per file: a session already VISITING this file
+            // (e.g. opened via open_file under a custom name) is reused, not
+            // shadowed by a divergent second buffer of the same document.
+            // Several sessions visiting it is refused rather than guessed at —
+            // HashMap order would make {path} address a random one.
+            let mut visiting: Vec<String> = sessions
+                .iter()
+                .filter(|(_, ws)| ws.visited_path().as_deref() == Some(checked.as_path()))
+                .map(|(k, _)| k.clone())
+                .collect();
+            match visiting.len() {
+                1 => return Ok(visiting.remove(0)),
+                0 => {}
+                _ => {
+                    visiting.sort();
+                    return Err(format!(
+                        "ambiguous: sessions {} all visit {} — pass \"session\" explicitly",
+                        visiting.join(", "),
+                        checked.display()
+                    ));
+                }
+            }
+            let quire = Quire::open(&checked).map_err(|e| format!("cannot open file {p}: {e}"))?;
+            sessions.insert(id.clone(), make_workspace(Box::new(quire), false));
+            Ok(id)
+        }
+    }
+}
+
+/// Save the session's buffer back to its VISITED file — the `save: true`
+/// half of one-call editing. `Workspace::save_to` supplies the atomic write,
+/// the stale-read guard, and the rebase. Errors for a buffer with no visited
+/// file (e.g. `open_text`): those need `save_buffer` with an explicit path.
+fn save_visited(
+    sessions: &mut HashMap<String, Workspace>,
+    session: &str,
+) -> Result<String, String> {
+    let ws = sessions
+        .get_mut(session)
+        .ok_or_else(|| format!("no such session: {session}"))?;
+    let Some(path) = ws.visited_path() else {
+        return Err(
+            "save: the buffer has no visited file — use save_buffer with a path".to_string(),
+        );
+    };
+    // A refused save (e.g. the stale-read guard) must not strand the edit:
+    // the error names the warm session that still holds it.
+    let bytes = ws.save_to(&path).map_err(|e| {
+        format!(
+            "save failed: {e} — the edit is preserved in warm session \
+             \"{session}\"; resolve the file state or save_buffer it elsewhere"
+        )
+    })?;
+    Ok(format!(
+        "; saved {bytes} bytes to {}{}",
+        path.display(),
+        parse_warning(sessions, session)
+    ))
+}
+
+/// A save-time syntax check for buffers tree-sitter parses as CODE (Markdown
+/// almost never errors, and huge prose buffers should not pay a parse): a
+/// non-empty warning when the buffer no longer parses. Warns, never blocks.
+fn parse_warning(sessions: &mut HashMap<String, Workspace>, session: &str) -> &'static str {
+    let program = "(if (or (equal (treesit-language) \"rust\")\
+                           (equal (treesit-language) \"python\"))\
+                       (report \"err\" (if (treesit-has-error) 1 0)))";
+    match run_in_session(sessions, session, program) {
+        Ok(report) if report_value(&report, "err").as_deref() == Some("1") => {
+            "; WARNING: the saved buffer no longer parses (treesit-has-error)"
+        }
+        _ => "",
+    }
+}
+
 /// Build a warm [`Workspace`], read-only when requested.
 fn make_workspace(store: Box<dyn TextStore>, read_only: bool) -> Workspace {
     // Sandboxed (agent-facing) tier: the MCP server registers the core editing
@@ -323,7 +418,7 @@ fn tool_run_program(
     sessions: &mut HashMap<String, Workspace>,
     rehearse: bool,
 ) -> Result<String, String> {
-    let session = session_arg(args);
+    let session = resolve_session(args, sessions)?;
     let program = str_arg(args, "program")?;
     // TODO: resource limits (needs tulisp eval interruption) — a per-program
     // wall-clock/CPU bound can't be enforced until tulisp eval is cancellable.
@@ -351,7 +446,15 @@ fn tool_run_program(
         report.len_before,
         report.len_after,
     );
-    Ok(pretty(&report.to_json()))
+    let mut json = report.to_json();
+    if bool_arg(args, "save") {
+        if rehearse {
+            return Err("save is not available on rehearse (nothing persists)".to_string());
+        }
+        let note = save_visited(sessions, &session)?;
+        json["saved"] = Value::String(note.trim_start_matches("; ").to_string());
+    }
+    Ok(pretty(&json))
 }
 
 /// Evaluate `(message EXPR)` in the session and hand back the logged string
@@ -380,7 +483,7 @@ fn tool_read_region(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
-    let session = session_arg(args);
+    let session = resolve_session(args, sessions)?;
     let start = int_arg(args, "start")?;
     let end = int_arg(args, "end")?;
     run_message(
@@ -396,7 +499,7 @@ fn tool_read_region(
 /// marked, and a header (buffer name, line/col, point/size). The agent's "look at
 /// the screen". Backed by the `window` builtin; like `read_region`, it only reads.
 fn tool_view(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result<String, String> {
-    let session = session_arg(args);
+    let session = resolve_session(args, sessions)?;
     // Both args are optional and map straight onto `(window LINES POS)`; we build
     // the call positionally, dropping trailing args so `window`'s own defaults
     // (4 lines, current point) apply when they're omitted.
@@ -421,7 +524,7 @@ fn tool_insert_text(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
-    let session = session_arg(args);
+    let session = resolve_session(args, sessions)?;
     let text = str_arg(args, "text")?;
     let escaped = lisp_literal(&text);
     let program = match args.get("pos").and_then(Value::as_i64) {
@@ -434,7 +537,14 @@ fn tool_insert_text(
     audit_tool(&session, &program, &report);
     let chars = text.chars().count();
     let point = report_value(&report, "point").unwrap_or_default();
-    Ok(format!("inserted {chars} chars; point is now {point}"))
+    let saved = if bool_arg(args, "save") {
+        save_visited(sessions, &session)?
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "inserted {chars} chars; point is now {point}{saved}"
+    ))
 }
 
 /// `replace_text {session?, pattern, replacement, all?}` — replace the first
@@ -450,7 +560,13 @@ fn tool_replace_text(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
-    let session = session_arg(args);
+    let session = resolve_session(args, sessions)?;
+    if let Some(edits) = args.get("edits") {
+        if args.get("pattern").is_some() || args.get("replacement").is_some() {
+            return Err("pass either \"edits\" or pattern/replacement, not both".to_string());
+        }
+        return replace_text_batch(args, sessions, &session, edits);
+    }
     let pattern = str_arg(args, "pattern")?;
     let replacement = str_arg(args, "replacement")?;
     if pattern.is_empty() {
@@ -491,14 +607,93 @@ fn tool_replace_text(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let point = report_value(&report, "point").unwrap_or_default();
+    let saved = if bool_arg(args, "save") {
+        save_visited(sessions, &session)?
+    } else {
+        String::new()
+    };
     Ok(match (all, more) {
-        (true, _) => format!("replaced {n} occurrence(s); point is now {point}"),
-        (false, 0) => format!("replaced 1 occurrence; point is now {point}"),
+        (true, _) => format!("replaced {n} occurrence(s); point is now {point}{saved}"),
+        (false, 0) => format!("replaced 1 occurrence; point is now {point}{saved}"),
         (false, more) => format!(
             "replaced 1 occurrence; point is now {point}; {more} more match(es) \
-             remain (pass all:true to replace every occurrence)"
+             remain (pass all:true to replace every occurrence){saved}"
         ),
     })
+}
+
+/// The `edits: [{pattern, replacement, all?}, …]` form of `replace_text`:
+/// sequential literal edits applied in ONE `with-transaction`, so they are
+/// all-or-nothing — a miss rolls every earlier edit back and the error names
+/// the edit that failed. Each edit searches from the top of the accessible
+/// region against the buffer as the previous edits left it.
+fn replace_text_batch(
+    args: &Value,
+    sessions: &mut HashMap<String, Workspace>,
+    session: &str,
+    edits: &Value,
+) -> Result<String, String> {
+    let items = edits
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| "\"edits\" must be a non-empty array".to_string())?;
+    let mut body = String::new();
+    for (i, item) in items.iter().enumerate() {
+        let pattern = str_arg(item, "pattern")?;
+        let replacement = str_arg(item, "replacement")?;
+        if pattern.is_empty() {
+            return Err(format!("edit {}: pattern must not be empty", i + 1));
+        }
+        let all = bool_arg(item, "all");
+        let (pat, rep) = (lisp_literal(&pattern), lisp_literal(&replacement));
+        // The error message that aborts (and rolls back) the transaction
+        // names the edit; the pattern is echoed clamped.
+        let miss = lisp_escape(&format!(
+            "edit {}: no match for the pattern {:?}",
+            i + 1,
+            truncate_for_error(&pattern)
+        ));
+        let all_flag = if all { "t" } else { "nil" };
+        body.push_str(&format!(
+            "(goto-char (point-min))\
+             (let ((n 0))\
+               (while (and (or {all_flag} (= n 0)) (search-forward \"{pat}\" nil t))\
+                 (delete-region (match-beginning 0) (point))\
+                 (insert \"{rep}\")\
+                 (setq n (+ n 1)))\
+               (if (= n 0) (error \"{miss}\"))\
+               (report \"n\" n))"
+        ));
+    }
+    let program = format!("(with-transaction {body})");
+    let report = match run_in_session(sessions, session, &program) {
+        Ok(r) => r,
+        // The transaction aborts via (error "edit N: …"); hand back just that
+        // line, not the generated program's lisp backtrace.
+        Err(e) => {
+            let line = e
+                .lines()
+                .find(|l| l.contains("no match for the pattern"))
+                .map(|l| l.trim_start_matches("ERR LispError: ").trim().to_string());
+            return Err(line.unwrap_or(e));
+        }
+    };
+    audit_tool(session, &program, &report);
+    let total: usize = report
+        .reports
+        .iter()
+        .filter(|(k, _)| k == "n")
+        .filter_map(|(_, v)| v.parse::<usize>().ok())
+        .sum();
+    let saved = if bool_arg(args, "save") {
+        save_visited(sessions, session)?
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "applied {} edit(s), {total} replacement(s){saved}",
+        items.len()
+    ))
 }
 
 /// `search {session?, pattern, mode?}` — search forward from point and report
@@ -506,7 +701,7 @@ fn tool_replace_text(
 /// semantics), or report that nothing matched. `mode` ∈ exact|regex
 /// (default exact). Point moves to the match, as in Emacs.
 fn tool_search(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result<String, String> {
-    let session = session_arg(args);
+    let session = resolve_session(args, sessions)?;
     let pattern = str_arg(args, "pattern")?;
     let mode = args.get("mode").and_then(Value::as_str).unwrap_or("exact");
     // `search-forward` is literal, `re-search-forward` is regex. Each takes
@@ -540,7 +735,7 @@ fn tool_search(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Resul
 /// orientation: point does not move. `exact` mode (the default) matches the
 /// pattern literally.
 fn tool_occur(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result<String, String> {
-    let session = session_arg(args);
+    let session = resolve_session(args, sessions)?;
     let pattern = str_arg(args, "pattern")?;
     let mode = args.get("mode").and_then(Value::as_str).unwrap_or("exact");
     let needle = lisp_escape(&pattern);
@@ -567,7 +762,7 @@ fn tool_conflicts(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
-    let session = session_arg(args);
+    let session = resolve_session(args, sessions)?;
     run_message(sessions, &session, "(conflict-hunks)", "conflicts")
 }
 
@@ -640,12 +835,29 @@ fn tool_save_buffer(
 fn tool_session_status(sessions: &HashMap<String, Workspace>) -> Result<String, String> {
     let mut ids: Vec<&String> = sessions.keys().collect();
     ids.sort();
+    // Per session: the current buffer, its visited file, and the two states a
+    // resuming agent must know without probe programs — an active narrowing,
+    // and whether the visited file drifted on disk (the stale-save guard's
+    // view).
+    let sessions_json: Vec<Value> = ids
+        .into_iter()
+        .map(|id| {
+            let ws = &sessions[id];
+            json!({
+                "id": id,
+                "buffer": ws.buffer_name(),
+                "file": ws.visited_path().map(|p| p.display().to_string()),
+                "narrowed": ws.is_narrowed(),
+                "stale": ws.is_stale(),
+            })
+        })
+        .collect();
     let roots: Vec<String> = crate::safety::roots()
         .iter()
         .map(|r| r.display().to_string())
         .collect();
     Ok(json!({
-        "sessions": ids,
+        "sessions": sessions_json,
         "roots": roots,
         "audit": crate::safety::audit_enabled(),
     })
@@ -712,6 +924,14 @@ fn tool_schemas() -> Vec<Value> {
         "type": "string",
         "description": "Warm session id; defaults to \"default\" when omitted."
     });
+    let path = json!({
+        "type": "string",
+        "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Pass path OR session, not both."
+    });
+    let save = json!({
+        "type": "boolean",
+        "description": "After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false."
+    });
     vec![
         json!({
             "name": "open_file",
@@ -748,6 +968,8 @@ fn tool_schemas() -> Vec<Value> {
                 "properties": {
                     "program": { "type": "string", "description": "Emacs-Lisp program, e.g. (while (re-search-forward \"foo\" nil t) (replace-match \"bar\"))." },
                     "session": session,
+                    "path": path,
+                    "save": save,
                 },
                 "required": ["program"],
             },
@@ -760,6 +982,7 @@ fn tool_schemas() -> Vec<Value> {
                 "properties": {
                     "program": { "type": "string", "description": "Emacs-Lisp program to rehearse (run then roll back)." },
                     "session": session,
+                    "path": path,
                 },
                 "required": ["program"],
             },
@@ -773,6 +996,7 @@ fn tool_schemas() -> Vec<Value> {
                     "start": { "type": "integer", "description": "1-based start position (inclusive)." },
                     "end": { "type": "integer", "description": "1-based end position (exclusive)." },
                     "session": session,
+                    "path": path,
                 },
                 "required": ["start", "end"],
             },
@@ -786,6 +1010,7 @@ fn tool_schemas() -> Vec<Value> {
                     "lines": { "type": "integer", "description": "Context lines on each side of the cursor line (default 4)." },
                     "pos": { "type": "integer", "description": "1-based position to center on (default: current point)." },
                     "session": session,
+                    "path": path,
                 },
                 "required": [],
             },
@@ -799,6 +1024,8 @@ fn tool_schemas() -> Vec<Value> {
                     "text": { "type": "string", "description": "The literal text to insert." },
                     "pos": { "type": "integer", "description": "1-based position to insert at (default: current point)." },
                     "session": session,
+                    "path": path,
+                    "save": save,
                 },
                 "required": ["text"],
             },
@@ -812,9 +1039,12 @@ fn tool_schemas() -> Vec<Value> {
                     "pattern": { "type": "string", "description": "The exact text to find (literal, not regex)." },
                     "replacement": { "type": "string", "description": "The literal replacement text." },
                     "all": { "type": "boolean", "description": "Replace every occurrence (default false: first only)." },
+                    "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?}, …] applied in order inside ONE transaction — all-or-nothing; a miss rolls everything back and names the failed edit.", "items": { "type": "object" } },
                     "session": session,
+                    "path": path,
+                    "save": save,
                 },
-                "required": ["pattern", "replacement"],
+                "required": [],
             },
         }),
         json!({
@@ -830,6 +1060,7 @@ fn tool_schemas() -> Vec<Value> {
                         "description": "exact (literal) or regex (RE2). Defaults to exact. (For whitespace/case-insensitive matching, pass a regex.)",
                     },
                     "session": session,
+                    "path": path,
                 },
                 "required": ["pattern"],
             },
@@ -849,6 +1080,7 @@ fn tool_schemas() -> Vec<Value> {
                     "nlines": { "type": "integer", "description": "Context lines around each hit (default 0)." },
                     "limit": { "type": "integer", "description": "Max matching lines rendered (default 100); the rest are summarized in a tail line." },
                     "session": session,
+                    "path": path,
                 },
                 "required": ["pattern"],
             },
@@ -860,6 +1092,7 @@ fn tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "session": session,
+                    "path": path,
                 },
                 "required": [],
             },
