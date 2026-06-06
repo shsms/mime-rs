@@ -46,8 +46,19 @@ pub struct Hunk {
 /// Scan the accessible region for well-formed conflict hunks, in buffer order.
 /// Point is preserved; match data is clobbered (the scan searches).
 pub fn scan(b: &mut dyn TextStore) -> Vec<Hunk> {
+    scan_with_strays(b).0
+}
+
+/// Like [`scan`], but also counts the STRAY opener lines in the same pass:
+/// well-formed `<<<<<<<` marker lines that did not parse into a hunk
+/// (malformed, unterminated, or nested conflicts — an opener glued to its
+/// label, like `<<<<<<<x`, is plain text, not a stray). The overview surfaces
+/// the count so an agent never mistakes "0 parsed hunks" for "nothing
+/// conflict-shaped present".
+pub fn scan_with_strays(b: &mut dyn TextStore) -> (Vec<Hunk>, usize) {
     let saved = b.point();
     let mut hunks = Vec::new();
+    let mut strays = 0;
     b.goto_char(b.point_min());
     while let Some(after) = b.search_forward("<<<<<<<", None) {
         let start = after - 7;
@@ -60,12 +71,20 @@ pub fn scan(b: &mut dyn TextStore) -> Vec<Hunk> {
                 b.goto_char(h.end);
                 hunks.push(h);
             }
-            // Malformed: resume the search just after this run.
-            None => b.goto_char(after),
+            // Malformed: count the opener as a stray when it is marker-form,
+            // then resume the search just after the run.
+            None => {
+                let (line, _) = line_at(b, start);
+                let mlen = run_len(line.strip_suffix('\r').unwrap_or(&line), '<');
+                if marker_label(&line, '<', mlen).is_some() {
+                    strays += 1;
+                }
+                b.goto_char(after);
+            }
         }
     }
     b.goto_char(saved);
-    hunks
+    (hunks, strays)
 }
 
 /// The line starting at `pos`: its text and the position just past its
@@ -206,34 +225,6 @@ pub fn side_text(b: &dyn TextStore, h: &Hunk, side: &str) -> Result<String, Stri
     }
 }
 
-/// Count opener-shaped lines (a `<<<<<<<` run of ≥ 7 at a line start, in
-/// marker form) that lie OUTSIDE every parsed hunk — the leftovers of
-/// malformed, unterminated, or nested conflicts. The overview surfaces the
-/// count so an agent never mistakes "0 parsed hunks" for "nothing
-/// conflict-shaped present". Point preserved; match data clobbered.
-pub fn stray_opener_lines(b: &mut dyn TextStore, hunks: &[Hunk]) -> usize {
-    let saved = b.point();
-    let mut strays = 0;
-    b.goto_char(b.point_min());
-    while let Some(after) = b.search_forward("<<<<<<<", None) {
-        let start = after - 7;
-        if start > b.point_min() && b.char_before(start) != Some('\n') {
-            continue;
-        }
-        if hunks.iter().any(|h| h.start <= start && start < h.end) {
-            continue;
-        }
-        let (line, next) = line_at(b, start);
-        let mlen = run_len(line.strip_suffix('\r').unwrap_or(&line), '<');
-        if marker_label(&line, '<', mlen).is_some() {
-            strays += 1;
-        }
-        b.goto_char(next.max(after));
-    }
-    b.goto_char(saved);
-    strays
-}
-
 /// Render the `conflict-hunks` overview: one line per hunk with its number,
 /// char position + line (goto-char-able), labels, and side sizes; plus a
 /// trailing warning when `strays` opener lines were left unparsed.
@@ -270,10 +261,13 @@ pub fn render(b: &dyn TextStore, hunks: &[Hunk], strays: usize) -> String {
         ));
     }
     if strays > 0 {
+        // No `^` anchor in the suggestion: the engine's windowed search treats
+        // `^` as a haystack anchor, not a line anchor, so an anchored pattern
+        // would miss these very lines.
         out.push_str(&format!(
             "  ! {strays} unparsed '<<<<<<<' marker line{} — malformed or nested \
              conflict text; resolve the hunks above and re-list, or inspect \
-             with (occur \"^<<<<<<<\")\n",
+             with (occur \"<<<<<<<\")\n",
             if strays == 1 { "" } else { "s" }
         ));
     }
@@ -381,7 +375,7 @@ mod tests {
         assert_eq!(hunks[0].ours_label, "inner");
         assert_eq!(b.substring(hunks[0].ours.0, hunks[0].ours.1), "in-ours\n");
         // The outer opener is reported as a stray, not silently dropped.
-        assert_eq!(stray_opener_lines(&mut b, &hunks), 1);
+        assert_eq!(scan_with_strays(&mut b).1, 1);
         // Resolving the inner hunk makes the outer well-formed on re-scan.
         b.delete_region(hunks[0].start, hunks[0].end);
         b.goto_char(hunks[0].start);
@@ -393,7 +387,7 @@ mod tests {
             b.substring(hunks[0].ours.0, hunks[0].ours.1),
             "out-ours\nin-resolved\n"
         );
-        assert_eq!(stray_opener_lines(&mut b, &hunks), 0);
+        assert_eq!(scan_with_strays(&mut b).1, 0);
     }
 
     #[test]
@@ -417,7 +411,7 @@ mod tests {
         // An unterminated conflict is no hunk, but its opener is not silent.
         let (hunks, mut b) = hunks_of("<<<<<<< A\nours\n=======\ntheirs, no closer\n");
         assert_eq!(hunks.len(), 0);
-        assert_eq!(stray_opener_lines(&mut b, &hunks), 1);
+        assert_eq!(scan_with_strays(&mut b).1, 1);
         let out = render(&b, &hunks, 1);
         assert!(out.contains("no conflicts"), "got: {out}");
         assert!(

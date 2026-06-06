@@ -1316,8 +1316,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun("conflict-hunks", move || -> String {
             let mut sess = s.borrow_mut();
             let b = sess.buffer.as_mut();
-            let hunks = crate::conflict::scan(b);
-            let strays = crate::conflict::stray_opener_lines(b, &hunks);
+            let (hunks, strays) = crate::conflict::scan_with_strays(b);
             crate::conflict::render(&*b, &hunks, strays)
         });
     }
