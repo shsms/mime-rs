@@ -117,9 +117,9 @@ impl Session {
     /// buffer, the analog of [`generate_new_buffer`] for a store that exists. If
     /// `make_current`, the present current buffer is stashed into `inactive` and
     /// `store` becomes current; otherwise `store` joins `inactive`. Returns its
-    /// name. Unlike `generate_new_buffer` the name is taken as-is (callers that
-    /// want reuse-by-name check `has_buffer` first); the trusted `find-file`
-    /// builtin does exactly that.
+    /// name. Unlike `generate_new_buffer` the name is taken as-is — callers
+    /// dedup and uniquify first (the trusted `find-file` reuses via
+    /// [`buffer_visiting`] and renames collisions with [`unique_buffer_name`]).
     pub fn install_buffer(&mut self, store: Box<dyn TextStore>, make_current: bool) -> String {
         let name = store.name().to_string();
         if make_current {
@@ -131,8 +131,23 @@ impl Session {
         name
     }
 
+    /// The name of the buffer (current or inactive) visiting `path`, if any —
+    /// compared canonically when both sides resolve, so `find-file` dedups by
+    /// the FILE rather than by basename (two `doc.txt`s in different
+    /// directories are different buffers).
+    pub fn buffer_visiting(&self, path: &std::path::Path) -> Option<String> {
+        let visits = |b: &dyn TextStore| b.file_stamp().is_some_and(|st| same_file(path, &st.path));
+        if visits(self.buffer.as_ref()) {
+            return Some(self.buffer.name().to_string());
+        }
+        self.inactive
+            .iter()
+            .find(|b| visits(b.as_ref()))
+            .map(|b| b.name().to_string())
+    }
+
     /// `name` if free, else the first available `name<N>` (N ≥ 2), Emacs-style.
-    fn unique_buffer_name(&self, name: &str) -> String {
+    pub(crate) fn unique_buffer_name(&self, name: &str) -> String {
         if !self.has_buffer(name) {
             return name.to_string();
         }
@@ -501,11 +516,22 @@ impl Workspace {
 /// (e.g. the visited file was deleted) an exact path match still counts.
 fn stale_visit(store: &dyn TextStore, path: &std::path::Path) -> Option<String> {
     let stamp = store.file_stamp()?;
-    let same = match (path.canonicalize(), stamp.path.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => path == stamp.path,
-    };
-    if same { stamp.check() } else { None }
+    if same_file(path, &stamp.path) {
+        stamp.check()
+    } else {
+        None
+    }
+}
+
+/// One notion of path identity for the whole engine: canonical when both
+/// sides resolve (symlinks, `..`), exact otherwise (e.g. a deleted visited
+/// file). `find-file` dedup and the stale-save guard MUST agree on this, or a
+/// buffer could dedup as visiting a file the guard treats as a different one.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
 }
 
 /// Evaluate `program` (Emacs Lisp / tulisp) against `buffer` once, cold; return

@@ -1388,6 +1388,9 @@ impl TextStore for Quire {
     fn name(&self) -> &str {
         &self.name
     }
+    fn set_name(&mut self, name: &str) {
+        self.name = name.to_string();
+    }
     fn last_match(&self) -> Option<&MatchData> {
         self.last_match.as_ref()
     }

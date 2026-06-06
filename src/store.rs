@@ -4,6 +4,9 @@
 //! positions, Emacs-style; `point_min`/`point_max` honor the narrowing.
 pub trait TextStore {
     fn name(&self) -> &str;
+    /// Rename the buffer — `find-file` uniquifies a colliding basename
+    /// (`doc.txt<2>`) before installing the store.
+    fn set_name(&mut self, name: &str);
     /// The most recent search's match data (whole-match span + group texts).
     fn last_match(&self) -> Option<&crate::buffer::MatchData>;
     /// A cheap, independent copy of this store (structural sharing for Quire,

@@ -1803,6 +1803,29 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
 }
 
+/// Shared body of `find-file` / `find-file-noselect`: a buffer already
+/// visiting `path` (canonical compare — dedup by FILE, not basename) is
+/// reused; otherwise the file is opened and installed under its basename,
+/// uniquified Emacs-style (`doc.txt<2>`) when a different file already owns
+/// that name. `select` makes the buffer current.
+fn find_file_buffer(s: &SharedSession, path: &str, select: bool) -> Result<String, Error> {
+    let p = std::path::Path::new(path);
+    let mut sess = s.borrow_mut();
+    if let Some(name) = sess.buffer_visiting(p) {
+        if select {
+            sess.set_buffer(&name).map_err(|e| err(&e))?;
+        }
+        return Ok(name);
+    }
+    let mut store: Box<dyn crate::store::TextStore> =
+        Box::new(crate::Quire::open(p).map_err(|e| err(&format!("find-file {path}: {e}")))?);
+    let unique = sess.unique_buffer_name(store.name());
+    if unique != store.name() {
+        store.set_name(&unique);
+    }
+    Ok(sess.install_buffer(store, select))
+}
+
 /// Apply a batch of non-overlapping window edits in document order — the
 /// shared tail of the streaming `replace-regexp` / `replace-string`. `edits`
 /// are ascending `(byte_start, byte_end, replacement)` spans in `window`;
@@ -1986,55 +2009,23 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
     {
         let s = session.clone();
         // (find-file PATH) — open PATH (mmap-backed Quire) into a new buffer and
-        // make it current; returns the buffer name. If a buffer with that file's
-        // name is already open, switch to it instead of opening a duplicate (like
-        // Emacs `find-file`). IO errors propagate as a tulisp Error.
+        // make it current; returns the buffer name. A buffer already VISITING
+        // that file (canonical-path compare) is switched to instead of opening
+        // a duplicate, like Emacs `find-file`; a different file that merely
+        // shares the basename gets a uniquified name (`doc.txt<2>`). IO errors
+        // propagate as a tulisp Error.
         ctx.defun("find-file", move |path: String| -> Result<String, Error> {
-            let p = std::path::Path::new(&path);
-            // The name a freshly-opened Quire would carry (its file name); reuse
-            // an already-open buffer with that name rather than opening it twice.
-            let name = p
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.clone());
-            let mut sess = s.borrow_mut();
-            if sess.has_buffer(&name) {
-                sess.set_buffer(&name).map_err(|e| err(&e))?;
-                return Ok(name);
-            }
-            let store: Box<dyn crate::store::TextStore> = Box::new(
-                crate::Quire::open(p).map_err(|e| err(&format!("find-file {path}: {e}")))?,
-            );
-            Ok(sess.install_buffer(store, true))
+            find_file_buffer(&s, &path, true)
         });
     }
     {
         let s = session.clone();
         // (find-file-noselect PATH) — open PATH into a buffer WITHOUT making it
-        // current (Emacs `find-file-noselect`); returns the buffer name. Reuses an
-        // already-open buffer of the same name, like find-file.
-        // TODO: dedup by canonical path, not basename — two files sharing a
-        // basename in different dirs collide (the second aliases the first).
-        // Fix: key buffers by visited path; uniquify the name (Emacs `doc.txt<2>`).
-        // Same limitation in `find-file` above.
+        // current (Emacs `find-file-noselect`); returns the buffer name. The
+        // same visiting-buffer reuse and name uniquification as find-file.
         ctx.defun(
             "find-file-noselect",
-            move |path: String| -> Result<String, Error> {
-                let p = std::path::Path::new(&path);
-                let name = p
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.clone());
-                let mut sess = s.borrow_mut();
-                if sess.has_buffer(&name) {
-                    return Ok(name);
-                }
-                let store: Box<dyn crate::store::TextStore> = Box::new(
-                    crate::Quire::open(p)
-                        .map_err(|e| err(&format!("find-file-noselect {path}: {e}")))?,
-                );
-                Ok(sess.install_buffer(store, false))
-            },
+            move |path: String| -> Result<String, Error> { find_file_buffer(&s, &path, false) },
         );
     }
     {
@@ -2379,6 +2370,104 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn find_file_dedups_by_path_and_uniquifies_colliding_basenames() {
+        let dir = temp_dir("find-file-dedup");
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        std::fs::write(dir.join("a/doc.txt"), "alpha").unwrap();
+        std::fs::write(dir.join("b/doc.txt"), "beta").unwrap();
+        let (pa, pb) = (
+            dir.join("a/doc.txt").to_string_lossy().into_owned(),
+            dir.join("b/doc.txt").to_string_lossy().into_owned(),
+        );
+
+        let mut ws = trusted("main-body");
+        let r = ws
+            .run(&format!(
+                r#"(report "first" (find-file "{pa}"))
+                   (report "second" (find-file "{pb}"))
+                   (report "second-txt" (buffer-string))
+                   (report "revisit" (find-file-noselect "{pa}"))
+                   (set-buffer "doc.txt")
+                   (report "first-txt" (buffer-string))"#
+            ))
+            .unwrap();
+        // Two files sharing a basename are two buffers — the second is
+        // uniquified, not an alias of the first.
+        assert_eq!(report(&r, "first"), "\"doc.txt\"");
+        assert_eq!(report(&r, "second"), "\"doc.txt<2>\"");
+        assert_eq!(report(&r, "second-txt"), "\"beta\"");
+        // Revisiting the FILE (not the name) finds the original buffer.
+        assert_eq!(report(&r, "revisit"), "\"doc.txt\"");
+        assert_eq!(report(&r, "first-txt"), "\"alpha\"");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn revert_buffer_recovers_from_a_stale_save_refusal() {
+        let dir = temp_dir("revert");
+        let file = dir.join("doc.txt");
+        std::fs::write(&file, "v1 content\n").unwrap();
+
+        // Sandboxed tier on purpose: revert-buffer re-reads only the
+        // already-authorized visited path, so agents can recover too.
+        let mut ws = Workspace::new(Box::new(crate::Quire::open(&file).unwrap()));
+        ws.run(r#"(goto-char (point-max)) (insert "edit\n")"#)
+            .unwrap();
+
+        // An external writer lands; the stale guard refuses the save.
+        std::fs::write(&file, "v2 external\n").unwrap();
+        let e = ws.save_to(&file).unwrap_err().to_string();
+        assert!(e.contains("revert-buffer"), "recovery hint missing: {e}");
+
+        // Revert: the buffer now matches the disk, point clamped, stamp
+        // fresh — and a re-applied edit saves cleanly.
+        let r = ws
+            .run(
+                r#"(report "reverted" (if (revert-buffer) 1 0))
+                   (report "txt" (buffer-string))
+                   (report "stale" (if (buffer-stale-p) 1 0))
+                   (goto-char (point-max))
+                   (insert "edit\n")"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "reverted"), "1");
+        assert_eq!(report(&r, "txt"), "\"v2 external\\n\"");
+        assert_eq!(report(&r, "stale"), "0");
+        ws.save_to(&file).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "v2 external\nedit\n"
+        );
+
+        // A revert keeps the buffer's (possibly uniquified) name, and live
+        // marker handles DETACH rather than aliasing newly created markers
+        // (the fresh registry is padded to the old id space).
+        let r = ws
+            .run(
+                r#"(setq m (copy-marker 3))
+                   (revert-buffer)
+                   (report "old-marker" (if (marker-position m) 1 0))
+                   (setq m2 (copy-marker 5))
+                   (report "new-marker" (marker-position m2))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "old-marker"), "0", "detached, not aliased");
+        assert_eq!(report(&r, "new-marker"), "5");
+
+        // No visited file → a proper error.
+        let mut scratch = Workspace::new(Box::new(crate::Buffer::from_string("s", "x")));
+        let e = match scratch.run("(revert-buffer)") {
+            Err(e) => e,
+            Ok(_) => panic!("revert-buffer without a visited file must error"),
+        };
+        assert!(e.contains("no visited file"), "got: {e}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
