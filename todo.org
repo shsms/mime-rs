@@ -37,6 +37,12 @@ legacy ~mime~./
 
 ** TODO Dirty-span diffs [#C]
 
+** TODO Stale-save escape hatch
+When the ~FileStamp~ guard refuses a save (visited file changed externally),
+the only outs are re-opening — which discards the warm buffer's edits — or
+saving elsewhere. Add ~revert-buffer~ (re-read from disk, Emacs parity) and
+decide whether a force-save belongs next to it or stays deliberately absent.
+
 ** TODO find-file dedup by path, not basename
 Two files sharing a basename collide (the second aliases the first). Key
 buffers by visited path and uniquify the name Emacs-style (~doc.txt<2>~);
@@ -67,6 +73,12 @@ A wall-clock/CPU bound per program — blocked on tulisp cooperative
 cancellation (eval interruption), see the wishlist below.
 
 * Structural editing
+
+** TODO Conflict hunk context helper
+Deciding a resolution usually needs the code AROUND the hunk; today the agent
+parses ~@pos~ out of the overview and calls ~view~. A
+~(conflict-context &optional N LINES)~ — the hunk plus a few surrounding
+lines, rendered — would make the decision view one call.
 
 ** TODO treesit × narrowing
 The treesit builtins parse the FULL document and report absolute positions
