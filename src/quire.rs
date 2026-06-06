@@ -720,9 +720,32 @@ impl Quire {
     }
 
     /// Split `piece` at `byte` (a char boundary within it) into `(left, right)`.
+    /// Counts the smaller side and derives the other from the piece's cached
+    /// totals — splitting a multi-megabyte piece near one end must not rescan
+    /// the rest of it (per-edit rescans made an edit sweep over a fresh
+    /// document O(n²)).
     fn split_piece(&self, piece: &Piece, byte: usize) -> (Piece, Piece) {
-        let left = self.make_piece(piece.source, piece.start, byte);
-        let right = self.make_piece(piece.source, piece.start + byte, piece.len - byte);
+        let bytes = &self.backing(piece.source)[piece.start..piece.start + piece.len];
+        let (left_chars, left_lines) = if byte <= piece.len / 2 {
+            count_chars_lines(&bytes[..byte])
+        } else {
+            let (c, l) = count_chars_lines(&bytes[byte..]);
+            (piece.chars - c, piece.lines - l)
+        };
+        let left = Piece {
+            source: piece.source,
+            start: piece.start,
+            len: byte,
+            chars: left_chars,
+            lines: left_lines,
+        };
+        let right = Piece {
+            source: piece.source,
+            start: piece.start + byte,
+            len: piece.len - byte,
+            chars: piece.chars - left_chars,
+            lines: piece.lines - left_lines,
+        };
         (left, right)
     }
 
@@ -856,17 +879,48 @@ impl Quire {
                         out.push(*p);
                         continue;
                     }
-                    // Overlaps: keep the surviving prefix and/or suffix.
+                    // Overlaps: keep the surviving prefix and/or suffix. ONE
+                    // bounded walk to the deletion's end inside this piece
+                    // finds both byte cuts and the newline count up to each;
+                    // the suffix summary is derived from the piece's cached
+                    // totals, never by rescanning the (possibly huge) tail —
+                    // a per-edit tail rescan made a replace sweep O(n²).
                     let keep_left = lo.saturating_sub(p_lo); // chars kept at front
                     let drop_to = hi.min(p_hi) - p_lo; // chars dropped up to (excl)
                     let s = self.piece_str(p);
+                    let (mut bend, mut nl_end) = (s.len(), p.lines);
+                    let (mut bstart, mut nl_start) = (s.len(), p.lines);
+                    let (mut ci, mut nl) = (0usize, 0usize);
+                    for (b, ch) in s.char_indices() {
+                        if ci == keep_left {
+                            (bend, nl_end) = (b, nl);
+                        }
+                        if ci == drop_to {
+                            (bstart, nl_start) = (b, nl);
+                            break;
+                        }
+                        ci += 1;
+                        if ch == '\n' {
+                            nl += 1;
+                        }
+                    }
                     if keep_left > 0 {
-                        let bend = s.char_indices().nth(keep_left).map_or(s.len(), |(b, _)| b);
-                        out.push(self.make_piece(p.source, p.start, bend));
+                        out.push(Piece {
+                            source: p.source,
+                            start: p.start,
+                            len: bend,
+                            chars: keep_left,
+                            lines: nl_end,
+                        });
                     }
                     if drop_to < p.chars {
-                        let bstart = s.char_indices().nth(drop_to).map_or(s.len(), |(b, _)| b);
-                        out.push(self.make_piece(p.source, p.start + bstart, p.len - bstart));
+                        out.push(Piece {
+                            source: p.source,
+                            start: p.start + bstart,
+                            len: p.len - bstart,
+                            chars: p.chars - drop_to,
+                            lines: p.lines - nl_start,
+                        });
                     }
                 }
                 Arc::new(Node::leaf(out))
