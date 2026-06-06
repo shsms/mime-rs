@@ -1617,12 +1617,19 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     // ---- structural / AST-aware editing (M7, tree-sitter) ----
     // Markdown, Rust, and Python; the language comes from the buffer name's
     // extension (`Lang::from_buffer_name`), overridable per buffer with
-    // `treesit-set-language`, falling back to Markdown (`syntax_of`). Every
-    // call re-parses the buffer fresh (incremental re-parse is a TODO in
-    // syntax.rs). Node spans are reported in 1-based char positions, like the
-    // rest of the builtins. A "defun" is the language's enclosing construct:
-    // a Markdown `section`, a Rust `function_item`/`impl_item`/type item, a
-    // Python `function_definition`/`class_definition`.
+    // `treesit-set-language`, falling back to Markdown (`syntax_of`). The
+    // parse persists on the Session keyed by content version — a run of
+    // treesit calls parses once, an edit re-parses on the next call (full
+    // re-parse; incremental InputEdits are a TODO in syntax.rs). Node spans
+    // are reported in 1-based char positions, like the rest of the builtins,
+    // and are WHOLE-DOCUMENT positions by design: the structural layer reads
+    // the full document regardless of narrowing (the one deliberate exception
+    // to narrowing composition — a restriction that cuts a function in half
+    // must not change what the tree says the function is). Motion still can't
+    // escape: goto_char clamps into the accessible region. A "defun" is the
+    // language's enclosing construct: a Markdown `section`, a Rust
+    // `function_item`/`impl_item`/type item, a Python
+    // `function_definition`/`class_definition`.
     {
         let s = session.clone();
         // (treesit-language) — report and return the language the current
@@ -1663,7 +1670,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // ("document" / "source_file" / "module"). Proves the buffer parses.
         ctx.defun("treesit-root-type", move || -> String {
             let mut sess = s.borrow_mut();
-            let kind = syntax_of(&sess).root_kind();
+            let kind = syntax_of(&mut sess).root_kind();
             sess.reports
                 .push(("treesit-root-type".to_string(), kind.clone()));
             kind
@@ -1676,7 +1683,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // syntax?" check an agent runs after editing code.
         ctx.defun("treesit-has-error", move || -> bool {
             let mut sess = s.borrow_mut();
-            let broken = syntax_of(&sess).has_error();
+            let broken = syntax_of(&mut sess).has_error();
             sess.reports
                 .push(("treesit-has-error".to_string(), broken.to_string()));
             broken
@@ -1692,7 +1699,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             move |pos: Option<i64>| -> Result<TulispObject, Error> {
                 let mut sess = s.borrow_mut();
                 let p = pos.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
-                let node = syntax_of(&sess).named_node_at(p);
+                let node = syntax_of(&mut sess).named_node_at(p);
                 Ok(match node {
                     Some(n) => {
                         sess.reports
@@ -1716,7 +1723,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun("treesit-beginning-of-defun", move || -> i64 {
             let mut sess = s.borrow_mut();
             let p = sess.buffer.point();
-            if let Some(d) = syntax_of(&sess).enclosing_defun(p) {
+            if let Some(d) = syntax_of(&mut sess).enclosing_defun(p) {
                 sess.buffer.goto_char(d.start);
             }
             sess.buffer.point() as i64
@@ -1730,7 +1737,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun("treesit-end-of-defun", move || -> i64 {
             let mut sess = s.borrow_mut();
             let p = sess.buffer.point();
-            if let Some(d) = syntax_of(&sess).enclosing_defun(p) {
+            if let Some(d) = syntax_of(&mut sess).enclosing_defun(p) {
                 sess.buffer.goto_char(d.end);
             }
             sess.buffer.point() as i64
@@ -1746,7 +1753,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             move |pos: Option<i64>| -> TulispObject {
                 let mut sess = s.borrow_mut();
                 let p = pos.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
-                match syntax_of(&sess).enclosing_defun_name(p) {
+                match syntax_of(&mut sess).enclosing_defun_name(p) {
                     Some(name) => {
                         sess.reports
                             .push(("treesit-defun-name".to_string(), name.clone()));
@@ -1767,7 +1774,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun("treesit-narrow-to-defun", move |pos: Option<i64>| -> bool {
             let mut sess = s.borrow_mut();
             let p = pos.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
-            match syntax_of(&sess).enclosing_defun(p) {
+            match syntax_of(&mut sess).enclosing_defun(p) {
                 Some(d) => {
                     sess.buffer.narrow_to_region(d.start, d.end);
                     true
@@ -1784,7 +1791,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // without reading it whole.
         ctx.defun("treesit-list-defuns", move || -> Vec<String> {
             let mut sess = s.borrow_mut();
-            let defuns = syntax_of(&sess).defuns();
+            let defuns = syntax_of(&mut sess).defuns();
             let mut names = Vec::with_capacity(defuns.len());
             for d in defuns {
                 sess.reports.push((
@@ -1804,7 +1811,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // nil (point unmoved) if no defun has that name.
         ctx.defun("treesit-goto-defun", move |name: String| -> TulispObject {
             let mut sess = s.borrow_mut();
-            match syntax_of(&sess).find_defun(&name) {
+            match syntax_of(&mut sess).find_defun(&name) {
                 Some(d) => {
                     sess.reports.push((
                         "treesit-defun".to_string(),
@@ -1829,7 +1836,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             "treesit-query",
             move |pattern: String| -> Result<Vec<String>, Error> {
                 let mut sess = s.borrow_mut();
-                let caps = syntax_of(&sess)
+                let caps = syntax_of(&mut sess)
                     .query(&pattern)
                     .map_err(|e| err(&format!("treesit-query: {e}")))?;
                 let mut spans = Vec::with_capacity(caps.len());
@@ -1937,9 +1944,23 @@ fn lang_of(sess: &crate::engine::Session) -> Lang {
         .unwrap_or(Lang::Markdown)
 }
 
-/// Parse the current buffer for the `treesit-*` builtins (fresh each call).
-fn syntax_of(sess: &crate::engine::Session) -> Syntax {
-    Syntax::parse(sess.buffer.text(), lang_of(sess))
+/// The current buffer's parse for the `treesit-*` builtins — cached on the
+/// Session and reused while (buffer, language, content version) are
+/// unchanged, so a run of treesit calls parses once. An edit re-stamps the
+/// store version and the next call re-parses in full (incremental re-parse
+/// via InputEdits remains the syntax.rs TODO).
+fn syntax_of(sess: &mut crate::engine::Session) -> std::rc::Rc<Syntax> {
+    let lang = lang_of(sess);
+    let version = sess.buffer.version();
+    if let Some((l, v, syn)) = &sess.syntax_cache
+        && *l == lang
+        && *v == version
+    {
+        return std::rc::Rc::clone(syn);
+    }
+    let syn = std::rc::Rc::new(Syntax::parse(sess.buffer.text(), lang));
+    sess.syntax_cache = Some((lang, version, std::rc::Rc::clone(&syn)));
+    syn
 }
 
 /// Register the *orchestration* builtin group — multiple buffers, file I/O,

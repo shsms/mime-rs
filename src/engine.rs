@@ -61,6 +61,15 @@ pub struct Session {
     /// extension detection. A `Vec` + linear scan, like `inactive`: buffer
     /// counts are tiny.
     pub lang_overrides: Vec<(String, crate::syntax::Lang)>,
+    /// The persistent tree-sitter parse: the last `Syntax` the `treesit-*`
+    /// builtins built, keyed by (language, store content version). The
+    /// version is globally unique per text state (see `TextStore::version`),
+    /// so it alone identifies the parsed text — no buffer name needed — and
+    /// the language catches `treesit-set-language` / rename-driven detection
+    /// changes. A run of treesit calls parses once; an edit re-stamps the
+    /// version and the next call re-parses. One slot — agents work one
+    /// buffer at a time, and a parse is only worth caching while it's hot.
+    pub syntax_cache: Option<(crate::syntax::Lang, u64, Rc<crate::syntax::Syntax>)>,
 }
 
 impl Session {
@@ -262,6 +271,7 @@ impl Workspace {
             log: Vec::new(),
             args: Vec::new(),
             lang_overrides: Vec::new(),
+            syntax_cache: None,
         }));
 
         let mut ctx = TulispContext::new();
@@ -688,6 +698,31 @@ mod tests {
         assert!(!r.dirty, "main untouched");
         assert_eq!(r.diff, "");
         assert_eq!(r.final_text, "primary text!");
+    }
+
+    #[test]
+    fn treesit_parse_caches_per_content_version() {
+        let mut ws = Workspace::new(Box::new(crate::Buffer::from_string("t.md", "# A\nbody\n")));
+        ws.run("(treesit-list-defuns)").unwrap();
+        let stamp = |ws: &Workspace| {
+            let s = ws.session.borrow();
+            s.syntax_cache.as_ref().map(|(_, v, _)| *v).unwrap()
+        };
+        let v1 = stamp(&ws);
+        // A second treesit call with no edit reuses the cached parse.
+        ws.run("(treesit-root-type)").unwrap();
+        assert_eq!(stamp(&ws), v1, "no edit: the parse is reused");
+        // An edit re-stamps the content version; the next call re-parses and
+        // sees the new structure (no stale tree is served).
+        let r = ws
+            .run(r##"(goto-char (point-max)) (insert "# B\nmore\n") (treesit-list-defuns)"##)
+            .unwrap();
+        assert_ne!(stamp(&ws), v1, "edit: a fresh parse");
+        assert!(
+            r.reports.iter().any(|(_, v)| v.contains("B")),
+            "the new section is visible: {:?}",
+            r.reports
+        );
     }
 
     #[test]

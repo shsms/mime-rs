@@ -319,6 +319,9 @@ pub struct Quire {
     /// Lazy fallback cache for [`TextStore::text`] only (see module docs).
     /// `None` after any mutation; refilled on demand by [`Quire::full_text`].
     text_cache: RefCell<Option<String>>,
+    /// Content version (see `TextStore::version`): re-stamped on every text
+    /// mutation; a snapshot keeps it — same version, same text.
+    version: u64,
 }
 
 impl Quire {
@@ -391,6 +394,7 @@ impl Quire {
             last_match: None,
             stamp: None,
             text_cache: RefCell::new(None),
+            version: crate::store::next_version(),
         }
     }
 
@@ -412,6 +416,7 @@ impl Quire {
             last_match: self.last_match.clone(),
             stamp: self.stamp.clone(),
             text_cache: RefCell::new(None),
+            version: self.version,
         }
     }
 
@@ -1028,6 +1033,7 @@ impl Quire {
         }
         crate::store::markers_after_insert(&mut self.markers, at, n);
         self.last_match = None;
+        self.version = crate::store::next_version();
         self.invalidate();
     }
 
@@ -1050,6 +1056,7 @@ impl Quire {
         }
         crate::store::markers_after_delete(&mut self.markers, lo, hi);
         self.last_match = None;
+        self.version = crate::store::next_version();
         self.invalidate();
     }
 
@@ -1135,6 +1142,7 @@ impl Quire {
         }
         crate::store::markers_after_delete(&mut self.markers, start, end);
         crate::store::markers_after_insert(&mut self.markers, start, new_len);
+        self.version = crate::store::next_version();
         self.invalidate();
         Ok(())
     }
@@ -1390,6 +1398,9 @@ impl TextStore for Quire {
     }
     fn set_name(&mut self, name: &str) {
         self.name = name.to_string();
+    }
+    fn version(&self) -> u64 {
+        self.version
     }
     fn last_match(&self) -> Option<&MatchData> {
         self.last_match.as_ref()

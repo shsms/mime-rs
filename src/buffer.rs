@@ -33,6 +33,9 @@ pub struct Buffer {
     markers: Vec<Option<usize>>,
     pub name: String,
     pub last_match: Option<MatchData>,
+    /// Content version (see `TextStore::version`): re-stamped on every text
+    /// mutation; a clone (snapshot) keeps it — same version, same text.
+    version: u64,
 }
 
 impl Buffer {
@@ -49,6 +52,7 @@ impl Buffer {
             markers: Vec::new(),
             name: name.into(),
             last_match: None,
+            version: crate::store::next_version(),
         }
     }
 
@@ -132,6 +136,7 @@ impl Buffer {
         }
         crate::store::markers_after_insert(&mut self.markers, at_char, n);
         self.last_match = None;
+        self.version = crate::store::next_version();
     }
 
     pub fn delete_region(&mut self, a: usize, b: usize) {
@@ -150,6 +155,7 @@ impl Buffer {
         }
         crate::store::markers_after_delete(&mut self.markers, lo, hi);
         self.last_match = None;
+        self.version = crate::store::next_version();
     }
 
     pub fn substring(&self, a: usize, b: usize) -> String {
@@ -224,6 +230,7 @@ impl Buffer {
         // A replace is a delete of the match span followed by an insert at its start.
         crate::store::markers_after_delete(&mut self.markers, md.start, md.end);
         crate::store::markers_after_insert(&mut self.markers, md.start, new_len);
+        self.version = crate::store::next_version();
         Ok(())
     }
 
@@ -435,6 +442,9 @@ impl crate::store::TextStore for Buffer {
     }
     fn set_name(&mut self, name: &str) {
         self.name = name.to_string();
+    }
+    fn version(&self) -> u64 {
+        self.version
     }
     fn last_match(&self) -> Option<&MatchData> {
         self.last_match.as_ref()

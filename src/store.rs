@@ -7,6 +7,12 @@ pub trait TextStore {
     /// Rename the buffer — `find-file` uniquifies a colliding basename
     /// (`doc.txt<2>`) before installing the store.
     fn set_name(&mut self, name: &str);
+    /// Content version: a globally unique stamp (see [`next_version`]) taken
+    /// at creation and again on every text mutation. Equal versions imply
+    /// equal text (a snapshot keeps its source's version; divergent edits get
+    /// fresh stamps), so caches keyed on it — the per-session tree-sitter
+    /// parse — invalidate exactly when the text changes.
+    fn version(&self) -> u64;
     /// The most recent search's match data (whole-match span + group texts).
     fn last_match(&self) -> Option<&crate::buffer::MatchData>;
     /// A cheap, independent copy of this store (structural sharing for Quire,
@@ -88,6 +94,13 @@ pub trait TextStore {
     /// streaming atomic save uses this so a multi-GB `Quire` is written piece by
     /// piece, never materialized into one allocation; `Buffer` writes its string.
     fn write_to(&self, w: &mut dyn std::io::Write) -> std::io::Result<usize>;
+}
+
+/// The next content-version stamp (see [`TextStore::version`]): a process-wide
+/// monotonic counter, so no two distinct text states ever share a value.
+pub(crate) fn next_version() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Shift markers after inserting `len` chars at absolute position `at`. Emacs
