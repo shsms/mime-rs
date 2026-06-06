@@ -1455,6 +1455,65 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         );
     }
     {
+        // (conflict-context &optional N LINES) — the decision view in one
+        // call: hunk N (or the hunk at point) rendered in place with LINES
+        // (default 3) lines of surrounding code, view-style gutter marking
+        // the hunk's own lines. Deciding a resolution usually needs the code
+        // AROUND the hunk; this replaces the conflict-hunks → parse @pos →
+        // view round-trip. Read-only: point is preserved.
+        let s = session.clone();
+        ctx.defun(
+            "conflict-context",
+            move |n: Option<i64>, lines: Option<i64>| -> Result<String, Error> {
+                let mut sess = s.borrow_mut();
+                let b = sess.buffer.as_mut();
+                let hunks = crate::conflict::scan(b);
+                let h = crate::conflict::pick(&hunks, n, b.point())
+                    .map_err(|e| err(&e))?
+                    .clone();
+                let idx = hunks.iter().position(|x| x.start == h.start).unwrap_or(0) + 1;
+                let ctx_lines = lines.unwrap_or(3).max(0) as usize;
+                let saved = b.point();
+                let pmin = b.point_min();
+                let min_line = b.line_number_at_pos(pmin);
+                let max_line = b.line_number_at_pos(b.point_max());
+                let hunk_lo = b.line_number_at_pos(h.start);
+                // h.end sits just past the hunk; the char before it is on the
+                // closer's line.
+                let hunk_hi = b.line_number_at_pos(h.end.saturating_sub(1).max(h.start));
+                let lo = hunk_lo.saturating_sub(ctx_lines).max(min_line);
+                let hi = (hunk_hi + ctx_lines).min(max_line);
+                let mut out = format!(
+                    "\u{2014} conflict {idx}/{} @{} ({} \u{2194} {}) \u{2014}\n",
+                    hunks.len(),
+                    h.start,
+                    h.ours_label,
+                    h.theirs_label,
+                );
+                b.goto_char(pmin);
+                b.forward_line((lo - min_line) as i64);
+                for line_no in lo..=hi {
+                    let start = b.point();
+                    b.end_of_line();
+                    let end = b.point();
+                    let text = b.substring(start, end);
+                    let gutter = if (hunk_lo..=hunk_hi).contains(&line_no) {
+                        '>'
+                    } else {
+                        ' '
+                    };
+                    out.push_str(&format!("{line_no:>5} {gutter} {text}\n"));
+                    if line_no < hi {
+                        b.goto_char(end);
+                        b.forward_line(1);
+                    }
+                }
+                b.goto_char(saved);
+                Ok(out)
+            },
+        );
+    }
+    {
         // (conflict-keep SIDE &optional N) — resolve hunk N (or the hunk at
         // point) by replacing the whole hunk with SIDE: "ours" | "theirs" |
         // "base" | "both" (ours then theirs) | "all" (ours, base, theirs —
@@ -2535,6 +2594,36 @@ mod tests {
             Ok(_) => panic!("base on a two-way hunk must error"),
         };
         assert!(e.contains("no base section"), "got: {e}");
+    }
+
+    #[test]
+    fn conflict_context_renders_the_hunk_with_surrounding_lines() {
+        let mut ws =
+            trusted("a\nb\nc\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\nx\ny\nz\n");
+        let r = ws
+            .run(
+                r#"(goto-char 1)
+                   (message (conflict-context 1 2))
+                   (report "point" (point))"#,
+            )
+            .unwrap();
+        let view = &r.log[0];
+        assert!(
+            view.contains("conflict 1/1 @7 (HEAD \u{2194} branch)"),
+            "got: {view}"
+        );
+        // Two context lines on each side, the hunk's own lines marked.
+        assert!(
+            !view.contains("\n    1   a"),
+            "line 1 is beyond the context"
+        );
+        assert!(view.contains("    2   b\n"), "got: {view}");
+        assert!(view.contains("    4 > <<<<<<< HEAD\n"), "got: {view}");
+        assert!(view.contains("    6 > =======\n"), "got: {view}");
+        assert!(view.contains("    8 > >>>>>>> branch\n"), "got: {view}");
+        assert!(view.contains("   10   y\n"), "got: {view}");
+        assert!(!view.contains("   11"), "line 11 is beyond the context");
+        assert_eq!(report(&r, "point"), "1", "read-only: point preserved");
     }
 
     #[test]
