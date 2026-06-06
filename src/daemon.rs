@@ -198,7 +198,12 @@ fn op_run(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>, rehearse: b
                 report.len_before,
                 report.len_after,
             );
-            report.to_json()
+            let mut json = report.to_json();
+            // Drift signal, like the MCP server's: present only when true.
+            if ws.is_stale() {
+                json["stale"] = Value::Bool(true);
+            }
+            json
         }
         Err(e) => {
             // Failure shape: the reports/log the program accumulated before it

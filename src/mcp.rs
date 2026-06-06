@@ -448,6 +448,11 @@ fn tool_run_program(
         report.len_after,
     );
     let mut json = report.to_json();
+    // Same drift signal the read tools carry (see stale_note), structured:
+    // present only when true, so the common case costs no tokens.
+    if sessions.get(&session).is_some_and(|ws| ws.is_stale()) {
+        json["stale"] = Value::Bool(true);
+    }
     if bool_arg(args, "save") {
         if rehearse {
             return Err("save is not available on rehearse (nothing persists)".to_string());
@@ -458,11 +463,27 @@ fn tool_run_program(
     Ok(pretty(&json))
 }
 
+/// One warning line appended to read-tool output when the visited file has
+/// drifted under the warm buffer. The stale guard protects saves; READS were
+/// silent — and a warm mmap-backed buffer can serve outright corrupted bytes
+/// after an external IN-PLACE overwrite (rename-based writers are safe), so
+/// a stale read must not pass as clean.
+fn stale_note(sessions: &HashMap<String, Workspace>, session: &str) -> &'static str {
+    if sessions.get(session).is_some_and(|ws| ws.is_stale()) {
+        "\nWARNING: the visited file changed on disk after it was opened — \
+         this read may be stale or corrupted; run_program (revert-buffer) \
+         re-reads the file (discarding the warm buffer's edits)"
+    } else {
+        ""
+    }
+}
+
 /// Evaluate `(message EXPR)` in the session and hand back the logged string
 /// verbatim. `message` stores its argument *raw* in the log, so rendered text
 /// comes back without tulisp's string re-quoting (`report` would print
 /// \"hello\" rather than hello). The read-only convenience tools —
-/// read_region, view, occur, conflicts — all ride this channel.
+/// read_region, view, occur, conflicts — all ride this channel, so the stale
+/// warning lands on each of them here.
 fn run_message(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
@@ -470,11 +491,12 @@ fn run_message(
     what: &str,
 ) -> Result<String, String> {
     let report = run_in_session(sessions, session, &format!("(message {expr})"))?;
-    report
+    let text = report
         .log
         .into_iter()
         .next()
-        .ok_or_else(|| format!("{what}: no text returned"))
+        .ok_or_else(|| format!("{what}: no text returned"))?;
+    Ok(format!("{text}{}", stale_note(sessions, session)))
 }
 
 /// `read_region {session?, start, end}` — the substring `[start, end)`, fetched
@@ -720,13 +742,14 @@ fn tool_search(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Resul
                  (report \"found\" 0)))"
     );
     let report = run_in_session(sessions, &session, &program)?;
+    let note = stale_note(sessions, &session);
     if report_value(&report, "found").as_deref() == Some("1") {
         let pos = report_value(&report, "pos").unwrap_or_default();
         Ok(format!(
-            "match ({mode}): point is now {pos} (just after the match)"
+            "match ({mode}): point is now {pos} (just after the match){note}"
         ))
     } else {
-        Ok(format!("no {mode} match for pattern"))
+        Ok(format!("no {mode} match for pattern{note}"))
     }
 }
 

@@ -591,6 +591,48 @@ fn path_reuses_a_session_already_visiting_the_file() {
 }
 
 #[test]
+fn stale_reads_warn_and_revert_buffer_recovers() {
+    let dir = temp_dir("stale-read");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+
+    s.call_ok(1, "open_file", json!({ "path": p }));
+    let view = s.call_ok(2, "view", json!({ "path": p }));
+    assert!(
+        !view.contains("WARNING"),
+        "clean read must not warn: {view}"
+    );
+
+    // An external writer lands: every read tool carries the drift warning
+    // (a warm mmap can serve corrupted bytes after an in-place overwrite),
+    // and run results gain the structured flag.
+    std::fs::write(&file, "ALPHA external\n").unwrap();
+    let view = s.call_ok(3, "view", json!({ "path": p }));
+    assert!(
+        view.contains("WARNING") && view.contains("revert-buffer"),
+        "got: {view}"
+    );
+    let hit = s.call_ok(4, "search", json!({ "path": p, "pattern": "zzz" }));
+    assert!(hit.contains("WARNING"), "search warns too: {hit}");
+    let out = s.call_ok(5, "run_program", json!({ "path": p, "program": "(point)" }));
+    let out: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(out["stale"], true, "structured drift flag: {out}");
+
+    // revert-buffer re-reads the disk state; the warning clears.
+    s.call_ok(
+        6,
+        "run_program",
+        json!({ "path": p, "program": "(revert-buffer)" }),
+    );
+    let txt = s.call_ok(7, "read_region", json!({ "path": p, "start": 1, "end": 6 }));
+    assert_eq!(txt, "ALPHA", "fresh content after revert");
+    let view = s.call_ok(8, "view", json!({ "path": p }));
+    assert!(!view.contains("WARNING"), "stamp re-armed: {view}");
+}
+
+#[test]
 fn one_call_editing_with_path_save_and_batches() {
     let dir = temp_dir("one-call");
     let file = dir.join("prog.rs");
