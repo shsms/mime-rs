@@ -18,11 +18,6 @@ the same ~set-buffer~-home workaround). Diff the primary buffer's own
 before/after instead — or make the closing diff suppressible — and the three
 scripts can drop the workaround.
 
-** TODO Literal replace_text MCP tool [#B]
-~insert_text~'s counterpart: exact pattern in, literal replacement in, no
-elisp — removes the double-escaping risk in ~run_program~ for quote-heavy
-content (tulisp string literals also reject Rust's ~\u{…}~ escapes).
-
 ** TODO O(n) buffer-level replace [#B]
 ~replace-string~ / ~replace-regexp~ on a large Quire are effectively O(n²):
 the unbounded windowed search re-materializes point→end per match (a 43 MB

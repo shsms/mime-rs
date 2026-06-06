@@ -158,6 +158,7 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         "read_region" => tool_read_region(&args, sessions),
         "view" => tool_view(&args, sessions),
         "insert_text" => tool_insert_text(&args, sessions),
+        "replace_text" => tool_replace_text(&args, sessions),
         "search" => tool_search(&args, sessions),
         "occur" => tool_occur(&args, sessions),
         "conflicts" => tool_conflicts(&args, sessions),
@@ -420,10 +421,7 @@ fn tool_insert_text(
 ) -> Result<String, String> {
     let session = session_arg(args);
     let text = str_arg(args, "text")?;
-    // lisp_escape handles \ and "; we additionally fold real newlines/tabs into
-    // their escape sequences (valid in a tulisp string literal) to keep the
-    // program on one line.
-    let escaped = lisp_escape(&text).replace('\n', "\\n").replace('\t', "\\t");
+    let escaped = lisp_literal(&text);
     let program = match args.get("pos").and_then(Value::as_i64) {
         Some(pos) => {
             format!("(progn (goto-char {pos}) (insert \"{escaped}\") (report \"point\" (point)))")
@@ -431,9 +429,74 @@ fn tool_insert_text(
         None => format!("(progn (insert \"{escaped}\") (report \"point\" (point)))"),
     };
     let report = run_in_session(sessions, &session, &program)?;
+    audit_tool(&session, &program, &report);
     let chars = text.chars().count();
     let point = report_value(&report, "point").unwrap_or_default();
     Ok(format!("inserted {chars} chars; point is now {point}"))
+}
+
+/// `replace_text {session?, pattern, replacement, all?}` — replace the first
+/// occurrence of literal `pattern` (searching from the top of the accessible
+/// region) with literal `replacement`; `all: true` replaces every occurrence.
+/// `insert_text`'s counterpart: both strings arrive as raw JSON and are
+/// escaped on the server, and the replacement is spliced via
+/// delete-region + insert — never `replace-match` — so backslashes and `\1`
+/// in the replacement stay literal. Errors when nothing matches (the agent's
+/// signal that its anchor text is wrong). Edits the warm buffer; `save_buffer`
+/// persists.
+fn tool_replace_text(
+    args: &Value,
+    sessions: &mut HashMap<String, Workspace>,
+) -> Result<String, String> {
+    let session = session_arg(args);
+    let pattern = str_arg(args, "pattern")?;
+    let replacement = str_arg(args, "replacement")?;
+    if pattern.is_empty() {
+        return Err("replace_text: pattern must not be empty".to_string());
+    }
+    let all = bool_arg(args, "all");
+    let (pat, rep) = (lisp_literal(&pattern), lisp_literal(&replacement));
+    let all_flag = if all { "t" } else { "nil" };
+    // search → delete → insert per hit; `more` counts the matches left after
+    // the last replacement so a single replace can say "N more remain". The
+    // continue-guard runs BEFORE the search so a finished single replace does
+    // not move point past (and so under-count) the next match. A miss restores
+    // point — a failed replace is a no-op, not a stealth (goto-char (point-min)).
+    let program = format!(
+        "(progn (let ((p0 (point)) (n 0))\
+           (goto-char (point-min))\
+           (while (and (or {all_flag} (= n 0)) (search-forward \"{pat}\" nil t))\
+             (delete-region (match-beginning 0) (point))\
+             (insert \"{rep}\")\
+             (setq n (+ n 1)))\
+           (if (= n 0) (goto-char p0))\
+           (report \"n\" n)\
+           (report \"more\" (count-matches (regexp-quote \"{pat}\")))\
+           (report \"point\" (point))))"
+    );
+    let report = run_in_session(sessions, &session, &program)?;
+    audit_tool(&session, &program, &report);
+    let n: usize = report_value(&report, "n")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if n == 0 {
+        return Err(format!(
+            "replace_text: no match for the pattern {:?}",
+            truncate_for_error(&pattern)
+        ));
+    }
+    let more: usize = report_value(&report, "more")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let point = report_value(&report, "point").unwrap_or_default();
+    Ok(match (all, more) {
+        (true, _) => format!("replaced {n} occurrence(s); point is now {point}"),
+        (false, 0) => format!("replaced 1 occurrence; point is now {point}"),
+        (false, more) => format!(
+            "replaced 1 occurrence; point is now {point}; {more} more match(es) \
+             remain (pass all:true to replace every occurrence)"
+        ),
+    })
 }
 
 /// `search {session?, pattern, mode?}` — search forward from point and report
@@ -601,6 +664,39 @@ fn lisp_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Escape raw text into a tulisp string-literal body: [`lisp_escape`] plus
+/// folding real newlines/tabs into their escape sequences, so the generated
+/// program stays a single unambiguous line. The shared escaping of the
+/// literal-text tools (`insert_text`, `replace_text`).
+fn lisp_literal(s: &str) -> String {
+    lisp_escape(s).replace('\n', "\\n").replace('\t', "\\t")
+}
+
+/// Journal a convenience-tool edit exactly like `run_program` audits its
+/// programs, so the audit trail covers every mutating tool.
+fn audit_tool(session: &str, program: &str, report: &crate::RunReport) {
+    crate::safety::audit(
+        "mime-mcp",
+        session,
+        program,
+        report.dirty,
+        report.len_before,
+        report.len_after,
+    );
+}
+
+/// A pattern echoed into an error message, clamped so a pathological pattern
+/// cannot flood the result.
+fn truncate_for_error(s: &str) -> String {
+    const MAX: usize = 80;
+    if s.chars().count() <= MAX {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(MAX).collect();
+        format!("{head}…")
+    }
+}
+
 // ---- the tool catalogue ----------------------------------------------------
 
 /// `tools/list` result — every tool with a JSON Schema `inputSchema`.
@@ -644,7 +740,7 @@ fn tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "run_program",
-            "description": "Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and return a structured RunReport (unified diff, point, length before/after, and any (report ...)/(message ...) output). This is the core, general-purpose editing tool; the buffer and any defined functions persist for the next call.",
+            "description": "Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and return a structured RunReport (unified diff, point, length before/after, and any (report ...)/(message ...) output). This is the core, general-purpose editing tool; the buffer and any defined functions persist for the next call. On failure the error content is a JSON object {ok:false, error, dirty, reports, log} carrying the diagnostics the program emitted before dying; dirty=true means its pre-error edits persist (a run does not roll back on error — use rehearse, or with-transaction inside the program, for atomicity).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -703,6 +799,20 @@ fn tool_schemas() -> Vec<Value> {
                     "session": session,
                 },
                 "required": ["text"],
+            },
+        }),
+        json!({
+            "name": "replace_text",
+            "description": "Replace the FIRST occurrence of a literal pattern with literal replacement text (searching from the top of the accessible region); pass all:true to replace every occurrence. Both strings are plain — no Lisp escaping, no regex, no backref expansion (insert_text's counterpart; the fix for quote-heavy edits). Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Edits the warm buffer; call save_buffer to persist. For regex or position-scoped replacement, use run_program.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "The exact text to find (literal, not regex)." },
+                    "replacement": { "type": "string", "description": "The literal replacement text." },
+                    "all": { "type": "boolean", "description": "Replace every occurrence (default false: first only)." },
+                    "session": session,
+                },
+                "required": ["pattern", "replacement"],
             },
         }),
         json!({

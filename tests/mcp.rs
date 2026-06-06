@@ -145,6 +145,7 @@ fn full_session_round_trip_over_stdio() {
         "rehearse",
         "read_region",
         "search",
+        "replace_text",
         "occur",
         "conflicts",
         "checkpoint",
@@ -372,6 +373,87 @@ fn conflicts_overview_and_resolution_round_trip() {
     assert!(out.contains("no conflicts"), "got: {out}");
     let text = s.call_ok(5, "read_region", json!({ "start": 1, "end": 19 }));
     assert_eq!(text, "intro\ntheirs\ntail\n");
+}
+
+#[test]
+fn replace_text_is_literal_counted_and_quote_safe() {
+    let mut s = Server::spawn();
+    s.call_ok(
+        1,
+        "open_text",
+        json!({ "text": "a = b;\na = b;\na = b;\n" }),
+    );
+
+    // Single replace: first occurrence only, with a remaining-match hint.
+    let out = s.call_ok(
+        2,
+        "replace_text",
+        json!({ "pattern": "a = b;", "replacement": "a = c;" }),
+    );
+    assert!(out.contains("replaced 1 occurrence"), "got: {out}");
+    assert!(out.contains("2 more match(es) remain"), "got: {out}");
+
+    // all:true sweeps the rest.
+    let out = s.call_ok(
+        3,
+        "replace_text",
+        json!({ "pattern": "a = b;", "replacement": "a = c;", "all": true }),
+    );
+    assert!(out.contains("replaced 2 occurrence(s)"), "got: {out}");
+    let text = s.call_ok(4, "read_region", json!({ "start": 1, "end": 22 }));
+    assert_eq!(text, "a = c;\na = c;\na = c;\n");
+
+    // The friction case the tool exists for: patterns/replacements full of
+    // quotes, backslashes, and \u-style escapes — all literal, including
+    // backrefs that replace-match would have expanded.
+    s.call_ok(
+        5,
+        "open_text",
+        json!({ "text": "format!(\"\\u{2014} occur\")", "session": "q" }),
+    );
+    let out = s.call_ok(
+        6,
+        "replace_text",
+        json!({
+            "pattern": "format!(\"\\u{2014} occur\")",
+            "replacement": "write!(w, \"\\u{2026} occur \\1\")",
+            "session": "q"
+        }),
+    );
+    assert!(out.contains("replaced 1 occurrence"), "got: {out}");
+    let text = s.call_ok(
+        7,
+        "read_region",
+        json!({ "start": 1, "end": 31, "session": "q" }),
+    );
+    assert_eq!(text, "write!(w, \"\\u{2026} occur \\1\")");
+
+    // No match is a proper error that names the pattern — and a true no-op:
+    // the buffer and point are exactly as before.
+    let report = s.call_ok(
+        8,
+        "run_program",
+        json!({ "program": r#"(goto-char 4) (report "p" (point))"#, "session": "q" }),
+    );
+    let report: Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(report["reports"]["p"], "4");
+    let err = s.call_err(
+        9,
+        "replace_text",
+        json!({ "pattern": "absent", "replacement": "x", "session": "q" }),
+    );
+    assert!(err.contains("no match"), "got: {err}");
+    assert!(err.contains("absent"), "the error names the pattern: {err}");
+    let report = s.call_ok(
+        10,
+        "run_program",
+        json!({ "program": r#"(report "p" (point))"#, "session": "q" }),
+    );
+    let report: Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(
+        report["reports"]["p"], "4",
+        "failed replace left point alone"
+    );
 }
 
 #[test]
