@@ -393,13 +393,15 @@ impl Workspace {
 
         let value = match self.ctx.eval_string(program) {
             Ok(v) => v.to_string(),
-            // Record whether the dying program left edits behind (a warm run
-            // does not roll back), so the failure JSON can say so. The length
-            // check short-circuits the full-text compare for the common case
-            // of a size-changing edit on a large buffer.
+            // Record whether the dying program left edits behind in the
+            // primary buffer (a warm run does not roll back), so the failure
+            // JSON can say so. The length check short-circuits the full-text
+            // compare for the common case of a size-changing edit on a large
+            // buffer.
             Err(e) => {
                 let s = self.session.borrow();
-                let dirty = s.buffer.char_len() != len_before || s.buffer.text() != before;
+                let b = primary_buffer(&s, &name);
+                let dirty = b.char_len() != len_before || b.text() != before;
                 drop(s);
                 self.last_failure_dirty.set(dirty);
                 return Err(e.format(&self.ctx));
@@ -407,14 +409,18 @@ impl Workspace {
         };
 
         let s = self.session.borrow();
-        let after = s.buffer.text().to_string();
+        let primary = primary_buffer(&s, &name);
+        let after = primary.text().to_string();
         let len_after = after.chars().count();
         let report = RunReport {
             buffer_name: name,
             dirty: after != before,
             rehearsed,
             diff: unified_diff(&before, &after),
-            point: s.buffer.point(),
+            // The PRIMARY's point, like every other field — pairing the exit
+            // buffer's point with the primary's final_text handed consumers a
+            // position in a different buffer (possibly out of range).
+            point: primary.point(),
             len_before,
             len_after,
             reports: s.reports.clone(),
@@ -507,6 +513,27 @@ impl Workspace {
         let _ = self.session.borrow_mut().buffer.rebase_to_file(path);
         Ok(bytes)
     }
+}
+
+/// The PRIMARY buffer of a run — the one current when the program started,
+/// found again by name at exit. The closing report (`diff` / `dirty` /
+/// `len_*` / `final_text`) describes IT, not whatever buffer happens to be
+/// current when the program ends: a trusted program finishing on another
+/// buffer (a find-file'd document, a scratch buffer) used to get the
+/// primary's before-text diffed against that other buffer — an --infile run
+/// ending on a find-file'd document rendered the whole document as one giant
+/// insertion unless the script set-buffer'd home first. A primary killed
+/// mid-program falls back to the buffer current at exit rather than diffing
+/// against nothing.
+fn primary_buffer<'a>(s: &'a Session, name: &str) -> &'a dyn TextStore {
+    if s.buffer.name() == name {
+        return s.buffer.as_ref();
+    }
+    s.inactive
+        .iter()
+        .find(|b| b.name() == name)
+        .map(|b| b.as_ref())
+        .unwrap_or(s.buffer.as_ref())
 }
 
 /// `Some(reason)` when `store` visits `path` and the file on disk has drifted
@@ -630,6 +657,37 @@ mod tests {
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.clone())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn closing_report_tracks_the_primary_buffer_not_the_exit_buffer() {
+        let mut ws =
+            Workspace::new_trusted(Box::new(crate::Buffer::from_string("main", "primary text")));
+        // Edit the primary, then END on a different buffer.
+        let r = ws
+            .run(
+                r#"(goto-char (point-max)) (insert "!")
+                   (generate-new-buffer "side") (set-buffer "side")
+                   (insert "side stuff")"#,
+            )
+            .unwrap();
+        assert_eq!(r.buffer_name, "main");
+        assert_eq!(r.final_text, "primary text!", "primary's text, not side's");
+        assert_eq!(r.len_before, 12);
+        assert_eq!(r.len_after, 13);
+        assert_eq!(r.point, 14, "the PRIMARY's point, not the exit buffer's");
+        assert!(r.dirty);
+        assert!(r.diff.contains("+primary text!"), "diff: {}", r.diff);
+        assert!(!r.diff.contains("side stuff"), "diff: {}", r.diff);
+
+        // Come home; a run that edits only OTHER buffers reports its primary
+        // ("main") clean — no diff, original text.
+        ws.run(r#"(set-buffer "main")"#).unwrap();
+        let r = ws.run(r#"(set-buffer "side") (insert "more")"#).unwrap();
+        assert_eq!(r.buffer_name, "main");
+        assert!(!r.dirty, "main untouched");
+        assert_eq!(r.diff, "");
+        assert_eq!(r.final_text, "primary text!");
     }
 
     #[test]
