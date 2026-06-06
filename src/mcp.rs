@@ -669,7 +669,7 @@ fn tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "view",
-            "description": "Render a viewport around the cursor (or a given position): a few lines of context on each side, with a gutter, the current line marked, and a header. Your 'look at the screen'. Read-only.",
+            "description": "Render a viewport around the cursor (or a given position): a few lines of context on each side, with a gutter, the current line marked, and a header (flagged 'Narrow' when a restriction is active). Read-only. Coordinate convention everywhere: char positions (@N, point) are ABSOLUTE — feed goto-char; line numbers count from the accessible region's start — feed goto-line.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -712,7 +712,7 @@ fn tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "occur",
-            "description": "Overview of every line matching a pattern in the whole accessible region (composes with narrowing): line number + char position per hit (goto-char-able), optional context lines, long lines clamped. Read-only; point does not move. Your 'grep the buffer' for orientation before editing.",
+            "description": "Overview of every line matching a pattern in the whole accessible region (composes with narrowing): line number (narrowing-relative, goto-line-able) + char position (absolute, goto-char-able) per hit, optional context lines, long lines clamped. Read-only; point does not move. Your 'grep the buffer' for orientation before editing.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -731,7 +731,7 @@ fn tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "conflicts",
-            "description": "Overview of the merge-conflict hunks in the buffer: number, position + line, branch labels, side sizes; warns about marker lines it could not parse (malformed/nested). Read-only. Resolve via run_program: (conflict-keep SIDE &optional N) with ours|theirs|both, or base|all on diff3 hunks only; (conflict-replace TEXT &optional N) for a hand-crafted merge; (conflict-resolve-trivial) to sweep the safe ones; (conflict-diff &optional N) to see what differs; (conflict-text SIDE &optional N) to read one side. Mutating calls return the remaining count — wrap them in (report \"left\" …) to see it in run_program's JSON. N is 1-based and refreshes after each edit; nil N = the hunk at point.",
+            "description": "Overview of the merge-conflict hunks in the buffer: number, position + line, branch labels, side sizes; warns about marker lines it could not parse (malformed/nested). Read-only. Resolve via run_program: (conflict-keep SIDE &optional N) with ours|theirs|both, or base|all on diff3 hunks only; (conflict-replace TEXT &optional N) for a hand-crafted merge; (conflict-resolve-trivial) to sweep the safe ones; (conflict-diff &optional N) to see what differs; (conflict-text SIDE &optional N) to read one side. Mutating calls return the remaining count — wrap them in (report \"left\" …) to see it in run_program's JSON. N is 1-based and refreshes after each edit; nil N = the hunk at point. @positions are absolute, L labels narrowing-relative; a narrowing that cuts through a hunk hides it entirely — widen before resolving.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -306,8 +306,17 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                 let lo = cur_line.saturating_sub(n).max(1);
                 let hi = (cur_line + n).min(total);
                 let pmax = sess.buffer.point_max();
+                // An active restriction is flagged like Emacs's "Narrow"
+                // modeline indicator, so a viewport over a narrowed buffer is
+                // never mistaken for the whole file. Line numbers count from
+                // the accessible region's start; char positions stay absolute.
+                let narrow = if sess.buffer.narrowing().is_some() {
+                    "  Narrow"
+                } else {
+                    ""
+                };
                 let mut out = format!(
-                    "\u{2014} {}  line {} col {}  point {}/{} \u{2014}\n",
+                    "\u{2014} {}  line {} col {}  point {}/{}{narrow} \u{2014}\n",
                     sess.buffer.name(),
                     cur_line,
                     col,
@@ -2363,6 +2372,7 @@ mod tests {
         assert_eq!(report(&r, "back"), "10", "goto-line 2 = start of l4");
         let win = &r.log[0];
         assert!(win.contains("line 2"), "window header relative, got: {win}");
+        assert!(win.contains("Narrow"), "restriction flagged, got: {win}");
         assert!(
             win.contains("    2 > "),
             "window renders THE line, got: {win}"

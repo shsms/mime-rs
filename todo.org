@@ -65,11 +65,26 @@ default (Emacs parity — check ~$~/~\z~ interactions and the ulysses
 patterns), or document the divergence loudly. Surfaced by the review of the
 conflict overview's occur suggestion, which had to drop its anchor.
 
+** TODO forward-line shortfall at the top boundary
+Landing on a line beginning that sits exactly at point-min (or buffer start)
+reports a shortfall of 1 where Emacs reports 0 — the position is right, only
+the return value diverges. Pre-existing, identical in both stores; fixing it
+means teaching the backward scan that "no newline above, but already at a
+line beginning" is a complete move.
+
 ** TODO Per-program resource limits
 A wall-clock/CPU bound per program — blocked on tulisp cooperative
 cancellation (eval interruption), see the wishlist below.
 
 * Structural editing
+
+** TODO treesit × narrowing
+The treesit builtins parse the FULL document and report absolute positions
+regardless of narrowing — the one vocabulary family that doesn't compose with
+the (now coherent) narrowing semantics: ~treesit-beginning-of-defun~ can move
+point outside the restriction. Decide with the persistent-tree work below:
+either clamp treesit motion into the accessible region, or document that the
+structural layer is deliberately whole-document.
 
 ** TODO Persistent per-Session tree (the lever) [#B]
 Keep the parse on the ~Session~ instead of re-parsing every call. Unlocks:
