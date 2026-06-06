@@ -1770,7 +1770,10 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // enclosing defun at POS (default point), scoping every subsequent
         // edit/search to that one function/class/section (compose with
         // save-restriction / widen). Returns t, or nil (no narrowing) if POS
-        // is inside no defun.
+        // is inside no defun. REPLACES any existing restriction, like Emacs's
+        // narrowing commands — the defun is found in the whole document (see
+        // the section comment), so this can deliberately re-narrow outside
+        // the current restriction.
         ctx.defun("treesit-narrow-to-defun", move |pos: Option<i64>| -> bool {
             let mut sess = s.borrow_mut();
             let p = pos.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);

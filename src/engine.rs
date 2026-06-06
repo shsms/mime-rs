@@ -726,6 +726,41 @@ mod tests {
     }
 
     #[test]
+    fn treesit_reads_the_whole_document_but_motion_respects_narrowing() {
+        // The deliberate exception to narrowing composition: the structural
+        // layer parses the FULL document (a restriction cutting a function in
+        // half must not change what the tree says the function is), while
+        // motion clamps into the accessible region and narrow-to-defun
+        // REPLACES the restriction like Emacs narrowing commands do.
+        let text = "fn one() {\n    1;\n}\n\nfn two() {\n    2;\n}\n";
+        let mut ws = Workspace::new(Box::new(crate::Buffer::from_string("t.rs", text)));
+        let r = ws
+            .run(
+                r#"(narrow-to-region 1 12) ; a slice of fn one
+                   (goto-char 5)
+                   (report "begin" (treesit-beginning-of-defun))
+                   (report "end" (treesit-end-of-defun))
+                   (report "outline" (length (treesit-list-defuns)))
+                   (report "renarrow" (if (treesit-narrow-to-defun 30) 1 0))
+                   (report "pmin" (point-min))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "begin"), "1");
+        // fn one ends past the restriction; motion clamps to point-max.
+        assert_eq!(report(&r, "end"), "12");
+        // The outline sees BOTH defuns despite the narrowing.
+        assert_eq!(report(&r, "outline"), "2");
+        // narrow-to-defun at a position outside the restriction re-narrows
+        // there (whole-document by design).
+        assert_eq!(report(&r, "renarrow"), "1");
+        assert!(
+            report(&r, "pmin").parse::<usize>().unwrap() > 12,
+            "restriction moved to fn two: {:?}",
+            r.reports
+        );
+    }
+
+    #[test]
     fn save_to_persists_rebases_and_edits_again() {
         // save_to writes the buffer and re-bases the Quire onto the new file; the
         // buffer is unchanged, and editing the rebased buffer + saving again keeps
