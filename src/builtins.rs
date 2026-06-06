@@ -1013,26 +1013,66 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
 
     // ---- buffer-level replace commands (map-shaped bulk edits) ----
+    // Both are single-pass streaming rewrites: the window [point, point-max)
+    // is materialized ONCE, every match located in it, and the edits applied
+    // in document order with a running offset (`apply_window_edits`) —
+    // O(window + matches) instead of the search loop's O(window²)
+    // re-materialization per match on a large Quire. Replacement text is
+    // never re-matched, point lands after the last replacement (unchanged
+    // when nothing matches), and markers adjust per edit exactly as the
+    // search-and-replace loop did.
     {
         let s = session.clone();
         ctx.defun(
             "replace-regexp",
-            move |re: String, to: String| -> Result<TulispObject, Error> {
+            move |re: String, template: String| -> Result<TulispObject, Error> {
                 let rx = cached_regex(&re)?;
                 let mut sess = s.borrow_mut();
-                let mut count = 0i64;
-                loop {
-                    let start = sess.buffer.point();
-                    if sess.buffer.re_search_forward(&rx, None).is_none() {
-                        break;
-                    }
-                    sess.buffer.replace_match(&to).map_err(Error::lisp_error)?;
-                    count += 1;
-                    if sess.buffer.point() <= start {
-                        break; // no forward progress (empty match) — avoid looping
-                    }
+                let from = sess.buffer.point();
+                let to = sess.buffer.point_max();
+                // One char of context before point keeps `^`/`\b` honest at
+                // the window edge, as in the store searches — but never from
+                // before point-min, which counts as a real line beginning.
+                let ctx_from = from
+                    .saturating_sub(1)
+                    .max(sess.buffer.point_min().min(from));
+                let window = sess.buffer.substring(ctx_from, to);
+                let skip = if ctx_from < from {
+                    window.chars().next().map_or(0, char::len_utf8)
+                } else {
+                    0
+                };
+                // Locate every match left to right, expanding its replacement
+                // from its own groups; an empty match steps one char forward.
+                // A template with no backslash never reads its groups — skip
+                // materializing them (bulk replaces can have 100k+ matches).
+                let expands = template.contains('\\');
+                let mut edits: Vec<(usize, usize, String)> = Vec::new();
+                let mut at = skip;
+                while let Some(caps) = rx.captures_at(&window, at) {
+                    let whole = caps.get(0).expect("group 0 is the whole match");
+                    let expanded = if expands {
+                        let groups: Vec<Option<String>> = caps
+                            .iter()
+                            .map(|g| g.map(|m| m.as_str().to_string()))
+                            .collect();
+                        crate::buffer::expand_backrefs(&template, &groups)
+                    } else {
+                        template.clone()
+                    };
+                    edits.push((whole.start(), whole.end(), expanded));
+                    at = if whole.end() > whole.start() {
+                        whole.end()
+                    } else {
+                        match window[whole.end()..].chars().next() {
+                            Some(c) => whole.end() + c.len_utf8(),
+                            None => break,
+                        }
+                    };
                 }
-                Ok(TulispObject::from(count))
+                Ok(TulispObject::from(apply_window_edits(
+                    &mut sess, ctx_from, &window, edits,
+                )))
             },
         );
     }
@@ -1040,26 +1080,21 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         ctx.defun(
             "replace-string",
-            move |from: String, to: String| -> Result<TulispObject, Error> {
-                // Literal replacement: escape backslashes so replace-match does no
-                // \N / \& expansion.
-                let literal = to.replace('\\', "\\\\");
-                let mut sess = s.borrow_mut();
-                let mut count = 0i64;
-                loop {
-                    let start = sess.buffer.point();
-                    if sess.buffer.search_forward(&from, None).is_none() {
-                        break;
-                    }
-                    sess.buffer
-                        .replace_match(&literal)
-                        .map_err(Error::lisp_error)?;
-                    count += 1;
-                    if sess.buffer.point() <= start {
-                        break;
-                    }
+            move |needle: String, to: String| -> Result<TulispObject, Error> {
+                if needle.is_empty() {
+                    return Err(err("replace-string: empty search string"));
                 }
-                Ok(TulispObject::from(count))
+                let mut sess = s.borrow_mut();
+                let from = sess.buffer.point();
+                let pmax = sess.buffer.point_max();
+                let window = sess.buffer.substring(from, pmax);
+                let edits: Vec<(usize, usize, String)> = window
+                    .match_indices(needle.as_str())
+                    .map(|(b, m)| (b, b + m.len(), to.clone()))
+                    .collect();
+                Ok(TulispObject::from(apply_window_edits(
+                    &mut sess, from, &window, edits,
+                )))
             },
         );
     }
@@ -1707,6 +1742,60 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             },
         );
     }
+}
+
+/// Apply a batch of non-overlapping window edits in document order — the
+/// shared tail of the streaming `replace-regexp` / `replace-string`. `edits`
+/// are ascending `(byte_start, byte_end, replacement)` spans in `window`;
+/// `window_start` is the absolute char position of the window's first byte.
+/// One forward pass maps the byte offsets to char offsets, then each span is
+/// spliced as delete+insert — markers and the narrowing bound adjust per edit,
+/// exactly as `replace_match` would — with a running length delta keeping the
+/// positions current. Returns the edit count; point ends after the last
+/// replacement (untouched when there are none).
+fn apply_window_edits(
+    sess: &mut crate::engine::Session,
+    window_start: usize,
+    window: &str,
+    edits: Vec<(usize, usize, String)>,
+) -> i64 {
+    if edits.is_empty() {
+        return 0; // nothing to map or splice — skip the window walk
+    }
+    let bytes: Vec<usize> = edits.iter().flat_map(|(s, e, _)| [*s, *e]).collect();
+    // The single mapping pass requires ascending, non-overlapping spans; a
+    // violator would have its offsets silently collapsed to the window end.
+    debug_assert!(
+        bytes.windows(2).all(|w| w[0] <= w[1]),
+        "window edits must be ascending and non-overlapping"
+    );
+    let mut chars = Vec::with_capacity(bytes.len());
+    let (mut bi, mut count) = (0, 0usize);
+    for (b, _) in window.char_indices() {
+        while bi < bytes.len() && bytes[bi] == b {
+            chars.push(count);
+            bi += 1;
+        }
+        count += 1;
+    }
+    while bi < bytes.len() {
+        chars.push(count); // offsets sitting at the window's very end
+        bi += 1;
+    }
+    let mut delta = 0i64;
+    for (i, (_, _, repl)) in edits.iter().enumerate() {
+        let start = ((window_start + chars[2 * i]) as i64 + delta) as usize;
+        let end = ((window_start + chars[2 * i + 1]) as i64 + delta) as usize;
+        if end > start {
+            sess.buffer.delete_region(start, end);
+        }
+        sess.buffer.goto_char(start);
+        if !repl.is_empty() {
+            sess.buffer.insert(repl);
+        }
+        delta += repl.chars().count() as i64 - (end - start) as i64;
+    }
+    edits.len() as i64
 }
 
 /// The language the current buffer parses as: the buffer's

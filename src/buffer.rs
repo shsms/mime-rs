@@ -540,7 +540,9 @@ impl crate::store::TextStore for Buffer {
 }
 
 /// Expand Emacs-style `\N` (group) and `\&` (whole match) backrefs.
-fn expand_backrefs(rep: &str, groups: &[Option<String>]) -> String {
+/// `pub(crate)`: Quire's `replace_match` and the streaming `replace-regexp`
+/// builtin share this one copy.
+pub(crate) fn expand_backrefs(rep: &str, groups: &[Option<String>]) -> String {
     let mut out = String::new();
     let mut it = rep.chars().peekable();
     while let Some(c) = it.next() {

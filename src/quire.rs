@@ -1116,7 +1116,7 @@ impl Quire {
             .last_match
             .take()
             .ok_or("replace-match: no preceding match")?;
-        let expanded = expand_backrefs(replacement, &md.groups);
+        let expanded = crate::buffer::expand_backrefs(replacement, &md.groups);
         let (start, end) = (md.start, md.end);
         let new_len = expanded.chars().count();
         let old_len = end - start;
@@ -1510,39 +1510,6 @@ impl TextStore for Quire {
         });
         err.map_or(Ok(written), Err)
     }
-}
-
-/// Expand Emacs-style `\N` (group) and `\&` (whole match) backrefs. Mirrors
-/// `buffer::expand_backrefs` so `replace_match` matches the oracle exactly.
-fn expand_backrefs(rep: &str, groups: &[Option<String>]) -> String {
-    let mut out = String::new();
-    let mut it = rep.chars().peekable();
-    while let Some(c) = it.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match it.peek() {
-            Some('&') => {
-                it.next();
-                if let Some(Some(g)) = groups.first() {
-                    out.push_str(g);
-                }
-            }
-            Some(d) if d.is_ascii_digit() => {
-                let n = it.next().unwrap().to_digit(10).unwrap() as usize;
-                if let Some(Some(g)) = groups.get(n) {
-                    out.push_str(g);
-                }
-            }
-            Some('\\') => {
-                it.next();
-                out.push('\\');
-            }
-            _ => out.push('\\'),
-        }
-    }
-    out
 }
 
 #[cfg(test)]

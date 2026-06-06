@@ -1137,6 +1137,38 @@ mod tests {
     }
 
     #[test]
+    fn bulk_replace_counts_lands_point_and_respects_anchors_and_markers() {
+        let r = run(
+            "foo x\nfoo y\nbar foo\n",
+            r#"(goto-char 1)
+               (let ((m (copy-marker 19))) ; the final "o" of "bar foo"
+                 (report "n" (replace-regexp "^foo" "F"))
+                 (report "point" (point))
+                 (report "marker" (marker-position m))
+                 (report "none" (replace-string "absent" "X")))"#,
+        );
+        // Only the two line-start "foo"s — the third is mid-line.
+        assert_eq!(report(&r, "n"), "2");
+        assert_eq!(r.final_text, "F x\nF y\nbar foo\n");
+        assert_eq!(report(&r, "point"), "6"); // after the second replacement
+        assert_eq!(report(&r, "marker"), "15"); // tracked both shrinks
+        assert_eq!(report(&r, "none"), "0");
+    }
+
+    #[test]
+    fn bulk_replace_starts_at_point_and_keeps_replacement_text_unmatched() {
+        let r = run(
+            "ab ab ab",
+            r#"(goto-char 4) ; skip the first "ab"
+               (report "n" (replace-string "ab" "ab-ab"))"#,
+        );
+        // The two matches after point each expand; the "ab"s inside the
+        // replacements are not re-matched.
+        assert_eq!(report(&r, "n"), "2");
+        assert_eq!(r.final_text, "ab ab-ab ab-ab");
+    }
+
+    #[test]
     fn line_positions_and_goto_line() {
         let r = run(
             "hello\nworld\n",
