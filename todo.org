@@ -12,6 +12,17 @@ persisted). Check the CLI, daemon, and MCP front-ends share the discard and
 fix all three. Then ~upd-epub-to-jp.tl~'s enriched error shrinks back to a
 plain ~(error ...)~.
 
+** TODO One-shot closing diff: track the primary buffer [#B]
+The run's closing ~diff~/~len_*~ compare the *initial primary* buffer against
+whatever buffer is *current at exit*. A program invoked with ~--infile~ (so
+the primary is an empty ~*stdin*~) that ends on a ~find-file~'d document gets
+the whole document rendered as one giant insertion — ulysses-annotated's
+~upd-epub-to-jp.tl~ emitted ~2 MB of escaped JSON per run until it switched
+back to the primary before exiting (its add-anno / place-diff siblings carry
+the same ~set-buffer~-home workaround). Diff the primary buffer's own
+before/after instead — or make the closing diff suppressible — and the three
+scripts can drop the workaround.
+
 ** TODO Literal replace_text MCP tool [#B]
 ~insert_text~'s counterpart: exact pattern in, literal replacement in, no
 elisp — removes the double-escaping risk in ~run_program~ for quote-heavy
