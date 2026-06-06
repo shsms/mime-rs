@@ -203,8 +203,8 @@ fn op_run(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>, rehearse: b
         Err(e) => {
             // Failure shape: the reports/log the program accumulated before it
             // died ride along, so diagnostics survive the error.
-            let (reports, log) = ws.failure_context();
-            crate::result::failure_json(&e, &reports, &log)
+            let (reports, log, dirty) = ws.failure_context();
+            crate::result::failure_json(&e, &reports, &log, dirty)
         }
     }
 }

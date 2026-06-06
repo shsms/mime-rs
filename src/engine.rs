@@ -182,6 +182,11 @@ pub struct Workspace {
     /// The trust tier; `Trusted` additionally registers the orchestration builtin
     /// group. Fixed at construction — an agent cannot escalate it.
     capabilities: Capabilities,
+    /// Whether the most recent FAILED program left the buffer changed —
+    /// surfaced by [`failure_context`](Self::failure_context) so a failure
+    /// JSON can say whether partial edits persist (a warm run does not roll
+    /// back on error; read-only and rehearse sessions do).
+    last_failure_dirty: std::cell::Cell<bool>,
 }
 
 /// The trust tier a workspace runs at, chosen by the front-end MODE at launch
@@ -258,6 +263,7 @@ impl Workspace {
             session,
             read_only,
             capabilities,
+            last_failure_dirty: std::cell::Cell::new(false),
         }
     }
 
@@ -287,7 +293,19 @@ impl Workspace {
             .read_only
             .then(|| self.session.borrow().buffer.snapshot());
 
-        let (report, value) = self.eval_and_report(program, false)?;
+        let (report, value) = match self.eval_and_report(program, false) {
+            Ok(rv) => rv,
+            // A program that mutated and THEN died must not leave its edits in
+            // a read-only session either — restore the snapshot before
+            // propagating, and the failure is clean (not dirty).
+            Err(e) => {
+                if let Some(snap) = guard {
+                    self.session.borrow_mut().buffer = snap;
+                    self.last_failure_dirty.set(false);
+                }
+                return Err(e);
+            }
+        };
 
         // Enforce read-only after the fact: if the program left the buffer
         // changed, restore the snapshot and reject it. (Programs that only
@@ -334,6 +352,9 @@ impl Workspace {
         s.buffer = snap;
         s.kill_ring.truncate(kill_len);
         s.checkpoints.truncate(cp_len);
+        // The rollback above means a failed rehearsal never leaves edits; its
+        // reports/log DO remain readable via `failure_context`, by design.
+        self.last_failure_dirty.set(false);
         result.map(|(report, _value)| report)
     }
 
@@ -355,11 +376,20 @@ impl Workspace {
         };
         let len_before = before.chars().count();
 
-        let value = self
-            .ctx
-            .eval_string(program)
-            .map_err(|e| e.format(&self.ctx))?
-            .to_string();
+        let value = match self.ctx.eval_string(program) {
+            Ok(v) => v.to_string(),
+            // Record whether the dying program left edits behind (a warm run
+            // does not roll back), so the failure JSON can say so. The length
+            // check short-circuits the full-text compare for the common case
+            // of a size-changing edit on a large buffer.
+            Err(e) => {
+                let s = self.session.borrow();
+                let dirty = s.buffer.char_len() != len_before || s.buffer.text() != before;
+                drop(s);
+                self.last_failure_dirty.set(dirty);
+                return Err(e.format(&self.ctx));
+            }
+        };
 
         let s = self.session.borrow();
         let after = s.buffer.text().to_string();
@@ -379,14 +409,20 @@ impl Workspace {
         Ok((report, value))
     }
 
-    /// The reports and log the most recent program accumulated — read after a
-    /// FAILED run, where they hold everything the program said before it died
-    /// (they are cleared at the start of every run, so they always belong to
-    /// the last one; an error does not clear them). The failure JSONs carry
-    /// these so diagnostics need not be packed into the error string.
-    pub fn failure_context(&self) -> (Vec<(String, String)>, Vec<String>) {
+    /// What the most recent FAILED program left behind: the reports and log it
+    /// accumulated before dying (cleared at the start of every run, so they
+    /// always belong to the last one; an error does not clear them), plus
+    /// whether its edits persist — `true` only for a warm writable run that
+    /// mutated before erroring (read-only and rehearse sessions roll back).
+    /// The failure JSONs carry all three so diagnostics need not be packed
+    /// into the error string.
+    pub fn failure_context(&self) -> (Vec<(String, String)>, Vec<String>, bool) {
         let s = self.session.borrow();
-        (s.reports.clone(), s.log.clone())
+        (
+            s.reports.clone(),
+            s.log.clone(),
+            self.last_failure_dirty.get(),
+        )
     }
 
     /// The current buffer text — used by the daemon's `save` op.
@@ -619,14 +655,39 @@ mod tests {
             Ok(_) => panic!("program must fail"),
         };
         assert!(e.contains("boom"), "got: {e}");
-        // The diagnostics the program emitted before dying survive the error...
-        let (reports, log) = ws.failure_context();
+        // The diagnostics the program emitted before dying survive the error;
+        // a navigate-and-report program leaves no edits → not dirty.
+        let (reports, log, dirty) = ws.failure_context();
         assert_eq!(reports, vec![("step".to_string(), "1".to_string())]);
         assert_eq!(log, vec!["got here".to_string()]);
+        assert!(!dirty);
+        // A program that edits and THEN dies reports its lasting partial edit.
+        assert!(
+            ws.run(r#"(insert "partial ") (error "late boom")"#)
+                .is_err()
+        );
+        let (_, _, dirty) = ws.failure_context();
+        assert!(dirty, "warm runs keep pre-error edits — flagged");
+        assert!(ws.text().starts_with("partial "));
         // ...and the next run owns the slate again.
         ws.run("(point)").unwrap();
-        let (reports, log) = ws.failure_context();
+        let (reports, log, _) = ws.failure_context();
         assert!(reports.is_empty() && log.is_empty());
+    }
+
+    #[test]
+    fn read_only_rolls_back_a_program_that_edits_then_dies() {
+        let mut ws = Workspace::new_read_only(Box::new(Buffer::from_string("ref", "keep me")));
+        let e = match ws.run(r#"(insert "EDIT") (error "mid-flight")"#) {
+            Err(e) => e,
+            Ok(_) => panic!("program must fail"),
+        };
+        assert!(e.contains("mid-flight"), "got: {e}");
+        // The pre-error mutation must not survive in a read-only session...
+        assert_eq!(ws.text(), "keep me");
+        // ...so the failure is reported clean, not dirty.
+        let (_, _, dirty) = ws.failure_context();
+        assert!(!dirty);
     }
 
     #[test]

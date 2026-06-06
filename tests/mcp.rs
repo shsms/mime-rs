@@ -475,6 +475,20 @@ fn failed_run_carries_the_programs_reports_and_log() {
     );
     assert_eq!(failure["reports"]["saw"], "6");
     assert_eq!(failure["log"][0], "diag");
+    // A navigate-and-report program left no edits behind.
+    assert_eq!(failure["dirty"], false);
+
+    // A program that edits and THEN dies: the failure says the partial edit
+    // persists (a run does not roll back).
+    let err = s.call_err(
+        3,
+        "run_program",
+        json!({ "program": r#"(insert "partial ") (error "late boom")"# }),
+    );
+    let failure: Value = serde_json::from_str(&err).expect("failure content is JSON");
+    assert_eq!(failure["dirty"], true);
+    let text = s.call_ok(4, "read_region", json!({ "start": 1, "end": 14 }));
+    assert_eq!(text, "partial hello", "the pre-error edit persisted");
 }
 
 #[test]

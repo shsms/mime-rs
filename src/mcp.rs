@@ -333,11 +333,13 @@ fn tool_run_program(
         // content is the failure JSON carrying its reports/log, not just the
         // bare error string.
         Err(e) => {
-            let (reports, log) = sessions
+            let (reports, log, dirty) = sessions
                 .get(&session)
                 .map(|ws| ws.failure_context())
                 .unwrap_or_default();
-            return Err(pretty(&crate::result::failure_json(&e, &reports, &log)));
+            return Err(pretty(&crate::result::failure_json(
+                &e, &reports, &log, dirty,
+            )));
         }
     };
     // A rehearsal persists nothing, so it audits as a non-mutating event.

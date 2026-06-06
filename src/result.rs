@@ -62,13 +62,21 @@ pub fn reports_to_json(reports: &[(String, String)]) -> Value {
 /// The failure shape every front-end emits for a program that signaled an
 /// error: `ok:false` + the error string, PLUS the `reports`/`log` the program
 /// accumulated before it died — the diagnostics callers used to pack into the
-/// error message itself. Additive: `ok` stays the discriminator, and there is
-/// deliberately no `diff` (what a failed run left behind is the *next* run's
-/// concern, not a result).
-pub fn failure_json(error: &str, reports: &[(String, String)], log: &[String]) -> Value {
+/// error message itself — and `dirty`, whether the dying program's edits
+/// persist (true only for a warm writable run; read-only and rehearse roll
+/// back). Additive: `ok` stays the discriminator, and there is deliberately
+/// no `diff` (what a failed run left behind is the *next* run's concern, not
+/// a result).
+pub fn failure_json(
+    error: &str,
+    reports: &[(String, String)],
+    log: &[String],
+    dirty: bool,
+) -> Value {
     json!({
         "ok": false,
         "error": error,
+        "dirty": dirty,
         "reports": reports_to_json(reports),
         "log": log,
     })
