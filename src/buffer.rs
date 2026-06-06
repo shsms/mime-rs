@@ -258,52 +258,70 @@ impl Buffer {
     }
 
     // ---- line navigation ----
-    // Line motion honors the narrowing, like Emacs: newline scans run over the
-    // accessible region only, so point never escapes [point_min, point_max)
-    // even when the restriction starts or ends mid-line.
+    // Line motion honors the narrowing, like Emacs: the RESULT is clamped into
+    // [point_min, point_max] so point never escapes the accessible region even
+    // when the restriction starts or ends mid-line. The newline scan itself
+    // runs over the raw text and the clamp happens in CHAR space — deliberately
+    // not byte space, because `byte_of(point_min/point_max)` misses the hint's
+    // boundary fast paths on a narrowed buffer and would drag the byte hint to
+    // the region edge on every call, degrading line-walking loops (occur,
+    // window, conflict scans) to O(region²) conversions.
     /// Move point to the first char of its line (just after the previous
     /// newline), clamped to `point_min`.
     pub fn beginning_of_line(&mut self) {
-        let min_b = self.byte_of(self.point_min());
-        let b = self.byte_of(self.point).max(min_b);
-        let start = self.text[min_b..b]
-            .rfind('\n')
-            .map_or(min_b, |i| min_b + i + 1);
-        self.point = self.char_of(start);
+        let b = self.byte_of(self.point);
+        let start = self.text[..b].rfind('\n').map_or(0, |i| i + 1);
+        // The raise is document-clamped: a stale narrowing can outlive
+        // deletions that shrank the text past its bounds.
+        let min = self.point_min().min(self.char_len + 1);
+        self.point = self.char_of(start).max(min);
     }
     /// Move point to the end of its line (just before the next newline),
     /// clamped to `point_max`.
     pub fn end_of_line(&mut self) {
-        let limit = self.byte_of(self.point_max());
-        let b = self.byte_of(self.point).min(limit);
-        let end = self.text[b..limit].find('\n').map_or(limit, |i| b + i);
-        self.point = self.char_of(end);
+        let b = self.byte_of(self.point);
+        let end = self.text[b..].find('\n').map_or(self.text.len(), |i| b + i);
+        self.point = self.char_of(end).min(self.point_max());
     }
     /// Move point `n` lines forward, to a line beginning. Returns the count of
-    /// lines that could not be moved (0 on full success), like Emacs.
+    /// lines that could not be moved (0 on full success), like Emacs. A line
+    /// beginning outside the narrowing is unreachable: point clamps to the
+    /// boundary and the move counts as short.
     pub fn forward_line(&mut self, n: i64) -> i64 {
         self.beginning_of_line();
         let mut left = n.abs();
-        let min_b = self.byte_of(self.point_min());
-        let limit = self.byte_of(self.point_max());
         while left > 0 {
-            let b = self.byte_of(self.point).clamp(min_b, limit);
+            let b = self.byte_of(self.point);
             if n >= 0 {
-                match self.text[b..limit].find('\n') {
-                    Some(i) => self.point = self.char_of(b + i + 1),
+                match self.text[b..].find('\n') {
+                    Some(i) => {
+                        let target = self.char_of(b + i + 1);
+                        if target > self.point_max() {
+                            self.point = self.point_max();
+                            return left;
+                        }
+                        self.point = target;
+                    }
                     None => {
                         self.point = self.point_max();
                         return left;
                     }
                 }
             } else {
-                match self.text[min_b..b.saturating_sub(1).max(min_b)].rfind('\n') {
-                    Some(i) => self.point = self.char_of(min_b + i + 1),
-                    None => {
-                        self.point = self.point_min();
-                        return left;
-                    }
+                // Exclude the previous line's terminator: cut just before the
+                // char preceding point. `byte_of(point - 1)` keeps the cut on
+                // a char boundary even when the clamped line start sits after
+                // a multibyte char (a `b - 1` byte cut would split it).
+                let cut = self.byte_of(self.point.saturating_sub(1).max(1));
+                let target = match self.text[..cut].rfind('\n') {
+                    Some(i) => self.char_of(i + 1),
+                    None => 1,
+                };
+                if target <= self.point_min() {
+                    self.point = self.point_min();
+                    return left;
                 }
+                self.point = target;
             }
             left -= 1;
         }
