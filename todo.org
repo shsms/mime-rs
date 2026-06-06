@@ -56,6 +56,15 @@ buffers by visited path and uniquify the name Emacs-style (~doc.txt<2>~);
 ** TODO replace-match FIXEDCASE/LITERAL args
 It always expands backrefs; the optional Emacs arguments are unimplemented.
 
+** TODO Line anchors in windowed regex search
+~^~ / ~$~ anchor the *windowed slice*, not lines: the search builtins apply
+the pattern to ~text[start..end]~ without the multi-line flag, so
+~(re-search-forward "^foo")~ misses every line start except the window's own
+(Emacs regex ~^~ means line start). Options: compile searches with ~(?m)~ by
+default (Emacs parity — check ~$~/~\z~ interactions and the ulysses
+patterns), or document the divergence loudly. Surfaced by the review of the
+conflict overview's occur suggestion, which had to drop its anchor.
+
 ** TODO Per-program resource limits
 A wall-clock/CPU bound per program — blocked on tulisp cooperative
 cancellation (eval interruption), see the wishlist below.
