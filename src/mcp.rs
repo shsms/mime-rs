@@ -279,7 +279,8 @@ fn save_visited(
     let bytes = ws.save_to(&path).map_err(|e| {
         format!(
             "save failed: {e} — the edit is preserved in warm session \
-             \"{session}\"; resolve the file state or save_buffer it elsewhere"
+             \"{session}\"; save_buffer it elsewhere, or run_program \
+             (revert-buffer) to discard it and re-read the disk state"
         )
     })?;
     Ok(format!(

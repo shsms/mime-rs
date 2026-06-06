@@ -500,6 +500,49 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                 .into()
         });
     }
+    {
+        // (revert-buffer) — discard the buffer's edits and re-read the visited
+        // file from disk: the recovery path when the stale guard refuses a
+        // save (an external writer landed since open). Point is preserved by
+        // position (clamped to the new content); narrowing and markers are
+        // dropped with the old text. Re-reads only the already-authorized
+        // visited path, so it is safe in the sandboxed tier. There is
+        // deliberately no force-save counterpart — overwriting an external
+        // writer's work stays impossible; revert, re-apply, save.
+        let s = session.clone();
+        ctx.defun("revert-buffer", move || -> Result<bool, Error> {
+            let mut sess = s.borrow_mut();
+            let path = sess
+                .buffer
+                .file_stamp()
+                .map(|st| st.path.clone())
+                .ok_or_else(|| err("revert-buffer: buffer has no visited file"))?;
+            let point = sess.buffer.point();
+            let name = sess.buffer.name().to_string();
+            let markers = sess.buffer.marker_count();
+            let mut store = crate::Quire::open(&path).map_err(|e| {
+                err(&format!(
+                    "revert-buffer: cannot re-read {}: {e}",
+                    path.display()
+                ))
+            })?;
+            // Keep the buffer's identity: a fresh Quire is named after the
+            // file's basename, which would undo find-file's uniquification
+            // (doc.txt<2> reverting to a second "doc.txt") and detach any
+            // name-keyed state (lang_overrides).
+            crate::store::TextStore::set_name(&mut store, &name);
+            sess.buffer = Box::new(store);
+            // The old content's markers die with it — pad the fresh registry
+            // with detached slots so live Marker handles read nil instead of
+            // aliasing markers created after the revert (id reuse).
+            for _ in 0..markers {
+                sess.buffer.marker_create(None);
+            }
+            let max = sess.buffer.point_max();
+            sess.buffer.goto_char(point.min(max));
+            Ok(true)
+        });
+    }
 
     // ---- mark & region ----
     {
@@ -2403,6 +2446,18 @@ mod tests {
         // Revisiting the FILE (not the name) finds the original buffer.
         assert_eq!(report(&r, "revisit"), "\"doc.txt\"");
         assert_eq!(report(&r, "first-txt"), "\"alpha\"");
+
+        // revert-buffer keeps a uniquified name — no duplicate "doc.txt".
+        let r = ws
+            .run(
+                r#"(set-buffer "doc.txt<2>")
+                   (revert-buffer)
+                   (report "name" (current-buffer))
+                   (report "list" (buffer-list))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "name"), "\"doc.txt<2>\"");
+        assert_eq!(report(&r, "list"), "(\"doc.txt<2>\" \"main\" \"doc.txt\")");
 
         std::fs::remove_dir_all(&dir).ok();
     }

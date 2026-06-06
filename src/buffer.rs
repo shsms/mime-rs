@@ -529,6 +529,9 @@ impl crate::store::TextStore for Buffer {
     fn marker_position(&self, id: usize) -> Option<usize> {
         Buffer::marker_position(self, id)
     }
+    fn marker_count(&self) -> usize {
+        self.markers.len()
+    }
     fn marker_set(&mut self, id: usize, pos: Option<usize>) {
         Buffer::marker_set(self, id, pos)
     }

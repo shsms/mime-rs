@@ -62,6 +62,10 @@ pub trait TextStore {
     /// its id. Markers auto-adjust as text is inserted/deleted — Emacs markers,
     /// the durable positions that back multiple cursors/viewports.
     fn marker_create(&mut self, pos: Option<usize>) -> usize;
+    /// Number of marker slots ever issued (live or detached) — `revert-buffer`
+    /// pads a fresh store's registry to this length so old ids stay detached
+    /// instead of aliasing newly created markers.
+    fn marker_count(&self) -> usize;
     /// The marker's current absolute 1-based position, or `None` if detached.
     fn marker_position(&self, id: usize) -> Option<usize>;
     /// Point marker `id` at absolute `pos`, or detach it with `None`.

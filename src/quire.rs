@@ -1484,6 +1484,9 @@ impl TextStore for Quire {
     fn marker_position(&self, id: usize) -> Option<usize> {
         Quire::marker_position(self, id)
     }
+    fn marker_count(&self) -> usize {
+        self.markers.len()
+    }
     fn marker_set(&mut self, id: usize, pos: Option<usize>) {
         Quire::marker_set(self, id, pos)
     }

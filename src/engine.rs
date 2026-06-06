@@ -492,8 +492,8 @@ impl Workspace {
             if let Some(reason) = stale_visit(s.buffer.as_ref(), path) {
                 return Err(std::io::Error::other(format!(
                     "refusing to save: {} was {reason} after it was opened; \
-                     re-open the file to pick up the external change, or save \
-                     to a different path",
+                     (revert-buffer) discards the buffer's edits and re-reads \
+                     the file, or save to a different path",
                     path.display()
                 )));
             }
