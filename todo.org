@@ -58,16 +58,23 @@ cancellation (eval interruption), see the wishlist below.
 
 * Structural editing
 
-** TODO First-class nodes + incremental re-parse [#B]
-The parse now persists on the Session (re-parse per edit, not per call);
-next: nodes as first-class values (a live tree to reference, like
-markers), relational navigation + fields (~node-parent~ / ~child~ /
-~next-sibling~ / ~child-by-field-name~), and incremental re-parse
-(~InputEdit~s instead of O(buffer) per edit).
+** TODO Byte↔char index on Syntax [#C]
+Every node accessor converts byte offsets to char positions via an
+O(text) prefix scan (~char_of~), so mapping accessors over a big
+query's captures is O(captures × file). A line-offset index built once
+per parse (or reusing the store's tree summaries) makes it O(log).
 
-** TODO AST-edit ops [#C]
+** TODO Incremental re-parse (~InputEdit~s) [#C]
+Nodes are first-class values with relational navigation now; the last
+piece is feeding ~InputEdit~s from buffer mutations instead of a full
+re-parse per edit. Needs edit logging in both stores (byte offsets +
+row/col Points at mutation time), lazily enabled on first treesit use
+so non-treesit workloads pay nothing.
+
+** TODO AST-edit ops [#B]
 ~replace-node~ / ~wrap-node~ / ~raise-node~ / ~kill-node~ / insert-sibling —
-thin wrappers over delete+insert once nodes are first-class values.
+thin wrappers over delete+insert now that nodes are first-class values
+(take a NODE, splice at its span, return the re-parsed replacement).
 
 ** TODO More languages [#C]
 JS/TS, Go, …: a ~Lang~ variant + extension row + ~defun_kinds~ row each. Fix
