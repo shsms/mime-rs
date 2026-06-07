@@ -11,8 +11,9 @@
 //! Python parse with plain [`tree_sitter::Parser`]; their "defun" kinds are
 //! the function/type definition nodes ([`Lang::defun_kinds`]).
 //!
-//! The buffer is re-parsed fresh on every call (`Syntax::parse`). That is the
-//! simple, always-correct baseline; incremental re-parse is a TODO below.
+//! The parse persists on the `Session` keyed by content version (see
+//! `syntax_of` in builtins.rs); a fresh `Syntax::parse` runs only after an
+//! edit. Incremental re-parse is a TODO below.
 //!
 //! Positions: tree-sitter speaks UTF-8 **byte** offsets; mime-rs speaks 1-based
 //! **char** positions (Emacs-style, where a position sits *before* the char of
@@ -20,14 +21,14 @@
 //! multibyte content (em dashes, accents) maps correctly.
 //!
 //! TODO (future M7 work):
-//!   - Persistent per-`Session` tree + incremental re-parse: keep the parse on
-//!     the `Session` and feed `InputEdit`s on every buffer mutation instead of
-//!     re-parsing from scratch; nodes as first-class values (like markers)
-//!     unlock relational navigation (`node-parent` / `child-by-field-name`).
+//!   - Incremental re-parse: feed `InputEdit`s from buffer mutations instead
+//!     of a full re-parse per edit (needs edit logging in the stores, lazily
+//!     enabled so non-treesit workloads pay nothing).
 //!   - More languages (JS/TS, Go, …) — adding one is a `Lang` variant, an
 //!     extension mapping, and a `defun_kinds` row.
 //!   - AST-edit ops over the current node: `replace-node`, `wrap-node`,
-//!     `raise-node`, `kill-node`.
+//!     `raise-node`, `kill-node` — thin wrappers now that nodes are
+//!     first-class values.
 //!   - Surface a few of these as MCP tools once the builtin surface settles.
 
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
@@ -446,10 +447,10 @@ impl Syntax {
     }
 
     /// Run a tree-sitter query (`.scm` pattern syntax) over the whole buffer
-    /// and return every capture as `(capture_name, span)`, in match order —
+    /// and return every capture as `(capture_name, handle)`, in match order —
     /// structural search: "every `function_item`", "calls to `foo`", … .
     /// `Err` is the query compile error (pattern syntax / unknown node kind).
-    pub fn query(&self, pattern: &str) -> Result<Vec<(String, NodeSpan)>, String> {
+    pub fn query(&self, pattern: &str) -> Result<Vec<(String, NodeRef)>, String> {
         let query = Query::new(&self.lang.grammar(), pattern).map_err(|e| e.to_string())?;
         let names = query.capture_names();
         let mut cursor = QueryCursor::new();
@@ -459,7 +460,7 @@ impl Syntax {
             for cap in m.captures {
                 out.push((
                     names[cap.index as usize].to_string(),
-                    self.span_of(cap.node),
+                    Self::handle(cap.node),
                 ));
             }
         }
@@ -641,8 +642,10 @@ mod tests {
             .expect("valid query");
         let names: Vec<&str> = caps.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["callee", "callee"]);
-        // Spans address the buffer: the first capture is `abs`.
-        let (_, span) = &caps[0];
+        // Handles address the buffer: the first capture is `abs`.
+        let (_, h) = caps[0];
+        assert_eq!(syn.text_of_handle(h).as_deref(), Some("abs"));
+        let span = syn.describe(h).unwrap();
         let chars: Vec<char> = RS.chars().collect();
         let got: String = chars[span.start - 1..span.end - 1].iter().collect();
         assert_eq!(got, "abs");

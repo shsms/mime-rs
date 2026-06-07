@@ -2097,25 +2097,30 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // (treesit-query PATTERN) — run a tree-sitter query (.scm pattern
         // syntax) over the buffer: structural search ("every call to foo",
         // "all pub fns") instead of regex. Reports each capture as
-        // "@CAPTURE KIND START END" and returns the matching list of
-        // "START END" strings (split-string to consume). Errors if the
-        // pattern does not compile for the buffer's language.
+        // "@CAPTURE KIND START END" and returns the captures as a list of
+        // first-class NODE values (feed treesit-node-text / -start / the
+        // navigation family; the report rows carry the capture names).
+        // Errors if the pattern does not compile for the buffer's language.
         ctx.defun(
             "treesit-query",
-            move |pattern: String| -> Result<Vec<String>, Error> {
+            move |pattern: String| -> Result<Vec<TsNode>, Error> {
                 let mut sess = s.borrow_mut();
-                let caps = syntax_of(&mut sess)
+                let version = sess.buffer.version();
+                let syn = syntax_of(&mut sess);
+                let caps = syn
                     .query(&pattern)
                     .map_err(|e| err(&format!("treesit-query: {e}")))?;
-                let mut spans = Vec::with_capacity(caps.len());
-                for (name, n) in caps {
+                let mut nodes = Vec::with_capacity(caps.len());
+                for (name, h) in caps {
+                    let node = TsNode::new(&syn, version, h);
+                    let span = node.described()?;
                     sess.reports.push((
                         "capture".to_string(),
-                        format!("@{name} {} {} {}", n.kind, n.start, n.end),
+                        format!("@{name} {} {} {}", span.kind, span.start, span.end),
                     ));
-                    spans.push(format!("{} {}", n.start, n.end));
+                    nodes.push(node);
                 }
-                Ok(spans)
+                Ok(nodes)
             },
         );
     }
