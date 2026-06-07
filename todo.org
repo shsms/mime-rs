@@ -81,7 +81,66 @@ JS/TS, Go, …: a ~Lang~ variant + extension row + ~defun_kinds~ row each. Fix
 Python ~decorated_definition~ spans (include the decorators). Adjacent: a
 formatter for code edits (~rustfmt~ via ~call-process~, trusted tier only).
 
+* TUI cockpit (mime tui)
+
+A terminal UI over the engine — an observer/stepper first, an editor only
+if daily use pulls it there. Two entry modes sharing one shell:
+~mime tui SCRIPT.tl --file F~ (step a script locally) and
+~mime tui --attach [S]~ (watch a daemon session live). ratatui +
+crossterm behind a ~tui~ feature flag so the core stays lean; the
+single-threaded ~Rc~ engine fits a TUI event loop as-is.
+
+** TODO Phase 0 — script stepper spike [#B]
+~mime tui SCRIPT.tl --file F~: in-process trusted Workspace, three panes
+— buffer viewport (rendered from read_region + point, not the gutter'd
+~window~ string), program pane (top-level forms, current one
+highlighted), report/diff pane (per-step unified diff + reports/log).
+SPACE = eval next form, q = quit (discard unless --write).
+Prerequisites:
+- form-by-form eval: read ONE top-level form at a time from the source
+  and eval it against the warm context. If tulisp's reader can't yield
+  forms incrementally, that's a tulisp wishlist item (below).
+- per-step diff: store snapshot before each form, ~unified_diff~ after
+  (snapshots are O(log n) for Quire — cheap even per step).
+/Exit: watch a conflict-resolution script land hunk by hunk./
+
+** TODO Phase 1 — playback controls
+Auto-play with a speed setting (delay per form), pause/resume, restart
+(snapshot at program start; rollback + replay — rehearse semantics make
+this free), step-backward via the same snapshots (keep the last N),
+finish-and-save vs finish-and-discard. Status bar: point, narrowing,
+stale flag, step n/m, buffer name/version.
+
+** TODO Phase 2 — daemon cockpit (--attach)
+Watch an AGENT edit live: poll the daemon (the accept loop is
+single-threaded and serves one connection at a time, so short poll
+connections, not a held-open subscription) with a new read-only
+~op_render {session, pos?, lines}~ + the existing op_status; panes for
+viewport, per-run diffs as they land, audit-journal tail, session list.
+Read-only by design — the cockpit must never be a second writer.
+Stretch: a REPL pane that sends forms to the watched session (it IS a
+warm single writer, so interleaving with the agent needs a turn-taking
+rule or an explicit "take control" toggle).
+
+** TODO Phase 3 — polish
+- treesit-driven syntax highlighting of the viewport (the persistent
+  parse + node spans are exactly a fontifier's input).
+- edit-level animation: step INSIDE a form (watch replace-regexp sweep
+  its matches) — needs the store edit-event log, the same
+  infrastructure incremental re-parse (~InputEdit~s) wants; build once,
+  serve both.
+- conflict hunks rendered with side colouring; ~conflict-context~ as a
+  pane.
+/Decide before an "editor" grows out of this: granular undo (the
+checkpoint mechanism is too coarse for interactive editing) and keymaps
+(tulisp-dispatched) are the gating engine features./
+
 * tulisp wishlist
+
+** TODO Incremental reader (one form at a time)
+~mime tui~'s stepper needs to read a single top-level form from a
+source string (returning the form + the rest), instead of parse-all →
+eval-all. Check what the parser already exposes before adding API.
 
 ** TODO ~format~ conversions ~%x %o %c %e %g~
 ** TODO Obarray introspection
