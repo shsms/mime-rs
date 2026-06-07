@@ -1416,12 +1416,23 @@ mod tests {
 
     #[test]
     fn treesit_node_at_accepts_explicit_pos() {
-        // Explicit POS argument inside the H2 body paragraph.
+        // Explicit POS argument inside the H2 body paragraph. The return is a
+        // first-class node value; its accessors read it back.
         let p = MD.find("More").unwrap() + 1;
-        let r = run(MD, &format!("(report \"t\" (treesit-node-at {p}))"));
-        // Returns the node type (here the paragraph's inline content); reported
-        // through `report` it renders as a quoted tulisp string.
-        assert_eq!(report(&r, "t"), "\"inline\"");
+        let r = run(
+            MD,
+            &format!(
+                r#"(let ((n (treesit-node-at {p})))
+                     (report "n" n)
+                     (report "type" (treesit-node-type n))
+                     (report "is-node" (if (treesit-node-p n) 1 0))
+                     (report "not-node" (if (treesit-node-p 5) 1 0)))"#
+            ),
+        );
+        assert_eq!(report(&r, "n"), "#<node inline @31..46>");
+        assert_eq!(report(&r, "type"), "\"inline\"");
+        assert_eq!(report(&r, "is-node"), "1");
+        assert_eq!(report(&r, "not-node"), "0");
         assert_eq!(report(&r, "treesit-node-type"), "inline");
     }
 

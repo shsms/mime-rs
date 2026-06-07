@@ -244,16 +244,6 @@ impl Syntax {
         &self.text[node.start_byte()..node.end_byte()]
     }
 
-    /// The smallest *named* node covering char position `pos`, as a [`NodeSpan`].
-    /// `None` only for a degenerate (empty) tree. A zero-width query at `pos`
-    /// finds the node containing the gap before the char at `pos`.
-    pub fn named_node_at(&self, pos: usize) -> Option<NodeSpan> {
-        let b = self.byte_of(pos);
-        self.root()
-            .named_descendant_for_byte_range(b, b)
-            .map(|n| self.span_of(n))
-    }
-
     /// The nearest enclosing defun-kind node (see [`Lang::defun_kinds`]) at
     /// `pos`, as a char span. Walks up from the smallest node at `pos`; the
     /// innermost qualifying construct wins (a method, not its `impl`). `None`

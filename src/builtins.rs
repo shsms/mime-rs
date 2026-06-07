@@ -3,7 +3,7 @@
 //! `Session`). M0 subset: navigation, edit, regex search/replace, reporting.
 //! Subagents extend this with region/mark, kill-ring, markers, and narrowing.
 use crate::engine::{Checkpoint, SharedSession};
-use crate::syntax::{Lang, Syntax};
+use crate::syntax::{Lang, NodeRef, Syntax};
 use tulisp::{Error, Shared, TulispContext, TulispConvertible, TulispObject, TulispValue};
 
 fn bad_regex(e: regex::Error) -> Error {
@@ -71,6 +71,102 @@ impl TulispConvertible for Marker {
     fn into_tulisp(self) -> TulispObject {
         Shared::new(self).into()
     }
+}
+
+/// A first-class parse-tree node: a [`NodeRef`] paired with the `Rc`'d
+/// [`Syntax`] it came from and the buffer content version that parse
+/// reflects. Accessors refuse an OUTDATED node (the buffer was edited since
+/// the parse) instead of serving positions from a stale tree — Emacs's
+/// `treesit-node-outdated` discipline. Cheap to clone; the `Rc` keeps the
+/// parse alive even after the session cache moves on.
+#[derive(Clone)]
+struct TsNode {
+    syn: std::rc::Rc<Syntax>,
+    h: NodeRef,
+    version: u64,
+}
+
+impl TsNode {
+    fn new(syn: &std::rc::Rc<Syntax>, version: u64, h: NodeRef) -> TsNode {
+        TsNode {
+            syn: std::rc::Rc::clone(syn),
+            h,
+            version,
+        }
+    }
+
+    /// A sibling value in the same parse (relational results).
+    fn derive(&self, h: NodeRef) -> TsNode {
+        TsNode::new(&self.syn, self.version, h)
+    }
+
+    /// The node's kind + char span, or an error for a handle the parse can't
+    /// relocate (impossible for handles minted by this module — surfaced as
+    /// an error rather than a panic or a sentinel, so a bug can't take the
+    /// process down or feed position 0 onward).
+    fn described(&self) -> Result<crate::syntax::NodeSpan, Error> {
+        self.syn
+            .describe(self.h)
+            .ok_or_else(|| err("internal: node could not be relocated in its parse"))
+    }
+}
+
+impl std::fmt::Display for TsNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Rendered lazily — queries mint hundreds of nodes and most are
+        // never printed.
+        match self.syn.describe(self.h) {
+            Some(s) => write!(f, "#<node {} @{}..{}>", s.kind, s.start, s.end),
+            None => write!(f, "#<node ?>"),
+        }
+    }
+}
+
+impl TulispConvertible for TsNode {
+    fn from_tulisp(value: &TulispObject) -> Result<Self, Error> {
+        value
+            .as_any()
+            .ok()
+            .and_then(|v| v.downcast_ref::<TsNode>().cloned())
+            .ok_or_else(|| err("expected a tree-sitter node"))
+    }
+    fn into_tulisp(self) -> TulispObject {
+        Shared::new(self).into()
+    }
+}
+
+/// `Some(node)` → the node value, `None` → nil (relational dead ends).
+trait IntoTulispOpt {
+    fn into_tulisp_opt(self) -> TulispObject;
+}
+impl IntoTulispOpt for Option<TsNode> {
+    fn into_tulisp_opt(self) -> TulispObject {
+        self.map_or_else(TulispObject::nil, TulispConvertible::into_tulisp)
+    }
+}
+
+/// An optional lisp flag argument: true unless missing or nil.
+fn truthy(v: &Option<TulispObject>) -> bool {
+    v.as_ref().is_some_and(|v| !v.null())
+}
+
+/// Guard every node accessor: the node's parse must reflect the CURRENT
+/// content of one of the session's buffers (versions are globally unique per
+/// text state, so a version match IS a content match). The node's own buffer
+/// need not be the current one — accessors read the node's own `Rc<Syntax>`,
+/// and its positions address the buffer it came from. Note:
+/// `treesit-set-language` re-parses but does not retire old nodes (the text
+/// is unchanged, so their positions stay right); nodes simply keep the
+/// grammar they were minted under.
+fn live_node(sess: &crate::engine::Session, n: &TsNode) -> Result<(), Error> {
+    if n.version == sess.buffer.version() || sess.inactive.iter().any(|b| b.version() == n.version)
+    {
+        return Ok(());
+    }
+    Err(err(
+        "outdated node: its buffer changed since the node's parse — \
+         re-fetch it (treesit-node-at / treesit-defun-at / treesit-query)",
+    ))
 }
 
 /// Clamp one occur output line to ~240 chars, keeping a window around the
@@ -1692,28 +1788,197 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     {
         let s = session.clone();
         // (treesit-node-at &optional POS) — the smallest NAMED node covering POS
-        // (default point). Reports its type and 1-based char start/end; returns
-        // the type string (nil if the tree is empty).
+        // (default point), as a first-class node value (nil for an empty
+        // tree). Reports its type and 1-based char start/end too. Feed the
+        // value to the treesit-node-* family: parent / child / siblings /
+        // child-by-field-name / type / start / end / text.
         ctx.defun(
             "treesit-node-at",
             move |pos: Option<i64>| -> Result<TulispObject, Error> {
                 let mut sess = s.borrow_mut();
                 let p = pos.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
-                let node = syntax_of(&mut sess).named_node_at(p);
-                Ok(match node {
-                    Some(n) => {
+                let version = sess.buffer.version();
+                let syn = syntax_of(&mut sess);
+                Ok(match syn.node_at(p) {
+                    Some(h) => {
+                        let node = TsNode::new(&syn, version, h);
+                        let span = node.described()?;
                         sess.reports
-                            .push(("treesit-node-type".to_string(), n.kind.clone()));
+                            .push(("treesit-node-type".to_string(), span.kind));
                         sess.reports
-                            .push(("treesit-node-start".to_string(), n.start.to_string()));
+                            .push(("treesit-node-start".to_string(), span.start.to_string()));
                         sess.reports
-                            .push(("treesit-node-end".to_string(), n.end.to_string()));
-                        TulispValue::from(n.kind).into_ref(None)
+                            .push(("treesit-node-end".to_string(), span.end.to_string()));
+                        node.into_tulisp()
                     }
                     None => TulispObject::nil(),
                 })
             },
         );
+    }
+    {
+        let s = session.clone();
+        // (treesit-defun-at &optional POS) — the nearest enclosing defun at
+        // POS (default point) as a node value; nil if POS is inside no defun.
+        // The node-valued sibling of treesit-beginning-of-defun.
+        ctx.defun(
+            "treesit-defun-at",
+            move |pos: Option<i64>| -> Result<TulispObject, Error> {
+                let mut sess = s.borrow_mut();
+                let p = pos.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
+                let version = sess.buffer.version();
+                let syn = syntax_of(&mut sess);
+                Ok(syn
+                    .defun_at(p)
+                    .map(|h| TsNode::new(&syn, version, h))
+                    .into_tulisp_opt())
+            },
+        );
+    }
+    // ---- the treesit-node-* family: relational navigation over node values.
+    // Every accessor checks the node is CURRENT (see live_node); navigation
+    // results are node values in the same parse, nil where the tree ends.
+    // NAMED (where accepted, default nil) restricts to named nodes, skipping
+    // anonymous tokens like punctuation — Emacs's signatures.
+    {
+        let s = session.clone();
+        // (treesit-node-type NODE) — the node's kind ("function_item", …).
+        ctx.defun(
+            "treesit-node-type",
+            move |n: TsNode| -> Result<String, Error> {
+                live_node(&s.borrow(), &n)?;
+                Ok(n.described()?.kind)
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (treesit-node-start NODE) — 1-based char position (whole-document).
+        ctx.defun(
+            "treesit-node-start",
+            move |n: TsNode| -> Result<i64, Error> {
+                live_node(&s.borrow(), &n)?;
+                Ok(n.described()?.start as i64)
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (treesit-node-end NODE) — position just past the node, Emacs-style.
+        ctx.defun("treesit-node-end", move |n: TsNode| -> Result<i64, Error> {
+            live_node(&s.borrow(), &n)?;
+            Ok(n.described()?.end as i64)
+        });
+    }
+    {
+        let s = session.clone();
+        // (treesit-node-text NODE) — the node's source text.
+        ctx.defun(
+            "treesit-node-text",
+            move |n: TsNode| -> Result<String, Error> {
+                live_node(&s.borrow(), &n)?;
+                n.syn
+                    .text_of_handle(n.h)
+                    .ok_or_else(|| err("internal: node could not be relocated in its parse"))
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (treesit-node-parent NODE) — the parent node, nil at the root.
+        ctx.defun(
+            "treesit-node-parent",
+            move |n: TsNode| -> Result<TulispObject, Error> {
+                live_node(&s.borrow(), &n)?;
+                Ok(n.syn.parent_of(n.h).map(|h| n.derive(h)).into_tulisp_opt())
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (treesit-node-child NODE I &optional NAMED) — the I-th (0-based)
+        // child; a negative I counts from the end (-1 = last), Emacs-style.
+        // NAMED counts named children only.
+        ctx.defun(
+            "treesit-node-child",
+            move |n: TsNode, i: i64, named: Option<TulispObject>| -> Result<TulispObject, Error> {
+                live_node(&s.borrow(), &n)?;
+                let named = truthy(&named);
+                let i = if i < 0 {
+                    let count = n.syn.child_count_of(n.h, named).unwrap_or(0) as i64;
+                    if count + i < 0 {
+                        return Ok(TulispObject::nil());
+                    }
+                    (count + i) as usize
+                } else {
+                    i as usize
+                };
+                Ok(n.syn
+                    .child_of(n.h, i, named)
+                    .map(|h| n.derive(h))
+                    .into_tulisp_opt())
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (treesit-node-child-count NODE &optional NAMED).
+        ctx.defun(
+            "treesit-node-child-count",
+            move |n: TsNode, named: Option<TulispObject>| -> Result<i64, Error> {
+                live_node(&s.borrow(), &n)?;
+                Ok(n.syn.child_count_of(n.h, truthy(&named)).unwrap_or(0) as i64)
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (treesit-node-next-sibling NODE &optional NAMED).
+        ctx.defun(
+            "treesit-node-next-sibling",
+            move |n: TsNode, named: Option<TulispObject>| -> Result<TulispObject, Error> {
+                live_node(&s.borrow(), &n)?;
+                Ok(n.syn
+                    .next_sibling_of(n.h, truthy(&named))
+                    .map(|h| n.derive(h))
+                    .into_tulisp_opt())
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (treesit-node-prev-sibling NODE &optional NAMED).
+        ctx.defun(
+            "treesit-node-prev-sibling",
+            move |n: TsNode, named: Option<TulispObject>| -> Result<TulispObject, Error> {
+                live_node(&s.borrow(), &n)?;
+                Ok(n.syn
+                    .prev_sibling_of(n.h, truthy(&named))
+                    .map(|h| n.derive(h))
+                    .into_tulisp_opt())
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (treesit-node-child-by-field-name NODE FIELD) — the child filling a
+        // grammar field ("name", "body", "parameters", …); nil if unfilled.
+        ctx.defun(
+            "treesit-node-child-by-field-name",
+            move |n: TsNode, field: String| -> Result<TulispObject, Error> {
+                live_node(&s.borrow(), &n)?;
+                Ok(n.syn
+                    .child_by_field_of(n.h, &field)
+                    .map(|h| n.derive(h))
+                    .into_tulisp_opt())
+            },
+        );
+    }
+    {
+        // (treesit-node-p X) — t iff X is a tree-sitter node value.
+        ctx.defun("treesit-node-p", move |v: TulispObject| -> bool {
+            TsNode::from_tulisp(&v).is_ok()
+        });
     }
     {
         let s = session.clone();
@@ -2719,6 +2984,117 @@ mod tests {
             "occur label, got: {}",
             r.log[1]
         );
+    }
+
+    #[test]
+    fn zero_width_nodes_negative_indexes_and_cross_buffer_access() {
+        // Zero-width nodes (incomplete code) answer through every accessor —
+        // a query capturing one used to PANIC the process.
+        let mut ws = trusted("def f():");
+        let r = ws
+            .run(
+                r#"(treesit-set-language "python")
+                   (let* ((blk (car (treesit-query "(block) @b"))))
+                     (report "type" (treesit-node-type blk))
+                     (report "width" (- (treesit-node-end blk)
+                                        (treesit-node-start blk)))
+                     (report "parent" (treesit-node-type (treesit-node-parent blk))))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "type"), "\"block\"");
+        assert_eq!(report(&r, "width"), "0");
+        assert_eq!(report(&r, "parent"), "\"function_definition\"");
+
+        // Negative child index counts from the end (Emacs); too-negative → nil.
+        let mut ws = trusted("fn f() { 1; }");
+        let r = ws
+            .run(
+                r#"(treesit-set-language "rust")
+                   (let ((d (treesit-defun-at 1)))
+                     (report "last" (treesit-node-text (treesit-node-child d -1)))
+                     (report "too-neg" (if (treesit-node-child d -99) 1 0)))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "last"), "\"{ 1; }\"");
+        assert_eq!(report(&r, "too-neg"), "0");
+
+        // A node from a non-current buffer still answers (its parse reflects
+        // a LIVE buffer); it only outdates when its own buffer changes.
+        let mut ws = trusted("fn alpha() {}");
+        let r = ws
+            .run(
+                r#"(treesit-set-language "rust")
+                   (setq n (treesit-defun-at 1))
+                   (generate-new-buffer "side")
+                   (set-buffer "side")
+                   (report "cross" (treesit-node-type n))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "cross"), "\"function_item\"");
+        let e = match ws.run(r#"(set-buffer "main") (insert "x") (treesit-node-type n)"#) {
+            Err(e) => e,
+            Ok(_) => panic!("must outdate when its own buffer changes"),
+        };
+        assert!(e.contains("outdated node"), "got: {e}");
+    }
+
+    #[test]
+    fn node_values_navigate_the_tree_and_expire_on_edit() {
+        let mut ws = trusted("fn norm(x: i64) -> i64 {\n    x.abs()\n}\n");
+        let r = ws
+            .run(
+                r#"(treesit-set-language "rust")
+                   (let* ((leaf (treesit-node-at (- (point-max) 8))) ; inside abs
+                          (defun-node (treesit-defun-at (point-min)))
+                          (name (treesit-node-child-by-field-name defun-node "name"))
+                          (params (treesit-node-child-by-field-name defun-node "parameters")))
+                     (report "leaf-type" (treesit-node-type leaf))
+                     (report "fn-type" (treesit-node-type defun-node))
+                     (report "fn-start" (treesit-node-start defun-node))
+                     (report "name-text" (treesit-node-text name))
+                     (report "params-text" (treesit-node-text params))
+                     (report "kids" (treesit-node-child-count defun-node))
+                     (report "named-kids" (treesit-node-child-count defun-node t))
+                     (report "root-type"
+                             (treesit-node-type (treesit-node-parent defun-node)))
+                     (report "no-parent"
+                             (if (treesit-node-parent (treesit-node-parent defun-node))
+                                 1 0))
+                     ;; siblings: name -> parameters in the named view
+                     (report "sib"
+                             (treesit-node-text (treesit-node-next-sibling name t)))
+                     (report "sib-back"
+                             (treesit-node-text
+                              (treesit-node-prev-sibling
+                               (treesit-node-next-sibling name t) t)))
+                     ;; raw view: child 0 of the fn is the "fn" keyword token
+                     (report "kw" (treesit-node-text (treesit-node-child defun-node 0)))
+                     (setq stale defun-node))"#,
+            )
+            .unwrap();
+        assert!(report(&r, "leaf-type").contains("field_identifier"));
+        assert_eq!(report(&r, "fn-type"), "\"function_item\"");
+        assert_eq!(report(&r, "fn-start"), "1");
+        assert_eq!(report(&r, "name-text"), "\"norm\"");
+        assert_eq!(report(&r, "params-text"), "\"(x: i64)\"");
+        assert_eq!(report(&r, "named-kids"), "4"); // name params return_type body
+        assert!(
+            report(&r, "kids").parse::<i64>().unwrap() > 4,
+            "raw view includes tokens"
+        );
+        assert_eq!(report(&r, "root-type"), "\"source_file\"");
+        assert_eq!(report(&r, "no-parent"), "0", "root has no parent");
+        assert_eq!(report(&r, "sib"), "\"(x: i64)\"");
+        assert_eq!(report(&r, "sib-back"), "\"norm\"");
+        assert_eq!(report(&r, "kw"), "\"fn\"");
+
+        // An edit outdates every node from the old parse: accessors refuse
+        // rather than serve positions from a stale tree.
+        let e = match ws.run(r#"(insert "// hi\n") (treesit-node-type stale)"#) {
+            Err(e) => e,
+            Ok(_) => panic!("an outdated node must not answer"),
+        };
+        assert!(e.contains("outdated node"), "got: {e}");
     }
 
     #[test]
