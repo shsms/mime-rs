@@ -136,6 +136,20 @@ pub struct Defun {
     pub end: usize,
 }
 
+/// A durable reference to one node of THIS parse — the data a first-class
+/// lisp node value carries. tree-sitter nodes borrow their tree, so they
+/// cannot be stored; a `NodeRef` re-finds the node instead: the byte range
+/// narrows the search ([`Node::descendant_for_byte_range`] lands on the
+/// smallest node in it) and the id — stable for the tree's lifetime — picks
+/// the right ancestor when several nodes share the range. Only meaningful
+/// against the `Syntax` it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeRef {
+    id: usize,
+    start_byte: usize,
+    end_byte: usize,
+}
+
 impl Syntax {
     /// Parse `text` as `lang`. Owns a copy of the text so the returned value is
     /// self-contained (node byte ranges index into it).
@@ -332,6 +346,115 @@ impl Syntax {
         }
     }
 
+    // ---- first-class nodes (NodeRef handles) -------------------------------
+
+    fn handle(node: Node<'_>) -> NodeRef {
+        NodeRef {
+            id: node.id(),
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+        }
+    }
+
+    /// Re-find the node a [`NodeRef`] points at: a containment-guided descent
+    /// from the root, comparing ids. (`descendant_for_byte_range` is NOT
+    /// enough: a ZERO-WIDTH node — a missing `block` in `def f():`, a missing
+    /// closer — is skipped by it in favor of an adjacent token whose ancestor
+    /// chain never reaches the target, so the descent recurses into every
+    /// child whose range contains the handle's instead.) `None` only if the
+    /// handle is not from this parse — a caller bug surfaced gently.
+    fn locate(&self, h: NodeRef) -> Option<Node<'_>> {
+        fn descend<'t>(node: Node<'t>, h: NodeRef) -> Option<Node<'t>> {
+            if node.id() == h.id {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                // Containment is non-strict: a zero-width handle on a child's
+                // boundary is "inside" both neighbours — try each.
+                if child.start_byte() <= h.start_byte
+                    && h.end_byte <= child.end_byte()
+                    && let Some(found) = descend(child, h)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        descend(self.root(), h)
+    }
+
+    /// The smallest *named* node covering char position `pos`, as a handle.
+    pub fn node_at(&self, pos: usize) -> Option<NodeRef> {
+        let b = self.byte_of(pos);
+        self.root()
+            .named_descendant_for_byte_range(b, b)
+            .map(Self::handle)
+    }
+
+    /// The nearest enclosing defun at `pos`, as a handle.
+    pub fn defun_at(&self, pos: usize) -> Option<NodeRef> {
+        self.enclosing_defun_node(pos).map(Self::handle)
+    }
+
+    /// The handle's kind + 1-based char span — what a node value displays.
+    pub fn describe(&self, h: NodeRef) -> Option<NodeSpan> {
+        self.locate(h).map(|n| self.span_of(n))
+    }
+
+    /// The handle's source text.
+    pub fn text_of_handle(&self, h: NodeRef) -> Option<String> {
+        self.locate(h).map(|n| self.text_of(n).to_string())
+    }
+
+    /// Relational navigation. Each returns a handle in this same parse, or
+    /// `None` where the tree ends. `named` skips anonymous tokens
+    /// (punctuation, keywords), which is almost always what an agent wants.
+    pub fn parent_of(&self, h: NodeRef) -> Option<NodeRef> {
+        self.locate(h)?.parent().map(Self::handle)
+    }
+
+    pub fn child_of(&self, h: NodeRef, i: usize, named: bool) -> Option<NodeRef> {
+        let n = self.locate(h)?;
+        let i = u32::try_from(i).ok()?; // a 2^32+ index is out of range, not child 0
+        if named {
+            n.named_child(i).map(Self::handle)
+        } else {
+            n.child(i).map(Self::handle)
+        }
+    }
+
+    pub fn child_count_of(&self, h: NodeRef, named: bool) -> Option<usize> {
+        let n = self.locate(h)?;
+        Some(if named {
+            n.named_child_count()
+        } else {
+            n.child_count()
+        })
+    }
+
+    pub fn next_sibling_of(&self, h: NodeRef, named: bool) -> Option<NodeRef> {
+        let n = self.locate(h)?;
+        if named {
+            n.next_named_sibling().map(Self::handle)
+        } else {
+            n.next_sibling().map(Self::handle)
+        }
+    }
+
+    pub fn prev_sibling_of(&self, h: NodeRef, named: bool) -> Option<NodeRef> {
+        let n = self.locate(h)?;
+        if named {
+            n.prev_named_sibling().map(Self::handle)
+        } else {
+            n.prev_sibling().map(Self::handle)
+        }
+    }
+
+    pub fn child_by_field_of(&self, h: NodeRef, field: &str) -> Option<NodeRef> {
+        self.locate(h)?.child_by_field_name(field).map(Self::handle)
+    }
+
     /// Run a tree-sitter query (`.scm` pattern syntax) over the whole buffer
     /// and return every capture as `(capture_name, span)`, in match order —
     /// structural search: "every `function_item`", "calls to `foo`", … .
@@ -403,7 +526,10 @@ mod tests {
         let syn = Syntax::parse(DOC, Lang::Markdown);
         // Char position inside "Title" — the smallest named node is the heading's
         // inline content.
-        let span = syn.named_node_at(4).expect("a node at point");
+        let span = syn
+            .node_at(4)
+            .and_then(|h| syn.describe(h))
+            .expect("a node at point");
         assert_eq!(span.kind, "inline");
         // "# Title\n" — inline "Title" is chars 3..=7, i.e. span [3, 8).
         assert_eq!((span.start, span.end), (3, 8));
@@ -414,7 +540,10 @@ mod tests {
         let syn = Syntax::parse(DOC, Lang::Markdown);
         // "Hello para." begins at char 10 (after "# Title\n\n").
         let p = DOC.find("Hello").unwrap() + 1; // 1-based char == byte here (ASCII)
-        let span = syn.named_node_at(p).expect("a node at point");
+        let span = syn
+            .node_at(p)
+            .and_then(|h| syn.describe(h))
+            .expect("a node at point");
         assert_eq!(span.kind, "inline");
     }
 
@@ -537,12 +666,82 @@ mod tests {
     }
 
     #[test]
+    fn node_handles_relocate_and_navigate() {
+        let syn = Syntax::parse(RS, Lang::Rust);
+        // Start from the smallest node inside `self.x.abs()`.
+        let p = RS.find("abs").unwrap() + 1;
+        let leaf = syn.node_at(p).expect("a node at point");
+        assert_eq!(syn.describe(leaf).unwrap().kind, "field_identifier");
+        assert_eq!(syn.text_of_handle(leaf).as_deref(), Some("abs"));
+
+        // Ascend: field_expression → call_expression … up to the root.
+        let parent = syn.parent_of(leaf).expect("a parent");
+        assert_eq!(syn.describe(parent).unwrap().kind, "field_expression");
+        let mut up = parent;
+        while let Some(next) = syn.parent_of(up) {
+            up = next;
+        }
+        assert_eq!(syn.describe(up).unwrap().kind, "source_file");
+
+        // Fields and children: norm's function_item has a name field.
+        let norm = syn.defun_at(p).expect("enclosing defun");
+        let name = syn.child_by_field_of(norm, "name").expect("name field");
+        assert_eq!(syn.text_of_handle(name).as_deref(), Some("norm"));
+        assert!(syn.child_count_of(norm, true).unwrap() >= 2);
+        let first = syn.child_of(norm, 0, true).expect("first named child");
+        assert_eq!(syn.describe(first).unwrap().kind, "identifier");
+
+        // Siblings walk the impl's surroundings: struct → impl → fn main.
+        let strct = syn.defun_at(2).expect("struct at top");
+        let next = syn.next_sibling_of(strct, true).expect("impl follows");
+        assert_eq!(syn.describe(next).unwrap().kind, "impl_item");
+        assert_eq!(
+            syn.prev_sibling_of(next, true),
+            Some(strct),
+            "prev inverts next"
+        );
+
+        // Unnamed children are visible when asked for: fn main's body block
+        // has `{` as child 0 in the unnamed view.
+        let main = syn.find_defun("main").unwrap();
+        let main_h = syn.defun_at(main.start).expect("main handle");
+        let body = syn.child_by_field_of(main_h, "body").expect("body field");
+        let brace = syn.child_of(body, 0, false).expect("the { token");
+        assert_eq!(syn.describe(brace).unwrap().kind, "{");
+    }
+
+    #[test]
+    fn zero_width_nodes_locate_and_navigate() {
+        // Incomplete code produces real ZERO-WIDTH nodes (a missing `block`
+        // in `def f():`); descendant_for_byte_range skips them, so locate's
+        // containment descent must find them — a panic here took down the
+        // whole process when a query captured one.
+        let syn = Syntax::parse("def f():", Lang::Python);
+        let caps = syn.query("(block) @b").expect("valid query");
+        assert_eq!(caps.len(), 1, "the zero-width block is captured");
+        let (_, h) = caps[0];
+        let span = syn.describe(h).expect("zero-width handle locates");
+        assert_eq!(span.kind, "block");
+        assert_eq!(span.start, span.end, "zero width");
+        assert_eq!(syn.text_of_handle(h).as_deref(), Some(""));
+        // Navigation works from it too: it has a real parent.
+        let parent = syn.parent_of(h).expect("the function_definition");
+        assert_eq!(syn.describe(parent).unwrap().kind, "function_definition");
+        // And child-by-field reaches it from above.
+        let body = syn.child_by_field_of(parent, "body").expect("body field");
+        assert_eq!(body, h);
+    }
+
+    #[test]
     fn char_positions_handle_multibyte() {
         // Em dash (3 bytes) before the heading word shifts byte vs. char offsets.
         let doc = "# Tëa — pot\n\nbody\n";
         let syn = Syntax::parse(doc, Lang::Markdown);
         let p = doc.chars().position(|c| c == 'b').unwrap() + 1; // char index of "body"
-        let span = syn.named_node_at(p).expect("a node at point");
+        let span = syn
+            .node_at(p)
+            .and_then(|h| syn.describe(h))
+            .expect("a node at point");
         assert_eq!(span.kind, "inline");
         // The span must be addressable as chars: substring by char span recovers
         // the original word.
