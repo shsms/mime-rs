@@ -18,11 +18,26 @@ DONE so far: literal ~search_forward~ streams the range a chunk at a time
 materializes point→point-max — which retires the conflict builtins'
 full-buffer ~scan~ cost (each ~scan~ walked the whole tail per marker).
 Remaining: a resumable streaming DFA (~regex-automata~) so ~re_search_forward~
-/ ~looking_at~ stream too (they still ~collect_range~ the window); streaming
-~search_backward~ (still materializes [bound, point)); and global-replace a
-multi-GB file across cores.
+/ ~looking_at~ stream too (they still ~collect_range~ the window — and
+~looking_at~'s window is UNBOUNDED, point→point-max, so an anchored check on
+a huge paged buffer copies the whole tail; cap it or stream it first);
+streaming ~search_backward~ (still materializes [bound, point)); and
+global-replace a multi-GB file across cores. Also: ~find_forward~ matches
+with a naive ~windows().position()~ — swap in ~memchr::memmem~ (SIMD two-way)
+for long/common-prefix needles.
 /Exit: global-replace a multi-GB file across cores; ulysses bench beats
 legacy ~mime~./
+
+** TODO Paged reader: fuse the open scans, coarsen the drift stat [#C]
+Two perf follow-ups from the paged-reader landing, both scaling with file
+size. (1) ~Quire::open~ reads the whole file TWICE — ~is_valid_utf8~ then
+~count_chars_lines~ — where mmap+~from_utf8~ was one pass; fuse them into a
+single page-by-page scan that validates UTF-8 AND tallies chars/lines (carry
+an incomplete trailing char once). Also restore the parallel fan-out for the
+paged count (it's owned-only now; threads can ~read_at~ disjoint ranges).
+(2) The fresh-read drift check does a ~stat~-by-path per page MISS until it
+latches — ~16k stats per GB on a cold scan of a clean file. Check once per
+read op (or every K pages), not per 64 KiB page.
 
 ** TODO Bytecode-compile hot programs [#C]
 
