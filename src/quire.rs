@@ -137,6 +137,15 @@ impl Original {
             Original::Paged(p) => p.count_chars_lines(),
         }
     }
+
+    /// Whether a paged file has been observed drifted on a fresh read since open
+    /// (always `false` for owned text — it has no file to drift).
+    fn drifted(&self) -> bool {
+        match self {
+            Original::Owned(_) => false,
+            Original::Paged(p) => p.drifted(),
+        }
+    }
 }
 
 /// Bytes per page the on-demand reader fetches and caches.
@@ -200,15 +209,31 @@ struct PagedFile {
     file: std::fs::File,
     len: usize,
     cache: RefCell<PageCache>,
+    /// Identity of the file at open time. A fresh page read re-checks it (a
+    /// stat-by-path) and latches `drifted` on a mismatch — once an external
+    /// writer has touched the file, a not-yet-cached page can no longer be
+    /// trusted to be consistent with the open-time char/line summaries.
+    stamp: crate::safety::FileStamp,
+    /// Sticky: set the first time a fresh read sees the file drifted, so the
+    /// buffer keeps reporting stale even if the writer later restores the mtime
+    /// (which a bare stat would then read as clean again).
+    drifted: std::cell::Cell<bool>,
 }
 
 impl PagedFile {
-    fn open(file: std::fs::File, len: usize) -> PagedFile {
+    fn open(file: std::fs::File, len: usize, stamp: crate::safety::FileStamp) -> PagedFile {
         PagedFile {
             file,
             len,
             cache: RefCell::new(PageCache::new()),
+            stamp,
+            drifted: std::cell::Cell::new(false),
         }
+    }
+
+    /// Whether a fresh read has ever observed the file drifted since open.
+    fn drifted(&self) -> bool {
+        self.drifted.get()
     }
 
     /// Fill `buf` from file offset `off` with `read_at` (pread), retrying short
@@ -233,6 +258,16 @@ impl PagedFile {
     fn page(&self, pno: u64) -> Rc<[u8]> {
         if let Some(p) = self.cache.borrow_mut().get(pno) {
             return p;
+        }
+        // Fresh read: the file may have drifted since open. Detect it once (a
+        // stat-by-path per miss until latched) so `is_stale` reports it durably.
+        // We still serve the page (no fault, no hard stop) — but note already-
+        // cached pages keep their pre-drift bytes while this fresh page reads the
+        // changed file, so a post-drift read can interleave old and new content.
+        // That's why the sticky flag is the only correctness signal here: callers
+        // must treat a drifted buffer as untrustworthy and revert, not parse it.
+        if !self.drifted.get() && self.stamp.check().is_some() {
+            self.drifted.set(true);
         }
         let start = pno as usize * PAGE;
         let want = PAGE.min(self.len - start);
@@ -542,7 +577,12 @@ impl Quire {
     pub fn open(path: &Path) -> std::io::Result<Quire> {
         let file = std::fs::File::open(path)?;
         let len = file.metadata()?.len() as usize;
-        let paged = PagedFile::open(file, len);
+        // Stamp the visited file so save paths (and the pager's fresh-read drift
+        // check) can detect an external writer. Captured right after the open;
+        // the open→stat window is tiny and a writer landing inside it still
+        // differs from the *saved* stamp later.
+        let stamp = crate::safety::FileStamp::capture(path)?;
+        let paged = PagedFile::open(file, len, stamp.clone());
         if !paged.is_valid_utf8() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -554,10 +594,7 @@ impl Quire {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
         let mut quire = Quire::with_original(name, Original::Paged(paged));
-        // Stamp the visited file so save paths can detect external changes.
-        // Stat-by-path right after the open; the open→stat window is tiny and
-        // a writer landing inside it still differs from the *saved* stamp later.
-        quire.stamp = Some(crate::safety::FileStamp::capture(path)?);
+        quire.stamp = Some(stamp);
         Ok(quire)
     }
 
@@ -652,7 +689,11 @@ impl Quire {
                 lines: summary.lines,
             }]))
         };
-        self.original = Rc::new(Original::Paged(PagedFile::open(file, bytes_len)));
+        self.original = Rc::new(Original::Paged(PagedFile::open(
+            file,
+            bytes_len,
+            stamp.clone(),
+        )));
         self.add = Arc::new(Vec::new());
         self.root = root;
         self.stamp = Some(stamp);
@@ -1795,6 +1836,9 @@ impl TextStore for Quire {
     fn file_stamp(&self) -> Option<&crate::safety::FileStamp> {
         self.stamp.as_ref()
     }
+    fn drifted(&self) -> bool {
+        self.original.drifted()
+    }
     fn rebase_to_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         Quire::rebase_to(self, path)
     }
@@ -2274,6 +2318,47 @@ mod tests {
         let text = TextStore::text(&q);
         assert_eq!(text.chars().count(), len_at_open);
         assert_eq!(TextStore::char_after(&q, 1), Some('x'));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn paged_fresh_read_after_drift_latches_sticky_stale() {
+        let path = tmp_path("drift");
+        std::fs::write(&path, "a".repeat(3 * PAGE)).unwrap();
+        let orig_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let q = Quire::open(&path).unwrap();
+        // Read page 0 → clean (the open just stamped the file).
+        assert_eq!(TextStore::char_after(&q, 1), Some('a'));
+        assert!(!TextStore::drifted(&q), "clean right after open");
+
+        // External in-place change (size + mtime differ → the stamp drifts).
+        std::fs::write(&path, "b".repeat(3 * PAGE + 7)).unwrap();
+        // A read of a not-yet-cached page is a FRESH read: it detects and
+        // latches the drift.
+        let _ = TextStore::char_after(&q, 2 * PAGE + 100);
+        assert!(
+            TextStore::drifted(&q),
+            "a fresh read of a changed file must latch stale"
+        );
+
+        // Sticky: restore the exact original bytes AND mtime, so a bare stat
+        // would now read clean — the latched flag must still report stale.
+        std::fs::write(&path, "a".repeat(3 * PAGE)).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(orig_mtime))
+            .unwrap();
+        assert_eq!(
+            q.stamp.as_ref().unwrap().check(),
+            None,
+            "a bare stat reads clean again after the reset"
+        );
+        assert!(
+            TextStore::drifted(&q),
+            "the drift latch survives an mtime/size reset"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

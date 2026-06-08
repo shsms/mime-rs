@@ -476,13 +476,13 @@ impl Workspace {
     }
 
     /// Whether the visited file changed on disk since open/rebase (the
-    /// stale-read guard's view); `false` for an unvisited buffer.
+    /// stale-read guard's view); `false` for an unvisited buffer. A current
+    /// stat catches drift now; the store's sticky `drifted` flag keeps reporting
+    /// it after a fresh read already saw the change (so an mtime reset can't
+    /// make a corrupted read look clean again).
     pub fn is_stale(&self) -> bool {
-        self.session
-            .borrow()
-            .buffer
-            .file_stamp()
-            .is_some_and(|st| st.check().is_some())
+        let s = self.session.borrow();
+        s.buffer.drifted() || s.buffer.file_stamp().is_some_and(|st| st.check().is_some())
     }
 
     /// The current buffer text — used by the daemon's `save` op.

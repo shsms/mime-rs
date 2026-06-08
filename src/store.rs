@@ -90,6 +90,14 @@ pub trait TextStore {
         None
     }
 
+    /// `true` once a read has observed the visited file drifted on disk since
+    /// open — a *sticky* signal a lazy backing sets when it fetches fresh bytes
+    /// from a changed file (so staleness survives an mtime reset that a bare
+    /// stat would miss). `false` by default; only a file-backed store sets it.
+    fn drifted(&self) -> bool {
+        false
+    }
+
     /// Stream the buffer's bytes into `w` and return the byte count written. The
     /// streaming atomic save uses this so a multi-GB `Quire` is written piece by
     /// piece, never materialized into one allocation; `Buffer` writes its string.
