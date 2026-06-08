@@ -2421,6 +2421,27 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
         // multi-GB Quire is never materialized into one allocation just to save.
         ctx.defun("write-file", move |path: String| -> Result<i64, Error> {
             let p = std::path::Path::new(&path);
+            // Is this our OWN visited file? If so, apply the same stale-read
+            // guard as save_buffer — refuse to overwrite it when it drifted on
+            // disk since we opened it, rather than silently clobbering an
+            // external writer. Writing to any *other* path overwrites nothing
+            // of ours, so it stays unguarded (the export/write-anywhere case).
+            let own_file = {
+                let sess = s.borrow();
+                match sess.buffer.file_stamp() {
+                    Some(st) if crate::engine::same_file(p, &st.path) => {
+                        if let Some(reason) = st.check() {
+                            return Err(err(&format!(
+                                "refusing to write-file: {path} was {reason} after it \
+                                 was opened; run (revert-buffer) to re-read it, or \
+                                 write to a different path"
+                            )));
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            };
             let written = {
                 let sess = s.borrow();
                 let mut written = 0usize;
@@ -2431,18 +2452,11 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
                 .map_err(|e| err(&format!("write-file {path}: {e}")))?;
                 written
             };
-            // If we just overwrote our OWN visited file, re-stamp the session
-            // onto the fresh bytes (mirrors save_to's rebase) so the
-            // external-change guard doesn't later trip against this very write —
-            // a second edit→write in the same session would otherwise look like
-            // an external writer landed and force a needless re-open. Writing
-            // elsewhere leaves visiting untouched. Best-effort: a failed
-            // re-stamp just leaves the guard conservatively armed.
-            let own_file = s
-                .borrow()
-                .buffer
-                .file_stamp()
-                .is_some_and(|st| crate::engine::same_file(p, &st.path));
+            // Overwrote our own visited file → re-stamp the session onto the
+            // fresh bytes (mirrors save_to's rebase) so the guard doesn't later
+            // trip against this very write and force a needless re-open. Writing
+            // elsewhere left visiting — and the stamp — untouched. Best-effort:
+            // a failed re-stamp just leaves the guard conservatively armed.
             if own_file {
                 let _ = s.borrow_mut().buffer.rebase_to_file(p);
             }
@@ -2920,6 +2934,41 @@ mod tests {
             .run(r#"(report "stale" (if (buffer-stale-p) 1 0))"#)
             .unwrap();
         assert_eq!(report(&r, "stale"), "0");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_file_refuses_to_clobber_an_externally_changed_visited_file() {
+        let dir = temp_dir("write-file-stale");
+        let file = dir.join("doc.txt");
+        std::fs::write(&file, "theirs v1\n").unwrap();
+        let mut ws = Workspace::new_trusted(Box::new(crate::Quire::open(&file).unwrap()));
+        let path = file.to_string_lossy().into_owned();
+        ws.run(r#"(goto-char (point-max)) (insert "ours\n")"#)
+            .unwrap();
+
+        // An external writer lands after open (atomic rename → new inode, so
+        // the Quire's mmap of the old inode stays intact); writing back over the
+        // visited file must refuse (like save_buffer) rather than clobber it.
+        crate::safety::write_atomic(&file, b"theirs v2 external\n").unwrap();
+        let err = match ws.run(&format!(r#"(write-file "{path}")"#)) {
+            Err(e) => e,
+            Ok(_) => panic!("write-file over a drifted visited file must fail"),
+        };
+        assert!(err.contains("refusing to write-file"), "got: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "theirs v2 external\n",
+            "their bytes are intact"
+        );
+
+        // Exporting the same buffer ELSEWHERE is still fine — nothing of theirs
+        // is at that path, so the guard does not apply.
+        let other = dir.join("export.txt");
+        let other_path = other.to_string_lossy().into_owned();
+        ws.run(&format!(r#"(write-file "{other_path}")"#)).unwrap();
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), ws.text());
 
         std::fs::remove_dir_all(&dir).ok();
     }
