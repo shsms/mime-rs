@@ -564,7 +564,7 @@ fn stale_visit(store: &dyn TextStore, path: &std::path::Path) -> Option<String> 
 /// sides resolve (symlinks, `..`), exact otherwise (e.g. a deleted visited
 /// file). `find-file` dedup and the stale-save guard MUST agree on this, or a
 /// buffer could dedup as visiting a file the guard treats as a different one.
-fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+pub(crate) fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(ca), Ok(cb)) => ca == cb,
         _ => a == b,

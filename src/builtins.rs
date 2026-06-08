@@ -2386,13 +2386,32 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
         // returns the byte count written. Streams the buffer via `write_to`, so a
         // multi-GB Quire is never materialized into one allocation just to save.
         ctx.defun("write-file", move |path: String| -> Result<i64, Error> {
-            let sess = s.borrow();
-            let mut written = 0usize;
-            crate::safety::write_atomic_with(std::path::Path::new(&path), |w| {
-                written = sess.buffer.write_to(w)?;
-                Ok(())
-            })
-            .map_err(|e| err(&format!("write-file {path}: {e}")))?;
+            let p = std::path::Path::new(&path);
+            let written = {
+                let sess = s.borrow();
+                let mut written = 0usize;
+                crate::safety::write_atomic_with(p, |w| {
+                    written = sess.buffer.write_to(w)?;
+                    Ok(())
+                })
+                .map_err(|e| err(&format!("write-file {path}: {e}")))?;
+                written
+            };
+            // If we just overwrote our OWN visited file, re-stamp the session
+            // onto the fresh bytes (mirrors save_to's rebase) so the
+            // external-change guard doesn't later trip against this very write —
+            // a second edit→write in the same session would otherwise look like
+            // an external writer landed and force a needless re-open. Writing
+            // elsewhere leaves visiting untouched. Best-effort: a failed
+            // re-stamp just leaves the guard conservatively armed.
+            let own_file = s
+                .borrow()
+                .buffer
+                .file_stamp()
+                .is_some_and(|st| crate::engine::same_file(p, &st.path));
+            if own_file {
+                let _ = s.borrow_mut().buffer.rebase_to_file(p);
+            }
             Ok(written as i64)
         });
     }
@@ -2815,6 +2834,58 @@ mod tests {
             Ok(_) => panic!("revert-buffer without a visited file must error"),
         };
         assert!(e.contains("no visited file"), "got: {e}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_file_to_the_visited_path_restamps_and_doesnt_self_trip_the_guard() {
+        let dir = temp_dir("write-file-restamp");
+        let file = dir.join("doc.txt");
+        std::fs::write(&file, "v1\n").unwrap();
+        // write-file is a trusted-tier (CLI/script) builtin — the tier this
+        // self-trip bites when a script drives an edit→write→edit→save loop.
+        let mut ws = Workspace::new_trusted(Box::new(crate::Quire::open(&file).unwrap()));
+        let path = file.to_string_lossy().into_owned();
+
+        // Edit, then write the buffer back over its OWN visited file. The write
+        // advances the file's mtime/size, but re-stamping the session means the
+        // external-change guard does NOT then read its own write as drift.
+        let r = ws
+            .run(&format!(
+                r#"(goto-char (point-max)) (insert "a\n")
+                   (report "wrote" (write-file "{path}"))
+                   (report "stale" (if (buffer-stale-p) 1 0))"#
+            ))
+            .unwrap();
+        assert_eq!(report(&r, "wrote"), "5"); // "v1\na\n"
+        assert_eq!(report(&r, "stale"), "0", "own write must not read as drift");
+
+        // A second edit→save to the same path then succeeds — no needless
+        // re-open forced by the guard tripping on the prior write.
+        ws.run(r#"(goto-char (point-max)) (insert "b\n")"#).unwrap();
+        ws.save_to(&file)
+            .expect("save after self-write must not be refused");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1\na\nb\n");
+
+        // Writing ELSEWHERE leaves visiting (and the stamp) untouched: the
+        // session still guards its original file, not the export target.
+        let other = dir.join("export.txt");
+        let other_path = other.to_string_lossy().into_owned();
+        let r = ws
+            .run(&format!(
+                r#"(report "wrote" (write-file "{other_path}"))
+                   (report "stale" (if (buffer-stale-p) 1 0))"#
+            ))
+            .unwrap();
+        assert_eq!(report(&r, "wrote"), "7"); // "v1\na\nb\n"
+        assert_eq!(report(&r, "stale"), "0", "still tracking the visited file");
+        // Drift the export target — irrelevant, it is not the visited file.
+        std::fs::write(&other, "clobbered\n").unwrap();
+        let r = ws
+            .run(r#"(report "stale" (if (buffer-stale-p) 1 0))"#)
+            .unwrap();
+        assert_eq!(report(&r, "stale"), "0");
 
         std::fs::remove_dir_all(&dir).ok();
     }
