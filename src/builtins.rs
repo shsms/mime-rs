@@ -1990,6 +1990,121 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             TsNode::from_tulisp(&v).is_ok()
         });
     }
+    // ---- node-EDIT ops: splice at a node's span, return the re-parsed result.
+    // Thin wrappers over the store's delete/insert that take a NODE from the
+    // CURRENT buffer (live_current_node), edit at its span, then re-parse so the
+    // replacement node comes back for chaining. A node from another buffer or an
+    // outdated parse is refused — its span would address the wrong text.
+    {
+        let s = session.clone();
+        // (treesit-replace-node NODE TEXT) — replace NODE's whole span with the
+        // literal TEXT. Returns the re-parsed node now at the replacement start.
+        ctx.defun(
+            "treesit-replace-node",
+            move |n: TsNode, text: String| -> Result<TulispObject, Error> {
+                let mut sess = s.borrow_mut();
+                let span = edit_span(&sess, &n)?;
+                Ok(splice_and_reparse(&mut sess, span.start, span.end, &text))
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (treesit-wrap-node NODE BEFORE AFTER) — insert BEFORE at NODE's start
+        // and AFTER at its end, wrapping it (e.g. an expr in `Some(` … `)`).
+        // Returns the re-parsed node at the wrapped region's start.
+        ctx.defun(
+            "treesit-wrap-node",
+            move |n: TsNode, before: String, after: String| -> Result<TulispObject, Error> {
+                let mut sess = s.borrow_mut();
+                let span = edit_span(&sess, &n)?;
+                {
+                    // AFTER first (the end insert leaves the start untouched),
+                    // then BEFORE at the start.
+                    let b = sess.buffer.as_mut();
+                    b.goto_char(span.end);
+                    b.insert(&after);
+                    b.goto_char(span.start);
+                    b.insert(&before);
+                }
+                Ok(reparse_at(&mut sess, span.start))
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (treesit-raise-node NODE) — replace NODE's PARENT with NODE (paredit
+        // raise-sexp): the node's text takes the parent's place, DELETING the
+        // node's siblings. Errors at the root (no parent). Returns the raised node.
+        ctx.defun(
+            "treesit-raise-node",
+            move |n: TsNode| -> Result<TulispObject, Error> {
+                let mut sess = s.borrow_mut();
+                live_current_node(&sess, &n)?;
+                let parent = n.syn.parent_of(n.h).ok_or_else(|| {
+                    err("treesit-raise-node: the node has no parent (it is the root)")
+                })?;
+                let pspan = n
+                    .syn
+                    .describe(parent)
+                    .ok_or_else(|| err("internal: parent could not be relocated"))?;
+                within_region(&sess, &pspan)?;
+                let text = n
+                    .syn
+                    .text_of_handle(n.h)
+                    .ok_or_else(|| err("internal: node could not be relocated"))?;
+                Ok(splice_and_reparse(&mut sess, pspan.start, pspan.end, &text))
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (treesit-kill-node NODE) — delete NODE's span, pushing its text to the
+        // kill-ring (yank-able). Point lands at the deletion start; returns nil.
+        ctx.defun(
+            "treesit-kill-node",
+            move |n: TsNode| -> Result<TulispObject, Error> {
+                let mut sess = s.borrow_mut();
+                let span = edit_span(&sess, &n)?;
+                let text = n
+                    .syn
+                    .text_of_handle(n.h)
+                    .ok_or_else(|| err("internal: node could not be relocated"))?;
+                sess.kill_ring.push(text);
+                let b = sess.buffer.as_mut();
+                b.delete_region(span.start, span.end);
+                b.goto_char(span.start);
+                Ok(TulispObject::nil())
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (treesit-insert-sibling NODE TEXT &optional BEFORE) — insert TEXT just
+        // after NODE (or before it when BEFORE is non-nil), as an adjacent
+        // sibling. Returns the re-parsed node at the insertion point.
+        ctx.defun(
+            "treesit-insert-sibling",
+            move |n: TsNode,
+                  text: String,
+                  before: Option<TulispObject>|
+                  -> Result<TulispObject, Error> {
+                let mut sess = s.borrow_mut();
+                let span = edit_span(&sess, &n)?;
+                let pos = if truthy(&before) {
+                    span.start
+                } else {
+                    span.end
+                };
+                {
+                    let b = sess.buffer.as_mut();
+                    b.goto_char(pos);
+                    b.insert(&text);
+                }
+                Ok(reparse_at(&mut sess, pos))
+            },
+        );
+    }
     {
         let s = session.clone();
         // (treesit-beginning-of-defun) — move point to the start of the
@@ -2244,6 +2359,85 @@ fn syntax_of(sess: &mut crate::engine::Session) -> std::rc::Rc<Syntax> {
     let syn = std::rc::Rc::new(Syntax::parse(sess.buffer.text(), lang));
     sess.syntax_cache = Some((lang, version, std::rc::Rc::clone(&syn)));
     syn
+}
+
+/// Stricter [`live_node`] for the node-EDIT ops: the node must reflect the
+/// CURRENT buffer (its parse version equals the current buffer's), because the
+/// op mutates the current buffer at the node's span — a node from an inactive
+/// buffer (which `live_node` would accept) addresses the wrong text.
+fn live_current_node(sess: &crate::engine::Session, n: &TsNode) -> Result<(), Error> {
+    if n.version == sess.buffer.version() {
+        Ok(())
+    } else {
+        Err(err(
+            "outdated or non-current node: the current buffer changed since the \
+             node's parse — re-fetch it (treesit-node-at / treesit-defun-at / \
+             treesit-query)",
+        ))
+    }
+}
+
+/// Refuse to splice a span that escapes the buffer's accessible region. The
+/// treesit layer reads the WHOLE document (positions are document-absolute,
+/// ignoring narrowing), so a node fetched outside an active restriction has a
+/// span `delete_region` would honor but `goto_char` would clamp to the
+/// narrowing edge — the two halves of the splice would disagree and corrupt the
+/// buffer. So an out-of-region edit is rejected, not silently mangled.
+fn within_region(
+    sess: &crate::engine::Session,
+    span: &crate::syntax::NodeSpan,
+) -> Result<(), Error> {
+    if span.start >= sess.buffer.point_min() && span.end <= sess.buffer.point_max() {
+        Ok(())
+    } else {
+        Err(err(
+            "node lies outside the buffer's accessible region — widen (or re-fetch \
+             a node inside the narrowing) before editing it",
+        ))
+    }
+}
+
+/// Resolve a node for an edit op: it must be current and its span must lie within
+/// the accessible region. Returns the span to splice.
+fn edit_span(sess: &crate::engine::Session, n: &TsNode) -> Result<crate::syntax::NodeSpan, Error> {
+    live_current_node(sess, n)?;
+    let span = n.described()?;
+    within_region(sess, &span)?;
+    Ok(span)
+}
+
+/// The parse-tree node now covering 1-based char `pos`, as a fresh node value in
+/// a re-parse of the (just-mutated) current buffer — `nil` if none. The tail of
+/// every node-edit op: the splice re-stamped the version, so this re-parses and
+/// hands back the replacement, letting edits chain (replace → navigate result).
+fn reparse_at(sess: &mut crate::engine::Session, pos: usize) -> TulispObject {
+    let version = sess.buffer.version();
+    let syn = syntax_of(sess);
+    syn.node_at(pos)
+        .map(|h| TsNode::new(&syn, version, h))
+        .into_tulisp_opt()
+}
+
+/// Splice `text` over the current buffer's char span `[start, end)` — delete then
+/// insert at `start`, via the store mutators (which re-stamp the version, adjust
+/// markers, and clear match-data) — and return the re-parsed node at `start`.
+fn splice_and_reparse(
+    sess: &mut crate::engine::Session,
+    start: usize,
+    end: usize,
+    text: &str,
+) -> TulispObject {
+    {
+        let b = sess.buffer.as_mut();
+        if end > start {
+            b.delete_region(start, end);
+        }
+        b.goto_char(start);
+        if !text.is_empty() {
+            b.insert(text);
+        }
+    }
+    reparse_at(sess, start)
 }
 
 /// Register the *orchestration* builtin group — multiple buffers, file I/O,
@@ -3267,6 +3461,148 @@ mod tests {
             Ok(_) => panic!("an outdated node must not answer"),
         };
         assert!(e.contains("outdated node"), "got: {e}");
+    }
+
+    #[test]
+    fn treesit_replace_node_swaps_the_span_and_returns_the_reparse() {
+        let mut ws = trusted("fn f() {\n    foo(bar)\n}\n");
+        let r = ws
+            .run(
+                r#"(treesit-set-language "rust")
+                   (goto-char (point-min)) (search-forward "bar")
+                   (report "ret" (treesit-node-text
+                     (treesit-replace-node (treesit-node-at (- (point) 1)) "baz")))"#,
+            )
+            .unwrap();
+        assert_eq!(ws.text(), "fn f() {\n    foo(baz)\n}\n");
+        assert_eq!(report(&r, "ret"), "\"baz\"", "returns the re-parsed node");
+    }
+
+    #[test]
+    fn treesit_wrap_node_brackets_the_span() {
+        let mut ws = trusted("fn f() -> i64 {\n    x\n}\n");
+        ws.run(
+            r#"(treesit-set-language "rust")
+               (goto-char (point-min)) (search-forward "x")
+               (treesit-wrap-node (treesit-node-at (- (point) 1)) "Some(" ")")"#,
+        )
+        .unwrap();
+        assert_eq!(ws.text(), "fn f() -> i64 {\n    Some(x)\n}\n");
+    }
+
+    #[test]
+    fn treesit_raise_node_replaces_its_parent() {
+        // The identifier's parent is the parenthesized_expression `(inner)`;
+        // raising it strips the parens.
+        let mut ws = trusted("fn f() {\n    (inner)\n}\n");
+        ws.run(
+            r#"(treesit-set-language "rust")
+               (goto-char (point-min)) (search-forward "inner")
+               (treesit-raise-node (treesit-node-at (- (point) 1)))"#,
+        )
+        .unwrap();
+        assert_eq!(ws.text(), "fn f() {\n    inner\n}\n");
+    }
+
+    #[test]
+    fn treesit_kill_node_deletes_the_span_and_yanks() {
+        let mut ws = trusted("fn f() {\n    foo(bar)\n}\n");
+        ws.run(
+            r#"(treesit-set-language "rust")
+               (goto-char (point-min)) (search-forward "bar")
+               (treesit-kill-node (treesit-node-at (- (point) 1)))"#,
+        )
+        .unwrap();
+        assert_eq!(ws.text(), "fn f() {\n    foo()\n}\n", "span deleted");
+        // The killed text went to the kill-ring → yank restores it.
+        ws.run(r#"(goto-char (point-max)) (yank)"#).unwrap();
+        assert_eq!(ws.text(), "fn f() {\n    foo()\n}\nbar");
+    }
+
+    #[test]
+    fn treesit_insert_sibling_adds_text_after_the_node() {
+        let mut ws = trusted("fn f() {}\n");
+        ws.run(
+            r#"(treesit-set-language "rust")
+               (treesit-insert-sibling (treesit-defun-at (point-min)) "\nfn g() {}" nil)"#,
+        )
+        .unwrap();
+        assert_eq!(ws.text(), "fn f() {}\nfn g() {}\n");
+    }
+
+    #[test]
+    fn node_edit_ops_refuse_an_outdated_node() {
+        let mut ws = trusted("fn f() {\n    x\n}\n");
+        let e = match ws.run(
+            r#"(treesit-set-language "rust")
+               (setq n (treesit-node-at 1))
+               (insert "// edit\n")            ; bumps the version → n is stale
+               (treesit-replace-node n "y")"#,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("editing through an outdated node must fail"),
+        };
+        assert!(e.contains("outdated or non-current node"), "got: {e}");
+    }
+
+    #[test]
+    fn node_edit_ops_refuse_a_node_outside_the_narrowing() {
+        // The treesit layer reads the whole document, so a node can be fetched
+        // OUTSIDE an active narrowing — but its span would corrupt the buffer
+        // (delete honors absolute coords, goto clamps to the restriction), so the
+        // edit is refused and the buffer is left untouched.
+        let original = "fn a() {\n    foo(bar)\n}\nfn b() {\n    qux\n}\n";
+        let mut ws = trusted(original);
+        let e = match ws.run(
+            r#"(treesit-set-language "rust")
+               (goto-char (point-min)) (search-forward "bar")
+               (setq n (treesit-node-at (- (point) 1)))     ; node in fn a
+               (search-forward "fn b")
+               (narrow-to-region (point) (point-max))       ; restrict to fn b
+               (treesit-replace-node n "BAZ")"#,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("editing a node outside the narrowing must fail"),
+        };
+        assert!(
+            e.contains("outside the buffer's accessible region"),
+            "got: {e}"
+        );
+        assert_eq!(
+            ws.text(),
+            original,
+            "buffer must be untouched (no corruption)"
+        );
+    }
+
+    #[test]
+    fn node_edit_returns_a_node_usable_for_a_chained_edit() {
+        // The headline reason the ops return a node: replace, then act on the
+        // RE-PARSED result without re-fetching.
+        let mut ws = trusted("fn f() {\n    foo(bar)\n}\n");
+        ws.run(
+            r#"(treesit-set-language "rust")
+               (goto-char (point-min)) (search-forward "bar")
+               (let ((n (treesit-replace-node (treesit-node-at (- (point) 1)) "baz")))
+                 (treesit-wrap-node n "Some(" ")"))"#,
+        )
+        .unwrap();
+        assert_eq!(ws.text(), "fn f() {\n    foo(Some(baz))\n}\n");
+    }
+
+    #[test]
+    fn treesit_raise_node_errors_at_the_root() {
+        let mut ws = trusted("foo\n");
+        let e = match ws.run(
+            r#"(treesit-set-language "rust")
+               (setq n (treesit-node-at 1))
+               (while (treesit-node-parent n) (setq n (treesit-node-parent n)))
+               (treesit-raise-node n)"#, // n is now the root → no parent
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("raising the root must fail"),
+        };
+        assert!(e.contains("no parent"), "got: {e}");
     }
 
     #[test]
