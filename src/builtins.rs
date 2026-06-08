@@ -191,21 +191,31 @@ fn clamp_occur_line(text: &str, col: usize) -> String {
 /// hunk, compute its replacement via `text` (a side's content, or a literal),
 /// splice it in place of the whole hunk, and return the REMAINING conflict
 /// count. The re-scan keeps that count honest even when a replacement itself
-/// contains marker-shaped lines.
-fn conflict_splice<F>(s: &SharedSession, n: Option<i64>, text: F) -> Result<i64, Error>
+/// contains marker-shaped lines. `warn` inspects the chosen hunk before the
+/// splice and, when it returns `Some`, the message is pushed to the run log
+/// (the `(message …)` channel) — used to flag a fused "keep both" join.
+fn conflict_splice<F, W>(s: &SharedSession, n: Option<i64>, text: F, warn: W) -> Result<i64, Error>
 where
     F: FnOnce(&dyn crate::store::TextStore, &crate::conflict::Hunk) -> Result<String, String>,
+    W: FnOnce(&dyn crate::store::TextStore, &crate::conflict::Hunk) -> Option<String>,
 {
     let mut sess = s.borrow_mut();
-    let b = sess.buffer.as_mut();
-    let hunks = crate::conflict::scan(b);
-    let h = crate::conflict::pick(&hunks, n, b.point()).map_err(|e| err(&e))?;
-    let text = text(&*b, h).map_err(|e| err(&e))?;
-    let (start, end) = (h.start, h.end);
-    b.delete_region(start, end);
-    b.goto_char(start);
-    b.insert(&text);
-    Ok(crate::conflict::scan(b).len() as i64)
+    let (count, warning) = {
+        let b = sess.buffer.as_mut();
+        let hunks = crate::conflict::scan(b);
+        let h = crate::conflict::pick(&hunks, n, b.point()).map_err(|e| err(&e))?;
+        let text = text(&*b, h).map_err(|e| err(&e))?;
+        let warning = warn(&*b, h);
+        let (start, end) = (h.start, h.end);
+        b.delete_region(start, end);
+        b.goto_char(start);
+        b.insert(&text);
+        (crate::conflict::scan(b).len() as i64, warning)
+    };
+    if let Some(w) = warning {
+        sess.log.push(w);
+    }
+    Ok(count)
 }
 
 pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
@@ -1661,7 +1671,12 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun(
             "conflict-keep",
             move |side: String, n: Option<i64>| -> Result<i64, Error> {
-                conflict_splice(&s, n, |b, h| crate::conflict::side_text(b, h, &side))
+                conflict_splice(
+                    &s,
+                    n,
+                    |b, h| crate::conflict::side_text(b, h, &side),
+                    |b, h| crate::conflict::keep_warning(b, h, &side),
+                )
             },
         );
     }
@@ -1673,7 +1688,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun(
             "conflict-replace",
             move |text: String, n: Option<i64>| -> Result<i64, Error> {
-                conflict_splice(&s, n, |_, _| Ok(text.clone()))
+                conflict_splice(&s, n, |_, _| Ok(text.clone()), |_, _| None)
             },
         );
     }
@@ -3450,6 +3465,58 @@ mod tests {
             .unwrap();
         assert_eq!(report(&r, "left"), "0");
         assert_eq!(report(&r, "txt"), "\"o\\nt\\n\"");
+    }
+
+    #[test]
+    fn conflict_keep_both_warns_when_a_shared_suffix_fuses_the_sides() {
+        // Each side is the BODY of a brace block that the post-marker `}` was
+        // meant to close; keeping both concatenates them, so the single `}`
+        // closes only theirs and ours' block is left open — broken but
+        // reported resolved. The keep still happens; a warning rides the log.
+        let mut ws = trusted(
+            "fn pick() {\n<<<<<<< HEAD\n  if a {\n    one()\n=======\n  if b {\n    two()\n\
+             >>>>>>> branch\n  }\n}\n",
+        );
+        let r = ws
+            .run(r#"(report "left" (conflict-keep "both" 1))"#)
+            .unwrap();
+        assert_eq!(report(&r, "left"), "0", "keep still resolves the hunk");
+        assert!(
+            r.log.iter().any(|m| m.contains("leave a bracket open")),
+            "fused-keep warning missing; log = {:?}",
+            r.log
+        );
+
+        // The common, safe case — sides that each close what they open — keeps
+        // both with no warning (the join is balanced).
+        let mut ws = trusted("<<<<<<< HEAD\nfoo()\n=======\nbar()\n>>>>>>> branch\n");
+        let r = ws
+            .run(r#"(report "left" (conflict-keep "both" 1))"#)
+            .unwrap();
+        assert_eq!(report(&r, "left"), "0");
+        assert!(r.log.is_empty(), "balanced join must not warn: {:?}", r.log);
+    }
+
+    #[test]
+    fn conflict_keep_all_warns_on_fused_diff3_sides() {
+        // diff3: ours, base, AND theirs each open a brace the post-marker `}`
+        // was meant to close. Keeping "all" concatenates all three, so the
+        // single `}` closes only the last — the warning must fire (the base
+        // section participates in the dangle count too).
+        let mut ws = trusted(
+            "fn pick() {\n<<<<<<< HEAD\n  if a {\n    one()\n\
+             ||||||| base\n  if z {\n    zero()\n=======\n  if b {\n    two()\n\
+             >>>>>>> branch\n  }\n}\n",
+        );
+        let r = ws
+            .run(r#"(report "left" (conflict-keep "all" 1))"#)
+            .unwrap();
+        assert_eq!(report(&r, "left"), "0", "keep still resolves the hunk");
+        assert!(
+            r.log.iter().any(|m| m.contains("leave a bracket open")),
+            "fused-keep warning missing for \"all\"; log = {:?}",
+            r.log
+        );
     }
 
     #[test]

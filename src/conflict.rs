@@ -228,6 +228,67 @@ pub fn side_text(b: &dyn TextStore, h: &Hunk, side: &str) -> Result<String, Stri
     }
 }
 
+/// Net unclosed openers per bracket class — `{}`, `()`, `[]` — over `s`.
+/// A class entry > 0 means the text leaves that bracket open. Strings and
+/// comments are NOT parsed (a `{` in a string counts); this is a cheap
+/// heuristic for a warning, never a hard syntax check.
+fn net_open(s: &str) -> [i32; 3] {
+    let mut d = [0i32; 3];
+    for c in s.chars() {
+        match c {
+            '{' => d[0] += 1,
+            '}' => d[0] -= 1,
+            '(' => d[1] += 1,
+            ')' => d[1] -= 1,
+            '[' => d[2] += 1,
+            ']' => d[2] -= 1,
+            _ => {}
+        }
+    }
+    d
+}
+
+/// A non-blocking warning for `conflict-keep "both"`/`"all"`: when two or more
+/// of the kept sides EACH leave a bracket open, a shared closing line in the
+/// post-marker context (e.g. a `}` folded into the trailing context, so each
+/// side is the *body* of a construct that line closes) balances only the LAST
+/// side after concatenation — the earlier construct runs unclosed into the next
+/// and the result is syntactically broken yet reported resolved. `keep_warning`
+/// gathers the sides; this counts the danglers. `None` when at most one side is
+/// open (the join is unambiguous). Bracket-counting only — warns, never blocks.
+fn fused_keep_warning(parts: &[String]) -> Option<String> {
+    let dangling = parts
+        .iter()
+        .filter(|p| net_open(p).iter().any(|&d| d > 0))
+        .count();
+    (dangling >= 2).then(|| {
+        "conflict-keep: two or more kept sides each leave a bracket open — a \
+         shared closing line after the hunk balances only the last, so an \
+         earlier construct may now be unclosed; re-check the join"
+            .to_string()
+    })
+}
+
+/// The `fused_keep_warning` for keeping `side` of `h` — `Some(reason)` only for
+/// the multi-side modes (`both`/`all`) whose concatenation can fuse constructs;
+/// `None` for the single-side modes, which never join.
+pub fn keep_warning(b: &dyn TextStore, h: &Hunk, side: &str) -> Option<String> {
+    let sub = |span: (usize, usize)| b.substring(span.0, span.1);
+    let parts: Vec<String> = match side {
+        "both" => vec![sub(h.ours), sub(h.theirs)],
+        "all" => {
+            let mut v = vec![sub(h.ours)];
+            if let Some(span) = h.base {
+                v.push(sub(span));
+            }
+            v.push(sub(h.theirs));
+            v
+        }
+        _ => return None,
+    };
+    fused_keep_warning(&parts)
+}
+
 /// Render the `conflict-hunks` overview: one line per hunk with its number,
 /// char position + line (goto-char-able), labels, and side sizes; plus a
 /// trailing warning when `strays` opener lines were left unparsed.
