@@ -1522,6 +1522,25 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         });
     }
     {
+        // (conflicts) — the hunks' start positions (1-based, goto-char-able),
+        // in document order; nil when the buffer is clean. The structured
+        // companion to conflict-count: count says how MANY, this says WHERE —
+        // so a resolve loop can walk the hunks itself (goto-char →
+        // conflict-context to inspect, conflict-keep to resolve) without
+        // parsing the conflict-hunks overview text. Each position lands INSIDE
+        // its hunk, so the at-point commands address it directly. Re-scan after
+        // each edit: resolving a hunk shifts the later positions. (The MCP
+        // `conflicts` tool instead renders the human overview; for that text
+        // from lisp use `(conflict-hunks)`.)
+        let s = session.clone();
+        ctx.defun("conflicts", move || -> Vec<i64> {
+            crate::conflict::scan(s.borrow_mut().buffer.as_mut())
+                .iter()
+                .map(|h| h.start as i64)
+                .collect()
+        });
+    }
+    {
         // (conflict-hunks) — rendered overview: one line per hunk with its
         // number, char position + line, labels, and side sizes; appends a
         // warning when marker-shaped lines were left unparsed (malformed or
@@ -3517,6 +3536,44 @@ mod tests {
             "fused-keep warning missing for \"all\"; log = {:?}",
             r.log
         );
+    }
+
+    #[test]
+    fn conflicts_lists_hunk_positions_for_a_pure_lisp_resolve_loop() {
+        // A clean buffer has no conflicts: (conflicts) is nil (empty list).
+        let mut clean = trusted("just some text\nno markers here\n");
+        let r = clean.run(r#"(report "n" (length (conflicts)))"#).unwrap();
+        assert_eq!(report(&r, "n"), "0");
+
+        let mut ws = trusted(
+            "a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> b\nmid\n\
+             <<<<<<< HEAD\np\n=======\nq\n>>>>>>> b\nz\n",
+        );
+        // WHERE the conflicts are, as goto-char-able positions — the structured
+        // companion to conflict-count's HOW MANY. First position is "a\n" past,
+        // i.e. char 3 (the opener line's start), and it sits inside its hunk.
+        let r = ws
+            .run(
+                r#"(report "n" (length (conflicts)))
+                   (report "first" (car (conflicts)))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "n"), "2");
+        assert_eq!(report(&r, "first"), "3");
+
+        // A whole resolve loop driven from lisp alone — no MCP front door:
+        // jump to each hunk's position and resolve it at point until none remain.
+        let r = ws
+            .run(
+                r#"(while (> (conflict-count) 0)
+                     (goto-char (car (conflicts)))
+                     (conflict-keep "theirs"))
+                   (report "left" (length (conflicts)))
+                   (report "txt" (buffer-string))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "left"), "0");
+        assert_eq!(report(&r, "txt"), "\"a\\ny\\nmid\\nq\\nz\\n\"");
     }
 
     #[test]
