@@ -2957,7 +2957,11 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("write-file over a drifted visited file must fail"),
         };
-        assert!(err.contains("refusing to write-file"), "got: {err}");
+        // Refused for the right reason — the rename changed the inode.
+        assert!(
+            err.contains("refusing to write-file") && err.contains("replaced on disk"),
+            "got: {err}"
+        );
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "theirs v2 external\n",
@@ -2970,6 +2974,39 @@ mod tests {
         let other_path = other.to_string_lossy().into_owned();
         ws.run(&format!(r#"(write-file "{other_path}")"#)).unwrap();
         assert_eq!(std::fs::read_to_string(&other).unwrap(), ws.text());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_file_refuses_on_an_in_place_mtime_size_drift() {
+        // The other drift branch of FileStamp::check: an external in-place
+        // rewrite keeps the inode but changes size/mtime. (A different LENGTH
+        // makes the size check fire regardless of mtime granularity.) The guard
+        // must still refuse — only the reason differs from the new-inode case.
+        let dir = temp_dir("write-file-stale-inplace");
+        let file = dir.join("doc.txt");
+        std::fs::write(&file, "theirs v1\n").unwrap();
+        let mut ws = Workspace::new_trusted(Box::new(crate::Quire::open(&file).unwrap()));
+        let path = file.to_string_lossy().into_owned();
+        ws.run(r#"(goto-char (point-max)) (insert "ours\n")"#)
+            .unwrap();
+
+        // In-place (same inode), longer content → size differs.
+        std::fs::write(&file, "theirs version two, rather longer\n").unwrap();
+        let err = match ws.run(&format!(r#"(write-file "{path}")"#)) {
+            Err(e) => e,
+            Ok(_) => panic!("write-file over an in-place-changed file must fail"),
+        };
+        assert!(
+            err.contains("refusing to write-file") && err.contains("modified on disk"),
+            "got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "theirs version two, rather longer\n",
+            "their bytes are intact"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
