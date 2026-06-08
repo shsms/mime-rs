@@ -262,9 +262,10 @@ fn fused_keep_warning(parts: &[String]) -> Option<String> {
         .filter(|p| net_open(p).iter().any(|&d| d > 0))
         .count();
     (dangling >= 2).then(|| {
-        "conflict-keep: two or more kept sides each leave a bracket open — a \
-         shared closing line after the hunk balances only the last, so an \
-         earlier construct may now be unclosed; re-check the join"
+        "conflict-keep: two or more kept sides each leave a bracket open, so \
+         concatenating them likely leaves an earlier construct unclosed (any \
+         shared closing line after the hunk would balance only the last) — \
+         re-check the join, e.g. with (treesit-has-error)"
             .to_string()
     })
 }
