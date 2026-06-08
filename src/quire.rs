@@ -1,9 +1,11 @@
-//! Quire — the `TextStore` over an immutable, memory-mapped original plus an
+//! Quire — the `TextStore` over an immutable, read-on-demand original plus an
 //! append-only add buffer (M1), with a **persistent measured B-tree** spine.
 //! This is VS Code's piece tree in its copy-on-write form: the document is an
 //! ordered sequence of *pieces* `(source, start, len)` that reference one of two
-//! immutable backing stores; the original is `mmap`ed (paged by the OS, never
-//! fully resident) and the add buffer holds only inserted text. An edit splits
+//! immutable backing stores; the original file is read on demand a page at a
+//! time into a bounded LRU cache (never fully resident — and never `mmap`ed, so
+//! external truncation can't SIGBUS and an in-place rewrite can't alias an
+//! in-flight read), and the add buffer holds only inserted text. An edit splits
 //! pieces and points a new one at the add buffer — original bytes never move.
 //!
 //! Positions are 1-based char positions, Emacs-style, exactly like
@@ -22,12 +24,13 @@
 //! **persistent** and a snapshot is just a clone of the root `Arc`.
 //!
 //! ## Shared, immutable backings → O(1) snapshots
-//! Both backing stores are `Arc`-shared. The original (mmap or owned string) is
-//! immutable for the program's life. The add buffer is append-only; a `Quire`
-//! appends to it in place while it is uniquely owned, and **copies it on write**
-//! the first time it must grow while a snapshot still shares it (so divergent
-//! timelines never clobber each other's bytes). A snapshot therefore clones two
-//! `Arc`s and copies only the cursor state — no document bytes move. See
+//! The original (a paged file or owned string) is immutable for the program's
+//! life and shared via `Rc`. The add buffer is `Arc`-shared and append-only; a
+//! `Quire` appends to it in place while it is uniquely owned, and **copies it on
+//! write** the first time it must grow while a snapshot still shares it (so
+//! divergent timelines never clobber each other's bytes). A snapshot therefore
+//! clones those two backing pointers and copies only the cursor state — no
+//! document bytes move. See
 //! [`Quire::snapshot`].
 //!
 //! ## What is (and isn't) materialized
@@ -46,13 +49,16 @@
 use crate::buffer::MatchData;
 use crate::store::TextStore;
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// Which immutable backing store a piece points into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
-    /// The file (mmap) or the owned text passed to [`Quire::from_string`].
+    /// The file (read on demand) or the owned text from [`Quire::from_string`].
     Original,
     /// The append-only add buffer — holds only inserted text.
     Add,
@@ -81,47 +87,227 @@ impl Piece {
     }
 }
 
-/// The immutable original: either an mmap of a file or owned text. Both are
-/// treated uniformly as `&[u8]` / `&str`; the mmap is never copied wholesale.
-/// Wrapped in an [`Arc`] so every snapshot shares it with zero copying.
+/// The immutable original: either owned text (`from_string`) or a file read on
+/// demand a page at a time (`open`). Read uniformly through [`Original::for_bytes`]
+/// — never one contiguous `&[u8]` over the whole thing — so the file backing
+/// need not be fully resident. Shared via [`Rc`] so every snapshot shares it.
 enum Original {
     /// `from_string` — owns its "original" text (no file). Needed for tests and
     /// scratch buffers without a path.
     Owned(String),
-    /// `open` — the file, mmapped read-only. The OS pages it in and out.
-    Mapped(memmap2::Mmap),
+    /// `open` — the file, read on demand into a bounded page cache.
+    Paged(PagedFile),
 }
 
 impl Original {
-    fn bytes(&self) -> &[u8] {
-        match self {
-            Original::Owned(s) => s.as_bytes(),
-            Original::Mapped(m) => m,
-        }
-    }
-
     fn len(&self) -> usize {
-        self.bytes().len()
+        match self {
+            Original::Owned(s) => s.len(),
+            Original::Paged(p) => p.len,
+        }
     }
 
     /// Invoke `f` with successive byte slices covering `[start, start+len)`, in
-    /// order; `f` returns `false` to stop. The contiguous backings yield the
-    /// whole range as one slice; a paged original (later) yields page-bounded
-    /// slices. A slice may end mid-char — treat it as raw bytes, never
-    /// `from_utf8` a single chunk on its own.
+    /// order; `f` returns `false` to stop. An owned original yields the whole
+    /// range as one slice; a paged original yields page-bounded slices. A slice
+    /// may end mid-char — treat it as raw bytes, never `from_utf8` a single chunk
+    /// on its own.
     fn for_bytes(&self, start: usize, len: usize, f: &mut dyn FnMut(&[u8]) -> bool) {
-        f(&self.bytes()[start..start + len]);
+        match self {
+            Original::Owned(s) => {
+                f(&s.as_bytes()[start..start + len]);
+            }
+            Original::Paged(p) => p.for_bytes(start, len, f),
+        }
     }
 
     /// Char and `\n` counts of the whole original — the one O(filesize) scan at
-    /// open time, fanned out over cores above [`PARALLEL_INDEX_THRESHOLD`].
+    /// open time. Owned text fans out over cores above [`PARALLEL_INDEX_THRESHOLD`];
+    /// a paged file is scanned sequentially page by page (nothing kept resident).
     fn count_chars_lines(&self) -> (usize, usize) {
-        let bytes = self.bytes();
-        if bytes.len() >= PARALLEL_INDEX_THRESHOLD {
-            count_chars_lines_parallel(bytes)
-        } else {
-            count_chars_lines(bytes)
+        match self {
+            Original::Owned(s) => {
+                let bytes = s.as_bytes();
+                if bytes.len() >= PARALLEL_INDEX_THRESHOLD {
+                    count_chars_lines_parallel(bytes)
+                } else {
+                    count_chars_lines(bytes)
+                }
+            }
+            Original::Paged(p) => p.count_chars_lines(),
         }
+    }
+}
+
+/// Bytes per page the on-demand reader fetches and caches.
+const PAGE: usize = 64 * 1024;
+/// Resident page budget: at most this many pages are cached at once (LRU
+/// eviction past it), bounding a paged Quire's read footprint regardless of file
+/// size. 256 × 64 KiB = 16 MiB.
+const CACHE_PAGES: usize = 256;
+
+/// A bounded LRU of file pages. Single-threaded (the engine is `!Send`); pages
+/// are `Rc<[u8]>` so a reader clones one out and drops the cache borrow before
+/// touching the bytes — eviction can't pull a page out from under an in-flight
+/// read, and the callback can't re-enter the `RefCell`.
+struct PageCache {
+    pages: HashMap<u64, (Rc<[u8]>, u64)>, // page index → (bytes, last-use tick)
+    tick: u64,
+}
+
+impl PageCache {
+    fn new() -> PageCache {
+        PageCache {
+            pages: HashMap::new(),
+            tick: 0,
+        }
+    }
+
+    /// Touch and return the cached page, or `None` on a miss.
+    fn get(&mut self, page: u64) -> Option<Rc<[u8]>> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.pages.get_mut(&page).map(|e| {
+            e.1 = tick;
+            e.0.clone()
+        })
+    }
+
+    /// Cache `bytes` for `page`, evicting the least-recently-used page first if
+    /// the budget is full.
+    fn insert(&mut self, page: u64, bytes: Rc<[u8]>) {
+        if self.pages.len() >= CACHE_PAGES && !self.pages.contains_key(&page) {
+            let victim = self
+                .pages
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(&p, _)| p);
+            if let Some(v) = victim {
+                self.pages.remove(&v);
+            }
+        }
+        self.tick += 1;
+        self.pages.insert(page, (bytes, self.tick));
+    }
+}
+
+/// An open file read on demand, one [`PAGE`] at a time, into a bounded LRU
+/// [`PageCache`]. Replaces the whole-file mmap: a `read_at` page is an owned
+/// copy, so the bytes can't be mutated under an in-flight read (mmap aliasing)
+/// and a truncated file can't SIGBUS — a short read just leaves the page's tail
+/// zero-filled, keeping document byte offsets valid.
+struct PagedFile {
+    file: std::fs::File,
+    len: usize,
+    cache: RefCell<PageCache>,
+}
+
+impl PagedFile {
+    fn open(file: std::fs::File, len: usize) -> PagedFile {
+        PagedFile {
+            file,
+            len,
+            cache: RefCell::new(PageCache::new()),
+        }
+    }
+
+    /// Fill `buf` from file offset `off` with `read_at` (pread), retrying short
+    /// reads; returns the bytes actually read (`< buf.len()` only on EOF /
+    /// external truncation). Never faults.
+    fn read_into(&self, buf: &mut [u8], off: usize) -> usize {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match self.file.read_at(&mut buf[filled..], (off + filled) as u64) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        filled
+    }
+
+    /// The page at index `pno`, reading + caching it on a miss. The page is the
+    /// expected extent (`PAGE`, or shorter for the last page); a `read_at` that
+    /// comes up short (truncation) leaves the tail zero-filled.
+    fn page(&self, pno: u64) -> Rc<[u8]> {
+        if let Some(p) = self.cache.borrow_mut().get(pno) {
+            return p;
+        }
+        let start = pno as usize * PAGE;
+        let want = PAGE.min(self.len - start);
+        let mut buf = vec![0u8; want];
+        self.read_into(&mut buf, start);
+        let rc: Rc<[u8]> = Rc::from(buf.into_boxed_slice());
+        self.cache.borrow_mut().insert(pno, rc.clone());
+        rc
+    }
+
+    /// Page-chunked [`Original::for_bytes`].
+    fn for_bytes(&self, start: usize, len: usize, f: &mut dyn FnMut(&[u8]) -> bool) {
+        let end = start + len;
+        let mut pos = start;
+        while pos < end {
+            let pno = (pos / PAGE) as u64;
+            let page = self.page(pno);
+            let within = pos - pno as usize * PAGE;
+            let take = (end - pos).min(page.len() - within);
+            if take == 0 {
+                break; // defensive; pos < end <= len keeps page coverage non-empty
+            }
+            if !f(&page[within..within + take]) {
+                break;
+            }
+            pos += take;
+        }
+    }
+
+    /// Scan the whole file once, page by page, counting chars (`\n`s); keeps
+    /// nothing resident. Sequential — the parallel open-time scan is owned-only
+    /// for now (a paged parallel scan is a follow-up).
+    fn count_chars_lines(&self) -> (usize, usize) {
+        let (mut chars, mut lines) = (0usize, 0usize);
+        let mut buf = vec![0u8; PAGE];
+        let mut off = 0usize;
+        while off < self.len {
+            let want = PAGE.min(self.len - off);
+            let filled = self.read_into(&mut buf[..want], off);
+            let (c, l) = count_chars_lines(&buf[..filled]);
+            chars += c;
+            lines += l;
+            off += want;
+        }
+        (chars, lines)
+    }
+
+    /// Validate the file is UTF-8 by a streaming scan, carrying an incomplete
+    /// trailing char across page boundaries. Keeps nothing resident.
+    fn is_valid_utf8(&self) -> bool {
+        let mut carry: Vec<u8> = Vec::new();
+        let mut buf = vec![0u8; PAGE];
+        let mut off = 0usize;
+        while off < self.len {
+            let want = PAGE.min(self.len - off);
+            let filled = self.read_into(&mut buf[..want], off);
+            let combined: Vec<u8> = if carry.is_empty() {
+                buf[..filled].to_vec()
+            } else {
+                let mut v = std::mem::take(&mut carry);
+                v.extend_from_slice(&buf[..filled]);
+                v
+            };
+            match std::str::from_utf8(&combined) {
+                Ok(_) => {}
+                Err(e) if e.error_len().is_none() => {
+                    // An incomplete char at the chunk's tail: carry it forward.
+                    carry = combined[e.valid_up_to()..].to_vec();
+                }
+                Err(_) => return false,
+            }
+            off += want;
+        }
+        // Leftover carry = a truncated char at end-of-file = invalid.
+        carry.is_empty()
     }
 }
 
@@ -316,7 +502,7 @@ impl Node {
 pub struct Quire {
     name: String,
     /// Immutable original backing, shared by every snapshot.
-    original: Arc<Original>,
+    original: Rc<Original>,
     /// Append-only add buffer, shared by every snapshot; copied-on-write before
     /// a shared `Quire` grows it (see [`Quire::add_mut`]). Pieces with
     /// `source == Add` reference byte ranges in here.
@@ -349,15 +535,15 @@ pub struct Quire {
 }
 
 impl Quire {
-    /// Open `path` and mmap it read-only as the immutable original. Rejects
-    /// non-UTF-8 input (an explicit byte mode can come later, per the plan).
+    /// Open `path` as the immutable original, read on demand a page at a time
+    /// (no mmap — so external truncation can't SIGBUS and an in-place rewrite
+    /// can't alias an in-flight read). Rejects non-UTF-8 input via a streaming
+    /// scan (an explicit byte mode can come later, per the plan).
     pub fn open(path: &Path) -> std::io::Result<Quire> {
         let file = std::fs::File::open(path)?;
-        // SAFETY: we treat the mapping as immutable for Quire's lifetime. The
-        // plan notes a paged-LRU reader can replace mmap to rule out SIGBUS on
-        // external truncation; for M1 the mmap is the backing.
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        if std::str::from_utf8(&mmap).is_err() {
+        let len = file.metadata()?.len() as usize;
+        let paged = PagedFile::open(file, len);
+        if !paged.is_valid_utf8() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Quire::open: file is not valid UTF-8",
@@ -367,7 +553,7 @@ impl Quire {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        let mut quire = Quire::with_original(name, Original::Mapped(mmap));
+        let mut quire = Quire::with_original(name, Original::Paged(paged));
         // Stamp the visited file so save paths can detect external changes.
         // Stat-by-path right after the open; the open→stat window is tiny and
         // a writer landing inside it still differs from the *saved* stamp later.
@@ -403,7 +589,7 @@ impl Quire {
         };
         Quire {
             name,
-            original: Arc::new(original),
+            original: Rc::new(original),
             add: Arc::new(Vec::new()),
             root,
             point: 1,
@@ -417,7 +603,7 @@ impl Quire {
         }
     }
 
-    /// An O(1)/O(log n) snapshot: clone the tree root and both backing `Arc`s
+    /// An O(1)/O(log n) snapshot: clone the tree root and both backing pointers
     /// (no document bytes copied) and copy only the cursor/narrowing/match state.
     /// The result is an independent `Quire` whose future edits path-copy from the
     /// shared root and copy-on-write the add buffer, so neither version disturbs
@@ -425,7 +611,7 @@ impl Quire {
     pub fn snapshot(&self) -> Quire {
         Quire {
             name: self.name.clone(),
-            original: Arc::clone(&self.original),
+            original: Rc::clone(&self.original),
             add: Arc::clone(&self.add),
             root: Arc::clone(&self.root),
             point: self.point,
@@ -439,17 +625,16 @@ impl Quire {
         }
     }
 
-    /// Re-base onto `path` after the buffer was just saved there: re-mmap the new
-    /// file as a single `Original` piece and drop the pre-save backing (the old,
-    /// now-unlinked mmap inode) plus the add buffer. Point/mark/narrowing/markers
-    /// are kept. The saved file is byte-identical to the current content, so the
-    /// char/line totals are reused from the live summary — no re-scan. O(1) + mmap.
+    /// Re-base onto `path` after the buffer was just saved there: re-open the new
+    /// file as a single paged `Original` piece and drop the pre-save backing (the
+    /// old, now-unlinked inode + its page cache) plus the add buffer.
+    /// Point/mark/narrowing/markers are kept. The saved file is byte-identical to
+    /// the current content, so the char/line totals are reused from the live
+    /// summary — no re-scan, no UTF-8 re-validation. O(1) + open.
     pub fn rebase_to(&mut self, path: &Path) -> std::io::Result<()> {
         let stamp = crate::safety::FileStamp::capture(path)?;
         let file = std::fs::File::open(path)?;
-        // SAFETY: same immutable-mapping contract as `Quire::open`.
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        let bytes_len = mmap.len();
+        let bytes_len = file.metadata()?.len() as usize;
         debug_assert_eq!(
             bytes_len,
             self.total_bytes(),
@@ -467,7 +652,7 @@ impl Quire {
                 lines: summary.lines,
             }]))
         };
-        self.original = Arc::new(Original::Mapped(mmap));
+        self.original = Rc::new(Original::Paged(PagedFile::open(file, bytes_len)));
         self.add = Arc::new(Vec::new());
         self.root = root;
         self.stamp = Some(stamp);
@@ -1177,7 +1362,7 @@ impl Quire {
     /// Materializes the *window* `[point, bound)` to run the regex, then maps the
     /// byte match back to char positions. The window is the search bound, not the
     /// document; for the common all-original case the plan calls for scanning the
-    /// mmap directly and an incremental DFA across pieces — TODO. Capturing
+    /// paged file directly and an incremental DFA across pieces — TODO. Capturing
     /// `replace_match`'s groups needs the matched substrings regardless.
     ///
     /// TODO (M6, deferred): parallelize search/replace the way the initial
@@ -1922,7 +2107,7 @@ mod tests {
     }
 
     #[test]
-    fn open_mmaps_a_file() {
+    fn open_reads_a_file() {
         let mut path = std::env::temp_dir();
         path.push(format!("quire_open_test_{}.txt", std::process::id()));
         std::fs::write(&path, "line one\nline two\nαβγ\n").unwrap();
@@ -1947,6 +2132,148 @@ mod tests {
             Ok(_) => panic!("expected non-UTF-8 file to be rejected"),
             Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Tempfile path unique to a test name + this process.
+    fn tmp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("quire_paged_{tag}_{}.txt", std::process::id()))
+    }
+
+    #[test]
+    fn open_rejects_a_file_truncated_mid_char() {
+        // A 3-byte char with its last byte missing: the streaming validator must
+        // reject it (a leftover carry at EOF), like the whole-buffer check did.
+        let path = tmp_path("trunc-char");
+        let mut bytes = "ok\n".as_bytes().to_vec();
+        bytes.extend_from_slice(&"€".as_bytes()[..2]); // drop the final byte
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            Quire::open(&path).is_err(),
+            "truncated trailing char must fail"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_reads_an_empty_file_via_the_paged_path() {
+        // A 0-byte file through Quire::open: the streaming validator accepts it,
+        // with_original short-circuits to an empty tree, and reads are empty —
+        // no page() is ever called (len 0), so no offset math runs on it.
+        let path = tmp_path("empty");
+        std::fs::write(&path, b"").unwrap();
+        let q = Quire::open(&path).unwrap();
+        assert_eq!(TextStore::char_len(&q), 0);
+        assert_eq!(TextStore::text(&q), "");
+        assert_eq!(TextStore::char_after(&q, 1), None);
+        assert_eq!(TextStore::substring(&q, 1, 1), "");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn paged_reads_multipage_content_with_a_char_straddling_a_page_edge() {
+        // A 3-byte char deliberately straddling a PAGE boundary, then several
+        // more pages of mixed ASCII/multibyte/newlines — exercises the chunked
+        // char/byte seeks across page splits against the in-memory oracle.
+        let path = tmp_path("multi");
+        let mut content = String::new();
+        content.push_str(&"a".repeat(PAGE - 1)); // chars 1..=PAGE-1
+        content.push('€'); // char PAGE: bytes [PAGE-1, PAGE+2) straddle the page edge
+        while content.len() < 3 * PAGE {
+            content.push_str("xy€z\nq\t");
+        }
+        std::fs::write(&path, &content).unwrap();
+
+        let mut q = Quire::open(&path).unwrap();
+        let mut oracle = Buffer::from_string("oracle", &content);
+        assert_eq!(TextStore::text(&q), TextStore::text(&oracle));
+        assert_eq!(TextStore::char_len(&q), TextStore::char_len(&oracle));
+
+        let euro = PAGE; // 1-based position of the straddling '€'
+        for p in [euro - 1, euro, euro + 1, 1, TextStore::char_len(&q)] {
+            assert_eq!(
+                TextStore::char_after(&q, p),
+                TextStore::char_after(&oracle, p),
+                "char_after({p})"
+            );
+        }
+        // Substring + line number spanning the page edge.
+        assert_eq!(
+            TextStore::substring(&q, euro - 3, euro + 4),
+            TextStore::substring(&oracle, euro - 3, euro + 4),
+        );
+        assert_eq!(
+            TextStore::line_number_at_pos(&q, euro + 1000),
+            TextStore::line_number_at_pos(&oracle, euro + 1000),
+        );
+        // A search whose needle crosses the page boundary.
+        TextStore::goto_char(&mut q, 1);
+        TextStore::goto_char(&mut oracle, 1);
+        assert_eq!(
+            TextStore::search_forward(&mut q, "a€xy", None),
+            TextStore::search_forward(&mut oracle, "a€xy", None),
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn paged_cache_eviction_keeps_reads_correct() {
+        // Content larger than the page-cache budget, so reads must evict and
+        // re-read pages. Materializing the whole document (text()) walks every
+        // page while the cache holds only CACHE_PAGES of them at a time.
+        let path = tmp_path("evict");
+        let budget = CACHE_PAGES * PAGE;
+        let mut content = String::with_capacity(budget + 4 * PAGE);
+        while content.len() < budget + 3 * PAGE {
+            content.push_str("the quick brown fox jumps over €\n");
+        }
+        std::fs::write(&path, &content).unwrap();
+
+        let q = Quire::open(&path).unwrap();
+        let oracle = Buffer::from_string("oracle", &content);
+        assert!(
+            content.len() > budget,
+            "must exceed the cache budget to evict"
+        );
+        assert_eq!(TextStore::char_len(&q), TextStore::char_len(&oracle));
+        // Full materialization is correct despite eviction mid-scan.
+        assert_eq!(TextStore::text(&q), TextStore::text(&oracle));
+        // Far-apart reads (forcing re-reads of long-evicted pages).
+        let last = TextStore::char_len(&q);
+        for p in [1, last / 3, 2 * last / 3, last - 4] {
+            assert_eq!(
+                TextStore::char_after(&q, p),
+                TextStore::char_after(&oracle, p)
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn paged_open_survives_external_truncation() {
+        // The SIGBUS-on-truncate guarantee: mmap would fault when an in-flight
+        // read touched a page past a shrunk file. The pager zero-fills a short
+        // read instead, so reads stay panic-free and internally consistent.
+        let path = tmp_path("trunc");
+        let content = "x".repeat(3 * PAGE);
+        std::fs::write(&path, &content).unwrap();
+        let q = Quire::open(&path).unwrap();
+        let len_at_open = TextStore::char_len(&q);
+        assert_eq!(len_at_open, 3 * PAGE);
+
+        // External truncation after open, before any page is read.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+
+        // Must NOT SIGBUS/panic; char count stays the open-time total (offsets
+        // are fixed), and the materialized text matches that length.
+        let text = TextStore::text(&q);
+        assert_eq!(text.chars().count(), len_at_open);
+        assert_eq!(TextStore::char_after(&q, 1), Some('x'));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1990,16 +2317,16 @@ mod tests {
         // Edit so there is a non-trivial add buffer and tree to share.
         TextStore::goto_char(&mut q, 7);
         TextStore::insert(&mut q, "INSERTED ");
-        let orig_ptr = Arc::as_ptr(&q.original);
+        let orig_ptr = Rc::as_ptr(&q.original);
         let add_ptr = Arc::as_ptr(&q.add);
         let root_ptr = Arc::as_ptr(&q.root);
         let snap = q.snapshot();
         // Snapshot points at the very same backing + spine allocations.
-        assert_eq!(Arc::as_ptr(&snap.original), orig_ptr, "original not shared");
+        assert_eq!(Rc::as_ptr(&snap.original), orig_ptr, "original not shared");
         assert_eq!(Arc::as_ptr(&snap.add), add_ptr, "add buffer not shared");
         assert_eq!(Arc::as_ptr(&snap.root), root_ptr, "tree spine not shared");
         // All three backings are now multiply-owned (proof: no deep copy).
-        assert!(Arc::strong_count(&q.original) >= 2);
+        assert!(Rc::strong_count(&q.original) >= 2);
         assert!(Arc::strong_count(&q.add) >= 2);
         assert!(Arc::strong_count(&q.root) >= 2);
     }
@@ -2321,13 +2648,13 @@ mod tests {
     }
 
     #[test]
-    fn save_to_open_path_keeps_mmap_reads_correct() {
-        // Regression for the mmap-aliasing bug. `save_buffer` once overwrote the
-        // very file `Quire` had mmapped as its immutable original, mutating those
-        // bytes under the live pieces — so mmap-backed reads (collect_range, behind
+    fn save_to_open_path_keeps_paged_reads_correct() {
+        // Regression for the original-aliasing bug. `save_buffer` once overwrote
+        // the very file `Quire` read as its immutable original, mutating those
+        // bytes under the live pieces — so file-backed reads (collect_range, behind
         // substring/read_region/search) returned shifted garbage while full_text
         // (served from the text cache) still looked fine. `safety::write_atomic`
-        // (temp + rename) leaves the mmapped inode intact. Open a file, edit so the
+        // (temp + rename) leaves the original inode intact. Open a file, edit so the
         // content shifts, save IN PLACE to the same path, and confirm windowed reads
         // stay byte-correct.
         let initial = format!(
@@ -2343,10 +2670,10 @@ mod tests {
         q.insert(" <INSERTED so everything after shifts> ");
         let saved = q.full_text().to_string();
 
-        // Save IN PLACE to the path the mmap maps — the aliasing case.
+        // Save IN PLACE to the original's path — the aliasing case.
         crate::safety::write_atomic(&tmp, saved.as_bytes()).unwrap();
 
-        // Reads through the mmap must still match full_text after the save.
+        // File-backed reads must still match full_text after the save.
         let flen = saved.chars().count();
         let cl = q.char_len();
         assert_eq!(cl, flen, "char_len drifted after in-place save");
@@ -2415,7 +2742,7 @@ mod tests {
             true
         });
         assert_eq!(n, 1, "rebase should collapse to a single piece");
-        assert!(all_original, "the piece should be the new mmap original");
+        assert!(all_original, "the piece should be the new paged original");
         assert!(q.add.is_empty(), "add buffer should be reset");
         assert_eq!(q.full_text(), content, "content preserved");
         assert_eq!(
@@ -2544,8 +2871,8 @@ mod tests {
     }
 
     #[test]
-    fn differential_with_held_snapshots_mmap() {
-        // Same stress, but the Quire is opened from a real file → mmap-backed
+    fn differential_with_held_snapshots_paged() {
+        // Same stress, but the Quire is opened from a real file → paged file-backed
         // original (the open_file path the warm MCP server uses), combined with
         // held snapshots and windowed reads.
         let path = std::env::temp_dir().join(format!("mime-quire-snap-{}.txt", std::process::id()));
