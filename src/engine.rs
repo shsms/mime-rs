@@ -70,6 +70,16 @@ pub struct Session {
     /// version and the next call re-parses. One slot — agents work one
     /// buffer at a time, and a parse is only worth caching while it's hot.
     pub syntax_cache: Option<(crate::syntax::Lang, u64, Rc<crate::syntax::Syntax>)>,
+    /// The buffer's content [`version`](crate::store::TextStore::version) at the
+    /// last load or save — the point the warm buffer last matched its file on
+    /// disk. The buffer is "modified since load/save" exactly when its current
+    /// version differs; auto-revert only re-reads an *unmodified* drifted buffer
+    /// (a modified one is the genuine conflict the stale-WARN still covers).
+    /// Tracks the session's CURRENT buffer. Auto-revert fires only on the
+    /// sandboxed MCP path, which is single-buffer, so this is sufficient; a
+    /// per-buffer baseline would be needed before extending it to the trusted
+    /// tier's inactive/switched buffers.
+    pub synced_version: u64,
 }
 
 impl Session {
@@ -262,6 +272,7 @@ impl Workspace {
         read_only: bool,
         capabilities: Capabilities,
     ) -> Workspace {
+        let synced_version = buffer.version();
         let session: SharedSession = Rc::new(RefCell::new(Session {
             buffer,
             inactive: Vec::new(),
@@ -272,6 +283,7 @@ impl Workspace {
             args: Vec::new(),
             lang_overrides: Vec::new(),
             syntax_cache: None,
+            synced_version,
         }));
 
         let mut ctx = TulispContext::new();
@@ -485,6 +497,26 @@ impl Workspace {
         s.buffer.drifted() || s.buffer.file_stamp().is_some_and(|st| st.check().is_some())
     }
 
+    /// Whether the buffer has unsaved edits since its last load/save (its content
+    /// version moved off the synced baseline).
+    pub fn is_modified(&self) -> bool {
+        let s = self.session.borrow();
+        s.buffer.version() != s.synced_version
+    }
+
+    /// Auto-revert (Emacs `auto-revert-mode`): if the visited file drifted on
+    /// disk and the buffer has NO unsaved edits, silently re-read it so the next
+    /// read/edit sees the current file instead of stale-or-corrupt bytes. Returns
+    /// whether it reverted. A read-only or MODIFIED buffer is never touched — a
+    /// read-only buffer is an unwritable reference the engine must not swap, and
+    /// a modified one is the genuine conflict the stale-WARN path covers.
+    pub fn auto_revert_if_clean(&mut self) -> bool {
+        if self.is_read_only() || self.is_modified() || !self.is_stale() {
+            return false;
+        }
+        revert_in_place(&mut self.session.borrow_mut()).is_ok()
+    }
+
     /// The current buffer text — used by the daemon's `save` op.
     pub fn text(&self) -> String {
         self.session.borrow().buffer.text().to_string()
@@ -521,8 +553,41 @@ impl Workspace {
             written
         };
         let _ = self.session.borrow_mut().buffer.rebase_to_file(path);
+        // The buffer now matches its file on disk → reset the modified baseline
+        // so a clean post-save buffer doesn't read as modified.
+        let v = self.session.borrow().buffer.version();
+        self.session.borrow_mut().synced_version = v;
         Ok(bytes)
     }
+}
+
+/// Re-read the buffer's visited file from disk, discarding the warm buffer's
+/// edits — the body shared by the `revert-buffer` builtin and auto-revert. Point
+/// is kept by position (clamped to the new content); narrowing and markers are
+/// dropped with the old text (the fresh registry is padded so old marker handles
+/// read nil rather than aliasing new ones). The buffer keeps its (possibly
+/// uniquified) name, and the load/save baseline is reset so the reverted buffer
+/// reads as unmodified.
+pub(crate) fn revert_in_place(sess: &mut Session) -> Result<(), String> {
+    let path = sess
+        .buffer
+        .file_stamp()
+        .map(|st| st.path.clone())
+        .ok_or_else(|| "revert-buffer: buffer has no visited file".to_string())?;
+    let point = sess.buffer.point();
+    let name = sess.buffer.name().to_string();
+    let markers = sess.buffer.marker_count();
+    let mut store = crate::Quire::open(&path)
+        .map_err(|e| format!("revert-buffer: cannot re-read {}: {e}", path.display()))?;
+    crate::store::TextStore::set_name(&mut store, &name);
+    sess.buffer = Box::new(store);
+    for _ in 0..markers {
+        sess.buffer.marker_create(None);
+    }
+    let max = sess.buffer.point_max();
+    sess.buffer.goto_char(point.min(max));
+    sess.synced_version = sess.buffer.version();
+    Ok(())
 }
 
 /// The PRIMARY buffer of a run — the one current when the program started,
@@ -828,6 +893,72 @@ mod tests {
             .save_to(&other)
             .expect_err("deleting the now-visited file is drift");
         assert!(err.to_string().contains("deleted"), "got: {err}");
+    }
+
+    #[test]
+    fn auto_revert_refreshes_a_clean_drifted_buffer_but_not_a_modified_one() {
+        let tmp = std::env::temp_dir().join(format!("mime-autorevert-{}.txt", std::process::id()));
+        std::fs::write(&tmp, "v1\n").unwrap();
+        let mut ws = Workspace::new(Box::new(Quire::open(&tmp).unwrap()));
+        assert_eq!(ws.text(), "v1\n");
+        assert!(!ws.is_modified(), "fresh open is unmodified");
+
+        // External change, buffer still clean → auto-revert re-reads the file.
+        crate::safety::write_atomic(&tmp, b"v2 external\n").unwrap();
+        assert!(ws.is_stale(), "drift detected");
+        assert!(ws.auto_revert_if_clean(), "a clean + stale buffer reverts");
+        assert_eq!(ws.text(), "v2 external\n", "buffer now matches the file");
+        assert!(!ws.is_stale(), "fresh stamp after the revert");
+        assert!(!ws.is_modified());
+
+        // Now EDIT (→ modified), then drift again → auto-revert must NOT fire.
+        ws.run(r#"(goto-char (point-max)) (insert "mine\n")"#)
+            .unwrap();
+        assert!(ws.is_modified(), "an edit makes it modified");
+        crate::safety::write_atomic(&tmp, b"v3 external\n").unwrap();
+        assert!(ws.is_stale());
+        assert!(
+            !ws.auto_revert_if_clean(),
+            "a modified buffer is never auto-reverted"
+        );
+        assert_eq!(ws.text(), "v2 external\nmine\n", "the edits are preserved");
+        assert!(ws.is_stale(), "still flagged for the user to resolve");
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn save_resets_the_modified_baseline() {
+        let tmp = std::env::temp_dir().join(format!("mime-synced-{}.txt", std::process::id()));
+        std::fs::write(&tmp, "a\n").unwrap();
+        let mut ws = Workspace::new(Box::new(Quire::open(&tmp).unwrap()));
+        assert!(!ws.is_modified());
+        ws.run(r#"(goto-char (point-max)) (insert "b\n")"#).unwrap();
+        assert!(ws.is_modified(), "edit → modified");
+        ws.save_to(&tmp).unwrap();
+        assert!(!ws.is_modified(), "save → clean baseline");
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn auto_revert_never_swaps_a_read_only_buffer() {
+        // A read-only buffer is an unwritable reference: auto-revert must not
+        // swap it even when its file drifts (that would defeat the contract).
+        let tmp = std::env::temp_dir().join(format!("mime-ro-revert-{}.txt", std::process::id()));
+        std::fs::write(&tmp, "ref v1\n").unwrap();
+        let mut ws = Workspace::new_read_only(Box::new(Quire::open(&tmp).unwrap()));
+        crate::safety::write_atomic(&tmp, b"ref v2 external (longer)\n").unwrap();
+        assert!(ws.is_stale(), "drift detected");
+        assert!(
+            !ws.auto_revert_if_clean(),
+            "a read-only buffer is never auto-reverted"
+        );
+        assert_eq!(
+            ws.text(),
+            "ref v1\n",
+            "the read-only reference is untouched"
+        );
+        assert!(ws.is_stale(), "still flagged on the stale-WARN path");
+        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]

@@ -340,6 +340,15 @@ fn run_or_rehearse(
     let ws = sessions
         .get_mut(session)
         .ok_or_else(|| format!("no such session: {session} (open_file/open_text first)"))?;
+    // Emacs auto-revert-mode: before serving a read or running a program, if the
+    // visited file drifted and the warm buffer has NO unsaved edits, silently
+    // re-read it so the operation sees the current file rather than stale-or-
+    // corrupt bytes. A modified buffer is left alone (the stale-WARN conflict).
+    // Skipped on a rehearse: that dry-run must persist nothing, but the revert
+    // (a buffer swap) would land before rehearse takes its rollback snapshot.
+    if !rehearse {
+        ws.auto_revert_if_clean();
+    }
     if rehearse {
         ws.rehearse(program)
     } else {

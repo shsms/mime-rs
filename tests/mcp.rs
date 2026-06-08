@@ -591,7 +591,7 @@ fn path_reuses_a_session_already_visiting_the_file() {
 }
 
 #[test]
-fn stale_reads_warn_and_revert_buffer_recovers() {
+fn auto_revert_refreshes_clean_reads_while_modified_reads_warn() {
     let dir = temp_dir("stale-read");
     let file = dir.join("doc.txt");
     std::fs::write(&file, "alpha\n").unwrap();
@@ -605,31 +605,94 @@ fn stale_reads_warn_and_revert_buffer_recovers() {
         "clean read must not warn: {view}"
     );
 
-    // An external writer lands: every read tool carries the drift warning
-    // (a warm mmap can serve corrupted bytes after an in-place overwrite),
-    // and run results gain the structured flag.
+    // An external writer lands while the warm buffer has NO unsaved edits:
+    // auto-revert-mode silently re-reads the file on the next read, so the read
+    // sees the current content with NO drift warning.
     std::fs::write(&file, "ALPHA external\n").unwrap();
-    let view = s.call_ok(3, "view", json!({ "path": p }));
-    assert!(
-        view.contains("WARNING") && view.contains("revert-buffer"),
-        "got: {view}"
+    let txt = s.call_ok(3, "read_region", json!({ "path": p, "start": 1, "end": 6 }));
+    assert_eq!(
+        txt, "ALPHA",
+        "clean+stale buffer auto-reverted to the new file"
     );
-    let hit = s.call_ok(4, "search", json!({ "path": p, "pattern": "zzz" }));
-    assert!(hit.contains("WARNING"), "search warns too: {hit}");
+    let view = s.call_ok(4, "view", json!({ "path": p }));
+    assert!(
+        !view.contains("WARNING"),
+        "auto-reverted read does not warn: {view}"
+    );
     let out = s.call_ok(5, "run_program", json!({ "path": p, "program": "(point)" }));
     let out: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(out["stale"], true, "structured drift flag: {out}");
+    assert!(
+        out.get("stale").is_none(),
+        "no drift flag after auto-revert: {out}"
+    );
 
-    // revert-buffer re-reads the disk state; the warning clears.
+    // Now MODIFY the buffer, then drift the file again. A modified buffer is the
+    // genuine conflict — it is NOT auto-reverted, so reads carry the warning.
     s.call_ok(
         6,
         "run_program",
+        json!({ "path": p, "program": "(goto-char (point-max)) (insert \"mine\\n\")" }),
+    );
+    std::fs::write(&file, "THIRD external, a different length\n").unwrap();
+    let view = s.call_ok(7, "view", json!({ "path": p }));
+    assert!(
+        view.contains("WARNING") && view.contains("revert-buffer"),
+        "a modified + drifted read warns: {view}"
+    );
+    let out = s.call_ok(8, "run_program", json!({ "path": p, "program": "(point)" }));
+    let out: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        out["stale"], true,
+        "structured drift flag on a modified buffer: {out}"
+    );
+
+    // Explicit revert-buffer still recovers (discarding the edit) and clears.
+    s.call_ok(
+        9,
+        "run_program",
         json!({ "path": p, "program": "(revert-buffer)" }),
     );
-    let txt = s.call_ok(7, "read_region", json!({ "path": p, "start": 1, "end": 6 }));
-    assert_eq!(txt, "ALPHA", "fresh content after revert");
-    let view = s.call_ok(8, "view", json!({ "path": p }));
+    let txt = s.call_ok(
+        10,
+        "read_region",
+        json!({ "path": p, "start": 1, "end": 6 }),
+    );
+    assert_eq!(txt, "THIRD", "fresh content after explicit revert");
+    let view = s.call_ok(11, "view", json!({ "path": p }));
     assert!(!view.contains("WARNING"), "stamp re-armed: {view}");
+}
+
+#[test]
+fn rehearse_does_not_auto_revert_a_clean_drifted_buffer() {
+    // rehearse is a dry-run that must persist NOTHING — so it must not silently
+    // auto-revert (a buffer swap that would land before the rollback snapshot).
+    let dir = temp_dir("rehearse-revert");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "original\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+    s.call_ok(1, "open_file", json!({ "path": p }));
+
+    // Drift the file (different length) while the buffer is clean.
+    std::fs::write(&file, "changed on disk and longer\n").unwrap();
+    s.call_ok(2, "rehearse", json!({ "path": p, "program": "(point)" }));
+
+    // session_status reads is_stale directly (no auto-revert): the buffer must
+    // still be stale, proving the rehearse did not silently revert it.
+    let status = s.call_ok(3, "session_status", json!({}));
+    let status: Value = serde_json::from_str(&status).unwrap();
+    assert!(
+        status["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|sess| sess["stale"] == true),
+        "rehearse must leave the buffer stale (no silent revert): {status}"
+    );
+
+    // A real read, by contrast, DOES auto-revert the clean drifted buffer.
+    let txt = s.call_ok(4, "read_region", json!({ "path": p, "start": 1, "end": 8 }));
+    assert_eq!(txt, "changed", "a read auto-reverts where rehearse did not");
 }
 
 #[test]

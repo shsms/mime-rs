@@ -619,35 +619,10 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // writer's work stays impossible; revert, re-apply, save.
         let s = session.clone();
         ctx.defun("revert-buffer", move || -> Result<bool, Error> {
-            let mut sess = s.borrow_mut();
-            let path = sess
-                .buffer
-                .file_stamp()
-                .map(|st| st.path.clone())
-                .ok_or_else(|| err("revert-buffer: buffer has no visited file"))?;
-            let point = sess.buffer.point();
-            let name = sess.buffer.name().to_string();
-            let markers = sess.buffer.marker_count();
-            let mut store = crate::Quire::open(&path).map_err(|e| {
-                err(&format!(
-                    "revert-buffer: cannot re-read {}: {e}",
-                    path.display()
-                ))
-            })?;
-            // Keep the buffer's identity: a fresh Quire is named after the
-            // file's basename, which would undo find-file's uniquification
-            // (doc.txt<2> reverting to a second "doc.txt") and detach any
-            // name-keyed state (lang_overrides).
-            crate::store::TextStore::set_name(&mut store, &name);
-            sess.buffer = Box::new(store);
-            // The old content's markers die with it — pad the fresh registry
-            // with detached slots so live Marker handles read nil instead of
-            // aliasing markers created after the revert (id reuse).
-            for _ in 0..markers {
-                sess.buffer.marker_create(None);
-            }
-            let max = sess.buffer.point_max();
-            sess.buffer.goto_char(point.min(max));
+            // Keeps the buffer's (possibly uniquified) name, drops the old
+            // content's markers/narrowing, and resets the modified baseline —
+            // see `engine::revert_in_place`, shared with auto-revert.
+            crate::engine::revert_in_place(&mut s.borrow_mut()).map_err(|e| err(&e))?;
             Ok(true)
         });
     }
