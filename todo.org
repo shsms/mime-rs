@@ -93,11 +93,6 @@ re-parse per edit. Needs edit logging in both stores (byte offsets +
 row/col Points at mutation time), lazily enabled on first treesit use
 so non-treesit workloads pay nothing.
 
-** TODO AST-edit ops [#B]
-~replace-node~ / ~wrap-node~ / ~raise-node~ / ~kill-node~ / insert-sibling —
-thin wrappers over delete+insert now that nodes are first-class values
-(take a NODE, splice at its span, return the re-parsed replacement).
-
 ** TODO More languages [#C]
 JS/TS, Go, …: a ~Lang~ variant + extension row + ~defun_kinds~ row each. Fix
 Python ~decorated_definition~ spans (include the decorators). Adjacent: a
