@@ -1524,14 +1524,16 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     {
         // (conflicts) — the hunks' start positions (1-based, goto-char-able),
         // in document order; nil when the buffer is clean. The structured
-        // companion to conflict-count: count says how MANY, this says WHERE —
-        // so a resolve loop can walk the hunks itself (goto-char →
-        // conflict-context to inspect, conflict-keep to resolve) without
-        // parsing the conflict-hunks overview text. Each position lands INSIDE
-        // its hunk, so the at-point commands address it directly. Re-scan after
-        // each edit: resolving a hunk shifts the later positions. (The MCP
-        // `conflicts` tool instead renders the human overview; for that text
-        // from lisp use `(conflict-hunks)`.)
+        // companion to conflict-count: count says how MANY, this says WHERE.
+        // Each position lands INSIDE its hunk, so the at-point commands address
+        // it directly (goto-char → conflict-context to inspect, conflict-keep to
+        // resolve) without parsing the conflict-hunks overview text. The list is
+        // a SNAPSHOT: resolving a hunk shifts every later position, so a resolve
+        // loop must re-scan each pass — `(while (> (conflict-count) 0) (goto-char
+        // (car (conflicts))) (conflict-keep …))` — or walk one snapshot bottom-up
+        // (last hunk first), where the earlier positions stay valid. (The MCP
+        // `conflicts` tool instead renders the human overview; for that text from
+        // lisp use `(conflict-hunks)`.)
         let s = session.clone();
         ctx.defun("conflicts", move || -> Vec<i64> {
             crate::conflict::scan(s.borrow_mut().buffer.as_mut())
