@@ -99,6 +99,30 @@ impl Original {
             Original::Mapped(m) => m,
         }
     }
+
+    fn len(&self) -> usize {
+        self.bytes().len()
+    }
+
+    /// Invoke `f` with successive byte slices covering `[start, start+len)`, in
+    /// order; `f` returns `false` to stop. The contiguous backings yield the
+    /// whole range as one slice; a paged original (later) yields page-bounded
+    /// slices. A slice may end mid-char — treat it as raw bytes, never
+    /// `from_utf8` a single chunk on its own.
+    fn for_bytes(&self, start: usize, len: usize, f: &mut dyn FnMut(&[u8]) -> bool) {
+        f(&self.bytes()[start..start + len]);
+    }
+
+    /// Char and `\n` counts of the whole original — the one O(filesize) scan at
+    /// open time, fanned out over cores above [`PARALLEL_INDEX_THRESHOLD`].
+    fn count_chars_lines(&self) -> (usize, usize) {
+        let bytes = self.bytes();
+        if bytes.len() >= PARALLEL_INDEX_THRESHOLD {
+            count_chars_lines_parallel(bytes)
+        } else {
+            count_chars_lines(bytes)
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -364,16 +388,11 @@ impl Quire {
         // (see `count_chars_lines_parallel`); the tree itself is still the single
         // whole-file piece — only the counting is fanned out. (Making it
         // incremental/background remains a later option — TODO.)
-        let bytes = original.bytes();
-        let bytes_len = bytes.len();
+        let bytes_len = original.len();
         let root = if bytes_len == 0 {
             Node::empty()
         } else {
-            let (chars, lines) = if bytes_len >= PARALLEL_INDEX_THRESHOLD {
-                count_chars_lines_parallel(bytes)
-            } else {
-                count_chars_lines(bytes)
-            };
+            let (chars, lines) = original.count_chars_lines();
             Arc::new(Node::leaf(vec![Piece {
                 source: Source::Original,
                 start: 0,
@@ -456,20 +475,116 @@ impl Quire {
         Ok(())
     }
 
-    /// Bytes of the backing store a piece points into.
-    fn backing(&self, source: Source) -> &[u8] {
+    /// Invoke `f` with successive byte slices covering `[start, start+len)` of
+    /// `source`, in order; `f` returns `false` to stop. The unit of access that
+    /// works the same over a contiguous (Add / owned) backing and a paged
+    /// original: callers scan or copy bytes rather than borrowing one `&str` over
+    /// the whole range. A chunk may end mid-char, so it's raw bytes only.
+    fn for_bytes(
+        &self,
+        source: Source,
+        start: usize,
+        len: usize,
+        mut f: impl FnMut(&[u8]) -> bool,
+    ) {
+        if len == 0 {
+            return;
+        }
         match source {
-            Source::Original => self.original.bytes(),
-            Source::Add => &self.add,
+            Source::Add => {
+                f(&self.add[start..start + len]);
+            }
+            Source::Original => self.original.for_bytes(start, len, &mut f),
         }
     }
 
-    /// A piece's referenced bytes, as `&str` (always on char boundaries).
-    fn piece_str(&self, p: &Piece) -> &str {
-        let bytes = &self.backing(p.source)[p.start..p.start + p.len];
-        // SAFETY: both backings are UTF-8 and pieces are only ever split on char
-        // boundaries (see `split_piece`), so this slice is valid UTF-8.
-        unsafe { std::str::from_utf8_unchecked(bytes) }
+    /// Walk the chars of `piece` in order, one chunked byte pass, calling
+    /// `f(byte_offset_of_char_start, char_index, newlines_before_char)`; `f`
+    /// returns `false` to stop. Char starts are the non-continuation bytes, so no
+    /// UTF-8 decode is needed — chunk splits inside a multi-byte char are
+    /// invisible to the counts. The unifying primitive for every within-piece
+    /// char→byte seek (locate, summary_before, the insert/delete leaf cuts).
+    fn for_each_char_mark(&self, piece: &Piece, mut f: impl FnMut(usize, usize, usize) -> bool) {
+        let mut bp = 0usize; // byte offset within the piece
+        let mut ci = 0usize; // chars seen so far
+        let mut nl = 0usize; // newlines seen so far
+        self.for_bytes(piece.source, piece.start, piece.len, |chunk| {
+            for &b in chunk {
+                if (b & 0xC0) != 0x80 {
+                    // A char starts here.
+                    if !f(bp, ci, nl) {
+                        return false;
+                    }
+                    ci += 1;
+                }
+                if b == b'\n' {
+                    nl += 1;
+                }
+                bp += 1;
+            }
+            true
+        });
+    }
+
+    /// Byte offset (within `piece`) of the start of char `n`, and the newline
+    /// count before it. `n == piece.chars` yields `(piece.len, piece.lines)` —
+    /// the end. One bounded chunked walk (stops at `n`, not the whole piece).
+    fn scan_prefix(&self, piece: &Piece, n: usize) -> (usize, usize) {
+        let mut mark = (piece.len, piece.lines);
+        if n < piece.chars {
+            self.for_each_char_mark(piece, |bp, ci, nl| {
+                if ci == n {
+                    mark = (bp, nl);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        mark
+    }
+
+    /// Char and newline counts of `[start, start+len)` in `source`, summed over
+    /// chunks (chars = non-continuation bytes, lines = `\n` bytes — both additive
+    /// across chunk splits).
+    fn count_range(&self, source: Source, start: usize, len: usize) -> (usize, usize) {
+        let (mut chars, mut lines) = (0usize, 0usize);
+        self.for_bytes(source, start, len, |chunk| {
+            let (c, l) = count_chars_lines(chunk);
+            chars += c;
+            lines += l;
+            true
+        });
+        (chars, lines)
+    }
+
+    /// The char whose first byte is at offset `byte` within `piece` (a char
+    /// boundary), or `None` past the piece's end. Reads only the lead char's
+    /// bytes (≤4).
+    fn decode_char(&self, piece: &Piece, byte: usize) -> Option<char> {
+        if byte >= piece.len {
+            return None;
+        }
+        let mut buf = [0u8; 4];
+        let mut i = 0usize;
+        let take = (piece.len - byte).min(4);
+        self.for_bytes(piece.source, piece.start + byte, take, |chunk| {
+            for &b in chunk {
+                buf[i] = b;
+                i += 1;
+            }
+            true
+        });
+        let clen = match buf[0] {
+            b if b < 0x80 => 1,
+            b if b < 0xE0 => 2,
+            b if b < 0xF0 => 3,
+            _ => 4,
+        }
+        .min(i);
+        std::str::from_utf8(&buf[..clen])
+            .ok()
+            .and_then(|s| s.chars().next())
     }
 
     /// A mutable handle to the add buffer, performing copy-on-write if it is
@@ -539,11 +654,7 @@ impl Quire {
                 Node::Leaf { pieces, .. } => {
                     for piece in pieces {
                         if target < piece.chars {
-                            let byte = self
-                                .piece_str(piece)
-                                .char_indices()
-                                .nth(target)
-                                .map_or(piece.len, |(b, _)| b);
+                            let byte = self.scan_prefix(piece, target).0;
                             return Some((*piece, byte));
                         }
                         target -= piece.chars;
@@ -561,7 +672,7 @@ impl Quire {
             return None;
         }
         let (piece, byte) = self.locate(p)?;
-        self.piece_str(&piece)[byte..].chars().next()
+        self.decode_char(&piece, byte)
     }
 
     /// Accumulated summary of everything strictly before 1-based char position
@@ -596,13 +707,11 @@ impl Quire {
                     for piece in pieces {
                         if target < piece.chars {
                             // Partial piece: scan its first `target` chars.
-                            let s = self.piece_str(piece);
-                            let bend = s.char_indices().nth(target).map_or(s.len(), |(b, _)| b);
-                            let pre = &s[..bend];
+                            let (bend, lines) = self.scan_prefix(piece, target);
                             acc = acc.add(Summary {
                                 bytes: bend,
                                 chars: target,
-                                lines: pre.bytes().filter(|&b| b == b'\n').count(),
+                                lines,
                             });
                             return acc;
                         }
@@ -657,11 +766,17 @@ impl Quire {
     /// it. The borrow is valid until the next mutation (which clears the cache).
     fn full_text(&self) -> &str {
         if self.text_cache.borrow().is_none() {
-            let mut s = String::with_capacity(self.total_bytes());
+            let mut bytes = Vec::with_capacity(self.total_bytes());
             self.for_each_piece(|piece| {
-                s.push_str(self.piece_str(piece));
+                self.for_bytes(piece.source, piece.start, piece.len, |chunk| {
+                    bytes.extend_from_slice(chunk);
+                    true
+                });
                 true
             });
+            // SAFETY: the document is valid UTF-8 (every piece spans a
+            // char-aligned range of a UTF-8 backing), so the concatenation is.
+            let s = unsafe { String::from_utf8_unchecked(bytes) };
             *self.text_cache.borrow_mut() = Some(s);
         }
         // SAFETY: we only hand out a borrow tied to `&self`; the cache is an
@@ -679,29 +794,29 @@ impl Quire {
     fn collect_range(&self, lo: usize, hi: usize) -> String {
         let lo = lo.clamp(1, self.total_chars() + 1);
         let hi = hi.clamp(lo, self.total_chars() + 1);
-        let mut out = String::new();
+        let mut out: Vec<u8> = Vec::new();
         if lo == hi {
-            return out;
+            return String::new();
         }
         let mut pos = 1usize; // 1-based char position at the start of `piece`
         self.for_each_piece(|piece| {
             let piece_end = pos + piece.chars; // exclusive
             if piece_end > lo && pos < hi {
-                let s = self.piece_str(piece);
                 let from = lo.saturating_sub(pos); // chars to skip in this piece
                 let to = (hi - pos).min(piece.chars); // chars to take (exclusive)
-                let bstart = s.char_indices().nth(from).map_or(s.len(), |(b, _)| b);
-                let bend = if to >= piece.chars {
-                    s.len()
-                } else {
-                    s.char_indices().nth(to).map_or(s.len(), |(b, _)| b)
-                };
-                out.push_str(&s[bstart..bend]);
+                let bstart = self.scan_prefix(piece, from).0;
+                let bend = self.scan_prefix(piece, to).0;
+                self.for_bytes(piece.source, piece.start + bstart, bend - bstart, |chunk| {
+                    out.extend_from_slice(chunk);
+                    true
+                });
             }
             pos = piece_end;
             pos < hi
         });
-        out
+        // SAFETY: bstart/bend are char boundaries, so each copied span — and the
+        // concatenation across pieces — is valid UTF-8.
+        unsafe { String::from_utf8_unchecked(out) }
     }
 
     // ---- low-level tree splicing (touch only the spine / add buffer) -------
@@ -712,15 +827,13 @@ impl Quire {
 
     /// Build a `Piece` over a freshly known byte range, counting chars/lines.
     fn make_piece(&self, source: Source, start: usize, len: usize) -> Piece {
-        let bytes = &self.backing(source)[start..start + len];
-        // SAFETY: callers pass char-boundary-aligned ranges into UTF-8 backings.
-        let s = unsafe { std::str::from_utf8_unchecked(bytes) };
+        let (chars, lines) = self.count_range(source, start, len);
         Piece {
             source,
             start,
             len,
-            chars: s.chars().count(),
-            lines: s.bytes().filter(|&b| b == b'\n').count(),
+            chars,
+            lines,
         }
     }
 
@@ -730,11 +843,10 @@ impl Quire {
     /// the rest of it (per-edit rescans made an edit sweep over a fresh
     /// document O(n²)).
     fn split_piece(&self, piece: &Piece, byte: usize) -> (Piece, Piece) {
-        let bytes = &self.backing(piece.source)[piece.start..piece.start + piece.len];
         let (left_chars, left_lines) = if byte <= piece.len / 2 {
-            count_chars_lines(&bytes[..byte])
+            self.count_range(piece.source, piece.start, byte)
         } else {
-            let (c, l) = count_chars_lines(&bytes[byte..]);
+            let (c, l) = self.count_range(piece.source, piece.start + byte, piece.len - byte);
             (piece.chars - c, piece.lines - l)
         };
         let left = Piece {
@@ -825,8 +937,7 @@ impl Quire {
                 }
                 if let Some((i, within)) = split_at {
                     // Split the straddled piece on a char boundary, then insert.
-                    let s = self.piece_str(&out[i]);
-                    let byte = s.char_indices().nth(within).map_or(out[i].len, |(b, _)| b);
+                    let byte = self.scan_prefix(&out[i], within).0;
                     let (l, r) = self.split_piece(&out[i], byte);
                     out[i] = l;
                     out.insert(i + 1, r);
@@ -892,23 +1003,18 @@ impl Quire {
                     // a per-edit tail rescan made a replace sweep O(n²).
                     let keep_left = lo.saturating_sub(p_lo); // chars kept at front
                     let drop_to = hi.min(p_hi) - p_lo; // chars dropped up to (excl)
-                    let s = self.piece_str(p);
-                    let (mut bend, mut nl_end) = (s.len(), p.lines);
-                    let (mut bstart, mut nl_start) = (s.len(), p.lines);
-                    let (mut ci, mut nl) = (0usize, 0usize);
-                    for (b, ch) in s.char_indices() {
+                    let (mut bend, mut nl_end) = (p.len, p.lines);
+                    let (mut bstart, mut nl_start) = (p.len, p.lines);
+                    self.for_each_char_mark(p, |bp, ci, nl| {
                         if ci == keep_left {
-                            (bend, nl_end) = (b, nl);
+                            (bend, nl_end) = (bp, nl);
                         }
                         if ci == drop_to {
-                            (bstart, nl_start) = (b, nl);
-                            break;
+                            (bstart, nl_start) = (bp, nl);
+                            return false;
                         }
-                        ci += 1;
-                        if ch == '\n' {
-                            nl += 1;
-                        }
-                    }
+                        true
+                    });
                     if keep_left > 0 {
                         out.push(Piece {
                             source: p.source,
@@ -1513,17 +1619,19 @@ impl TextStore for Quire {
         let mut written = 0usize;
         let mut err = None;
         self.for_each_piece(|p| {
-            let bytes = self.piece_str(p).as_bytes();
-            match w.write_all(bytes) {
+            let mut ok = true;
+            self.for_bytes(p.source, p.start, p.len, |chunk| match w.write_all(chunk) {
                 Ok(()) => {
-                    written += bytes.len();
+                    written += chunk.len();
                     true
                 }
                 Err(e) => {
                     err = Some(e);
+                    ok = false;
                     false
                 }
-            }
+            });
+            ok
         });
         err.map_or(Ok(written), Err)
     }
