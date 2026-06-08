@@ -25,14 +25,6 @@ legacy ~mime~./
 
 ** TODO Dirty-span diffs [#C]
 
-** TODO Paged-LRU reader replacing mmap
-The real fix for the in-place-overwrite hazard: a warm Quire mmaps the
-file, so an external in-place truncate+rewrite mutates the mapped bytes
-under the piece tree (rename-based writers are safe — the old inode
-survives). Reads now WARN when the stamp is stale, but the bytes are
-still corrupt; a paged reader (or snapshot-at-open) makes them
-impossible, and also removes the SIGBUS-on-truncate risk.
-
 ** TODO Span-bounded search (anchors past an explicit BOUND)
 With an explicit search BOUND, ~$~/~\b~ treat the haystack cut as a
 boundary where Emacs consults the real buffer (it backtracks the match
