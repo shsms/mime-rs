@@ -33,32 +33,6 @@ survives). Reads now WARN when the stamp is stale, but the bytes are
 still corrupt; a paged reader (or snapshot-at-open) makes them
 impossible, and also removes the SIGBUS-on-truncate risk.
 
-** TODO save_buffer should refresh the session's own freshness stamp [#A]
-A warm session records the file's mtime/size at open and refuses to save
-when they no longer match (the external-change guard). But the session's
-own ~save_buffer~ advances mtime/size, so a second edit→save in the same
-session trips the guard against its *own* prior write and forces a
-needless re-open. Re-stamp the session right after it writes, so only
-genuinely external changes are caught.
-
-** TODO conflict-keep "both" can fuse hunks that share a closing suffix [#A]
-When ours and theirs share a trailing line (e.g. a closing ~}~ folded
-into the post-marker context, so each side's text is the *body* of a
-construct the suffix closes), keeping both concatenates ours-then-theirs
-with no separator: the last construct of ours runs straight into the
-first of theirs — syntactically broken, yet reported resolved (0 hunks
-remaining). Detect a dangling/unbalanced span across the join (or that
-both sides reuse the shared suffix) and warn, or splice the missing
-boundary. Until then ~both~ is only safe on hunks that are each
-self-contained.
-
-** TODO Expose the remaining-conflict count to programs [#A]
-~conflict-keep~ / ~conflict-diff~ / ~conflict-text~ are tulisp builtins, but
-the overview that reports how many hunks remain is MCP-only — a program
-mid-resolution that reaches for ~(conflicts)~ hits a void symbol. Add a
-lisp ~conflict-count~ (or have an overview builtin return the hunk list)
-so a resolve loop can test its own progress without the MCP front door.
-
 ** TODO Span-bounded search (anchors past an explicit BOUND)
 With an explicit search BOUND, ~$~/~\b~ treat the haystack cut as a
 boundary where Emacs consults the real buffer (it backtracks the match
