@@ -217,35 +217,52 @@ pub fn side_text(b: &dyn TextStore, h: &Hunk, side: &str) -> Result<String, Stri
         "ours" => Ok(ours()),
         "theirs" => Ok(theirs()),
         "base" => base().ok_or_else(|| "no base section (not a diff3 conflict)".to_string()),
-        "both" => Ok(format!("{}{}", ours(), theirs())),
-        "all" => Ok(format!(
-            "{}{}{}",
-            ours(),
-            base().unwrap_or_default(),
-            theirs()
-        )),
+        // `both`/`all` concatenate the sections `joined_spans` selects — the one
+        // source of truth `keep_warning` also counts danglers across, so the two
+        // can't drift on which sections a side means.
+        "both" | "all" => Ok(joined_spans(h, side)
+            .expect("joined_spans covers both/all")
+            .iter()
+            .map(|&(s, e)| b.substring(s, e))
+            .collect()),
         other => Err(format!("unknown side: {other} (ours|theirs|base|both|all)")),
     }
 }
 
-/// Net unclosed openers per bracket class — `{}`, `()`, `[]` — over `s`.
-/// A class entry > 0 means the text leaves that bracket open. Strings and
-/// comments are NOT parsed (a `{` in a string counts); this is a cheap
-/// heuristic for a warning, never a hard syntax check.
-fn net_open(s: &str) -> [i32; 3] {
-    let mut d = [0i32; 3];
+/// The buffer spans a multi-side keep concatenates, in order: `both` → [ours,
+/// theirs]; `all` → [ours, base?, theirs] (base omitted on a non-diff3 hunk,
+/// like `smerge-keep-all`). `None` for the single-section sides, which never
+/// join. One source of truth for which sections a side selects: `side_text`
+/// joins them, `keep_warning` counts danglers across them.
+fn joined_spans(h: &Hunk, side: &str) -> Option<Vec<(usize, usize)>> {
+    match side {
+        "both" => Some(vec![h.ours, h.theirs]),
+        "all" => Some(match h.base {
+            Some(base) => vec![h.ours, base, h.theirs],
+            None => vec![h.ours, h.theirs],
+        }),
+        _ => None,
+    }
+}
+
+/// True when `s` leaves any bracket class — `{}`, `()`, `[]` — unclosed (more
+/// openers than closers of that kind). Per-class so a `{` and a `)` don't
+/// cancel. Strings and comments are NOT parsed (a `{` in a string counts);
+/// this is a cheap heuristic for a warning, never a hard syntax check.
+fn leaves_bracket_open(s: &str) -> bool {
+    let (mut curly, mut round, mut square) = (0i32, 0i32, 0i32);
     for c in s.chars() {
         match c {
-            '{' => d[0] += 1,
-            '}' => d[0] -= 1,
-            '(' => d[1] += 1,
-            ')' => d[1] -= 1,
-            '[' => d[2] += 1,
-            ']' => d[2] -= 1,
+            '{' => curly += 1,
+            '}' => curly -= 1,
+            '(' => round += 1,
+            ')' => round -= 1,
+            '[' => square += 1,
+            ']' => square -= 1,
             _ => {}
         }
     }
-    d
+    curly > 0 || round > 0 || square > 0
 }
 
 /// A non-blocking warning for `conflict-keep "both"`/`"all"`: when two or more
@@ -257,10 +274,7 @@ fn net_open(s: &str) -> [i32; 3] {
 /// gathers the sides; this counts the danglers. `None` when at most one side is
 /// open (the join is unambiguous). Bracket-counting only — warns, never blocks.
 fn fused_keep_warning(parts: &[String]) -> Option<String> {
-    let dangling = parts
-        .iter()
-        .filter(|p| net_open(p).iter().any(|&d| d > 0))
-        .count();
+    let dangling = parts.iter().filter(|p| leaves_bracket_open(p)).count();
     (dangling >= 2).then(|| {
         "conflict-keep: two or more kept sides each leave a bracket open, so \
          concatenating them likely leaves an earlier construct unclosed (any \
@@ -274,19 +288,10 @@ fn fused_keep_warning(parts: &[String]) -> Option<String> {
 /// the multi-side modes (`both`/`all`) whose concatenation can fuse constructs;
 /// `None` for the single-side modes, which never join.
 pub fn keep_warning(b: &dyn TextStore, h: &Hunk, side: &str) -> Option<String> {
-    let sub = |span: (usize, usize)| b.substring(span.0, span.1);
-    let parts: Vec<String> = match side {
-        "both" => vec![sub(h.ours), sub(h.theirs)],
-        "all" => {
-            let mut v = vec![sub(h.ours)];
-            if let Some(span) = h.base {
-                v.push(sub(span));
-            }
-            v.push(sub(h.theirs));
-            v
-        }
-        _ => return None,
-    };
+    let parts: Vec<String> = joined_spans(h, side)?
+        .iter()
+        .map(|&(s, e)| b.substring(s, e))
+        .collect();
     fused_keep_warning(&parts)
 }
 
