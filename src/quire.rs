@@ -1014,35 +1014,79 @@ impl Quire {
         unsafe { (*ptr).as_ref().unwrap().as_str() }
     }
 
-    /// Materialize the absolute char range `[lo, hi)` (1-based) into an owned
-    /// `String` by walking pieces. Used for region reads and as the search
-    /// window. O(range + log n) — only the requested span is copied.
-    fn collect_range(&self, lo: usize, hi: usize) -> String {
+    /// Stream the bytes of the absolute char range `[lo, hi)` (1-based) to `f`,
+    /// in document order, page-bounded chunks — never materializing the range.
+    /// `f` returns `false` to stop early (e.g. a search that found its match). A
+    /// chunk may end mid-char, so it's raw bytes. O(streamed prefix + log n).
+    fn for_range_bytes(&self, lo: usize, hi: usize, mut f: impl FnMut(&[u8]) -> bool) {
         let lo = lo.clamp(1, self.total_chars() + 1);
         let hi = hi.clamp(lo, self.total_chars() + 1);
-        let mut out: Vec<u8> = Vec::new();
         if lo == hi {
-            return String::new();
+            return;
         }
         let mut pos = 1usize; // 1-based char position at the start of `piece`
         self.for_each_piece(|piece| {
             let piece_end = pos + piece.chars; // exclusive
+            let mut keep_going = true;
             if piece_end > lo && pos < hi {
                 let from = lo.saturating_sub(pos); // chars to skip in this piece
                 let to = (hi - pos).min(piece.chars); // chars to take (exclusive)
                 let bstart = self.scan_prefix(piece, from).0;
                 let bend = self.scan_prefix(piece, to).0;
                 self.for_bytes(piece.source, piece.start + bstart, bend - bstart, |chunk| {
-                    out.extend_from_slice(chunk);
-                    true
+                    keep_going = f(chunk);
+                    keep_going
                 });
             }
             pos = piece_end;
-            pos < hi
+            keep_going && pos < hi
         });
-        // SAFETY: bstart/bend are char boundaries, so each copied span — and the
-        // concatenation across pieces — is valid UTF-8.
+    }
+
+    /// Materialize the absolute char range `[lo, hi)` (1-based) into an owned
+    /// `String`. O(range + log n) — only the requested span is copied.
+    fn collect_range(&self, lo: usize, hi: usize) -> String {
+        let mut out: Vec<u8> = Vec::new();
+        self.for_range_bytes(lo, hi, |chunk| {
+            out.extend_from_slice(chunk);
+            true
+        });
+        // SAFETY: a char range is char-boundary-aligned, so the concatenation of
+        // its byte chunks is valid UTF-8.
         unsafe { String::from_utf8_unchecked(out) }
+    }
+
+    /// First occurrence of the literal `needle` in char range `[from, to)`,
+    /// returned as `(char_start, char_end)` (1-based, `end` exclusive), or
+    /// `None`. Streams the range a chunk at a time, carrying the last
+    /// `needle.len()-1` bytes across chunk boundaries to catch a match that
+    /// straddles one, and stops at the first hit — so it never materializes the
+    /// (possibly whole-document) window the way `collect_range` + `find` did.
+    fn find_forward(&self, needle: &str, from: usize, to: usize) -> Option<(usize, usize)> {
+        let nb = needle.as_bytes();
+        let nlen = nb.len();
+        if nlen == 0 {
+            return None; // callers handle the empty needle; guard windows(0)
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        let mut buf_start_chars = 0usize; // chars in [from, start-of-buf)
+        let mut start: Option<usize> = None;
+        self.for_range_bytes(from, to, |chunk| {
+            buf.extend_from_slice(chunk);
+            if let Some(o) = buf.windows(nlen).position(|w| w == nb) {
+                start = Some(from + buf_start_chars + count_chars_lines(&buf[..o]).0);
+                return false; // found — stop streaming
+            }
+            // Keep only the last needle-1 bytes: the longest prefix of a match
+            // that could still complete in the next chunk. Account the dropped
+            // bytes' chars so positions stay exact across the boundary.
+            let keep = (nlen - 1).min(buf.len());
+            let drop = buf.len() - keep;
+            buf_start_chars += count_chars_lines(&buf[..drop]).0;
+            buf.drain(..drop);
+            true
+        });
+        start.map(|s| (s, s + needle.chars().count()))
     }
 
     // ---- low-level tree splicing (touch only the spine / add buffer) -------
@@ -1686,10 +1730,7 @@ impl Quire {
         if from > to {
             return None;
         }
-        let window = self.collect_range(from, to);
-        let bpos = window.find(needle)?;
-        let start = from + window[..bpos].chars().count();
-        let end = start + needle.chars().count();
+        let (start, end) = self.find_forward(needle, from, to)?;
         self.last_match = Some(MatchData {
             start,
             end,
@@ -2359,6 +2400,83 @@ mod tests {
             TextStore::drifted(&q),
             "the drift latch survives an mtime/size reset"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn paged_streaming_search_finds_a_match_across_a_page_edge() {
+        // A literal needle deliberately straddling the PAGE boundary, then a
+        // second copy two pages later — exercises the cross-chunk carry and the
+        // continue-from-point loop against the in-memory oracle.
+        let path = tmp_path("search");
+        let needle = "NEEDLE-straddles-the-edge";
+        let mut content = String::new();
+        content.push_str(&"a".repeat(PAGE - 5)); // needle starts before, ends after PAGE
+        content.push_str(needle);
+        content.push_str(&"b".repeat(2 * PAGE));
+        content.push_str(needle); // a later occurrence
+        content.push('\n');
+        std::fs::write(&path, &content).unwrap();
+
+        let mut q = Quire::open(&path).unwrap();
+        let mut oracle = Buffer::from_string("oracle", &content);
+        TextStore::goto_char(&mut q, 1);
+        TextStore::goto_char(&mut oracle, 1);
+        // First (straddling) match, then the second, then a miss — all matching
+        // the oracle, including where point lands.
+        for _ in 0..2 {
+            assert_eq!(
+                TextStore::search_forward(&mut q, needle, None),
+                TextStore::search_forward(&mut oracle, needle, None),
+            );
+            assert_eq!(TextStore::point(&q), TextStore::point(&oracle));
+        }
+        assert_eq!(
+            TextStore::search_forward(&mut q, "no-such-token", None),
+            TextStore::search_forward(&mut oracle, "no-such-token", None),
+        );
+        // A needle longer than a single page still matches across chunks.
+        let big = "Z".repeat(PAGE + 17);
+        let mut content2 = format!("prefix\n{big}\nsuffix");
+        content2.push('\n');
+        let path2 = tmp_path("search-big");
+        std::fs::write(&path2, &content2).unwrap();
+        let mut q2 = Quire::open(&path2).unwrap();
+        let mut o2 = Buffer::from_string("oracle2", &content2);
+        assert_eq!(
+            TextStore::search_forward(&mut q2, &big, None),
+            TextStore::search_forward(&mut o2, &big, None),
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+    }
+
+    #[test]
+    fn paged_search_carries_a_multibyte_char_across_the_chunk_boundary() {
+        // The needle is PAST a 3-byte char that straddles the PAGE edge, so
+        // find_forward's keep/drop carry runs across a multibyte split BEFORE the
+        // match — exercising the char-position accounting through a dropped
+        // multibyte prefix (the all-ASCII straddle test doesn't reach this path).
+        let path = tmp_path("search-mb");
+        let mut content = String::new();
+        content.push_str(&"a".repeat(PAGE - 1));
+        content.push('€'); // bytes [PAGE-1, PAGE+2): straddles the page edge
+        content.push_str("bcMARKERdef\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let mut q = Quire::open(&path).unwrap();
+        let mut oracle = Buffer::from_string("oracle", &content);
+        // A needle after the straddle, and one that itself spans the straddle.
+        for n in ["MARKER", "a€bc"] {
+            TextStore::goto_char(&mut q, 1);
+            TextStore::goto_char(&mut oracle, 1);
+            assert_eq!(
+                TextStore::search_forward(&mut q, n, None),
+                TextStore::search_forward(&mut oracle, n, None),
+                "needle {n:?}"
+            );
+            assert_eq!(TextStore::point(&q), TextStore::point(&oracle));
+        }
         let _ = std::fs::remove_file(&path);
     }
 

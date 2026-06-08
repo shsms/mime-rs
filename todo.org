@@ -13,11 +13,14 @@ place-diff / upd-epub-to-jp on ulysses-annotated's ~mime-rs~ branch can
 drop their end-of-run ~set-buffer~ dance.
 
 ** TODO Streaming search [#C]
-Needs a resumable streaming DFA (~regex-automata~) for cross-chunk matches.
-Related: bounded/streaming search would also fix the conflict builtins'
-full-buffer ~scan~ cost on a huge Quire (each unbounded ~search_forward~ miss
-materializes point→point-max; every ~conflict-*~ call re-scans, and
-~conflict-keep~ scans twice — find + remaining count).
+DONE so far: literal ~search_forward~ streams the range a chunk at a time
+(needle-1 overlap across chunks) and stops at the first hit, so it no longer
+materializes point→point-max — which retires the conflict builtins'
+full-buffer ~scan~ cost (each ~scan~ walked the whole tail per marker).
+Remaining: a resumable streaming DFA (~regex-automata~) so ~re_search_forward~
+/ ~looking_at~ stream too (they still ~collect_range~ the window); streaming
+~search_backward~ (still materializes [bound, point)); and global-replace a
+multi-GB file across cores.
 /Exit: global-replace a multi-GB file across cores; ulysses bench beats
 legacy ~mime~./
 
