@@ -39,6 +39,18 @@ paged count (it's owned-only now; threads can ~read_at~ disjoint ranges).
 latches — ~16k stats per GB on a cold scan of a clean file. Check once per
 read op (or every K pages), not per 64 KiB page.
 
+** TODO Paged reader holds an open fd per buffer — fd use + rename reads [#C]
+Unlike the old mmap (which dropped the ~File~ after ~Mmap::map~), ~PagedFile~
+keeps ~file: std::fs::File~ open for the buffer's whole life. Two consequences:
+(1) one held fd per warm buffer — many warm daemon/MCP sessions = many fds;
+worth a soft cap or a re-open-on-demand mode. (2) Reads go through the held
+fd, so after an external RENAME-replace the buffer keeps serving the OLD
+(now-unlinked but stable) inode's bytes while drift IS flagged via the
+stat-by-path; on NFS the unlinked inode is silly-renamed to ~.nfsXXXX~ and
+lingers until the session drops (visible when dogfooding mime on its own
+NFS-hosted source). Decide whether a drifted paged buffer should re-open the
+path on the next read (pick up the new inode) rather than wait for revert.
+
 ** TODO Bytecode-compile hot programs [#C]
 
 ** TODO Dirty-span diffs [#C]
