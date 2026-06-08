@@ -188,24 +188,26 @@ fn clamp_occur_line(text: &str, col: usize) -> String {
 }
 
 /// Shared body of `conflict-keep` / `conflict-replace`: pick the addressed
-/// hunk, compute its replacement via `text` (a side's content, or a literal),
-/// splice it in place of the whole hunk, and return the REMAINING conflict
-/// count. The re-scan keeps that count honest even when a replacement itself
-/// contains marker-shaped lines. `warn` inspects the chosen hunk before the
-/// splice and, when it returns `Some`, the message is pushed to the run log
-/// (the `(message …)` channel) — used to flag a fused "keep both" join.
-fn conflict_splice<F, W>(s: &SharedSession, n: Option<i64>, text: F, warn: W) -> Result<i64, Error>
+/// hunk, compute its replacement via `produce` (which returns the splice text
+/// plus an optional warning), splice it in place of the whole hunk, and return
+/// the REMAINING conflict count. The re-scan keeps that count honest even when
+/// a replacement itself contains marker-shaped lines. When `produce` returns a
+/// warning it's pushed to the run log (the `(message …)` channel) — used to
+/// flag a fused "keep both" join, computed from the same section materialization
+/// as the splice text so the sides aren't read out of the buffer twice.
+fn conflict_splice<F>(s: &SharedSession, n: Option<i64>, produce: F) -> Result<i64, Error>
 where
-    F: FnOnce(&dyn crate::store::TextStore, &crate::conflict::Hunk) -> Result<String, String>,
-    W: FnOnce(&dyn crate::store::TextStore, &crate::conflict::Hunk) -> Option<String>,
+    F: FnOnce(
+        &dyn crate::store::TextStore,
+        &crate::conflict::Hunk,
+    ) -> Result<(String, Option<String>), Error>,
 {
     let mut sess = s.borrow_mut();
     let (count, warning) = {
         let b = sess.buffer.as_mut();
         let hunks = crate::conflict::scan(b);
         let h = crate::conflict::pick(&hunks, n, b.point()).map_err(|e| err(&e))?;
-        let text = text(&*b, h).map_err(|e| err(&e))?;
-        let warning = warn(&*b, h);
+        let (text, warning) = produce(&*b, h)?;
         let (start, end) = (h.start, h.end);
         b.delete_region(start, end);
         b.goto_char(start);
@@ -1692,12 +1694,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun(
             "conflict-keep",
             move |side: String, n: Option<i64>| -> Result<i64, Error> {
-                conflict_splice(
-                    &s,
-                    n,
-                    |b, h| crate::conflict::side_text(b, h, &side),
-                    |b, h| crate::conflict::keep_warning(b, h, &side),
-                )
+                conflict_splice(&s, n, |b, h| {
+                    crate::conflict::side_text_with_warning(b, h, &side).map_err(|e| err(&e))
+                })
             },
         );
     }
@@ -1709,7 +1708,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun(
             "conflict-replace",
             move |text: String, n: Option<i64>| -> Result<i64, Error> {
-                conflict_splice(&s, n, |_, _| Ok(text.clone()), |_, _| None)
+                conflict_splice(&s, n, |_, _| Ok((text.clone(), None)))
             },
         );
     }

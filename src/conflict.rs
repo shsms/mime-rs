@@ -217,14 +217,12 @@ pub fn side_text(b: &dyn TextStore, h: &Hunk, side: &str) -> Result<String, Stri
         "ours" => Ok(ours()),
         "theirs" => Ok(theirs()),
         "base" => base().ok_or_else(|| "no base section (not a diff3 conflict)".to_string()),
-        // `both`/`all` concatenate the sections `joined_spans` selects — the one
-        // source of truth `keep_warning` also counts danglers across, so the two
-        // can't drift on which sections a side means.
-        "both" | "all" => Ok(joined_spans(h, side)
-            .expect("joined_spans covers both/all")
-            .iter()
-            .map(|&(s, e)| b.substring(s, e))
-            .collect()),
+        // `both`/`all` concatenate the sections `joined_parts` materializes —
+        // the one source of truth `side_text_with_warning` also counts danglers
+        // across, so the two can't drift on which sections a side means.
+        "both" | "all" => Ok(joined_parts(b, h, side)
+            .expect("joined_parts covers both/all")
+            .concat()),
         other => Err(format!("unknown side: {other} (ours|theirs|base|both|all)")),
     }
 }
@@ -232,8 +230,7 @@ pub fn side_text(b: &dyn TextStore, h: &Hunk, side: &str) -> Result<String, Stri
 /// The buffer spans a multi-side keep concatenates, in order: `both` → [ours,
 /// theirs]; `all` → [ours, base?, theirs] (base omitted on a non-diff3 hunk,
 /// like `smerge-keep-all`). `None` for the single-section sides, which never
-/// join. One source of truth for which sections a side selects: `side_text`
-/// joins them, `keep_warning` counts danglers across them.
+/// join.
 fn joined_spans(h: &Hunk, side: &str) -> Option<Vec<(usize, usize)>> {
     match side {
         "both" => Some(vec![h.ours, h.theirs]),
@@ -243,6 +240,14 @@ fn joined_spans(h: &Hunk, side: &str) -> Option<Vec<(usize, usize)>> {
         }),
         _ => None,
     }
+}
+
+/// The materialized sections a multi-side keep concatenates — `joined_spans`
+/// read out of the buffer once. `None` for the single-section sides. The single
+/// source both `side_text` (joins them) and `side_text_with_warning` (joins +
+/// counts danglers) draw from, so a `both`/`all` keep reads the sides only once.
+fn joined_parts(b: &dyn TextStore, h: &Hunk, side: &str) -> Option<Vec<String>> {
+    joined_spans(h, side).map(|spans| spans.iter().map(|&(s, e)| b.substring(s, e)).collect())
 }
 
 /// True when `s` leaves any bracket class — `{}`, `()`, `[]` — unclosed (more
@@ -270,9 +275,9 @@ fn leaves_bracket_open(s: &str) -> bool {
 /// post-marker context (e.g. a `}` folded into the trailing context, so each
 /// side is the *body* of a construct that line closes) balances only the LAST
 /// side after concatenation — the earlier construct runs unclosed into the next
-/// and the result is syntactically broken yet reported resolved. `keep_warning`
-/// gathers the sides; this counts the danglers. `None` when at most one side is
-/// open (the join is unambiguous). Bracket-counting only — warns, never blocks.
+/// and the result is syntactically broken yet reported resolved. `None` when at
+/// most one side is open (the join is unambiguous). Bracket-counting only —
+/// warns, never blocks.
 fn fused_keep_warning(parts: &[String]) -> Option<String> {
     let dangling = parts.iter().filter(|p| leaves_bracket_open(p)).count();
     (dangling >= 2).then(|| {
@@ -284,15 +289,19 @@ fn fused_keep_warning(parts: &[String]) -> Option<String> {
     })
 }
 
-/// The `fused_keep_warning` for keeping `side` of `h` — `Some(reason)` only for
-/// the multi-side modes (`both`/`all`) whose concatenation can fuse constructs;
-/// `None` for the single-side modes, which never join.
-pub fn keep_warning(b: &dyn TextStore, h: &Hunk, side: &str) -> Option<String> {
-    let parts: Vec<String> = joined_spans(h, side)?
-        .iter()
-        .map(|&(s, e)| b.substring(s, e))
-        .collect();
-    fused_keep_warning(&parts)
+/// The text `conflict-keep SIDE` splices, paired with its fused-keep warning —
+/// both derived from ONE materialization of the kept sections, so a keep of a
+/// joining side (`both`/`all`) doesn't read the sides out of the buffer twice.
+/// The single-section sides never join, so their warning is always `None`.
+pub fn side_text_with_warning(
+    b: &dyn TextStore,
+    h: &Hunk,
+    side: &str,
+) -> Result<(String, Option<String>), String> {
+    match joined_parts(b, h, side) {
+        Some(parts) => Ok((parts.concat(), fused_keep_warning(&parts))),
+        None => Ok((side_text(b, h, side)?, None)),
+    }
 }
 
 /// Render the `conflict-hunks` overview: one line per hunk with its number,
