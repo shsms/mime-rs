@@ -66,19 +66,6 @@ line beginning" is a complete move.
 A wall-clock/CPU bound per program — blocked on tulisp cooperative
 cancellation (eval interruption), see the wishlist below.
 
-** TODO Auto-revert: re-read an unmodified buffer when its file changes [#B]
-Emacs ~auto-revert-mode~: when a buffer has NO unsaved edits (clean since
-its last load/save) and the visited file drifts on disk, silently revert
-it — re-read the new contents — instead of leaving it stale. We already
-detect drift (~is_stale~ + the paged reader's sticky ~drifted~ flag) and
-have ~revert-buffer~; this is the policy layer that fires it automatically
-for clean buffers, turning "this read may be stale/corrupted" into a fresh
-read. Needs a "modified since load/save" notion (compare the live content
-version against the one stamped at open/save) and a trigger point — checked
-on read entry where ~stale_note~ already runs. A MODIFIED buffer is never
-auto-reverted: that's the genuine conflict the stale-WARN still covers, so
-the user (or a future merge) decides.
-
 * Structural editing
 
 ** TODO Byte↔char index on Syntax [#C]
