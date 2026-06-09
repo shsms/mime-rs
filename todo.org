@@ -51,6 +51,19 @@ lingers until the session drops (visible when dogfooding mime on its own
 NFS-hosted source). Decide whether a drifted paged buffer should re-open the
 path on the next read (pick up the new inode) rather than wait for revert.
 
+** TODO Dogfooding friction: make warm-buffer save state legible [#C]
+From driving mime to edit mime-rs itself. (1) ~replace_text~/~run_program~
+edit the WARM buffer and do nothing to disk unless ~save:true~ — forgetting it
+(or interleaving a disk-level editor) loses the edit SILENTLY, no signal. Make
+the unsaved state legible: flag a buffer with unsaved edits in ~session_status~
+(and ideally in the ~replace_text~/~run_program~ result), and/or warn when a
+warm buffer has unsaved edits AND its file changed on disk (the auto-revert
+/stale machinery already detects the drift half). Consider a ~save~-by-default
+or a sticky "dirty" indicator so a forgotten save can't quietly vanish.
+(2) Appending a large NEW block has no anchor — ~treesit-insert-sibling~ now
+covers it in lisp; an MCP-level "insert relative to a defun/node" convenience
+would close the common "add a function after X" case without ~run_program~.
+
 ** TODO Bytecode-compile hot programs [#C]
 
 ** TODO Dirty-span diffs [#C]
