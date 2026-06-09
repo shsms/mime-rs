@@ -155,6 +155,11 @@ const PAGE: usize = 64 * 1024;
 /// size. 256 × 64 KiB = 16 MiB.
 const CACHE_PAGES: usize = 256;
 
+/// Initial chars materialized by an adaptively-windowed regex search/`looking_at`
+/// before it grows toward the bound. A hit within this window of point never
+/// copies the document tail; only a far hit (or a genuine miss) grows past it.
+const SEARCH_WINDOW_START: usize = 8 * 1024;
+
 /// A bounded LRU of file pages. Single-threaded (the engine is `!Send`); pages
 /// are `Rc<[u8]>` so a reader clones one out and drops the cache borrow before
 /// touching the bytes — eviction can't pull a page out from under an in-flight
@@ -1444,52 +1449,58 @@ impl Quire {
     /// Regex search forward from point (bounded by `bound` or point-max). On a
     /// hit: record match-data, move point past the match, return the new point.
     ///
-    /// Materializes the *window* `[point, bound)` to run the regex, then maps the
-    /// byte match back to char positions. The window is the search bound, not the
-    /// document; for the common all-original case the plan calls for scanning the
-    /// paged file directly and an incremental DFA across pieces — TODO. Capturing
-    /// `replace_match`'s groups needs the matched substrings regardless.
-    ///
-    /// TODO (M6, deferred): parallelize search/replace the way the initial
-    /// char/line index already is (see `count_chars_lines_parallel`). It is left
-    /// sequential on purpose — unlike a char/newline *count*, which is additive
-    /// over any char-boundary partition, a regex match can straddle a chunk seam,
-    /// so naive chunking misses boundary-spanning hits and double-counts overlaps.
-    /// Doing it right needs per-chunk overlap regions (≥ the max match width) and
-    /// dedup of seam matches, which interacts with `last_match`/replace ordering;
-    /// out of scope for this slice.
+    /// Adaptively windowed: materialize a window growing from `ctx_from` (one char
+    /// of context before point, so `^`/`\b` judge the real boundary at a mid-line
+    /// point — never crossing point-min, a real line beginning) and run the regex,
+    /// stopping the moment the match ends strictly inside the window — so a hit
+    /// near point never copies the document tail. A match ending exactly at a
+    /// non-EOF boundary is re-judged against a larger window (it may extend, or be
+    /// a `$`/`\b` artifact of the cut), so the result is identical to scanning the
+    /// whole `[point, bound)` window at once (including the `$`-at-bound divergence
+    /// the oracle documents). A genuine *miss* still grows to the bound — the
+    /// regex must see every byte to say "no", the residual a true streaming DFA
+    /// over the piece tree would close. Capturing `replace_match`'s groups needs
+    /// the matched substrings regardless.
     fn re_search_forward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize> {
         let from = self.point;
         let to = bound.unwrap_or_else(|| self.point_max());
         if from > to {
             return None;
         }
-        // Materialize one char of context BEFORE the search start (when one
-        // exists inside the accessible region — point-min counts as a real
-        // line beginning, so context never crosses it) and run the regex from
-        // the offset past it (`captures_at`), so `^`/`\b` judge the real
-        // boundary at a mid-line point. The window hard-truncates at the
-        // bound, like the oracle (see its doc comment for the `$`-at-bound
-        // divergence this accepts).
         let ctx_from = from.saturating_sub(1).max(self.point_min().min(from));
-        let window = self.collect_range(ctx_from, to);
-        let skip = if ctx_from < from {
-            window.chars().next().map_or(0, char::len_utf8)
-        } else {
-            0
-        };
-        let caps = re.captures_at(&window, skip)?;
-        let whole = caps.get(0)?;
-        let groups: Vec<Option<String>> = caps
-            .iter()
-            .map(|g| g.map(|m| m.as_str().to_string()))
-            .collect();
-        // Byte offsets in `window` → char offsets → absolute 1-based positions.
-        let start = ctx_from + window[..whole.start()].chars().count();
-        let end = ctx_from + window[..whole.end()].chars().count();
-        self.last_match = Some(MatchData { start, end, groups });
-        self.point = end;
-        Some(end)
+        let mut span = SEARCH_WINDOW_START;
+        loop {
+            let hi = (ctx_from + span).min(to);
+            let at_eof = hi >= to;
+            let window = self.collect_range(ctx_from, hi);
+            let skip = if ctx_from < from {
+                window.chars().next().map_or(0, char::len_utf8)
+            } else {
+                0
+            };
+            let caps = re.captures_at(&window, skip);
+            // A match ending inside the window is final; one ending at a non-EOF
+            // boundary might extend or be a cut artifact — grow and re-judge.
+            let settled = match &caps {
+                Some(c) => c.get(0).is_none_or(|m| m.end() < window.len()) || at_eof,
+                None => at_eof,
+            };
+            if settled {
+                let caps = caps?; // a settled `None` is a genuine miss
+                let whole = caps.get(0)?;
+                let groups: Vec<Option<String>> = caps
+                    .iter()
+                    .map(|g| g.map(|m| m.as_str().to_string()))
+                    .collect();
+                // Byte offsets in `window` → char offsets → absolute positions.
+                let start = ctx_from + window[..whole.start()].chars().count();
+                let end = ctx_from + window[..whole.end()].chars().count();
+                self.last_match = Some(MatchData { start, end, groups });
+                self.point = end;
+                return Some(end);
+            }
+            span = span.saturating_mul(2);
+        }
     }
 
     /// Replace the last match's region with `replacement` (after `\N` / `\&`
@@ -1540,25 +1551,36 @@ impl Quire {
     }
 
     fn looking_at(&self, re: &regex::Regex) -> bool {
-        // Anchor a regex at point. Like the oracle, the scan window runs from
-        // point to the *document* end (narrowing is ignored here), so a match
-        // that needs to read past point-max still sees the bytes; one char of
-        // context before point rides along so `^`/`\b` judge the real boundary
-        // — but never from before point-min, which counts as a real line
-        // beginning (see re_search_forward). TODO: replace the materialized
-        // tail with an incremental DFA reading a piece cursor so this never
-        // copies past the match.
+        // Anchor a regex at point. The scan window runs to the *document* end
+        // (narrowing is ignored here), with one char of context before point so
+        // `^`/`\b` judge the real boundary — but never from before point-min, a
+        // real line beginning (see re_search_forward). Adaptively windowed: a
+        // match anchored at point and ending inside the window settles `true`
+        // without copying the tail; growth only happens when no in-window match
+        // starts at point yet (it may appear with more text) or the match ends at
+        // a non-EOF boundary (a possible `$`/`\b` cut artifact). A genuine miss
+        // still grows to EOF — the residual a streaming DFA would close.
         let ctx_from = self
             .point
             .saturating_sub(1)
             .max(self.point_min().min(self.point));
-        let window = self.collect_range(ctx_from, self.total_chars() + 1);
-        let skip = if ctx_from < self.point {
-            window.chars().next().map_or(0, char::len_utf8)
-        } else {
-            0
-        };
-        re.find_at(&window, skip).is_some_and(|m| m.start() == skip)
+        let limit = self.total_chars() + 1;
+        let mut span = SEARCH_WINDOW_START;
+        loop {
+            let hi = (ctx_from + span).min(limit);
+            let at_eof = hi >= limit;
+            let window = self.collect_range(ctx_from, hi);
+            let skip = if ctx_from < self.point {
+                window.chars().next().map_or(0, char::len_utf8)
+            } else {
+                0
+            };
+            match re.find_at(&window, skip) {
+                Some(m) if m.start() == skip && (m.end() < window.len() || at_eof) => return true,
+                _ if at_eof => return false,
+                _ => span = span.saturating_mul(2),
+            }
+        }
     }
 
     fn mark(&self) -> Option<usize> {
@@ -2478,6 +2500,51 @@ mod tests {
             assert_eq!(TextStore::point(&q), TextStore::point(&oracle));
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn adaptive_regex_search_grows_the_window_and_matches_the_oracle() {
+        // A buffer larger than the initial search window so the window must grow;
+        // the match and a looking_at land PAST it. Every result is checked against
+        // the in-memory oracle, so the adaptive growth must be exact.
+        let mut content = "a".repeat(SEARCH_WINDOW_START + 2000);
+        content.push_str("NEEDLE then end\nmore\n");
+        content.push_str(&"b".repeat(500));
+        let mut q = Quire::from_string("q", &content);
+        let mut o = Buffer::from_string("o", &content);
+
+        // `a$` matches at the INITIAL all-`a` window's cut (end-of-window looks
+        // like end-of-text) but NOT in the full text (the a's are followed by
+        // `NEEDLE`, not a line end) — the adaptive search must grow past the cut
+        // artifact and settle to the oracle's `None`, not report the artifact.
+        for pat in ["NEEDLE", "end$", "x?NEEDLE", "no-such-token", "a$"] {
+            let re = regex::Regex::new(pat).unwrap();
+            TextStore::goto_char(&mut q, 1);
+            TextStore::goto_char(&mut o, 1);
+            assert_eq!(
+                TextStore::re_search_forward(&mut q, &re, None),
+                TextStore::re_search_forward(&mut o, &re, None),
+                "re_search past the window must agree with the oracle for {pat:?}"
+            );
+        }
+
+        // looking_at a match anchored at point that extends PAST the window.
+        let long = regex::Regex::new("a+NEEDLE").unwrap();
+        assert_eq!(
+            TextStore::looking_at(&q, &long),
+            TextStore::looking_at(&o, &long),
+        );
+        assert!(
+            TextStore::looking_at(&q, &long),
+            "a+NEEDLE matches at point 1"
+        );
+        // A non-match that the regex can only settle by reading to EOF.
+        let nope = regex::Regex::new("a+ZZZ").unwrap();
+        assert_eq!(
+            TextStore::looking_at(&q, &nope),
+            TextStore::looking_at(&o, &nope)
+        );
+        assert!(!TextStore::looking_at(&q, &nope));
     }
 
     // ---- snapshots: cheap + independent (the persistent-tree payoff) ----

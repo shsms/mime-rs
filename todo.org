@@ -14,17 +14,17 @@ drop their end-of-run ~set-buffer~ dance.
 
 ** TODO Streaming search [#C]
 DONE so far: literal ~search_forward~ streams the range a chunk at a time
-(needle-1 overlap across chunks) and stops at the first hit, so it no longer
-materializes point→point-max — which retires the conflict builtins'
-full-buffer ~scan~ cost (each ~scan~ walked the whole tail per marker).
-Remaining: a resumable streaming DFA (~regex-automata~) so ~re_search_forward~
-/ ~looking_at~ stream too (they still ~collect_range~ the window — and
-~looking_at~'s window is UNBOUNDED, point→point-max, so an anchored check on
-a huge paged buffer copies the whole tail; cap it or stream it first);
-streaming ~search_backward~ (still materializes [bound, point)); and
-global-replace a multi-GB file across cores. Also: ~find_forward~ matches
-with a naive ~windows().position()~ — swap in ~memchr::memmem~ (SIMD two-way)
-for long/common-prefix needles.
+(needle-1 overlap), stopping at the first hit; ~re_search_forward~ and
+~looking_at~ are ADAPTIVELY WINDOWED — the window grows from a small start and
+settles as soon as the match ends inside it, so a hit near point never copies
+the document tail (was point→EOF, unconditionally for ~looking_at~). Together
+these retire the conflict builtins' full-buffer ~scan~ cost.
+Remaining: a resumable streaming DFA (~regex-automata~) to close the residual —
+a regex MISS still grows the window to the bound (the engine must see every
+byte to say "no"); streaming ~search_backward~ (still materializes [bound,
+point)); and global-replace a multi-GB file across cores. Also: ~find_forward~
+matches with a naive ~windows().position()~ — swap in ~memchr::memmem~ (SIMD
+two-way) for long/common-prefix needles.
 /Exit: global-replace a multi-GB file across cores; ulysses bench beats
 legacy ~mime~./
 
