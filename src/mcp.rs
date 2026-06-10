@@ -469,6 +469,11 @@ fn tool_run_program(
         let note = save_visited(sessions, &session)?;
         json["saved"] = Value::String(note.trim_start_matches("; ").to_string());
     }
+    // Structured, present only when true (like `stale`): the edit is in the warm
+    // buffer, not on disk — saving was not requested and the buffer is dirty.
+    if is_unsaved(sessions, &session) {
+        json["unsaved"] = Value::Bool(true);
+    }
     Ok(pretty(&json))
 }
 
@@ -482,6 +487,27 @@ fn stale_note(sessions: &HashMap<String, Workspace>, session: &str) -> &'static 
         "\nWARNING: the visited file changed on disk after it was opened — \
          this read may be stale or corrupted; run_program (revert-buffer) \
          re-reads the file (discarding the warm buffer's edits)"
+    } else {
+        ""
+    }
+}
+
+/// Whether the session's buffer is file-backed and has edits NOT yet on its
+/// visited file — the signal that a `save` was forgotten. False for a clean
+/// buffer or one with no file (an `open_text` scratch buffer, which has nothing
+/// to forget to save).
+fn is_unsaved(sessions: &HashMap<String, Workspace>, session: &str) -> bool {
+    sessions
+        .get(session)
+        .is_some_and(|ws| ws.visited_path().is_some() && ws.is_modified())
+}
+
+/// A reminder appended to an edit tool's message when the edit lives only in the
+/// warm buffer, not on disk — so a forgotten `save` reads as a visible note
+/// instead of a silent loss. Empty when there's nothing to save.
+fn unsaved_note(sessions: &HashMap<String, Workspace>, session: &str) -> &'static str {
+    if is_unsaved(sessions, session) {
+        "\n(unsaved: edits are in the warm buffer, not on disk — pass save:true or save_buffer)"
     } else {
         ""
     }
@@ -574,8 +600,9 @@ fn tool_insert_text(
     } else {
         String::new()
     };
+    let unsaved = unsaved_note(sessions, &session);
     Ok(format!(
-        "inserted {chars} chars; point is now {point}{saved}"
+        "inserted {chars} chars; point is now {point}{saved}{unsaved}"
     ))
 }
 
@@ -644,12 +671,13 @@ fn tool_replace_text(
     } else {
         String::new()
     };
+    let unsaved = unsaved_note(sessions, &session);
     Ok(match (all, more) {
-        (true, _) => format!("replaced {n} occurrence(s); point is now {point}{saved}"),
-        (false, 0) => format!("replaced 1 occurrence; point is now {point}{saved}"),
+        (true, _) => format!("replaced {n} occurrence(s); point is now {point}{saved}{unsaved}"),
+        (false, 0) => format!("replaced 1 occurrence; point is now {point}{saved}{unsaved}"),
         (false, more) => format!(
             "replaced 1 occurrence; point is now {point}; {more} more match(es) \
-             remain (pass all:true to replace every occurrence){saved}"
+             remain (pass all:true to replace every occurrence){saved}{unsaved}"
         ),
     })
 }
@@ -722,8 +750,9 @@ fn replace_text_batch(
     } else {
         String::new()
     };
+    let unsaved = unsaved_note(sessions, session);
     Ok(format!(
-        "applied {} edit(s), {total} replacement(s){saved}",
+        "applied {} edit(s), {total} replacement(s){saved}{unsaved}",
         items.len()
     ))
 }
@@ -828,7 +857,10 @@ fn tool_restore_checkpoint(
     let label = str_arg(args, "label")?;
     let program = format!("(restore-checkpoint \"{}\")", lisp_escape(&label));
     run_in_session(sessions, &session, &program)?;
-    Ok(format!("restored to checkpoint \"{label}\""))
+    // Rewinding the buffer can leave it modified vs. disk — flag it like the
+    // edit tools so the restore isn't a silent unsaved change.
+    let unsaved = unsaved_note(sessions, &session);
+    Ok(format!("restored to checkpoint \"{label}\"{unsaved}"))
 }
 
 /// `list_checkpoints {session?}` — the labels currently captured.
@@ -868,10 +900,11 @@ fn tool_save_buffer(
 fn tool_session_status(sessions: &HashMap<String, Workspace>) -> Result<String, String> {
     let mut ids: Vec<&String> = sessions.keys().collect();
     ids.sort();
-    // Per session: the current buffer, its visited file, and the two states a
+    // Per session: the current buffer, its visited file, and the states a
     // resuming agent must know without probe programs — an active narrowing,
-    // and whether the visited file drifted on disk (the stale-save guard's
-    // view).
+    // whether the visited file drifted on disk (the stale-save guard's view),
+    // and whether the buffer has edits NOT yet written to its file (so a
+    // forgotten `save` is visible, not a silent loss).
     let sessions_json: Vec<Value> = ids
         .into_iter()
         .map(|id| {
@@ -882,6 +915,7 @@ fn tool_session_status(sessions: &HashMap<String, Workspace>) -> Result<String, 
                 "file": ws.visited_path().map(|p| p.display().to_string()),
                 "narrowed": ws.is_narrowed(),
                 "stale": ws.is_stale(),
+                "unsaved": ws.visited_path().is_some() && ws.is_modified(),
             })
         })
         .collect();
@@ -1177,7 +1211,7 @@ fn tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "session_status",
-            "description": "Report engine status: the ids of the currently live sessions, the allowed filesystem roots that open_file/save_buffer are confined to (MIME_ROOTS, default cwd), and whether the audit journal is on. Check the roots before opening or saving to learn the writable sandbox up front.",
+            "description": "Report engine status: per live session the current buffer, its visited file, and whether it is narrowed, stale (its file drifted on disk), or unsaved (has edits not yet written to that file — so a forgotten save is visible); plus the allowed filesystem roots that open_file/save_buffer are confined to (MIME_ROOTS, default cwd), and whether the audit journal is on. Check the roots before opening or saving to learn the writable sandbox up front.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},

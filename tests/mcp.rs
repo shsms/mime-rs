@@ -696,6 +696,131 @@ fn rehearse_does_not_auto_revert_a_clean_drifted_buffer() {
 }
 
 #[test]
+fn unsaved_edits_are_flagged_until_saved() {
+    let dir = temp_dir("unsaved");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+    s.call_ok(1, "open_file", json!({ "path": p }));
+
+    // A freshly opened buffer is clean — not flagged unsaved.
+    let st: Value = serde_json::from_str(&s.call_ok(2, "session_status", json!({}))).unwrap();
+    assert!(
+        st["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["unsaved"] == false),
+        "fresh buffer is not unsaved: {st}"
+    );
+
+    // Edit WITHOUT save → the run result flags it, and so does session_status.
+    let out: Value = serde_json::from_str(&s.call_ok(
+        3,
+        "run_program",
+        json!({ "path": p, "program": "(goto-char (point-max)) (insert \"beta\\n\")" }),
+    ))
+    .unwrap();
+    assert_eq!(out["unsaved"], true, "an unsaved edit is flagged: {out}");
+    let st: Value = serde_json::from_str(&s.call_ok(4, "session_status", json!({}))).unwrap();
+    assert!(
+        st["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["unsaved"] == true),
+        "session_status flags the unsaved buffer: {st}"
+    );
+
+    // An edit tool's text message carries the reminder when it doesn't save.
+    let msg = s.call_ok(
+        5,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "ALPHA" }),
+    );
+    assert!(msg.contains("unsaved"), "edit-tool message reminds: {msg}");
+
+    // Saving clears the flag everywhere.
+    s.call_ok(
+        6,
+        "run_program",
+        json!({ "path": p, "program": "(point)", "save": true }),
+    );
+    let out: Value = serde_json::from_str(&s.call_ok(
+        7,
+        "run_program",
+        json!({ "path": p, "program": "(point)" }),
+    ))
+    .unwrap();
+    assert!(
+        out.get("unsaved").is_none(),
+        "saved → no unsaved flag: {out}"
+    );
+    let st: Value = serde_json::from_str(&s.call_ok(8, "session_status", json!({}))).unwrap();
+    assert!(
+        st["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["unsaved"] == false),
+        "saved → not unsaved: {st}"
+    );
+}
+
+#[test]
+fn unsaved_flag_covers_insert_rehearse_and_restore_checkpoint() {
+    let dir = temp_dir("unsaved2");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+    // Explicit session id so the checkpoint tools (keyed by session, not path)
+    // address the same buffer.
+    s.call_ok(1, "open_file", json!({ "session": "s", "path": p }));
+
+    // insert_text without save → its text message carries the reminder.
+    let msg = s.call_ok(2, "insert_text", json!({ "session": "s", "text": "X" }));
+    assert!(msg.contains("unsaved"), "insert_text reminds: {msg}");
+
+    // Save to a clean baseline, then rehearse a would-be edit: it rolls back,
+    // so it must NOT report unsaved.
+    s.call_ok(
+        3,
+        "run_program",
+        json!({ "session": "s", "program": "(point)", "save": true }),
+    );
+    let out: Value = serde_json::from_str(&s.call_ok(
+        4,
+        "rehearse",
+        json!({ "session": "s", "program": "(goto-char (point-max)) (insert \"Z\")" }),
+    ))
+    .unwrap();
+    assert!(
+        out.get("unsaved").is_none(),
+        "rehearse rolls back → not unsaved: {out}"
+    );
+
+    // Checkpoint at the saved state, save a DIFFERENT content to disk, then
+    // restore the checkpoint — the buffer now differs from disk → unsaved.
+    s.call_ok(5, "checkpoint", json!({ "session": "s", "label": "cp0" }));
+    s.call_ok(
+        6,
+        "run_program",
+        json!({ "session": "s", "program": "(erase-buffer) (insert \"BETA\\n\")", "save": true }),
+    );
+    let restored = s.call_ok(
+        7,
+        "restore_checkpoint",
+        json!({ "session": "s", "label": "cp0" }),
+    );
+    assert!(
+        restored.contains("unsaved"),
+        "a restore that diverges from disk flags unsaved: {restored}"
+    );
+}
+
+#[test]
 fn one_call_editing_with_path_save_and_batches() {
     let dir = temp_dir("one-call");
     let file = dir.join("prog.rs");
