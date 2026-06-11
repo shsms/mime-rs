@@ -195,6 +195,39 @@ fn clamp_occur_line(text: &str, col: usize) -> String {
 /// warning it's pushed to the run log (the `(message …)` channel) — used to
 /// flag a fused "keep both" join, computed from the same section materialization
 /// as the splice text so the sides aren't read out of the buffer twice.
+/// Shared core of `keep-lines` / `flush-lines`: rewrite the region from the
+/// start of point's line to point-max, keeping (or dropping) the lines the
+/// regex matches; returns the number of lines deleted. Operates "from point",
+/// like Emacs; point lands at the region start. One delete + one insert, so
+/// markers in the rewritten region collapse to its start — coarse, but the
+/// classic bulk filter is rarely mixed with marker bookkeeping.
+fn filter_lines(s: &SharedSession, rx: &regex::Regex, keep_matching: bool) -> Result<i64, Error> {
+    let mut sess = s.borrow_mut();
+    sess.buffer.beginning_of_line();
+    let start = sess.buffer.point();
+    let end = sess.buffer.point_max();
+    let region = sess.buffer.substring(start, end);
+    let mut deleted = 0i64;
+    let kept: String = region
+        .split_inclusive('\n')
+        .filter(|line| {
+            let keep = rx.is_match(line.trim_end_matches('\n')) == keep_matching;
+            if !keep {
+                deleted += 1;
+            }
+            keep
+        })
+        .collect();
+    if kept != region {
+        sess.buffer.delete_region(start, end);
+        sess.buffer.goto_char(start);
+        sess.buffer.insert(&kept);
+    }
+    let landing = start.min(sess.buffer.point_max());
+    sess.buffer.goto_char(landing);
+    Ok(deleted)
+}
+
 fn conflict_splice<F>(s: &SharedSession, n: Option<i64>, produce: F) -> Result<i64, Error>
 where
     F: FnOnce(
@@ -1441,6 +1474,157 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             sess.kill_ring.push(text);
             sess.buffer.delete_region(p, end);
             Ok(TulispObject::nil())
+        });
+    }
+    {
+        // (kill-whole-line) — kill the entire line point is on, newline
+        // included, onto the kill-ring; point lands at the line's former
+        // start.
+        let s = session.clone();
+        ctx.defun("kill-whole-line", move || -> Result<TulispObject, Error> {
+            let mut sess = s.borrow_mut();
+            sess.buffer.beginning_of_line();
+            let start = sess.buffer.point();
+            sess.buffer.end_of_line();
+            let eol = sess.buffer.point();
+            let end = if eol < sess.buffer.point_max() {
+                eol + 1 // take the newline too
+            } else {
+                eol
+            };
+            let text = sess.buffer.substring(start, end);
+            sess.kill_ring.push(text);
+            sess.buffer.delete_region(start, end);
+            let landing = start.min(sess.buffer.point_max());
+            sess.buffer.goto_char(landing);
+            Ok(TulispObject::nil())
+        });
+    }
+    {
+        // (keep-lines REGEXP) — delete every line from the start of point's
+        // line to point-max that does NOT match; returns the count deleted.
+        // Emacs's classic bulk filter, here as one region rewrite.
+        let s = session.clone();
+        ctx.defun("keep-lines", move |re: String| -> Result<i64, Error> {
+            let rx = cached_regex(&re)?;
+            filter_lines(&s, &rx, true)
+        });
+    }
+    {
+        // (flush-lines REGEXP) — the inverse: delete every matching line.
+        let s = session.clone();
+        ctx.defun("flush-lines", move |re: String| -> Result<i64, Error> {
+            let rx = cached_regex(&re)?;
+            filter_lines(&s, &rx, false)
+        });
+    }
+    {
+        // (sort-lines &optional REVERSE BEG END) — sort the lines covering
+        // [BEG, END) (defaults: the whole accessible region) lexicographically;
+        // REVERSE non-nil sorts descending. Whole lines are reordered; a
+        // region cut mid-line is widened to line boundaries first.
+        let s = session.clone();
+        ctx.defun(
+            "sort-lines",
+            move |reverse: Option<TulispObject>,
+                  beg: Option<i64>,
+                  end: Option<i64>|
+                  -> Result<TulispObject, Error> {
+                let mut sess = s.borrow_mut();
+                let beg = beg.map_or_else(|| sess.buffer.point_min(), |b| b.max(1) as usize);
+                let end = end.map_or_else(|| sess.buffer.point_max(), |e| e.max(1) as usize);
+                // Widen to line boundaries.
+                sess.buffer.goto_char(beg);
+                sess.buffer.beginning_of_line();
+                let start = sess.buffer.point();
+                sess.buffer.goto_char(end.max(start));
+                if sess.buffer.point() > sess.buffer.point_min()
+                    && sess.buffer.char_before(sess.buffer.point()) != Some('\n')
+                {
+                    sess.buffer.end_of_line();
+                }
+                let stop = sess.buffer.point();
+                let region = sess.buffer.substring(start, stop);
+                let trailing_newline = region.ends_with('\n');
+                let mut lines: Vec<&str> = region.split('\n').collect();
+                if trailing_newline {
+                    lines.pop(); // the empty tail after the final newline
+                }
+                lines.sort();
+                if reverse.is_some_and(|r| r.is_truthy()) {
+                    lines.reverse();
+                }
+                let mut sorted = lines.join("\n");
+                if trailing_newline {
+                    sorted.push('\n');
+                }
+                if sorted != region {
+                    sess.buffer.delete_region(start, stop);
+                    sess.buffer.goto_char(start);
+                    sess.buffer.insert(&sorted);
+                }
+                sess.buffer.goto_char(start);
+                Ok(TulispObject::nil())
+            },
+        );
+    }
+    {
+        // (back-to-indentation) — point to the first non-whitespace char of
+        // the current line (or its end if blank); returns the new point.
+        let s = session.clone();
+        ctx.defun("back-to-indentation", move || -> i64 {
+            let mut sess = s.borrow_mut();
+            sess.buffer.beginning_of_line();
+            while matches!(
+                sess.buffer.char_after(sess.buffer.point()),
+                Some(' ') | Some('\t')
+            ) {
+                let p = sess.buffer.point();
+                sess.buffer.goto_char(p + 1);
+            }
+            sess.buffer.point() as i64
+        });
+    }
+    {
+        // (current-indentation) — the column of the current line's first
+        // non-whitespace char (tabs count 1), without moving point.
+        let s = session.clone();
+        ctx.defun("current-indentation", move || -> i64 {
+            let mut sess = s.borrow_mut();
+            let p0 = sess.buffer.point();
+            sess.buffer.beginning_of_line();
+            let mut n = 0i64;
+            while matches!(
+                sess.buffer.char_after(sess.buffer.point()),
+                Some(' ') | Some('\t')
+            ) {
+                let p = sess.buffer.point();
+                sess.buffer.goto_char(p + 1);
+                n += 1;
+            }
+            sess.buffer.goto_char(p0);
+            n
+        });
+    }
+    {
+        // (forward-paragraph) — move past the current paragraph to the next
+        // blank-line boundary (or point-max); returns the new point.
+        let s = session.clone();
+        ctx.defun("forward-paragraph", move || -> Result<i64, Error> {
+            let rx = cached_regex("\n[ \t]*\n")?;
+            let mut sess = s.borrow_mut();
+            match sess.buffer.re_search_forward(&rx, None) {
+                Some(_) => {
+                    // Land on the blank line itself (after the first newline).
+                    let p = sess.buffer.point();
+                    sess.buffer.goto_char(p.saturating_sub(1).max(1));
+                }
+                None => {
+                    let max = sess.buffer.point_max();
+                    sess.buffer.goto_char(max);
+                }
+            }
+            Ok(sess.buffer.point() as i64)
         });
     }
     {

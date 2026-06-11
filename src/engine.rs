@@ -1938,4 +1938,62 @@ mod tests {
         // Window [2, 6) = "ello" — the full "hello" no longer fits.
         assert_eq!(report(&r, "lim"), "0");
     }
+
+    #[test]
+    fn keep_and_flush_lines_filter_from_point() {
+        let r = run(
+            "head\nkeep a\ndrop b\nkeep c\n",
+            r#"(goto-char 6) ; on the "keep a" line
+               (report "flushed" (flush-lines "drop"))"#,
+        );
+        // "head" sits above point's line and is untouched.
+        assert_eq!(r.final_text.as_deref(), Some("head\nkeep a\nkeep c\n"));
+        assert_eq!(report(&r, "flushed"), "1");
+
+        let r = run(
+            "head\nkeep a\ndrop b\nkeep c\n",
+            r#"(goto-char 6)
+               (report "dropped" (keep-lines "keep"))"#,
+        );
+        assert_eq!(r.final_text.as_deref(), Some("head\nkeep a\nkeep c\n"));
+        assert_eq!(report(&r, "dropped"), "1");
+    }
+
+    #[test]
+    fn sort_lines_orders_the_region() {
+        let r = run("pear\napple\nmango\n", "(sort-lines)");
+        assert_eq!(r.final_text.as_deref(), Some("apple\nmango\npear\n"));
+        let r = run("pear\napple\nmango\n", "(sort-lines t)");
+        assert_eq!(r.final_text.as_deref(), Some("pear\nmango\napple\n"));
+    }
+
+    #[test]
+    fn kill_whole_line_takes_the_newline_and_yanks_back() {
+        let r = run(
+            "one\ntwo\nthree\n",
+            r#"(goto-char 6) ; mid "two"
+               (kill-whole-line)
+               (report "after" (buffer-string))
+               (end-of-buffer) (yank)"#,
+        );
+        assert_eq!(report(&r, "after"), "\"one\\nthree\\n\"");
+        assert_eq!(r.final_text.as_deref(), Some("one\nthree\ntwo\n"));
+    }
+
+    #[test]
+    fn indentation_helpers_and_forward_paragraph() {
+        let r = run(
+            "    indented line\n\nnext para\n",
+            r#"(goto-char 9)
+               (report "indent" (current-indentation))
+               (report "bti" (back-to-indentation))
+               (goto-char 1)
+               (report "para" (forward-paragraph))"#,
+        );
+        assert_eq!(report(&r, "indent"), "4");
+        assert_eq!(report(&r, "bti"), "5");
+        // The paragraph boundary is the start of the blank line after
+        // "indented line" (char 19: 17 line chars + its newline).
+        assert_eq!(report(&r, "para"), "19");
+    }
 }
