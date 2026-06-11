@@ -153,6 +153,30 @@ pub struct Syntax {
     text: String,
     lang: Lang,
     tree: ParseTree,
+    /// Byte↔char checkpoints, one per ~[`CHECKPOINT_BYTES`] of text (always
+    /// starting with `(0, 0)`), each `(byte_offset, chars_before_it)` on a
+    /// char boundary. Position conversions binary-search here and scan only
+    /// the residue, so they are O(log n + K) instead of the O(text) prefix
+    /// scan that made mapping a big query's captures O(captures × file).
+    checkpoints: Vec<(usize, usize)>,
+}
+
+/// Spacing of the byte↔char conversion checkpoints. 4 KiB keeps the residue
+/// scan cache-friendly while the table stays ~16 B per 4 KiB of text.
+const CHECKPOINT_BYTES: usize = 4096;
+
+fn build_checkpoints(text: &str) -> Vec<(usize, usize)> {
+    let mut cps = vec![(0usize, 0usize)];
+    let mut chars = 0usize;
+    let mut next = CHECKPOINT_BYTES;
+    for (b, _) in text.char_indices() {
+        if b >= next {
+            cps.push((b, chars));
+            next = b + CHECKPOINT_BYTES;
+        }
+        chars += 1;
+    }
+    cps
 }
 
 /// A node, projected into mime-rs terms: its kind and a 1-based char span
@@ -216,6 +240,7 @@ impl Syntax {
             }
         };
         Syntax {
+            checkpoints: build_checkpoints(text),
             text: text.to_string(),
             lang,
             tree,
@@ -252,11 +277,16 @@ impl Syntax {
     /// byte *before which* the char at `pos` starts; `char_len + 1` maps to the
     /// end of the text.
     fn byte_of(&self, pos: usize) -> usize {
-        let pos = pos.max(1);
-        self.text
-            .char_indices()
-            .nth(pos - 1)
-            .map_or(self.text.len(), |(b, _)| b)
+        let target = pos.max(1) - 1; // chars before the position
+        // Last checkpoint at or before `target` chars, then walk the residue.
+        let i = self.checkpoints.partition_point(|&(_, c)| c <= target) - 1;
+        let (mut byte, cp_chars) = self.checkpoints[i];
+        let mut it = self.text[byte..].char_indices();
+        match it.nth(target - cp_chars) {
+            Some((off, _)) => byte += off,
+            None => byte = self.text.len(),
+        }
+        byte
     }
 
     /// 1-based char position of byte offset `byte` (clamped, and snapped down to
@@ -266,7 +296,10 @@ impl Syntax {
         while byte > 0 && !self.text.is_char_boundary(byte) {
             byte -= 1;
         }
-        self.text[..byte].chars().count() + 1
+        // Last checkpoint at or before `byte`, then count only the residue.
+        let i = self.checkpoints.partition_point(|&(b, _)| b <= byte) - 1;
+        let (cp_byte, cp_chars) = self.checkpoints[i];
+        cp_chars + self.text[cp_byte..byte].chars().count() + 1
     }
 
     /// Project a tree-sitter node into a [`NodeSpan`] (kind + 1-based char span).
@@ -1015,6 +1048,52 @@ mod tests {
             ("a.tl", Lang::Elisp),
         ] {
             assert_eq!(Lang::from_buffer_name(file), Some(lang), "{file}");
+        }
+    }
+
+    #[test]
+    fn checkpointed_conversions_match_the_naive_scan() {
+        // Multibyte text long enough to span several 4 KiB checkpoints, so
+        // both the residue walks and the checkpoint hops are exercised.
+        let mut text = String::new();
+        for i in 0..600 {
+            text.push_str(&format!("line {i:04} — naïve café ‸körner\n"));
+        }
+        let syn = Syntax::parse(&text, Lang::Markdown);
+        assert!(
+            syn.checkpoints.len() > 3,
+            "spans checkpoints: {}",
+            syn.checkpoints.len()
+        );
+        let n_chars = text.chars().count();
+        let naive_byte_of = |pos: usize| -> usize {
+            let pos = pos.max(1);
+            text.char_indices()
+                .nth(pos - 1)
+                .map_or(text.len(), |(b, _)| b)
+        };
+        let naive_char_of = |byte: usize| -> usize {
+            let mut byte = byte.min(text.len());
+            while byte > 0 && !text.is_char_boundary(byte) {
+                byte -= 1;
+            }
+            text[..byte].chars().count() + 1
+        };
+        // Probe boundaries, checkpoint edges, mid-char bytes, and a spread.
+        let mut bytes: Vec<usize> = (0..=text.len()).step_by(997).collect();
+        bytes.extend([0, 1, text.len() - 1, text.len(), text.len() + 50]);
+        bytes.extend(
+            syn.checkpoints
+                .iter()
+                .flat_map(|&(b, _)| [b, b + 1, b.saturating_sub(1)]),
+        );
+        for b in bytes {
+            assert_eq!(syn.char_of(b), naive_char_of(b), "char_of({b})");
+        }
+        let mut poss: Vec<usize> = (1..=n_chars + 1).step_by(811).collect();
+        poss.extend([1, 2, n_chars, n_chars + 1, n_chars + 9]);
+        for p in poss {
+            assert_eq!(syn.byte_of(p), naive_byte_of(p), "byte_of({p})");
         }
     }
 }
