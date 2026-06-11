@@ -1272,3 +1272,42 @@ fn outline_scope_and_anchor_drive_structural_edits() {
     let b = outline.find("beta").expect("beta");
     assert!(a < m && m < b, "mid sits between alpha and beta: {outline}");
 }
+
+#[test]
+fn search_reports_direction_line_echo_and_case_folding() {
+    let mut s = Server::spawn();
+    s.call_ok(
+        1,
+        "open_text",
+        json!({ "text": "Alpha one\nbeta two\nALPHA three\n" }),
+    );
+
+    // Forward + case-insensitive exact: finds "Alpha" and echoes the line.
+    let hit = s.call_ok(
+        2,
+        "search",
+        json!({ "pattern": "alpha", "case_insensitive": true }),
+    );
+    assert!(hit.contains("line 1: Alpha one"), "got: {hit}");
+
+    // Backward from the end: the latest case-folded match is on line 3.
+    s.call_ok(3, "run_program", json!({ "program": "(end-of-buffer)" }));
+    let hit = s.call_ok(
+        4,
+        "search",
+        json!({ "pattern": "alpha", "case_insensitive": true, "direction": "backward" }),
+    );
+    assert!(hit.contains("line 3: ALPHA three"), "got: {hit}");
+    assert!(hit.contains("at the match start"), "got: {hit}");
+
+    // occur with case folding sees both spellings.
+    let oc = s.call_ok(
+        5,
+        "occur",
+        json!({ "pattern": "alpha", "case_insensitive": true }),
+    );
+    assert!(
+        oc.contains("Alpha one") && oc.contains("ALPHA three"),
+        "got: {oc}"
+    );
+}

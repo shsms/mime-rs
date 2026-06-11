@@ -1094,26 +1094,59 @@ fn tool_search(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Resul
     let session = resolve_session(args, sessions)?;
     let pattern = str_arg(args, "pattern")?;
     let mode = args.get("mode").and_then(Value::as_str).unwrap_or("exact");
-    // `search-forward` is literal, `re-search-forward` is regex. Each takes
-    // `(NEEDLE BOUND NOERROR)`; noerror=t makes a miss return nil instead of
-    // erroring. (Whitespace/case-insensitive "fuzzy" matching isn't a built-in:
-    // pass a regex — that's all mime's find_fuzzy compiles to.)
-    let (lisp_fn, needle) = match mode {
-        "exact" => ("search-forward", lisp_escape(&pattern)),
-        "regex" => ("re-search-forward", lisp_escape(&pattern)),
-        other => return Err(format!("unknown search mode: {other} (exact|regex)")),
+    let backward = match args.get("direction").and_then(Value::as_str) {
+        None | Some("forward") => false,
+        Some("backward") => true,
+        Some(other) => return Err(format!("unknown direction: {other} (forward|backward)")),
     };
+    let ci = bool_arg(args, "case_insensitive");
+    // `search-*` is literal, `re-search-*` is regex; each takes
+    // `(NEEDLE BOUND NOERROR)`, noerror=t making a miss return nil. A
+    // case-insensitive exact search compiles to a regex over the escaped
+    // literal with the (?i) flag.
+    let (lisp_fn, needle) = match (mode, ci) {
+        ("exact", false) if !backward => ("search-forward", lisp_escape(&pattern)),
+        ("exact", false) => ("search-backward", lisp_escape(&pattern)),
+        ("exact", true) | ("regex", _) => {
+            let re = match (mode, ci) {
+                ("exact", _) => format!("(?i){}", regex::escape(&pattern)),
+                (_, true) => format!("(?i){pattern}"),
+                _ => pattern.clone(),
+            };
+            (
+                if backward {
+                    "re-search-backward"
+                } else {
+                    "re-search-forward"
+                },
+                lisp_escape(&re),
+            )
+        }
+        (other, _) => return Err(format!("unknown search mode: {other} (exact|regex)")),
+    };
+    // On a hit, also report the line and echo its text (via the raw message
+    // channel) — a search was almost always followed by a view just to see
+    // what matched.
     let program = format!(
         "(let ((p ({lisp_fn} \"{needle}\" nil t)))\
-           (if p (progn (report \"found\" 1) (report \"pos\" p))\
+           (if p (progn (report \"found\" 1) (report \"pos\" p)\
+                        (report \"line\" (line-number-at-pos p))\
+                        (message (buffer-substring (line-beginning-position) (line-end-position))))\
                  (report \"found\" 0)))"
     );
     let report = run_in_session(sessions, &session, &program)?;
     let note = stale_note(sessions, &session);
     if report_value(&report, "found").as_deref() == Some("1") {
         let pos = report_value(&report, "pos").unwrap_or_default();
+        let line = report_value(&report, "line").unwrap_or_default();
+        let text = report.log.first().cloned().unwrap_or_default();
+        let where_ = if backward {
+            "at the match start"
+        } else {
+            "just after the match"
+        };
         Ok(format!(
-            "match ({mode}): point is now {pos} (just after the match){note}"
+            "match ({mode}): point is now {pos} ({where_}) — line {line}: {text}{note}"
         ))
     } else {
         Ok(format!("no {mode} match for pattern{note}"))
@@ -1129,11 +1162,22 @@ fn tool_occur(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result
     let session = resolve_session(args, sessions)?;
     let pattern = str_arg(args, "pattern")?;
     let mode = args.get("mode").and_then(Value::as_str).unwrap_or("exact");
-    let needle = lisp_escape(&pattern);
-    let pat_expr = match mode {
-        "exact" => format!("(regexp-quote \"{needle}\")"),
-        "regex" => format!("\"{needle}\""),
-        other => return Err(format!("unknown occur mode: {other} (exact|regex)")),
+    let ci = bool_arg(args, "case_insensitive");
+    let pat_expr = match (mode, ci) {
+        ("exact", false) => format!("(regexp-quote \"{}\")", lisp_escape(&pattern)),
+        ("exact", true) => format!(
+            "\"{}\"",
+            lisp_escape(&format!("(?i){}", regex::escape(&pattern)))
+        ),
+        ("regex", ci) => {
+            let re = if ci {
+                format!("(?i){pattern}")
+            } else {
+                pattern.clone()
+            };
+            format!("\"{}\"", lisp_escape(&re))
+        }
+        (other, _) => return Err(format!("unknown occur mode: {other} (exact|regex)")),
     };
     let nlines = args.get("nlines").and_then(Value::as_i64).unwrap_or(0);
     let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(100);
@@ -1533,7 +1577,7 @@ fn tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "search",
-            "description": "Search forward from point for a pattern and report the resulting position. Moves point to the match (Emacs semantics).",
+            "description": "Search from point for a pattern; report the resulting position plus the matched line's number and text. Moves point to the match — just after it (forward) or to its start (backward), Emacs semantics.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1541,8 +1585,14 @@ fn tool_schemas() -> Vec<Value> {
                     "mode": {
                         "type": "string",
                         "enum": ["exact", "regex"],
-                        "description": "exact (literal) or regex (RE2). Defaults to exact. (For whitespace/case-insensitive matching, pass a regex.)",
+                        "description": "exact (literal) or regex (RE2). Defaults to exact.",
                     },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["forward", "backward"],
+                        "description": "Search direction from point. Default forward. Backward finds the latest match wholly before point.",
+                    },
+                    "case_insensitive": { "type": "boolean", "description": "Match case-insensitively (both modes). Default false." },
                     "session": session,
                     "path": path,
                 },
@@ -1561,6 +1611,7 @@ fn tool_schemas() -> Vec<Value> {
                         "enum": ["exact", "regex"],
                         "description": "exact (literal) or regex (RE2). Defaults to exact.",
                     },
+                    "case_insensitive": { "type": "boolean", "description": "Match case-insensitively (both modes). Default false." },
                     "nlines": { "type": "integer", "description": "Context lines around each hit (default 0)." },
                     "limit": { "type": "integer", "description": "Max matching lines rendered (default 100); the rest are summarized in a tail line." },
                     "scope": scope,
