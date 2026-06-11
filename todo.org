@@ -28,28 +28,24 @@ two-way) for long/common-prefix needles.
 /Exit: global-replace a multi-GB file across cores; ulysses bench beats
 legacy ~mime~./
 
-** TODO Paged reader: fuse the open scans, coarsen the drift stat [#C]
-Two perf follow-ups from the paged-reader landing, both scaling with file
-size. (1) ~Quire::open~ reads the whole file TWICE — ~is_valid_utf8~ then
-~count_chars_lines~ — where mmap+~from_utf8~ was one pass; fuse them into a
-single page-by-page scan that validates UTF-8 AND tallies chars/lines (carry
-an incomplete trailing char once). Also restore the parallel fan-out for the
-paged count (it's owned-only now; threads can ~read_at~ disjoint ranges).
-(2) The fresh-read drift check does a ~stat~-by-path per page MISS until it
-latches — ~16k stats per GB on a cold scan of a clean file. Check once per
-read op (or every K pages), not per 64 KiB page.
+** TODO Paged reader: parallel fan-out for the fused open scan [#C]
+The residual of the open-scan item (the fused validate+count pass and the
+once-per-read-op drift stat landed 2026-06): the open-time scan is
+sequential where the owned-text count fans out across cores above
+~PARALLEL_INDEX_THRESHOLD~. Threads can ~read_at~ disjoint ranges; the
+UTF-8 carry needs per-chunk boundary fixups (validate each chunk, stitch
+the split chars at the seams).
 
-** TODO Paged reader holds an open fd per buffer — fd use + rename reads [#C]
-Unlike the old mmap (which dropped the ~File~ after ~Mmap::map~), ~PagedFile~
-keeps ~file: std::fs::File~ open for the buffer's whole life. Two consequences:
-(1) one held fd per warm buffer — many warm daemon/MCP sessions = many fds;
-worth a soft cap or a re-open-on-demand mode. (2) Reads go through the held
-fd, so after an external RENAME-replace the buffer keeps serving the OLD
-(now-unlinked but stable) inode's bytes while drift IS flagged via the
-stat-by-path; on NFS the unlinked inode is silly-renamed to ~.nfsXXXX~ and
-lingers until the session drops (visible when dogfooding mime on its own
-NFS-hosted source). Decide whether a drifted paged buffer should re-open the
-path on the next read (pick up the new inode) rather than wait for revert.
+** TODO Paged reader holds an open fd per buffer [#C]
+DECIDED (2026-06): a drifted paged buffer must NOT re-open the path
+mid-life — swapping inodes under a live piece tree mixes old and new
+bytes, and the old inode IS the correctness anchor for a modified
+buffer's edits. The exposure is mitigated at the session layer instead:
+auto-revert re-opens clean drifted buffers on next use, the warm-session
+cap (clean-LRU eviction) bounds held fds, and ~close_session~ releases
+deliberately — together these also bound the ~.nfsXXXX~ silly-rename
+lingering on NFS (now gitignored). Remaining idea, if fd pressure ever
+shows up in practice: a re-open-on-demand mode for CLEAN buffers only.
 
 ** TODO Dogfooding friction: MCP "insert relative to a defun/node" [#C]
 From driving mime to edit mime-rs itself. DONE: the unsaved state is now
@@ -100,12 +96,6 @@ ambiguity-as-error is arguably the right default. Measure the token
 breaks "replace the first TODO" one-shots).
 
 * Structural editing
-
-** TODO Byte↔char index on Syntax [#C]
-Every node accessor converts byte offsets to char positions via an
-O(text) prefix scan (~char_of~), so mapping accessors over a big
-query's captures is O(captures × file). A line-offset index built once
-per parse (or reusing the store's tree summaries) makes it O(log).
 
 ** TODO Incremental re-parse (~InputEdit~s) [#C]
 Nodes are first-class values with relational navigation now; the last
