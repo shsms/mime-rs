@@ -167,14 +167,12 @@ const CHECKPOINT_BYTES: usize = 4096;
 
 fn build_checkpoints(text: &str) -> Vec<(usize, usize)> {
     let mut cps = vec![(0usize, 0usize)];
-    let mut chars = 0usize;
     let mut next = CHECKPOINT_BYTES;
-    for (b, _) in text.char_indices() {
+    for (chars, (b, _)) in text.char_indices().enumerate() {
         if b >= next {
             cps.push((b, chars));
             next = b + CHECKPOINT_BYTES;
         }
-        chars += 1;
     }
     cps
 }
