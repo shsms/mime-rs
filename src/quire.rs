@@ -346,11 +346,68 @@ impl PagedFile {
         (chars, lines)
     }
 
-    /// ONE pass over the whole file, page by page: validate UTF-8 (carrying
-    /// an incomplete trailing char across page boundaries) AND count
-    /// chars/lines — fusing the two open-time scans that used to read a
-    /// multi-GB file twice. `None` = not valid UTF-8. Keeps nothing resident.
+    /// ONE pass over the whole file: validate UTF-8 AND count chars/lines —
+    /// fusing the two open-time scans that used to read a multi-GB file
+    /// twice. `None` = not valid UTF-8. Keeps nothing resident. Above
+    /// [`PARALLEL_INDEX_THRESHOLD`] the pass fans out over the available
+    /// cores (threads `read_at` disjoint byte ranges; chars split by the
+    /// partition are stitched at the seams), mirroring the owned-text
+    /// parallel count.
     fn validate_and_count(&self) -> Option<(usize, usize)> {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+        if threads == 1 || self.len < PARALLEL_INDEX_THRESHOLD {
+            return self.validate_and_count_seq();
+        }
+        let target = self.len.div_ceil(threads).max(PAGE);
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(threads);
+        let mut start = 0usize;
+        while start < self.len {
+            let end = (start + target).min(self.len);
+            ranges.push((start, end));
+            start = end;
+        }
+        // Only the File crosses threads (`read_at` is positional + &self);
+        // the PagedFile itself is !Sync (page cache, drift cells).
+        let file = &self.file;
+        let parts: Vec<ScanPart> = std::thread::scope(|scope| {
+            let handles: Vec<_> = ranges
+                .iter()
+                .map(|&(lo, hi)| scope.spawn(move || scan_range(file, lo, hi)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        // Stitch: each seam's (previous tail carry + next head skip) must
+        // form EXACTLY one valid char — which can never be '\n' (single
+        // byte, never split), so only the char count grows. A leading
+        // continuation byte in the first chunk, a dangling tail at EOF, or
+        // any malformed seam is invalid.
+        let (mut chars, mut lines) = (0usize, 0usize);
+        let mut prev_tail: Vec<u8> = Vec::new();
+        for part in parts {
+            let (head, c, l, tail) = part?;
+            if !prev_tail.is_empty() || !head.is_empty() {
+                let mut seam = std::mem::take(&mut prev_tail);
+                seam.extend_from_slice(&head);
+                let s = std::str::from_utf8(&seam).ok()?;
+                if s.chars().count() != 1 {
+                    return None;
+                }
+                chars += 1;
+            }
+            chars += c;
+            lines += l;
+            prev_tail = tail;
+        }
+        prev_tail.is_empty().then_some((chars, lines))
+    }
+
+    /// Sequential body of [`validate_and_count`], page by page, carrying an
+    /// incomplete trailing char across page boundaries.
+    fn validate_and_count_seq(&self) -> Option<(usize, usize)> {
         let (mut chars, mut lines) = (0usize, 0usize);
         let mut carry: Vec<u8> = Vec::new();
         let mut buf = vec![0u8; PAGE];
@@ -432,6 +489,76 @@ fn next_char_boundary(bytes: &[u8], mut i: usize) -> usize {
         i += 1;
     }
     i
+}
+
+/// One parallel-scan worker's result: the raw bytes it skipped at its head
+/// (leading continuation bytes of a char split by the partition), the
+/// chars/lines of its validated interior, and the trailing bytes of an
+/// incomplete char cut by its end. `None` = hard-invalid UTF-8 inside the
+/// chunk.
+type ScanPart = Option<(Vec<u8>, usize, usize, Vec<u8>)>;
+
+/// Validate + count one byte range of `file` for the parallel fused open
+/// scan — `read_at` is positional and thread-safe, so workers share the fd.
+/// Ragged edges are the caller's problem: head continuation bytes (max 3)
+/// are skipped and returned verbatim, an incomplete trailing char is carried
+/// out, and the seam stitching in `validate_and_count` re-joins them.
+fn scan_range(file: &std::fs::File, mut off: usize, end: usize) -> ScanPart {
+    use std::os::unix::fs::FileExt;
+    let mut head: Vec<u8> = Vec::new();
+    let (mut chars, mut lines) = (0usize, 0usize);
+    let mut carry: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; PAGE];
+    let mut first = true;
+    while off < end {
+        let want = PAGE.min(end - off);
+        let mut filled = 0usize;
+        while filled < want {
+            match file.read_at(&mut buf[filled..want], (off + filled) as u64) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let mut chunk: &[u8] = &buf[..filled];
+        if first {
+            first = false;
+            let skip = chunk
+                .iter()
+                .take(3)
+                .take_while(|&&b| (b & 0xC0) == 0x80)
+                .count();
+            head = chunk[..skip].to_vec();
+            chunk = &chunk[skip..];
+        }
+        let combined: Vec<u8>;
+        let piece: &[u8] = if carry.is_empty() {
+            chunk
+        } else {
+            let mut v = std::mem::take(&mut carry);
+            v.extend_from_slice(chunk);
+            combined = v;
+            &combined
+        };
+        let valid_to = match std::str::from_utf8(piece) {
+            Ok(_) => piece.len(),
+            Err(e) if e.error_len().is_none() => {
+                let v = e.valid_up_to();
+                carry = piece[v..].to_vec();
+                v
+            }
+            Err(_) => return None,
+        };
+        let (c, l) = count_chars_lines(&piece[..valid_to]);
+        chars += c;
+        lines += l;
+        if filled == 0 {
+            break; // truncation — count what we saw
+        }
+        off += filled;
+    }
+    Some((head, chars, lines, carry))
 }
 
 /// Parallel driver for [`count_chars_lines`]: split `bytes` into roughly
@@ -2341,6 +2468,31 @@ mod tests {
             TextStore::search_forward(&mut q, "two", None),
             Some("line one\nline ".chars().count() + 1 + 3)
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parallel_fused_scan_matches_sequential() {
+        // A file past PARALLEL_INDEX_THRESHOLD, multibyte THROUGHOUT, so
+        // wherever the per-core partition lands its seams, split chars are
+        // exercised — the parallel pass must agree with the sequential one
+        // bit-for-bit, and both with the naive count.
+        let path = tmp_path("parscan");
+        let unit = "é½‸a\n"; // 5 chars, 9 bytes
+        let text = unit.repeat((PARALLEL_INDEX_THRESHOLD / unit.len()) + 1024);
+        std::fs::write(&path, &text).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let len = file.metadata().unwrap().len() as usize;
+        let stamp = crate::safety::FileStamp::capture(&path).unwrap();
+        let paged = PagedFile::open(file, len, stamp);
+        assert!(
+            len >= PARALLEL_INDEX_THRESHOLD,
+            "exercises the parallel path"
+        );
+        let par = paged.validate_and_count().expect("valid");
+        let seq = paged.validate_and_count_seq().expect("valid");
+        assert_eq!(par, seq);
+        assert_eq!(par, (text.chars().count(), text.matches('\n').count()));
         let _ = std::fs::remove_file(&path);
     }
 
