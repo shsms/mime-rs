@@ -744,6 +744,9 @@ fn tool_replace_text(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
+    if args.get("files").is_some() {
+        return tool_replace_files(args, sessions);
+    }
     let session = resolve_session(args, sessions)?;
     if let Some(edits) = args.get("edits") {
         if args.get("pattern").is_some() || args.get("replacement").is_some() {
@@ -999,6 +1002,31 @@ fn replace_text_batch(
         .as_array()
         .filter(|a| !a.is_empty())
         .ok_or_else(|| "\"edits\" must be a non-empty array".to_string())?;
+    let scope = scope_prelude(args)?;
+    let total = run_batch_edits(sessions, session, items, &scope)?;
+    let saved = if bool_arg(args, "save") {
+        save_visited(sessions, session)?
+    } else {
+        String::new()
+    };
+    let unsaved = unsaved_note(sessions, session);
+    let view = view_echo(args, sessions, session);
+    Ok(format!(
+        "applied {} edit(s), {total} replacement(s){saved}{unsaved}{view}",
+        items.len()
+    ))
+}
+
+/// Build + run the transactional edit batch against ONE session and return
+/// the total replacement count — the core shared by the single-session
+/// `edits` form and the multi-file form. All-or-nothing per session: a miss
+/// or failed uniqueness check rolls the whole transaction back.
+fn run_batch_edits(
+    sessions: &mut HashMap<String, Workspace>,
+    session: &str,
+    items: &[Value],
+    scope: &Option<(String, String)>,
+) -> Result<usize, String> {
     let mut body = String::new();
     for (i, item) in items.iter().enumerate() {
         let pattern = str_arg(item, "pattern")?;
@@ -1050,15 +1078,14 @@ fn replace_text_batch(
                (report \"n\" n))"
         ));
     }
-    let scope = scope_prelude(args)?;
-    let program = match &scope {
+    let program = match scope {
         Some((_, prelude)) => format!("(save-restriction {prelude} (with-transaction {body}))"),
         None => format!("(with-transaction {body})"),
     };
     let report = match run_in_session(sessions, session, &program) {
         Ok(r) => r,
         Err(e) if e.contains("__no_defun__") => {
-            let name = scope.map(|(n, _)| n).unwrap_or_default();
+            let name = scope.as_ref().map(|(n, _)| n.clone()).unwrap_or_default();
             return Err(format!(
                 "scope: {}",
                 no_defun_error(sessions, session, &name)
@@ -1081,16 +1108,120 @@ fn replace_text_batch(
         .filter(|(k, _)| k == "n")
         .filter_map(|(_, v)| v.parse::<usize>().ok())
         .sum();
-    let saved = if bool_arg(args, "save") {
-        save_visited(sessions, session)?
-    } else {
-        String::new()
+    Ok(total)
+}
+
+/// The `files: [path…]` form of `replace_text`: the same edit spec applied
+/// to EVERY listed file, atomically ACROSS the set — a failure in any file
+/// rolls the already-edited ones back via their undo rings, so a cross-file
+/// rename is one call that either lands everywhere or nowhere. With
+/// `save: true` the files are saved only after every edit succeeded.
+fn tool_replace_files(
+    args: &Value,
+    sessions: &mut HashMap<String, Workspace>,
+) -> Result<String, String> {
+    if args.get("path").is_some() || args.get("session").is_some() {
+        return Err("pass \"files\" OR path/session, not both".to_string());
+    }
+    let files: Vec<String> = args
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .filter(|v: &Vec<String>| !v.is_empty())
+        .ok_or_else(|| "\"files\" must be a non-empty array of paths".to_string())?;
+    // Normalize the edit spec: an explicit `edits` array, or the single
+    // pattern/replacement promoted to a one-item batch.
+    let items: Vec<Value> = match args.get("edits") {
+        Some(edits) => edits
+            .as_array()
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| "\"edits\" must be a non-empty array".to_string())?
+            .clone(),
+        None => {
+            let pattern = str_arg(args, "pattern")?;
+            if pattern.is_empty() {
+                return Err("replace_text: pattern must not be empty".to_string());
+            }
+            vec![json!({
+                "pattern": pattern,
+                "replacement": str_arg(args, "replacement")?,
+                "all": bool_arg(args, "all"),
+                "expect_unique": bool_arg(args, "expect_unique"),
+            })]
+        }
     };
-    let unsaved = unsaved_note(sessions, session);
-    let view = view_echo(args, sessions, session);
+    let scope = scope_prelude(args)?;
+
+    // Apply per file; on any failure undo the files already edited so the
+    // whole call is all-or-nothing in the warm buffers.
+    let mut done: Vec<(String, String, usize)> = Vec::new(); // (path, session, n)
+    let rollback = |sessions: &mut HashMap<String, Workspace>, done: &[(String, String, usize)]| {
+        for (_, session, _) in done.iter().rev() {
+            if let Some(ws) = sessions.get_mut(session) {
+                let _ = ws.undo_last();
+            }
+        }
+    };
+    for f in &files {
+        let session = match resolve_session(&json!({ "path": f }), sessions) {
+            Ok(s) => s,
+            Err(e) => {
+                rollback(sessions, &done);
+                return Err(format!(
+                    "{f}: {e}\nnothing changed — the {} file(s) edited before it were rolled back",
+                    done.len()
+                ));
+            }
+        };
+        match run_batch_edits(sessions, &session, &items, &scope) {
+            Ok(n) => done.push((f.clone(), session, n)),
+            Err(e) => {
+                rollback(sessions, &done);
+                return Err(format!(
+                    "{f}: {e}\nnothing changed — the {} file(s) edited before it were rolled back",
+                    done.len()
+                ));
+            }
+        }
+    }
+
+    // Saves happen only after every file succeeded. A failed save (the
+    // stale guard) reports precisely which files reached disk and which
+    // stay warm — nothing is silently lost.
+    let mut save_note = String::new();
+    if bool_arg(args, "save") {
+        let mut saved = 0usize;
+        for (f, session, _) in &done {
+            if let Err(e) = save_visited(sessions, session) {
+                return Err(format!(
+                    "{f}: {e}\n({saved} file(s) before it were saved; the rest hold their \
+                     edits in warm sessions)"
+                ));
+            }
+            saved += 1;
+        }
+        save_note = format!("; saved {saved} file(s)");
+    }
+    let total: usize = done.iter().map(|(_, _, n)| n).sum();
+    let lines: Vec<String> = done
+        .iter()
+        .map(|(f, _, n)| format!("  {f} — {n} replacement(s)"))
+        .collect();
+    let unsaved = if bool_arg(args, "save") {
+        ""
+    } else {
+        "\n(unsaved: edits are in the warm buffers, not on disk — pass save:true or save_buffer each)"
+    };
     Ok(format!(
-        "applied {} edit(s), {total} replacement(s){saved}{unsaved}{view}",
-        items.len()
+        "applied {} edit(s) in {} file(s), {total} replacement(s) total:\n{}{save_note}{unsaved}",
+        items.len(),
+        done.len(),
+        lines.join("\n")
     ))
 }
 
@@ -1616,6 +1747,7 @@ pub(crate) fn tool_schemas() -> Vec<Value> {
                     "scope": scope,
                     "view": { "type": ["boolean", "integer"], "description": "Append a rendered viewport around point after the edit (true = 4 context lines, or a line count)." },
                     "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?}, …] applied in order inside ONE transaction — all-or-nothing; a miss (or a failed uniqueness check) rolls everything back and names the failed edit.", "items": { "type": "object" } },
+                    "files": { "type": "array", "description": "Apply the SAME edit spec (pattern/replacement or edits) to every listed file in one call — the cross-file rename. Atomic across the set: a failure in any file rolls the already-edited ones back; with save:true the files are saved only after every edit succeeded. Each path must contain the pattern (a miss is an error — list exactly the files you grepped). Not combinable with path/session.", "items": { "type": "string" } },
                     "session": session,
                     "path": path,
                     "save": save,

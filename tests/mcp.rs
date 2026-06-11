@@ -1366,3 +1366,53 @@ fn help_serves_topics_and_lists_them_on_a_miss() {
         "got: {err}"
     );
 }
+
+#[test]
+fn multi_file_replace_is_atomic_across_the_set() {
+    let dir = temp_dir("multi-file");
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    std::fs::write(&a, "old_name here\n").unwrap();
+    std::fs::write(&b, "calls old_name twice: old_name\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let (pa, pb) = (
+        a.to_string_lossy().into_owned(),
+        b.to_string_lossy().into_owned(),
+    );
+
+    // The cross-file rename: one call, saved only after both succeeded.
+    let ok = s.call_ok(
+        1,
+        "replace_text",
+        json!({
+            "files": [pa.clone(), pb.clone()],
+            "pattern": "old_name", "replacement": "new_name", "all": true,
+            "save": true,
+        }),
+    );
+    assert!(ok.contains("2 file(s), 3 replacement(s)"), "got: {ok}");
+    assert!(ok.contains("saved 2 file(s)"), "got: {ok}");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "new_name here\n");
+    assert_eq!(
+        std::fs::read_to_string(&b).unwrap(),
+        "calls new_name twice: new_name\n"
+    );
+
+    // A miss in the SECOND file rolls the first back: nothing changes
+    // anywhere (warm buffers included).
+    let err = s.call_err(
+        2,
+        "replace_text",
+        json!({
+            "files": [pa.clone(), pb.clone()],
+            "pattern": "new_name here", "replacement": "X",
+        }),
+    );
+    assert!(err.contains("rolled back"), "got: {err}");
+    let txt = s.call_ok(
+        3,
+        "read_region",
+        json!({ "path": pa, "start": 1, "end": 9 }),
+    );
+    assert_eq!(txt, "new_name", "file a's warm buffer was rolled back");
+}
