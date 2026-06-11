@@ -63,15 +63,6 @@ a defun/node" convenience (or a ~save~-by-default flag) would close the common
 further step: a warm buffer with unsaved edits AND a drifted file is the genuine
 conflict — could surface it more loudly than the per-tool flag.
 
-** TODO Attribute-inclusive Rust defun spans [#C]
-The survivor of the 2026-06 friction list (~re-search-backward~ and
-the session-miss hint landed): a Rust "defun" excludes its preceding
-~attribute_item~s, so delete/replace-a-test needs a manual hop to the
-~#[…]~ line, and insert_text's ~anchor: {where: "before"}~ lands
-between the attributes and the item (documented on the schema). An
-attribute-inclusive defun span (or a ~treesit-defun-with-attrs~ range
-helper) would make "remove/replace this test" a one-liner.
-
 ** TODO Bytecode-compile hot programs [#C]
 
 ** TODO Dirty-span diffs [#C]
@@ -85,16 +76,6 @@ The high-level ~regex~ API can't express both; ~regex-automata~'s
 outside it. Switch the searches to it and the divergence (documented on
 ~Buffer::re_search_forward~) closes.
 
-** TODO replace-match FIXEDCASE/LITERAL args
-It always expands backrefs; the optional Emacs arguments are unimplemented.
-
-** TODO forward-line shortfall at the top boundary
-Landing on a line beginning that sits exactly at point-min (or buffer start)
-reports a shortfall of 1 where Emacs reports 0 — the position is right, only
-the return value diverges. Pre-existing, identical in both stores; fixing it
-means teaching the backward scan that "no newline above, but already at a
-line beginning" is a complete move.
-
 ** TODO Per-program resource limits
 A wall-clock/CPU bound per program — blocked on tulisp cooperative
 cancellation (eval interruption), see the wishlist below.
@@ -107,37 +88,16 @@ an error instead of a silent outcome, one-call recovery, and
 discoverability over memorized conventions. The 2026-06 review batch
 (uniform path addressing, undo_last, expect_unique, close_session,
 outline + scope/anchor, help + describe-mcp, diff clamping, search
-direction/echo/case-folding, viewport echo) has landed; what follows
-is the remainder.
+direction/echo/case-folding, viewport echo) has landed, as has the
+follow-up round (multi-file ~files:~ batches, clean-LRU session cap,
+decorated defun spans, ~make docs~ generation); what follows is the
+remainder.
 
 ** TODO Consider expect_unique as replace_text's DEFAULT [#B]
 The flag exists and errors with the match lines; for weaker models
 ambiguity-as-error is arguably the right default. Measure the token
 / ergonomics cost on real sessions before flipping (a default flip
 breaks "replace the first TODO" one-shots).
-
-** TODO LRU eviction of clean idle sessions [#C]
-~close_session~ covers deliberate release; a bounded-count fallback
-would cap fd use when an agent never closes anything.
-
-** TODO Regenerate README/skill tool tables from describe-mcp [#C]
-~mime describe-mcp~ emits the catalogue; wire it into the README
-(and the user skill file) so the three copies stop drifting — a
-Makefile target that splices the output would do.
-
-** TODO Multi-file batch edits (design pass first) [#C]
-~replace_text {files: [path…], edits: […]}~ — explicit path list
-(no globs), one transaction + stale guard + report per file, still
-roots-confined and audited. Cross-file renames are the one rule-
-shaped edit where the built-in tools currently beat mime on call
-count. Prefer this over exposing trusted ~find-file~ through MCP:
-an explicit list stays reviewable per file.
-
-** TODO Document relative paths in the tool schemas [#C]
-~check_path~ already resolves relative paths against the cwd; the
-~path~ schema description should say so — saves an absolute-path
-prefix per call in single-root setups, and weaker models otherwise
-copy whatever convention they saw last.
 
 * Structural editing
 
