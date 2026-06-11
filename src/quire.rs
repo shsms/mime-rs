@@ -1120,14 +1120,18 @@ impl Quire {
         let nb = needle.as_bytes();
         let nlen = nb.len();
         if nlen == 0 {
-            return None; // callers handle the empty needle; guard windows(0)
+            return None; // callers handle the empty needle
         }
+        // memmem's two-way searcher (SIMD prefilter) — built once, reused per
+        // chunk; the naive windows().position() scan was the residual cost on
+        // long or common-prefix needles.
+        let finder = memchr::memmem::Finder::new(nb);
         let mut buf: Vec<u8> = Vec::new();
         let mut buf_start_chars = 0usize; // chars in [from, start-of-buf)
         let mut start: Option<usize> = None;
         self.for_range_bytes(from, to, |chunk| {
             buf.extend_from_slice(chunk);
-            if let Some(o) = buf.windows(nlen).position(|w| w == nb) {
+            if let Some(o) = finder.find(&buf) {
                 start = Some(from + buf_start_chars + count_chars_lines(&buf[..o]).0);
                 return false; // found — stop streaming
             }
@@ -1141,6 +1145,36 @@ impl Quire {
             true
         });
         start.map(|s| (s, s + needle.chars().count()))
+    }
+
+    /// LAST occurrence of the literal `needle` in char range `[from, to)`,
+    /// streamed BACKWARD chunk by chunk (with a needle-sized overlap reaching
+    /// down across each boundary), stopping at the first — i.e. latest —
+    /// hit. Locating an anchor just above point no longer materializes the
+    /// whole `[bound, point)` window the way `collect_range` + `rfind` did.
+    fn find_backward(&self, needle: &str, from: usize, to: usize) -> Option<(usize, usize)> {
+        let nb = needle.as_bytes();
+        if nb.is_empty() {
+            return None; // callers handle the empty needle
+        }
+        let nchars = needle.chars().count();
+        let finder = memchr::memmem::FinderRev::new(nb);
+        const CHUNK_CHARS: usize = 16 * 1024;
+        let mut hi = to;
+        while hi > from {
+            let lo = hi.saturating_sub(CHUNK_CHARS).max(from);
+            // A match may straddle the lower edge: extend the window down by
+            // needle-1 chars so it is seen here (the chunk below would only
+            // see its prefix).
+            let scan_lo = lo.saturating_sub(nchars - 1).max(from);
+            let window = self.collect_range(scan_lo, hi);
+            if let Some(b) = finder.rfind(window.as_bytes()) {
+                let start = scan_lo + window[..b].chars().count();
+                return Some((start, start + nchars));
+            }
+            hi = lo;
+        }
+        None
     }
 
     // ---- low-level tree splicing (touch only the spine / add buffer) -------
@@ -1852,10 +1886,7 @@ impl Quire {
         if lo > hi {
             return None;
         }
-        let window = self.collect_range(lo, hi);
-        let bpos = window.rfind(needle)?;
-        let start = lo + window[..bpos].chars().count();
-        let end = start + needle.chars().count();
+        let (start, end) = self.find_backward(needle, lo, hi)?;
         self.last_match = Some(MatchData {
             start,
             end,
@@ -2311,6 +2342,39 @@ mod tests {
             Some("line one\nline ".chars().count() + 1 + 3)
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn backward_search_chunking_matches_the_oracle() {
+        // Multibyte text spanning several backward 16K-char chunks, with one
+        // needle deep in the bottom chunk and one straddling the first chunk
+        // edge below point — the streamed backward search must agree with
+        // the oracle on both hits (latest first), the match data, and the
+        // final miss.
+        let mut chars: Vec<char> = std::iter::repeat_n('é', 40_000).collect();
+        let plant = |chars: &mut Vec<char>, at: usize| {
+            for (i, c) in "NEEDLE".chars().enumerate() {
+                chars[at + i] = c;
+            }
+        };
+        plant(&mut chars, 4_999);
+        plant(&mut chars, 40_000 - 16_384 - 3); // spans the first chunk edge
+        let text: String = chars.iter().collect();
+
+        let mut q = Quire::from_string("t", &text);
+        let mut b = crate::buffer::Buffer::from_string("t", &text);
+        TextStore::goto_char(&mut q, chars.len() + 1);
+        b.goto_char(chars.len() + 1);
+        for round in 0..3 {
+            let qq = TextStore::search_backward(&mut q, "NEEDLE", None);
+            let bb = b.search_backward("NEEDLE", None);
+            assert_eq!(qq, bb, "round {round}");
+            assert_eq!(TextStore::point(&q), b.point(), "round {round}");
+        }
+        assert!(
+            TextStore::search_backward(&mut q, "NEEDLE", None).is_none(),
+            "no third match"
+        );
     }
 
     #[test]
