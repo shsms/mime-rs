@@ -223,6 +223,14 @@ struct PagedFile {
     /// buffer keeps reporting stale even if the writer later restores the mtime
     /// (which a bare stat would then read as clean again).
     drifted: std::cell::Cell<bool>,
+    /// True while a bulk [`PagedFile::for_bytes`] scan is in flight: the scan
+    /// statted for drift ONCE on entry, so the per-miss stat in
+    /// [`PagedFile::page`] is suppressed — a cold scan of a clean file used
+    /// to stat ~16k times per GB. Isolated page misses (char-at-style
+    /// lookups) keep the per-miss stat, so the latch test's contract — a
+    /// fresh read of a changed file detects it — holds at operation
+    /// granularity.
+    bulk_scan: std::cell::Cell<bool>,
 }
 
 impl PagedFile {
@@ -233,6 +241,14 @@ impl PagedFile {
             cache: RefCell::new(PageCache::new()),
             stamp,
             drifted: std::cell::Cell::new(false),
+            bulk_scan: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Stat the visited file and latch the sticky drift flag on a mismatch.
+    fn check_drift(&self) {
+        if !self.drifted.get() && self.stamp.check().is_some() {
+            self.drifted.set(true);
         }
     }
 
@@ -264,15 +280,17 @@ impl PagedFile {
         if let Some(p) = self.cache.borrow_mut().get(pno) {
             return p;
         }
-        // Fresh read: the file may have drifted since open. Detect it once (a
-        // stat-by-path per miss until latched) so `is_stale` reports it durably.
-        // We still serve the page (no fault, no hard stop) — but note already-
-        // cached pages keep their pre-drift bytes while this fresh page reads the
-        // changed file, so a post-drift read can interleave old and new content.
-        // That's why the sticky flag is the only correctness signal here: callers
-        // must treat a drifted buffer as untrustworthy and revert, not parse it.
-        if !self.drifted.get() && self.stamp.check().is_some() {
-            self.drifted.set(true);
+        // Fresh read: the file may have drifted since open. Detect it once
+        // per read OPERATION (a bulk scan stats on entry and suppresses the
+        // per-miss stat here) so `is_stale` reports it durably. We still
+        // serve the page (no fault, no hard stop) — but note already-cached
+        // pages keep their pre-drift bytes while this fresh page reads the
+        // changed file, so a post-drift read can interleave old and new
+        // content. That's why the sticky flag is the only correctness signal
+        // here: callers must treat a drifted buffer as untrustworthy and
+        // revert, not parse it.
+        if !self.bulk_scan.get() {
+            self.check_drift();
         }
         let start = pno as usize * PAGE;
         let want = PAGE.min(self.len - start);
@@ -283,8 +301,16 @@ impl PagedFile {
         rc
     }
 
-    /// Page-chunked [`Original::for_bytes`].
+    /// Page-chunked [`Original::for_bytes`]. Drift is statted ONCE here for
+    /// the whole scan; the per-page check is suppressed for its duration.
     fn for_bytes(&self, start: usize, len: usize, f: &mut dyn FnMut(&[u8]) -> bool) {
+        self.check_drift();
+        let prev = self.bulk_scan.replace(true);
+        self.for_bytes_inner(start, len, f);
+        self.bulk_scan.set(prev);
+    }
+
+    fn for_bytes_inner(&self, start: usize, len: usize, f: &mut dyn FnMut(&[u8]) -> bool) {
         let end = start + len;
         let mut pos = start;
         while pos < end {
@@ -320,34 +346,45 @@ impl PagedFile {
         (chars, lines)
     }
 
-    /// Validate the file is UTF-8 by a streaming scan, carrying an incomplete
-    /// trailing char across page boundaries. Keeps nothing resident.
-    fn is_valid_utf8(&self) -> bool {
+    /// ONE pass over the whole file, page by page: validate UTF-8 (carrying
+    /// an incomplete trailing char across page boundaries) AND count
+    /// chars/lines — fusing the two open-time scans that used to read a
+    /// multi-GB file twice. `None` = not valid UTF-8. Keeps nothing resident.
+    fn validate_and_count(&self) -> Option<(usize, usize)> {
+        let (mut chars, mut lines) = (0usize, 0usize);
         let mut carry: Vec<u8> = Vec::new();
         let mut buf = vec![0u8; PAGE];
         let mut off = 0usize;
         while off < self.len {
             let want = PAGE.min(self.len - off);
             let filled = self.read_into(&mut buf[..want], off);
-            let combined: Vec<u8> = if carry.is_empty() {
-                buf[..filled].to_vec()
+            let combined: Vec<u8>;
+            let chunk: &[u8] = if carry.is_empty() {
+                &buf[..filled]
             } else {
                 let mut v = std::mem::take(&mut carry);
                 v.extend_from_slice(&buf[..filled]);
-                v
+                combined = v;
+                &combined
             };
-            match std::str::from_utf8(&combined) {
-                Ok(_) => {}
+            let valid_to = match std::str::from_utf8(chunk) {
+                Ok(_) => chunk.len(),
                 Err(e) if e.error_len().is_none() => {
-                    // An incomplete char at the chunk's tail: carry it forward.
-                    carry = combined[e.valid_up_to()..].to_vec();
+                    // An incomplete char at the chunk's tail: carry it forward
+                    // and count only the validated prefix this round.
+                    let v = e.valid_up_to();
+                    carry = chunk[v..].to_vec();
+                    v
                 }
-                Err(_) => return false,
-            }
+                Err(_) => return None,
+            };
+            let (c, l) = count_chars_lines(&chunk[..valid_to]);
+            chars += c;
+            lines += l;
             off += want;
         }
         // Leftover carry = a truncated char at end-of-file = invalid.
-        carry.is_empty()
+        carry.is_empty().then_some((chars, lines))
     }
 }
 
@@ -588,17 +625,19 @@ impl Quire {
         // differs from the *saved* stamp later.
         let stamp = crate::safety::FileStamp::capture(path)?;
         let paged = PagedFile::open(file, len, stamp.clone());
-        if !paged.is_valid_utf8() {
+        // One fused pass: UTF-8 validation AND the char/line index (the two
+        // used to be separate whole-file scans — the dominant open cost).
+        let Some(counts) = paged.validate_and_count() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Quire::open: file is not valid UTF-8",
             ));
-        }
+        };
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        let mut quire = Quire::with_original(name, Original::Paged(paged));
+        let mut quire = Quire::with_original_counted(name, Original::Paged(paged), Some(counts));
         quire.stamp = Some(stamp);
         Ok(quire)
     }
@@ -610,6 +649,16 @@ impl Quire {
     }
 
     fn with_original(name: String, original: Original) -> Quire {
+        Quire::with_original_counted(name, original, None)
+    }
+
+    /// [`with_original`] with the char/line counts already in hand (the fused
+    /// open scan supplies them); `None` falls back to counting here.
+    fn with_original_counted(
+        name: String,
+        original: Original,
+        counts: Option<(usize, usize)>,
+    ) -> Quire {
         // One piece spanning the whole original. Counting its chars/lines is the
         // one up-front scan and the real cost of opening a multi-GB file. It is
         // parallelized over the available cores above `PARALLEL_INDEX_THRESHOLD`
@@ -620,7 +669,7 @@ impl Quire {
         let root = if bytes_len == 0 {
             Node::empty()
         } else {
-            let (chars, lines) = original.count_chars_lines();
+            let (chars, lines) = counts.unwrap_or_else(|| original.count_chars_lines());
             Arc::new(Node::leaf(vec![Piece {
                 source: Source::Original,
                 start: 0,
@@ -2260,6 +2309,27 @@ mod tests {
         assert_eq!(
             TextStore::search_forward(&mut q, "two", None),
             Some("line one\nline ".chars().count() + 1 + 3)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fused_open_counts_a_char_straddling_the_page_boundary() {
+        // 'é' (2 bytes) sits across the first page edge: the fused
+        // validate-and-count pass must carry the split char and still
+        // count it exactly once.
+        let path = tmp_path("straddle");
+        let mut text = "a".repeat(PAGE - 1);
+        text.push('é');
+        text.push_str("tail\n");
+        std::fs::write(&path, &text).unwrap();
+        let q = Quire::open(&path).unwrap();
+        assert_eq!(Quire::char_len(&q), text.chars().count());
+        assert_eq!(TextStore::char_after(&q, PAGE), Some('é'));
+        assert_eq!(
+            q.substring(PAGE, PAGE + 5),
+            "étail",
+            "reads across the boundary"
         );
         let _ = std::fs::remove_file(&path);
     }
