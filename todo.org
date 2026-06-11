@@ -79,6 +79,26 @@ follow-up round (multi-file ~files:~ batches, clean-LRU session cap,
 decorated defun spans, ~make docs~ generation); what follows is the
 remainder.
 
+** TODO save_buffer {to:} rebinds the visited file — a footgun for path-keyed sessions [#B] :dogfooding:
+
+Hit during the 2026-06-11 switchyard session. Recovery sequence after a
+bad save: ~save_buffer {path: X, to: TMP}~ to park the good buffer, then
+~mv TMP X~ — but the save-as had REBOUND the session's visited file to
+TMP, so the next ~save: true~ on the same session hit TMP's stale-guard
+("deleted on disk") instead of writing X, and the fix was a second
+save-as back onto X itself.
+
+Emacs' ~write-file~ does rebind, but mime's sessions are KEYED by
+canonical path — a session opened as X that silently starts visiting TMP
+breaks the addressing contract (the warm session is still listed under
+X, yet saves target TMP). For an agent, save-as is almost always "export
+a copy", not "move my session".
+
+Fix: make ~to:~ a pure copy-out (write the bytes, leave the visited file
+and stale-guard baseline untouched). If a true rename-the-session
+operation is ever wanted, make it explicit (~rebind: true~ or a separate
+tool). Also worth a line in ~help {topic: "sessions"}~ either way.
+
 ** TODO Consider expect_unique as replace_text's DEFAULT [#B]
 The flag exists and errors with the match lines; for weaker models
 ambiguity-as-error is arguably the right default. Measure the token
