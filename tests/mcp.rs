@@ -154,6 +154,9 @@ fn full_session_round_trip_over_stdio() {
         "list_checkpoints",
         "save_buffer",
         "session_status",
+        "outline",
+        "close_session",
+        "help",
     ] {
         assert!(names.contains(&expected), "tools/list missing {expected}");
     }
@@ -1342,4 +1345,24 @@ fn view_echo_appends_a_viewport_to_edit_results() {
         json!({ "pattern": "four", "replacement": "FOUR" }),
     );
     assert!(!ok.contains("— view —"), "got: {ok}");
+}
+
+#[test]
+fn help_serves_topics_and_lists_them_on_a_miss() {
+    let mut s = Server::spawn();
+    let index = s.call_ok(1, "help", json!({}));
+    assert!(
+        index.contains("regex") && index.contains("recipes"),
+        "got: {index}"
+    );
+    let regex = s.call_ok(2, "help", json!({ "topic": "regex" }));
+    assert!(
+        regex.contains("RE2") && regex.contains("replace-regexp"),
+        "got: {regex}"
+    );
+    let err = s.call_err(3, "help", json!({ "topic": "nope" }));
+    assert!(
+        err.contains("unknown help topic") && err.contains("treesit"),
+        "got: {err}"
+    );
 }

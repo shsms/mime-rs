@@ -170,6 +170,7 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         "list_checkpoints" => tool_list_checkpoints(&args, sessions),
         "save_buffer" => tool_save_buffer(&args, sessions),
         "session_status" => tool_session_status(sessions),
+        "help" => tool_help(&args),
         other => Err(format!("unknown tool: {other}")),
     };
 
@@ -1391,6 +1392,26 @@ fn tool_session_status(sessions: &HashMap<String, Workspace>) -> Result<String, 
     .to_string())
 }
 
+/// `help {topic?}` — the canonical reference briefs (regex dialect, treesit
+/// vocabulary, conflict workflow, session/saving semantics, recipes), served
+/// on demand so the always-loaded schemas can stay terse. No topic (or an
+/// unknown one) lists what exists.
+fn tool_help(args: &Value) -> Result<String, String> {
+    let index = || {
+        crate::help::TOPICS
+            .iter()
+            .map(|(name, blurb)| format!("  {name} — {blurb}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    match args.get("topic").and_then(Value::as_str) {
+        None => Ok(format!("help topics:\n{}", index())),
+        Some(t) => crate::help::topic(t)
+            .map(str::to_string)
+            .ok_or_else(|| format!("unknown help topic {t:?} — topics:\n{}", index())),
+    }
+}
+
 // ---- helpers ---------------------------------------------------------------
 
 fn pretty(v: &Value) -> String {
@@ -1462,7 +1483,7 @@ fn tools_list_result() -> Value {
     json!({ "tools": tool_schemas() })
 }
 
-fn tool_schemas() -> Vec<Value> {
+pub(crate) fn tool_schemas() -> Vec<Value> {
     // A reusable optional `session` property.
     let session = json!({
         "type": "string",
@@ -1742,6 +1763,17 @@ fn tool_schemas() -> Vec<Value> {
                     "force": { "type": "boolean", "description": "Discard unsaved edits. Default false: closing an unsaved session is an error." },
                     "session": session,
                     "path": path,
+                },
+                "required": [],
+            },
+        }),
+        json!({
+            "name": "help",
+            "description": "Reference briefs served on demand: the regex dialect (RE2 patterns, Emacs anchors/replacements), the treesit structural-editing vocabulary, the merge-conflict workflow, session/saving/undo semantics, and ready-to-adapt edit recipes. Call it with no topic to list the topics; reach for it BEFORE guessing at syntax or vocabulary.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": { "type": "string", "enum": ["regex", "treesit", "conflicts", "sessions", "recipes"], "description": "Which brief to fetch; omit to list them." },
                 },
                 "required": [],
             },
