@@ -161,6 +161,7 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         "replace_text" => tool_replace_text(&args, sessions),
         "search" => tool_search(&args, sessions),
         "occur" => tool_occur(&args, sessions),
+        "outline" => tool_outline(&args, sessions),
         "conflicts" => tool_conflicts(&args, sessions),
         "checkpoint" => tool_checkpoint(&args, sessions),
         "restore_checkpoint" => tool_restore_checkpoint(&args, sessions),
@@ -680,13 +681,30 @@ fn tool_insert_text(
     let session = resolve_session(args, sessions)?;
     let text = str_arg(args, "text")?;
     let escaped = lisp_literal(&text);
-    let program = match args.get("pos").and_then(Value::as_i64) {
-        Some(pos) => {
+    let anchor = anchor_prelude(args)?;
+    if anchor.is_some() && args.get("pos").is_some() {
+        return Err("pass either \"pos\" or \"anchor\", not both".to_string());
+    }
+    let program = match (&anchor, args.get("pos").and_then(Value::as_i64)) {
+        (Some((_, prelude)), _) => {
+            format!("(progn {prelude} (insert \"{escaped}\") (report \"point\" (point)))")
+        }
+        (None, Some(pos)) => {
             format!("(progn (goto-char {pos}) (insert \"{escaped}\") (report \"point\" (point)))")
         }
-        None => format!("(progn (insert \"{escaped}\") (report \"point\" (point)))"),
+        (None, None) => format!("(progn (insert \"{escaped}\") (report \"point\" (point)))"),
     };
-    let report = run_in_session(sessions, &session, &program)?;
+    let report = match run_in_session(sessions, &session, &program) {
+        Ok(r) => r,
+        Err(e) if e.contains("__no_defun__") => {
+            let name = anchor.map(|(n, _)| n).unwrap_or_default();
+            return Err(format!(
+                "anchor: {}",
+                no_defun_error(sessions, &session, &name)
+            ));
+        }
+        Err(e) => return Err(e),
+    };
     audit_tool(&session, &program, &report);
     let chars = text.chars().count();
     let point = report_value(&report, "point").unwrap_or_default();
@@ -776,8 +794,20 @@ fn tool_replace_text(
                (report \"point\" (point))))"
         )
     };
+    let scope = scope_prelude(args)?;
+    let program = match &scope {
+        Some((_, prelude)) => format!("(save-restriction {prelude} {program})"),
+        None => program,
+    };
     let report = match run_in_session(sessions, &session, &program) {
         Ok(r) => r,
+        Err(e) if e.contains("__no_defun__") => {
+            let name = scope.map(|(n, _)| n).unwrap_or_default();
+            return Err(format!(
+                "scope: {}",
+                no_defun_error(sessions, &session, &name)
+            ));
+        }
         Err(e) if unique && e.contains("__ambiguous__") => {
             let lines = match_lines(sessions, &session, &pat);
             return Err(format!(
@@ -829,6 +859,92 @@ fn tool_replace_text(
              expect_unique:true to make ambiguity an error){saved}{unsaved}"
         ),
     })
+}
+
+/// Parse `anchor: {defun: NAME, where?: "after"|"before"}` into the motion
+/// prelude for insert_text — "add this block right after function X" without
+/// hand-writing a program. `after` (the default) lands at the defun node's
+/// end; `before` at its start. NOTE: a Rust defun node excludes its preceding
+/// #[attributes], so `before` lands between them and the item — include the
+/// attributes in the inserted text or anchor on the previous defun instead.
+fn anchor_prelude(args: &Value) -> Result<Option<(String, String)>, String> {
+    let Some(anchor) = args.get("anchor") else {
+        return Ok(None);
+    };
+    let defun = anchor.get("defun").and_then(Value::as_str).ok_or(
+        "anchor: only {\"defun\": \"name\", \"where\": \"after\"|\"before\"} is supported",
+    )?;
+    let name = lisp_escape(defun);
+    let then = match anchor
+        .get("where")
+        .and_then(Value::as_str)
+        .unwrap_or("after")
+    {
+        "after" => "(goto-char (treesit-node-end (treesit-defun-at)))",
+        "before" => "nil",
+        other => {
+            return Err(format!(
+                "anchor.where must be \"after\" or \"before\", got {other:?}"
+            ));
+        }
+    };
+    Ok(Some((
+        defun.to_string(),
+        format!("(if (treesit-goto-defun \"{name}\") {then} (error \"__no_defun__\"))"),
+    )))
+}
+
+/// Parse `scope: {defun: NAME}` into a prelude that narrows to that defun
+/// (the caller wraps it in `save-restriction` so the narrowing is scoped to
+/// the one call). `None` when no scope was given; only the defun form exists
+/// today.
+fn scope_prelude(args: &Value) -> Result<Option<(String, String)>, String> {
+    let Some(scope) = args.get("scope") else {
+        return Ok(None);
+    };
+    let defun = scope
+        .get("defun")
+        .and_then(Value::as_str)
+        .ok_or("scope: only {\"defun\": \"name\"} is supported")?;
+    let name = lisp_escape(defun);
+    Ok(Some((
+        defun.to_string(),
+        format!(
+            "(if (treesit-goto-defun \"{name}\") (treesit-narrow-to-defun) (error \"__no_defun__\"))"
+        ),
+    )))
+}
+
+/// The error an `__no_defun__` abort becomes: names the missing defun and
+/// lists what the outline actually has, so the next call needs no detour
+/// through a separate orientation step.
+fn no_defun_error(sessions: &mut HashMap<String, Workspace>, session: &str, name: &str) -> String {
+    let names: Vec<String> = run_in_session(sessions, session, "(treesit-list-defuns)")
+        .map(|r| {
+            r.reports
+                .iter()
+                .filter(|(k, _)| k == "defun")
+                .filter_map(|(_, v)| v.splitn(4, ' ').nth(3).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if names.is_empty() {
+        format!(
+            "no defun named {name:?} — the buffer outlines no defuns at all \
+             (wrong language? treesit-set-language overrides extension detection)"
+        )
+    } else if names.len() > 12 {
+        format!(
+            "no defun named {name:?} — defuns here: {} … ({} total; the outline tool lists all)",
+            names[..12].join(", "),
+            names.len()
+        )
+    } else {
+        format!(
+            "no defun named {name:?} — defuns here: {}",
+            names.join(", ")
+        )
+    }
 }
 
 /// Line numbers of every occurrence of the (already lisp-escaped) literal
@@ -922,9 +1038,20 @@ fn replace_text_batch(
                (report \"n\" n))"
         ));
     }
-    let program = format!("(with-transaction {body})");
+    let scope = scope_prelude(args)?;
+    let program = match &scope {
+        Some((_, prelude)) => format!("(save-restriction {prelude} (with-transaction {body}))"),
+        None => format!("(with-transaction {body})"),
+    };
     let report = match run_in_session(sessions, session, &program) {
         Ok(r) => r,
+        Err(e) if e.contains("__no_defun__") => {
+            let name = scope.map(|(n, _)| n).unwrap_or_default();
+            return Err(format!(
+                "scope: {}",
+                no_defun_error(sessions, session, &name)
+            ));
+        }
         // The transaction aborts via (error "edit N: …"); hand back just that
         // line, not the generated program's lisp backtrace.
         Err(e) => {
@@ -1005,12 +1132,59 @@ fn tool_occur(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result
     };
     let nlines = args.get("nlines").and_then(Value::as_i64).unwrap_or(0);
     let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(100);
-    run_message(
+    let scope = scope_prelude(args)?;
+    let expr = match &scope {
+        // Inside the scope, occur's line numbers are defun-relative; the
+        // @positions stay absolute and goto-char-able.
+        Some((_, prelude)) => {
+            format!("(save-restriction {prelude} (occur {pat_expr} {nlines} {limit}))")
+        }
+        None => format!("(occur {pat_expr} {nlines} {limit})"),
+    };
+    match run_message(sessions, &session, &expr, "occur") {
+        Err(e) if e.contains("__no_defun__") => {
+            let name = scope.map(|(n, _)| n).unwrap_or_default();
+            Err(format!(
+                "scope: {}",
+                no_defun_error(sessions, &session, &name)
+            ))
+        }
+        other => other,
+    }
+}
+
+/// `outline {session?|path?}` — the buffer's structural outline: one
+/// `KIND START END NAME` line per defun (Rust/Python functions, types,
+/// impls; Markdown sections), via `treesit-list-defuns`. The natural first
+/// move on a code file — survey without reading it whole.
+fn tool_outline(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result<String, String> {
+    let session = resolve_session(args, sessions)?;
+    let report = run_in_session(
         sessions,
         &session,
-        &format!("(occur {pat_expr} {nlines} {limit})"),
-        "occur",
-    )
+        "(progn (report \"lang\" (treesit-language)) (treesit-list-defuns))",
+    )?;
+    let lang = report_value(&report, "lang")
+        .map(|s| s.trim_matches('"').to_string())
+        .unwrap_or_default();
+    let lines: Vec<String> = report
+        .reports
+        .iter()
+        .filter(|(k, _)| k == "defun")
+        .map(|(_, v)| v.clone())
+        .collect();
+    let note = stale_note(sessions, &session);
+    if lines.is_empty() {
+        return Ok(format!(
+            "no defuns found (language: {lang}) — for an extension-less buffer, \
+             (treesit-set-language \"rust\"|\"python\"|\"markdown\") overrides detection{note}"
+        ));
+    }
+    Ok(format!(
+        "— outline ({lang}, {} defuns): KIND START END NAME —\n{}{note}",
+        lines.len(),
+        lines.join("\n")
+    ))
 }
 
 /// `conflicts {session?}` — the rendered merge-conflict overview (hunk
@@ -1228,6 +1402,11 @@ fn tool_schemas() -> Vec<Value> {
         "type": "boolean",
         "description": "After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false."
     });
+    let scope = json!({
+        "type": "object",
+        "description": "Restrict this call to one part of the buffer without writing a program. {\"defun\": \"name\"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.",
+        "properties": { "defun": { "type": "string" } },
+    });
     vec![
         json!({
             "name": "open_file",
@@ -1319,6 +1498,7 @@ fn tool_schemas() -> Vec<Value> {
                 "properties": {
                     "text": { "type": "string", "description": "The literal text to insert." },
                     "pos": { "type": "integer", "description": "1-based position to insert at (default: current point)." },
+                    "anchor": { "type": "object", "description": "Insert relative to a named defun instead of a position: {\"defun\": \"name\", \"where\": \"after\"|\"before\"} (default after — lands at the defun's end; include separating newlines in the text). Rust note: a defun excludes its preceding #[attributes], so \"before\" lands between them and the item. Not combinable with pos.", "properties": { "defun": { "type": "string" }, "where": { "type": "string", "enum": ["after", "before"] } } },
                     "session": session,
                     "path": path,
                     "save": save,
@@ -1336,6 +1516,7 @@ fn tool_schemas() -> Vec<Value> {
                     "replacement": { "type": "string", "description": "The literal replacement text." },
                     "all": { "type": "boolean", "description": "Replace every occurrence (default false: first only)." },
                     "expect_unique": { "type": "boolean", "description": "Require the pattern to match exactly once: more than one match is an error (listing the match lines) and nothing is replaced. RECOMMENDED whenever the anchor text could plausibly repeat — first-match semantics would silently edit the wrong site. Default false." },
+                    "scope": scope,
                     "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?}, …] applied in order inside ONE transaction — all-or-nothing; a miss (or a failed uniqueness check) rolls everything back and names the failed edit.", "items": { "type": "object" } },
                     "session": session,
                     "path": path,
@@ -1376,10 +1557,23 @@ fn tool_schemas() -> Vec<Value> {
                     },
                     "nlines": { "type": "integer", "description": "Context lines around each hit (default 0)." },
                     "limit": { "type": "integer", "description": "Max matching lines rendered (default 100); the rest are summarized in a tail line." },
+                    "scope": scope,
                     "session": session,
                     "path": path,
                 },
                 "required": ["pattern"],
+            },
+        }),
+        json!({
+            "name": "outline",
+            "description": "The buffer's structural outline: one 'KIND START END NAME' line per defun (Rust/Python functions, types, impls, mods; Markdown sections), in document order with nested ones included. The natural first move on a code file — survey it without reading it whole; the names feed scope/anchor parameters and treesit-goto-defun.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": session,
+                    "path": path,
+                },
+                "required": [],
             },
         }),
         json!({

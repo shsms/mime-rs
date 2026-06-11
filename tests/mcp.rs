@@ -1218,3 +1218,57 @@ fn close_session_releases_and_guards_unsaved_edits() {
     let err = s.call_err(7, "close_session", json!({ "path": p }));
     assert!(err.contains("no warm session"), "got: {err}");
 }
+
+#[test]
+fn outline_scope_and_anchor_drive_structural_edits() {
+    let mut s = Server::spawn();
+    let src = "fn alpha() -> i64 {\n    let x = 1;\n    x\n}\n\nfn beta() -> i64 {\n    let x = 1;\n    x\n}\n";
+    s.call_ok(1, "open_text", json!({ "text": src, "name": "x.rs" }));
+
+    let outline = s.call_ok(2, "outline", json!({}));
+    assert!(
+        outline.contains("alpha") && outline.contains("beta") && outline.contains("rust"),
+        "outline: {outline}"
+    );
+
+    // Scoped replace touches only beta's copy of the shared line.
+    let ok = s.call_ok(
+        3,
+        "replace_text",
+        json!({
+            "pattern": "let x = 1;", "replacement": "let x = 2;",
+            "scope": { "defun": "beta" }
+        }),
+    );
+    assert!(ok.contains("replaced 1"), "got: {ok}");
+    let end = src.chars().count() + 1;
+    let txt = s.call_ok(4, "read_region", json!({ "start": 1, "end": end }));
+    assert!(
+        txt.contains("alpha() -> i64 {\n    let x = 1;"),
+        "alpha untouched: {txt}"
+    );
+    assert!(
+        txt.contains("beta() -> i64 {\n    let x = 2;"),
+        "beta edited: {txt}"
+    );
+
+    // A scope miss names the defuns that exist.
+    let err = s.call_err(
+        5,
+        "replace_text",
+        json!({ "pattern": "x", "replacement": "y", "scope": { "defun": "gamma" } }),
+    );
+    assert!(err.contains("gamma") && err.contains("alpha"), "got: {err}");
+
+    // Anchored insert lands between alpha and beta.
+    s.call_ok(
+        6,
+        "insert_text",
+        json!({ "text": "\n\nfn mid() -> i64 {\n    3\n}", "anchor": { "defun": "alpha" } }),
+    );
+    let outline = s.call_ok(7, "outline", json!({}));
+    let a = outline.find("alpha").expect("alpha");
+    let m = outline.find("mid").expect("mid");
+    let b = outline.find("beta").expect("beta");
+    assert!(a < m && m < b, "mid sits between alpha and beta: {outline}");
+}
