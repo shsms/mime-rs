@@ -1,177 +1,107 @@
 # mime-rs
 
-A scriptable, transactional text-editing engine. You drive it by submitting
-small **Emacs-Lisp** programs that edit an implicit current buffer; it returns a
-structured diff plus machine-readable reports, and it can rewind to checkpoints.
+Emacs-style batch editing as an engine: you send it a small **Emacs-Lisp
+program** (or one declarative tool call), it edits a buffer and hands back a
+unified diff plus machine-readable reports — and anything can be rewound.
 
-It serves two audiences from the same core:
+```elisp
+(goto-char (point-min))
+(report "n" (replace-regexp "world" "WORLD"))
+```
 
-- **Scripting & automation** — run whole Emacs-Lisp programs against files for
-  batch editing and build pipelines, the way you'd reach for `emacs --batch` or
-  `sed`/`awk`, but with real buffers, multi-file orchestration, structured
-  results, and rollback.
-- **AI agents** — a bounded, auditable editing surface between brittle
-  single-string "replace this exact text" edits and arbitrary code execution:
-  warm buffers, cheap rollback, an allowlisted filesystem, and an MCP front door.
+```sh
+printf 'hello world, brave world\n' | mime run prog.tl
+# → JSON: { diff: "-hello world…+hello WORLD…", reports: { n: "2" }, … }
+```
 
-The launch mode picks both the protocol *and* the capability tier, so the host
-decides how much power a caller gets. Pending work is tracked in
-[`todo.org`](todo.org).
+Built for two users at once:
 
-## Capability tiers
+- **You**, scripting bulk edits the way you'd reach for `emacs --batch` or
+  `sed` — but with real buffers, regex + structural search, multi-file
+  orchestration, and rollback.
+- **AI agents**, over MCP: a bounded editing surface where the common edit is
+  one call, an ambiguous edit is an *error* instead of a silent mistake, and
+  recovery from a misfire is one call (`undo_last`).
 
-- **Trusted** (local CLI) — the full language plus *orchestration*: multiple
-  buffers, file I/O (`find-file`, `insert-file-contents`, `write-file`,
-  `directory-files`), `with-current-buffer`, and program arguments (`arg`). Like
-  `emacs --batch`: for your own scripts and automation.
-- **Sandboxed** (daemon / MCP) — the editing core only: no orchestration, the
-  filesystem confined to `$MIME_ROOTS`, every run audited. Safe to expose to an
-  agent; the caller can't change its tier, the host fixes it at launch.
+## Why it's interesting
 
-## Status
-
-Real and dogfooded. The editor core, the `Quire` store, checkpoints /
-transactions / rehearse, the warm-session daemon, the MCP server, the trusted
-orchestration group, and a path-allowlist + audit safety layer all work. **165 tests,
-`clippy` clean.**
-
-- **`TextStore`** trait with two implementations: an in-memory `Buffer` (the
-  differential-test oracle) and **`Quire`**, a persistent measured-B-tree piece
-  store over an *mmapped* original + append-only add buffer (so multi-GB files
-  never go fully resident; O(log n) seeks, O(1) structural-sharing snapshots).
-  Saves are **atomic** (temp file + rename), so an in-place save never disturbs
-  the live mmap.
-- The **Emacs-Lisp editor vocabulary** — motion, mark/region, regex search/
-  replace, kill-ring, narrowing, **markers** (durable positions), a `window`
-  viewport, and M7 `treesit-*` (tree-sitter) structural editing — plus a
-  `regex`-backed string library, all on the
-  [`tulisp`](https://github.com/shsms/tulisp) interpreter.
-- **Structural editing (M7)** over **Markdown, Rust, and Python** — the
-  language detected from the buffer name (`.rs`, `.py`, `.md`, …, overridable
-  with `treesit-set-language`): outline a file (`treesit-list-defuns`), jump to
-  a function/class/section *by name* (`treesit-goto-defun`), scope edits to one
-  defun (`treesit-narrow-to-defun`), run tree-sitter **queries** (`.scm`
-  patterns, `treesit-query`) for structural search, and syntax-check after an
-  edit (`treesit-has-error`).
-- `checkpoint` / `restore-checkpoint` / `with-transaction` — workspace snapshots
-  and atomic, roll-back-on-error edits — and **`rehearse`**, a dry-run that
-  returns a program's diff then rolls the buffer back so nothing persists.
-- **One binary, three modes**: `mime run PROG.tl` (trusted one-shot),
-  `mime --daemon` (warm sessions over a unix socket, JSON-lines), and
-  `mime --mcp` (an MCP server, JSON-RPC over stdio, exposing the engine as tools
-  like `open_file` / `run_program` / `rehearse` / `view` / `search` /
-  `checkpoint` / `save_buffer` / `session_status`).
-- **Safety**: in the sandboxed tier, file access is confined to `$MIME_ROOTS`
-  (or the cwd), which `session_status` advertises up front; `$MIME_AUDIT` logs
-  one JSON line per run. No shell, no network, no arbitrary filesystem access.
-
-Regex is **RE2** (the `regex` crate) — linear-time and streamable; Emacs
-*function names*, RE2 *syntax* (no in-pattern backreferences).
+- **Transactional everywhere.** Dry-run any program (`rehearse`), make
+  multi-step edits all-or-nothing (`with-transaction`), checkpoint and
+  rewind. Saves are atomic and refuse to clobber a file an external writer
+  changed — the edit stays warm instead of getting lost.
+- **Structural editing, nine languages.** Outline a file, jump to a function
+  *by name*, scope an edit to one defun, run tree-sitter queries — Rust,
+  Python, Markdown, HTML, JavaScript, CSS, TOML, YAML, Elisp. Defun spans
+  include `#[attributes]` / decorators, so "delete this test" is one motion.
+- **Huge files are fine.** The file-backed store is a persistent B-tree piece
+  table over a paged, read-on-demand original: O(log n) seeks, O(1)
+  snapshots, streaming searches, one parallel validate+index pass at open.
+  Multi-GB files never go fully resident.
+- **Two capability tiers, fixed by the host.** The local CLI is trusted
+  (full orchestration, like `emacs --batch`); the MCP/daemon tier is
+  sandboxed — filesystem confined to `$MIME_ROOTS`, every run audited, no
+  shell, no network.
+- **Honest results.** Token-frugal diffs (clamped when huge), per-call
+  reports, `stale`/`unsaved` flags only when true, and a save-time syntax
+  check for code buffers.
 
 ## Quick start
 
 ```sh
-# pipe text in — stdin uses the in-memory Buffer, so no filesystem access:
-printf 'hello world, brave world\n' | cargo run --bin mime -- run examples/uppercase.tl
-```
-
-`mime` prints a JSON result with the unified diff and any `(report …)` values —
-here, `world` → `WORLD` twice. `run` is the default verb, so `mime
-examples/uppercase.tl` works as shorthand. This embedded one-shot runs
-in-process at the trusted tier (no daemon); to edit a file in place, point
-`--file` at a path under the cwd (or `$MIME_ROOTS`) and add `--write`:
-
-```sh
+cargo install --path .            # or: make claude (see below)
+printf 'a world\n' | mime run examples/uppercase.tl
 mime run examples/uppercase.tl --file ./in.txt --write
+mime repl --file ./in.txt         # warm interactive session
 ```
 
-A file is opened through `Quire` (mmap-backed). The example is the map-shaped
-bulk edit written as the Emacs sequential loop:
+The vocabulary is Emacs: `goto-char`, `re-search-forward`, `replace-match`,
+narrowing, markers, the kill ring, `occur`, merge-conflict resolution,
+`treesit-*` — the full table is in
+[docs/vocabulary.md](docs/vocabulary.md). Regex is RE2 syntax under Emacs
+names (linear-time; no backreferences in patterns).
 
-```elisp
-(goto-char (point-min))
-(let ((n 0))
-  (while (re-search-forward "world" nil t)
-    (replace-match "WORLD")
-    (setq n (1+ n)))
-  (report "replaced" n))
-```
-
-## The vocabulary
-
-Programs are Emacs Lisp on `tulisp` (control flow, `let`, `lambda`, `dolist`,
-`condition-case`, …) plus these editor builtins:
-
-| Group | Primitives |
-|---|---|
-| Motion | `point` `point-min` `point-max` `goto-char` `goto-line` `forward-char` `forward-line` `forward-word` `backward-word` `forward-paragraph` `beginning-of-buffer` `end-of-buffer` `beginning-of-line` `end-of-line` `back-to-indentation` `line-beginning-position` `line-end-position` `line-number-at-pos` `current-column` `current-indentation` |
-| Predicates / chars | `bolp` `eolp` `bobp` `eobp` `char-after` `char-before` `looking-at` `looking-back` |
-| Mark & region | `set-mark` `mark` `region-beginning` `region-end` `exchange-point-and-mark` |
-| Markers | `make-marker` `point-marker` `copy-marker` `set-marker` `marker-position` `markerp` (durable positions; `goto-char` accepts a marker) |
-| Edit | `insert` `insert-char` `newline` `delete-char` `delete-region` `erase-buffer` `buffer-string` `buffer-substring` `upcase-region` `downcase-region` `delete-trailing-whitespace` `keep-lines` `flush-lines` `sort-lines` |
-| Kill ring | `kill-region` `kill-line` `kill-whole-line` `copy-region-as-kill` `yank` |
-| Search & replace | `re-search-forward` `re-search-backward` `search-forward` `search-backward` `replace-match` `match-string` `match-beginning` `match-end` `replace-string` `replace-regexp` `count-matches` `regexp-quote` |
-| Narrowing & scope | `narrow-to-region` `widen` `save-excursion` `save-restriction` |
-| Time travel | `checkpoint` `restore-checkpoint` `with-transaction` |
-| Merge conflicts | `conflict-count` `conflict-hunks` `conflict-goto` `conflict-text` `conflict-diff` `conflict-keep` `conflict-replace` `conflict-resolve-trivial` (git/diff3 markers; smerge-flavored) |
-| Structural (M7) | `treesit-language` `treesit-set-language` `treesit-root-type` `treesit-has-error` `treesit-beginning-of-defun` `treesit-end-of-defun` `treesit-defun-name` `treesit-narrow-to-defun` `treesit-list-defuns` `treesit-goto-defun` (tree-sitter; Markdown, Rust, Python, HTML, JavaScript, CSS, TOML, YAML, Elisp — `.el`/`.tl`) |
-| Nodes (first-class values) | `treesit-node-at` `treesit-defun-at` `treesit-query` (each returns nodes) · `treesit-node-type` `treesit-node-start` `treesit-node-end` `treesit-node-text` `treesit-node-parent` `treesit-node-child` `treesit-node-child-count` `treesit-node-next-sibling` `treesit-node-prev-sibling` `treesit-node-child-by-field-name` `treesit-node-p` (a buffer edit outdates old nodes) |
-| Observability | `report` `message` `window` `occur` `buffer-file-name` `buffer-stale-p` |
-| Orchestration (trusted tier) | `find-file` `find-file-noselect` `insert-file-contents` `write-file` `write-region` `directory-files` `generate-new-buffer` `set-buffer` `with-current-buffer` `current-buffer` `buffer-name` `buffer-list` `get-buffer` `kill-buffer` `arg` |
-| String library | `replace-regexp-in-string` `substring` `split-string` `string-trim`(`-left`/`-right`) `string-prefix-p` `string-suffix-p` `string-search` `string-replace` `string-join` `string-empty-p` `number-to-string` `string-to-number` `upcase` `downcase` `capitalize` `char-to-string` `string-to-char` |
-
-## Build
+## For agents (MCP)
 
 ```sh
-cargo build
-cargo test
+make claude    # cargo install + register `mime --mcp` with Claude Code
 ```
 
-`tulisp` comes from crates.io; the tree-sitter grammars (`tree-sitter-md`,
-`tree-sitter-rust`, `tree-sitter-python`) compile C, so a host C toolchain
-(`cc`) is required.
+Twenty tools; the ones that matter:
 
-## Claude Code
-
-```sh
-make claude    # cargo install + register `mime --mcp` as a user-scope MCP server
+```json
+replace_text {path, pattern, replacement, expect_unique: true, save: true}
+replace_text {files: [a, b, c], pattern, replacement, all: true, save: true}
+insert_text  {path, text, anchor: {defun: "parse_args"}}
+outline      {path}            // KIND START END NAME, per defun
+rehearse     {path, program}   // dry-run any lisp program, see the diff
+undo_last    {path}            // rewind the last mutating call
+help         {topic}           // regex | treesit | conflicts | sessions | recipes
 ```
 
-Every Claude Code session then picks the tools up automatically. The sandboxed
-tier's filesystem is confined to `MIME_ROOTS`, which defaults to this repo's
-parent directory (where your projects presumably live); override with
-`make claude MIME_ROOTS=/a:/b`, or set it empty to confine each session to its
-own working directory. `make uninstall-mcp` deregisters; `make test` runs the
-same fmt/clippy/test gate as CI.
+Multi-file edits are atomic across the set; `scope: {defun: "name"}` confines
+an edit to one function; warm sessions are bounded and never evicted with
+unsaved work. The full catalogue is generated from the live schemas into
+[docs/mcp-tools.md](docs/mcp-tools.md) (`make docs`), so it can't drift.
 
-The full MCP tool catalogue — every tool with its parameters, generated from
-the live schemas — lives in [docs/mcp-tools.md](docs/mcp-tools.md); `make docs`
-regenerates it (so it never drifts from what `tools/list` actually serves).
-At runtime the `help` tool serves the same ground truth as topic briefs.
+## Build & layout
 
-## Dogfooding feedback
+`cargo build` (a C toolchain is needed for the tree-sitter grammars);
+`make test` runs the CI gate — fmt, `clippy -D warnings`, 260+ tests
+including differential suites that pin the file-backed store to an in-memory
+oracle. Pending work: [`todo.org`](todo.org).
 
-mime-rs is used by AI agents (Claude Code drives it over MCP) as well as by
-hand. Agents using it are asked to flag friction as they hit it — a missing
-builtin, a confusing report, a query that should have been expressible — and
-suggest the improvement instead of silently working around it. If you are an
-agent reading this: when something here slows you down, say so in your summary
-and propose the fix (`todo.org` is the list to extend).
+The map: `store.rs` (the buffer trait) · `buffer.rs` / `quire.rs` (the two
+stores) · `builtins.rs` + `strings.rs` + `conflict.rs` + `syntax.rs` (the
+vocabulary) · `engine.rs` (sessions, tiers, time travel) · `safety.rs`
+(roots, atomic saves, audit) · `cli.rs` / `daemon.rs` / `mcp.rs` (the three
+front ends).
 
-## Layout
+## Dogfooding
 
-- `src/store.rs` — the `TextStore` trait (the buffer seam).
-- `src/buffer.rs` — in-memory `Buffer` (oracle).
-- `src/quire.rs` — `Quire`, the mmap-backed persistent-B-tree piece store.
-- `src/builtins.rs` — editor primitives registered on a `tulisp` context.
-- `src/strings.rs` — the RE2-backed string library.
-- `src/syntax.rs` — the tree-sitter layer behind the `treesit-*` builtins (M7):
-  language detection, defun outline/lookup, structural queries.
-- `src/engine.rs` — `run_program` / `rehearse`, sessions, checkpoints, capability tiers.
-- `src/safety.rs` — path allowlisting (`$MIME_ROOTS`), atomic saves, audit journal.
-- `src/cli.rs` — local one-shot + daemon-client verbs (`run`, `open`, `save`, `status`, `rehearse`, `repl`, `close`).
-- `src/daemon.rs` — the warm-session daemon (unix socket, JSON-lines).
-- `src/mcp.rs` — the MCP server (JSON-RPC over stdio).
-- `src/bin/mime.rs` — the single binary; dispatches to the CLI, daemon, or MCP mode.
+mime-rs is largely developed *through* mime-rs, by an agent driving it over
+MCP. If you are an agent using it and something slows you down — a missing
+builtin, a confusing report, an inexpressible query — say so and propose the
+fix; `todo.org` is the list to extend. Much of the agent surface exists
+because an agent hit the gap and said so.
 
 GPL-3.0 — see [`LICENSE`](LICENSE).
