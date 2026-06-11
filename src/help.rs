@@ -132,6 +132,9 @@ wrong-site edit. A FAILED run_program does NOT roll back (its error JSON
 says dirty:true when edits persist) — undo_last covers that too."#;
 
 const RECIPES: &str = r#"— recipes —
+Cross-file rename (one call, atomic across the set, saved only if every
+file succeeds — list exactly the files you grepped):
+  replace_text {files: [p1, p2, …], pattern, replacement, all: true, save: true}
 Replace inside one function (no program needed):
   replace_text {path, pattern, replacement, scope: {defun: "name"}}
 Add a function after another:
