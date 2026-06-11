@@ -7,7 +7,7 @@ CARGO_BIN ?= $(HOME)/.cargo/bin
 # each Claude Code session to its own working directory.
 MIME_ROOTS ?= $(abspath ..)
 
-.PHONY: build test install claude claude-mcp uninstall-mcp
+.PHONY: build test install claude claude-mcp uninstall-mcp docs
 
 build:
 	cargo build --release
@@ -20,6 +20,13 @@ test:
 
 install:
 	cargo install --path .
+
+# Regenerate the MCP tool catalogue from the live schemas — the single
+# source the README links to (no hand-synced copies).
+docs:
+	@mkdir -p docs
+	cargo run --quiet -- describe-mcp > docs/mcp-tools.md
+	@echo "wrote docs/mcp-tools.md"
 
 # Install + register: the one-shot Claude Code integration.
 claude: install claude-mcp
