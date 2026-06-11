@@ -32,6 +32,39 @@ use serde_json::{Value, json};
 const DEFAULT_SESSION: &str = "default";
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// Cap on warm sessions. Each file-backed session pins an open fd and a warm
+/// buffer; agents rarely work more than a handful of files, so past the cap
+/// the least-recently-used CLEAN session is evicted to make room. Sessions
+/// with un-persisted content (file-backed unsaved edits, or any modified
+/// scratch buffer) are never evicted — boundedness must not cost edits.
+const SESSION_CAP: usize = 16;
+
+/// The next recency stamp for [`Workspace::touch`].
+fn next_stamp() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Make room before installing a new warm session: evict clean LRU sessions
+/// until under [`SESSION_CAP`]. Best-effort — if everything holds unsaved
+/// work, the map grows past the cap rather than dropping edits.
+fn evict_for_room(sessions: &mut HashMap<String, Workspace>) {
+    while sessions.len() >= SESSION_CAP {
+        let victim = sessions
+            .iter()
+            .filter(|(_, ws)| !ws.is_modified())
+            .min_by_key(|(_, ws)| ws.last_used())
+            .map(|(k, _)| k.clone());
+        match victim {
+            Some(k) => {
+                eprintln!("mime-mcp: evicting idle clean session {k} (cap {SESSION_CAP})");
+                sessions.remove(&k);
+            }
+            None => break,
+        }
+    }
+}
+
 pub fn run() {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -256,6 +289,7 @@ fn resolve_session(
                 }
             }
             let quire = Quire::open(&checked).map_err(|e| format!("cannot open file {p}: {e}"))?;
+            evict_for_room(sessions);
             sessions.insert(id.clone(), make_workspace(Box::new(quire), false));
             Ok(id)
         }
@@ -315,11 +349,14 @@ fn make_workspace(store: Box<dyn TextStore>, read_only: bool) -> Workspace {
     // Sandboxed (agent-facing) tier: the MCP server registers the core editing
     // vocabulary only, never the orchestration group — read-only vs writable is
     // the only per-session distinction.
-    if read_only {
+    let ws = if read_only {
         Workspace::new_read_only(store)
     } else {
         Workspace::new(store)
-    }
+    };
+    // Creation counts as a use, so eviction order is well-defined from birth.
+    ws.touch(next_stamp());
+    ws
 }
 
 /// Run a program against an existing session and return the resulting
@@ -346,6 +383,7 @@ fn run_or_rehearse(
         return Err(no_such_session(sessions, session));
     }
     let ws = sessions.get_mut(session).expect("checked above");
+    ws.touch(next_stamp());
     // Emacs auto-revert-mode: before serving a read or running a program, if the
     // visited file drifted and the warm buffer has NO unsaved edits, silently
     // re-read it so the operation sees the current file rather than stale-or-
@@ -484,6 +522,7 @@ fn tool_open_file(
     let quire = Quire::open(&checked).map_err(|e| format!("cannot open file {path}: {e}"))?;
     let name = quire.name().to_string();
     let len = quire.char_len();
+    evict_for_room(sessions);
     sessions.insert(session.clone(), make_workspace(Box::new(quire), read_only));
     Ok(format!(
         "opened file {path} as buffer \"{name}\" ({len} chars{mode}) in session \"{session}\"",
@@ -506,6 +545,7 @@ fn tool_open_text(
         .to_string();
     let buffer = Buffer::from_string(name.clone(), text.clone());
     let len = text.chars().count();
+    evict_for_room(sessions);
     sessions.insert(session.clone(), make_workspace(Box::new(buffer), read_only));
     Ok(format!(
         "opened in-memory buffer \"{name}\" ({len} chars{mode}) in session \"{session}\"",

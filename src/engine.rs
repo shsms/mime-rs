@@ -226,6 +226,10 @@ pub struct Workspace {
     /// JSON can say whether partial edits persist (a warm run does not roll
     /// back on error; read-only and rehearse sessions do).
     last_failure_dirty: std::cell::Cell<bool>,
+    /// Recency stamp the MCP front-end writes on every use — the basis for
+    /// least-recently-used eviction when the warm-session cap is hit. The
+    /// engine itself never reads it.
+    last_used: std::cell::Cell<u64>,
     /// Automatic restore points, newest last — one per distinct text state
     /// captured just before a program runs, so [`undo_last`](Self::undo_last)
     /// can rewind a misfired edit in one call without any checkpoint
@@ -317,8 +321,19 @@ impl Workspace {
             read_only,
             capabilities,
             last_failure_dirty: std::cell::Cell::new(false),
+            last_used: std::cell::Cell::new(0),
             undo_ring: Vec::new(),
         }
+    }
+
+    /// Stamp this workspace as just-used (see `last_used`).
+    pub fn touch(&self, stamp: u64) {
+        self.last_used.set(stamp);
+    }
+
+    /// The most recent [`touch`](Self::touch) stamp; 0 = never used.
+    pub fn last_used(&self) -> u64 {
+        self.last_used.get()
     }
 
     /// Capture the current buffer state onto the undo ring unless its top

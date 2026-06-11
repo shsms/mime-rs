@@ -1416,3 +1416,47 @@ fn multi_file_replace_is_atomic_across_the_set() {
     );
     assert_eq!(txt, "new_name", "file a's warm buffer was rolled back");
 }
+
+#[test]
+fn warm_sessions_are_bounded_with_clean_lru_eviction() {
+    let mut s = Server::spawn();
+    // Fill to the cap with clean scratch sessions; edit one so it holds
+    // un-persisted content (eviction must never take it).
+    for i in 0..16 {
+        s.call_ok(
+            i + 1,
+            "open_text",
+            json!({ "text": "x", "session": format!("s{i}") }),
+        );
+    }
+    s.call_ok(
+        100,
+        "replace_text",
+        json!({ "session": "s3", "pattern": "x", "replacement": "edited" }),
+    );
+
+    // Opening more sessions evicts clean LRU entries, never s3.
+    for i in 16..20 {
+        s.call_ok(
+            i as i64 + 1,
+            "open_text",
+            json!({ "text": "x", "session": format!("s{i}") }),
+        );
+    }
+    let status: Value = serde_json::from_str(&s.call_ok(200, "session_status", json!({}))).unwrap();
+    let ids: Vec<String> = status["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(ids.len() <= 16, "bounded: {ids:?}");
+    assert!(
+        ids.contains(&"s3".to_string()),
+        "the edited session survives"
+    );
+    assert!(
+        !ids.contains(&"s0".to_string()),
+        "an idle clean session was evicted: {ids:?}"
+    );
+}
