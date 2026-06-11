@@ -1803,4 +1803,78 @@ mod tests {
         }
         std::fs::remove_file(&path).ok();
     }
+
+    #[test]
+    fn re_search_backward_finds_latest_match_and_moves_to_start() {
+        let r = run(
+            "foo1 bar foo2 baz",
+            r#"(end-of-buffer)
+               (report "pos" (re-search-backward "foo[0-9]"))
+               (replace-match "X")"#,
+        );
+        // Latest match (foo2 at 10) wins; point lands on its start.
+        assert_eq!(report(&r, "pos"), "10");
+        assert_eq!(r.final_text.as_deref(), Some("foo1 bar X baz"));
+    }
+
+    #[test]
+    fn re_search_backward_prefers_latest_start_with_overlaps() {
+        // "aa" in "aaa": a leftmost-biased sweep would report 1; the
+        // Emacs-style probe must land on the latest start, 2.
+        let r = run(
+            "aaa",
+            r#"(end-of-buffer) (report "pos" (re-search-backward "aa"))"#,
+        );
+        assert_eq!(report(&r, "pos"), "2");
+    }
+
+    #[test]
+    fn re_search_backward_honors_bound_and_noerror() {
+        let r = run(
+            "ab ab ab",
+            r#"(end-of-buffer)
+               (report "hit" (if (re-search-backward "ab" 5 t) (point) 0))
+               (goto-char 3)
+               (report "miss" (if (re-search-backward "zz" nil t) 1 0))"#,
+        );
+        // BOUND is the lower limit of the window [5, point): the latest
+        // match inside it starts at 7.
+        assert_eq!(report(&r, "hit"), "7");
+        assert_eq!(report(&r, "miss"), "0");
+    }
+
+    #[test]
+    fn re_search_backward_quire_matches_oracle() {
+        let path = std::env::temp_dir().join(format!("mime-rsb-{}.txt", std::process::id()));
+        let text = "alpha — beta\ngamma alpha délta\nalpha end\n";
+        std::fs::write(&path, text).unwrap();
+        let mut oracle = Workspace::new(Box::new(Buffer::from_string("t", text)));
+        let mut quire = Workspace::new(Box::new(Quire::open(&path).unwrap()));
+        let prog = r#"(end-of-buffer)
+                      (report "p1" (re-search-backward "alpha"))
+                      (report "p2" (re-search-backward "alpha" nil t))
+                      (replace-match "OMEGA")"#;
+        let o = oracle.run(prog).unwrap();
+        let q = quire.run(prog).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(report(&q, "p1"), report(&o, "p1"));
+        assert_eq!(report(&q, "p2"), report(&o, "p2"));
+        assert_eq!(q.final_text, o.final_text);
+        assert_eq!(q.point, o.point);
+    }
+
+    #[test]
+    fn looking_back_matches_text_ending_at_point() {
+        let r = run(
+            "hello world",
+            r#"(goto-char 6)
+               (report "yes" (if (looking-back "hel+o") 1 0))
+               (report "no" (if (looking-back "world") 1 0))
+               (report "lim" (if (looking-back "hello" 2) 1 0))"#,
+        );
+        assert_eq!(report(&r, "yes"), "1");
+        assert_eq!(report(&r, "no"), "0");
+        // Window [2, 6) = "ello" — the full "hello" no longer fits.
+        assert_eq!(report(&r, "lim"), "0");
+    }
 }

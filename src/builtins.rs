@@ -354,6 +354,28 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         );
     }
     {
+        // (re-search-backward REGEXP &optional BOUND NOERROR) — the mirror of
+        // re-search-forward: BOUND is the LOWER limit, point lands on the
+        // match start, and with overlapping candidates the latest start wins.
+        let s = session.clone();
+        ctx.defun(
+            "re-search-backward",
+            move |re: String,
+                  bound: Option<i64>,
+                  noerror: Option<TulispObject>|
+                  -> Result<TulispObject, Error> {
+                let rx = cached_regex(&re)?;
+                let bound = bound.map(|b| b.max(1) as usize);
+                let hit = s.borrow_mut().buffer.re_search_backward(&rx, bound);
+                match hit {
+                    Some(p) => Ok(TulispObject::from(p as i64)),
+                    None if noerror.is_some_and(|o| o.is_truthy()) => Ok(TulispObject::nil()),
+                    None => Err(Error::lisp_error(format!("Search failed: {re}"))),
+                }
+            },
+        );
+    }
+    {
         let s = session.clone();
         ctx.defun(
             "replace-match",
@@ -363,6 +385,32 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                     .replace_match(&newtext)
                     .map_err(Error::lisp_error)?;
                 Ok(TulispObject::nil())
+            },
+        );
+    }
+    {
+        // (looking-back REGEXP &optional LIMIT) — t when text ending exactly
+        // at point matches. Anchored with \z against the [LIMIT|point-min,
+        // point) window, so the leftmost (longest) qualifying match decides,
+        // like Emacs's greedy backward match. Like looking-at, records no
+        // match data; boundary context left of LIMIT is cut (the documented
+        // bound divergence).
+        let s = session.clone();
+        ctx.defun(
+            "looking-back",
+            move |re: String, limit: Option<i64>| -> Result<TulispObject, Error> {
+                let rx = cached_regex(&format!("(?:{re})\\z"))?;
+                let sess = s.borrow();
+                let point = sess.buffer.point();
+                let lo = match limit {
+                    Some(l) => (l.max(1) as usize).min(point),
+                    None => sess.buffer.point_min().min(point),
+                };
+                Ok(if rx.is_match(&sess.buffer.substring(lo, point)) {
+                    TulispObject::t()
+                } else {
+                    TulispObject::nil()
+                })
             },
         );
     }

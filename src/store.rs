@@ -35,6 +35,7 @@ pub trait TextStore {
     fn substring(&self, a: usize, b: usize) -> String;
 
     fn re_search_forward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize>;
+    fn re_search_backward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize>;
     fn search_forward(&mut self, needle: &str, bound: Option<usize>) -> Option<usize>;
     fn search_backward(&mut self, needle: &str, bound: Option<usize>) -> Option<usize>;
     fn replace_match(&mut self, replacement: &str) -> Result<(), String>;
@@ -102,6 +103,43 @@ pub trait TextStore {
     /// streaming atomic save uses this so a multi-GB `Quire` is written piece by
     /// piece, never materialized into one allocation; `Buffer` writes its string.
     fn write_to(&self, w: &mut dyn std::io::Write) -> std::io::Result<usize>;
+}
+
+/// The latest-starting match of `re` inside `window` (byte offsets), plus its
+/// capture-group texts — the backward-search primitive shared by both stores.
+/// Implemented the way Emacs does it, as repeated forward probes from
+/// successively later starts, so with OVERLAPPING matches the latest start
+/// wins where a plain `find_iter`-take-last would be leftmost-biased
+/// ("aa" in "aaa" must yield the match at 2, not 1). Each probe strictly
+/// advances, so the sweep terminates; an empty-pattern match degenerates to
+/// the window end, like Emacs.
+pub(crate) fn latest_match_in(
+    re: &regex::Regex,
+    window: &str,
+) -> Option<(usize, usize, Vec<Option<String>>)> {
+    let mut best: Option<(usize, usize)> = None;
+    let mut at = 0;
+    while let Some(m) = re.find_at(window, at) {
+        best = Some((m.start(), m.end()));
+        at = m.start() + 1;
+        while at < window.len() && !window.is_char_boundary(at) {
+            at += 1;
+        }
+        if at > window.len() {
+            break;
+        }
+    }
+    let (s, e) = best?;
+    // Re-run from the winning start to collect the groups; the leftmost match
+    // from `s` is the same span the probe found.
+    let caps = re.captures_at(window, s)?;
+    let whole = caps.get(0)?;
+    debug_assert_eq!((whole.start(), whole.end()), (s, e));
+    let groups = caps
+        .iter()
+        .map(|g| g.map(|m| m.as_str().to_string()))
+        .collect();
+    Some((s, e, groups))
 }
 
 /// The next content-version stamp (see [`TextStore::version`]): a process-wide

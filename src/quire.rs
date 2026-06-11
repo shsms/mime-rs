@@ -1761,6 +1761,24 @@ impl Quire {
         self.point = end;
         Some(end)
     }
+    /// Regex search backward from point (bounded below): the latest-starting
+    /// match wholly inside `[bound|point-min, point)`. On a hit: record
+    /// match-data, move point to the match START, return it. Like the exact
+    /// backward search, this still materializes the whole window (the
+    /// streaming-search todo covers both); the window edges count as
+    /// boundaries for `^`/`$`/`\b` — the documented cut divergence.
+    fn re_search_backward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize> {
+        let lo = bound.unwrap_or_else(|| self.point_min()).min(self.point);
+        let hi = self.point;
+        let window = self.collect_range(lo, hi);
+        let (ms, me, groups) = crate::store::latest_match_in(re, &window)?;
+        let start = lo + window[..ms].chars().count();
+        let end = lo + window[..me].chars().count();
+        self.last_match = Some(MatchData { start, end, groups });
+        self.point = start;
+        Some(start)
+    }
+
     /// Exact backward search from point (bounded below). On a hit: set
     /// match-data, move point to the match start, return it.
     fn search_backward(&mut self, needle: &str, bound: Option<usize>) -> Option<usize> {
@@ -1841,6 +1859,9 @@ impl TextStore for Quire {
     }
     fn re_search_forward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize> {
         Quire::re_search_forward(self, re, bound)
+    }
+    fn re_search_backward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize> {
+        Quire::re_search_backward(self, re, bound)
     }
     fn search_forward(&mut self, needle: &str, bound: Option<usize>) -> Option<usize> {
         Quire::search_forward(self, needle, bound)

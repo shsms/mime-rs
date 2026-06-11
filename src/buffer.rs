@@ -202,6 +202,24 @@ impl Buffer {
         Some(end)
     }
 
+    /// Regex search backward from point (bounded below by `bound` or
+    /// point-min): the latest-starting match wholly inside the window
+    /// `[bound, point)`. On a hit: record match-data, move point to the match
+    /// START, return it — Emacs `re-search-backward` semantics. The window
+    /// edges count as line/word boundaries for `^`/`$`/`\b`, the same cut
+    /// divergence the bounded forward search documents.
+    pub fn re_search_backward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize> {
+        let lo = bound.unwrap_or_else(|| self.point_min()).min(self.point);
+        let lo_b = self.byte_of(lo);
+        let hi_b = self.byte_of(self.point);
+        let (ms, me, groups) = crate::store::latest_match_in(re, self.text.get(lo_b..hi_b)?)?;
+        let start = self.char_of(lo_b + ms);
+        let end = self.char_of(lo_b + me);
+        self.last_match = Some(MatchData { start, end, groups });
+        self.point = start;
+        Some(start)
+    }
+
     /// Replace the last match's region with `replacement` (after `\N` / `\&`
     /// backref expansion); leave point at the end of the inserted text.
     pub fn replace_match(&mut self, replacement: &str) -> Result<(), String> {
@@ -490,6 +508,9 @@ impl crate::store::TextStore for Buffer {
     }
     fn re_search_forward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize> {
         Buffer::re_search_forward(self, re, bound)
+    }
+    fn re_search_backward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize> {
+        Buffer::re_search_backward(self, re, bound)
     }
     fn search_forward(&mut self, needle: &str, bound: Option<usize>) -> Option<usize> {
         Buffer::search_forward(self, needle, bound)
