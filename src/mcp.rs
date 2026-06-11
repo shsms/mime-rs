@@ -266,9 +266,10 @@ fn save_visited(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
 ) -> Result<String, String> {
-    let ws = sessions
-        .get_mut(session)
-        .ok_or_else(|| format!("no such session: {session}"))?;
+    if !sessions.contains_key(session) {
+        return Err(no_such_session(sessions, session));
+    }
+    let ws = sessions.get_mut(session).expect("checked above");
     let Some(path) = ws.visited_path() else {
         return Err(
             "save: the buffer has no visited file — use save_buffer with a path".to_string(),
@@ -337,9 +338,10 @@ fn run_or_rehearse(
     program: &str,
     rehearse: bool,
 ) -> Result<crate::RunReport, String> {
-    let ws = sessions
-        .get_mut(session)
-        .ok_or_else(|| format!("no such session: {session} (open_file/open_text first)"))?;
+    if !sessions.contains_key(session) {
+        return Err(no_such_session(sessions, session));
+    }
+    let ws = sessions.get_mut(session).expect("checked above");
     // Emacs auto-revert-mode: before serving a read or running a program, if the
     // visited file drifted and the warm buffer has NO unsaved edits, silently
     // re-read it so the operation sees the current file rather than stale-or-
@@ -353,6 +355,26 @@ fn run_or_rehearse(
         ws.rehearse(program)
     } else {
         ws.run(program)
+    }
+}
+
+/// A session-miss error that names the warm sessions, so a mistyped (or
+/// restart-orphaned) id is a one-glance fix instead of a guessing game.
+fn no_such_session(sessions: &HashMap<String, Workspace>, session: &str) -> String {
+    let mut ids: Vec<&String> = sessions.keys().collect();
+    ids.sort();
+    if ids.is_empty() {
+        format!(
+            "no such session: {session} (none are warm — pass path, or open_file/open_text first)"
+        )
+    } else {
+        format!(
+            "no such session: {session} — warm sessions: {}",
+            ids.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
 }
 
@@ -834,7 +856,7 @@ fn tool_checkpoint(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
-    let session = session_arg(args);
+    let session = resolve_session(args, sessions)?;
     let program = match args.get("label").and_then(Value::as_str) {
         Some(label) => format!("(report \"label\" (checkpoint \"{}\"))", lisp_escape(label)),
         None => "(report \"label\" (checkpoint))".to_string(),
@@ -853,7 +875,7 @@ fn tool_restore_checkpoint(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
-    let session = session_arg(args);
+    let session = resolve_session(args, sessions)?;
     let label = str_arg(args, "label")?;
     let program = format!("(restore-checkpoint \"{}\")", lisp_escape(&label));
     run_in_session(sessions, &session, &program)?;
@@ -868,29 +890,41 @@ fn tool_list_checkpoints(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
-    let session = session_arg(args);
+    let session = resolve_session(args, sessions)?;
     let program = "(report \"checkpoints\" (list-checkpoints))".to_string();
     let report = run_in_session(sessions, &session, &program)?;
     let labels = report_value(&report, "checkpoints").unwrap_or_else(|| "nil".to_string());
     Ok(format!("checkpoints: {labels}"))
 }
 
-/// `save_buffer {session?, path}` — write the session buffer's text to disk.
+/// `save_buffer {session?|path?, to?}` — write the session buffer's text to
+/// disk. `path` addresses WHICH session, like on every other tool; the
+/// destination is `to` (save-as), defaulting to the session's visited file —
+/// so a plain `save_buffer {path}` is "save this file" with the stale guard
+/// and parse warning applied.
 fn tool_save_buffer(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
-    let session = session_arg(args);
-    let path = str_arg(args, "path")?;
-    let checked = crate::safety::check_path(Path::new(&path))?;
-    // save_to writes atomically (temp + rename) and re-bases the buffer onto the
-    // new file, so an in-place save reclaims the pre-save mmap backing.
-    let bytes = sessions
-        .get_mut(&session)
-        .ok_or_else(|| format!("no such session: {session}"))?
-        .save_to(&checked)
-        .map_err(|e| format!("cannot write {path}: {e}"))?;
-    Ok(format!("wrote {bytes} bytes to {path}"))
+    let session = resolve_session(args, sessions)?;
+    match args.get("to").and_then(Value::as_str) {
+        None => save_visited(sessions, &session).map(|n| n.trim_start_matches("; ").to_string()),
+        Some(to) => {
+            let checked = crate::safety::check_path(Path::new(to))?;
+            if !sessions.contains_key(&session) {
+                return Err(no_such_session(sessions, &session));
+            }
+            // save_to writes atomically (temp + rename) and re-bases the
+            // buffer onto the new file, so an in-place save reclaims the
+            // pre-save mmap backing.
+            let bytes = sessions
+                .get_mut(&session)
+                .expect("checked above")
+                .save_to(&checked)
+                .map_err(|e| format!("cannot write {to}: {e}"))?;
+            Ok(format!("wrote {bytes} bytes to {to}"))
+        }
+    }
 }
 
 /// `session_status {}` — the live session ids plus the sandbox the engine
@@ -993,7 +1027,7 @@ fn tool_schemas() -> Vec<Value> {
     });
     let path = json!({
         "type": "string",
-        "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Pass path OR session, not both."
+        "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both."
     });
     let save = json!({
         "type": "boolean",
@@ -1172,6 +1206,7 @@ fn tool_schemas() -> Vec<Value> {
                 "properties": {
                     "label": { "type": "string", "description": "Optional label; auto-generated (auto-N) when omitted." },
                     "session": session,
+                    "path": path,
                 },
                 "required": [],
             },
@@ -1184,6 +1219,7 @@ fn tool_schemas() -> Vec<Value> {
                 "properties": {
                     "label": { "type": "string", "description": "Label of the checkpoint to restore." },
                     "session": session,
+                    "path": path,
                 },
                 "required": ["label"],
             },
@@ -1193,20 +1229,21 @@ fn tool_schemas() -> Vec<Value> {
             "description": "List the labels of checkpoints captured in this session.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "session": session },
+                "properties": { "session": session, "path": path },
                 "required": [],
             },
         }),
         json!({
             "name": "save_buffer",
-            "description": "Write the session buffer's current text to a file on disk.",
+            "description": "Write the session buffer's text to disk. Without `to`, save back to the session's visited file (atomic write, stale-read guard, parse warning — the same save the edit tools' save:true performs); with `to`, save-as to that path. NOTE: `path` addresses WHICH session, exactly like on every other tool — the destination parameter is `to`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Destination path." },
+                    "to": { "type": "string", "description": "Optional save-as destination. Omitted: write back to the visited file." },
                     "session": session,
+                    "path": path,
                 },
-                "required": ["path"],
+                "required": [],
             },
         }),
         json!({

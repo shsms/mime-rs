@@ -939,7 +939,7 @@ fn open_file_and_save_buffer_reject_out_of_root_paths() {
     let err = s.call_err(
         5,
         "save_buffer",
-        json!({ "path": "/tmp/mime-escape-should-fail.txt" }),
+        json!({ "to": "/tmp/mime-escape-should-fail.txt" }),
     );
     assert!(
         err.contains("outside the allowed roots"),
@@ -962,7 +962,8 @@ fn save_buffer_writes_inside_root() {
 
     s.call_ok(2, "open_text", json!({ "text": "hello world" }));
     let dest = root.join("out.txt");
-    let msg = s.call_ok(3, "save_buffer", json!({ "path": dest.to_str().unwrap() }));
+    // `to` is the save-as destination; `path` would address a session.
+    let msg = s.call_ok(3, "save_buffer", json!({ "to": dest.to_str().unwrap() }));
     assert!(msg.contains("wrote"), "save said: {msg}");
     assert_eq!(std::fs::read_to_string(&dest).unwrap(), "hello world");
 
@@ -1042,4 +1043,60 @@ fn audit_journal_records_one_line_per_run() {
     assert_eq!(second["dirty"], false);
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn uniform_path_addressing_on_checkpoint_and_save_tools() {
+    let dir = temp_dir("uniform-addr");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+
+    // checkpoint / list / restore address the file by path, like every
+    // other tool — no need to know the canonical-path session id.
+    let cp = s.call_ok(1, "checkpoint", json!({ "path": p, "label": "cp" }));
+    assert!(cp.contains("cp"), "checkpoint said: {cp}");
+    s.call_ok(
+        2,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "beta" }),
+    );
+    let cps = s.call_ok(3, "list_checkpoints", json!({ "path": p }));
+    assert!(cps.contains("cp"), "list said: {cps}");
+    s.call_ok(4, "restore_checkpoint", json!({ "path": p, "label": "cp" }));
+    let txt = s.call_ok(5, "read_region", json!({ "path": p, "start": 1, "end": 6 }));
+    assert!(txt.starts_with("alpha"), "restored: {txt}");
+
+    // save_buffer without `to` writes back to the visited file.
+    s.call_ok(
+        6,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "gamma" }),
+    );
+    let saved = s.call_ok(7, "save_buffer", json!({ "path": p }));
+    assert!(saved.contains("saved"), "save said: {saved}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "gamma\n");
+
+    // save_buffer with `to` is save-as.
+    let copy = dir.join("copy.txt");
+    let to = copy.to_string_lossy().into_owned();
+    s.call_ok(8, "save_buffer", json!({ "path": p, "to": to }));
+    assert_eq!(std::fs::read_to_string(&copy).unwrap(), "gamma\n");
+}
+
+#[test]
+fn session_miss_error_names_the_warm_sessions() {
+    let mut s = Server::spawn();
+    s.call_ok(1, "open_text", json!({ "text": "x", "session": "alpha" }));
+    s.call_ok(2, "open_text", json!({ "text": "y", "session": "beta" }));
+    let err = s.call_err(
+        3,
+        "run_program",
+        json!({ "session": "nope", "program": "(point)" }),
+    );
+    assert!(
+        err.contains("alpha") && err.contains("beta"),
+        "the miss should list the warm sessions: {err}"
+    );
 }
