@@ -86,6 +86,28 @@ pub fn failure_json(
     })
 }
 
+/// Clamp a unified diff for transport: a bulk edit (replace-regexp over a
+/// big file) produces a diff proportional to the whole change — megabytes
+/// straight into an agent's context. Beyond `max_lines`, keep the head and
+/// tail halves around an elision line that says how much was suppressed.
+pub fn clamp_diff(diff: &str, max_lines: usize) -> String {
+    let total = diff.lines().count();
+    if total <= max_lines.max(2) {
+        return diff.to_string();
+    }
+    let head_n = max_lines / 2;
+    let tail_n = max_lines - head_n;
+    let head: Vec<&str> = diff.lines().take(head_n).collect();
+    let tail: Vec<&str> = diff.lines().skip(total - tail_n).collect();
+    format!(
+        "{}\n… diff clamped: {} of {} lines elided (pass full_diff:true for everything) …\n{}",
+        head.join("\n"),
+        total - max_lines,
+        total,
+        tail.join("\n")
+    )
+}
+
 /// A unified (line-based) diff of the buffer before/after the program.
 pub fn unified_diff(before: &str, after: &str) -> String {
     format!(
@@ -97,6 +119,18 @@ pub fn unified_diff(before: &str, after: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_diff_keeps_head_and_tail_around_an_elision_line() {
+        let diff: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        let clamped = clamp_diff(&diff, 10);
+        assert!(clamped.contains("line 1\n"));
+        assert!(clamped.contains("line 100"));
+        assert!(clamped.contains("90 of 100 lines elided"), "{clamped}");
+        assert!(!clamped.contains("line 50"));
+        // Under the cap: untouched.
+        assert_eq!(clamp_diff("a\nb\nc", 10), "a\nb\nc");
+    }
 
     #[test]
     fn repeated_report_keys_aggregate_into_an_array() {

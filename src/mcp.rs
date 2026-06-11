@@ -553,6 +553,11 @@ fn tool_run_program(
         report.len_after,
     );
     let mut json = report.to_json();
+    // A bulk edit's diff can run to megabytes; clamp it for transport unless
+    // the caller asked for everything. 200 lines ≈ a large hand-made edit.
+    if !bool_arg(args, "full_diff") {
+        json["diff"] = Value::String(crate::result::clamp_diff(&report.diff, 200));
+    }
     // Same drift signal the read tools carry (see stale_note), structured:
     // present only when true, so the common case costs no tokens.
     if sessions.get(&session).is_some_and(|ws| ws.is_stale()) {
@@ -1442,6 +1447,7 @@ fn tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "program": { "type": "string", "description": "Emacs-Lisp program, e.g. (while (re-search-forward \"foo\" nil t) (replace-match \"bar\"))." },
+                    "full_diff": { "type": "boolean", "description": "Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count." },
                     "session": session,
                     "path": path,
                     "save": save,
