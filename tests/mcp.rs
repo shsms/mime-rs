@@ -1186,3 +1186,35 @@ fn expect_unique_makes_ambiguous_anchors_an_error() {
     let txt = s.call_ok(7, "read_region", json!({ "start": 8, "end": 15 }));
     assert_eq!(txt, "use y;\n", "batch rolled back: {txt}");
 }
+
+#[test]
+fn close_session_releases_and_guards_unsaved_edits() {
+    let dir = temp_dir("close");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+
+    // Closing a clean session by path works and empties the status.
+    s.call_ok(1, "occur", json!({ "path": p, "pattern": "alpha" }));
+    let closed = s.call_ok(2, "close_session", json!({ "path": p }));
+    assert!(closed.contains("closed"), "got: {closed}");
+    let status: Value = serde_json::from_str(&s.call_ok(3, "session_status", json!({}))).unwrap();
+    assert_eq!(status["sessions"].as_array().unwrap().len(), 0);
+
+    // An unsaved session refuses without force, closes with it.
+    s.call_ok(
+        4,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "beta" }),
+    );
+    let err = s.call_err(5, "close_session", json!({ "path": p }));
+    assert!(err.contains("unsaved"), "got: {err}");
+    let closed = s.call_ok(6, "close_session", json!({ "path": p, "force": true }));
+    assert!(closed.contains("discarded"), "got: {closed}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n");
+
+    // Closing something that isn't warm is a clean error, not an open.
+    let err = s.call_err(7, "close_session", json!({ "path": p }));
+    assert!(err.contains("no warm session"), "got: {err}");
+}

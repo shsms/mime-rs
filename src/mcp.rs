@@ -165,6 +165,7 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         "checkpoint" => tool_checkpoint(&args, sessions),
         "restore_checkpoint" => tool_restore_checkpoint(&args, sessions),
         "undo_last" => tool_undo_last(&args, sessions),
+        "close_session" => tool_close_session(&args, sessions),
         "list_checkpoints" => tool_list_checkpoints(&args, sessions),
         "save_buffer" => tool_save_buffer(&args, sessions),
         "session_status" => tool_session_status(sessions),
@@ -362,6 +363,72 @@ fn run_or_rehearse(
     } else {
         ws.run(program)
     }
+}
+
+/// Resolve a tool's target to an EXISTING warm session — the lookup half of
+/// [`resolve_session`] without its auto-open (closing a file that isn't warm
+/// must not first open it). `path` matches the canonical-path key or a
+/// session visiting the file; a bare `session` id is taken as-is.
+fn resolve_existing_session(
+    args: &Value,
+    sessions: &HashMap<String, Workspace>,
+) -> Result<String, String> {
+    let path = args.get("path").and_then(Value::as_str);
+    let session = args.get("session").and_then(Value::as_str);
+    match (path, session) {
+        (Some(_), Some(_)) => Err("pass either \"path\" or \"session\", not both".to_string()),
+        (None, s) => Ok(s.unwrap_or(DEFAULT_SESSION).to_string()),
+        (Some(p), None) => {
+            let checked = crate::safety::check_path(Path::new(p))?;
+            let id = checked.to_string_lossy().into_owned();
+            if sessions.contains_key(&id) {
+                return Ok(id);
+            }
+            let mut visiting: Vec<String> = sessions
+                .iter()
+                .filter(|(_, ws)| ws.visited_path().as_deref() == Some(checked.as_path()))
+                .map(|(k, _)| k.clone())
+                .collect();
+            match visiting.len() {
+                1 => Ok(visiting.remove(0)),
+                0 => Err(format!("no warm session visits {}", checked.display())),
+                _ => {
+                    visiting.sort();
+                    Err(format!(
+                        "ambiguous: sessions {} all visit {} — pass \"session\" explicitly",
+                        visiting.join(", "),
+                        checked.display()
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// `close_session {session?|path?, force?}` — drop a warm session, releasing
+/// its buffer (and the open fd a file-backed one holds). Refuses while the
+/// buffer has unsaved edits unless `force: true` discards them.
+fn tool_close_session(
+    args: &Value,
+    sessions: &mut HashMap<String, Workspace>,
+) -> Result<String, String> {
+    let session = resolve_existing_session(args, sessions)?;
+    if !sessions.contains_key(&session) {
+        return Err(no_such_session(sessions, &session));
+    }
+    let unsaved = is_unsaved(sessions, &session);
+    if unsaved && !bool_arg(args, "force") {
+        return Err(format!(
+            "session \"{session}\" has unsaved edits — save_buffer (or save: true) \
+             first, or pass force: true to discard them"
+        ));
+    }
+    sessions.remove(&session);
+    Ok(if unsaved {
+        format!("closed session \"{session}\" (unsaved edits discarded)")
+    } else {
+        format!("closed session \"{session}\"")
+    })
 }
 
 /// A session-miss error that names the warm sessions, so a mistyped (or
@@ -1381,6 +1448,19 @@ fn tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "to": { "type": "string", "description": "Optional save-as destination. Omitted: write back to the visited file." },
+                    "session": session,
+                    "path": path,
+                },
+                "required": [],
+            },
+        }),
+        json!({
+            "name": "close_session",
+            "description": "Drop a warm session: releases its buffer and the open file handle a file-backed session holds. Refuses while the session has unsaved edits unless force:true discards them. Use it when done with a file, or to force a clean re-open from disk.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "force": { "type": "boolean", "description": "Discard unsaved edits. Default false: closing an unsaved session is an error." },
                     "session": session,
                     "path": path,
                 },
