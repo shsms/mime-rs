@@ -349,10 +349,11 @@ fn run_or_rehearse(
     // visited file drifted and the warm buffer has NO unsaved edits, silently
     // re-read it so the operation sees the current file rather than stale-or-
     // corrupt bytes. A modified buffer is left alone (the stale-WARN conflict).
-    // Skipped on a rehearse: that dry-run must persist nothing, but the revert
-    // (a buffer swap) would land before rehearse takes its rollback snapshot.
+    // This runs BEFORE a rehearse takes its rollback snapshot too: the revert
+    // discards nothing (the buffer is clean), and without it the preview would
+    // run against bytes the committing run — which does revert — won't use.
+    ws.auto_revert_if_clean();
     if !rehearse {
-        ws.auto_revert_if_clean();
         // Auto-capture the pre-program state (version-deduped, bounded) so
         // undo_last can rewind a misfired edit without prior checkpoint
         // discipline. After the auto-revert, so undo never resurrects bytes

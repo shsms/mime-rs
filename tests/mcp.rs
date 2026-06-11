@@ -664,9 +664,11 @@ fn auto_revert_refreshes_clean_reads_while_modified_reads_warn() {
 }
 
 #[test]
-fn rehearse_does_not_auto_revert_a_clean_drifted_buffer() {
-    // rehearse is a dry-run that must persist NOTHING — so it must not silently
-    // auto-revert (a buffer swap that would land before the rollback snapshot).
+fn rehearse_auto_reverts_a_clean_drifted_buffer_like_a_run_would() {
+    // A clean drifted buffer auto-reverts BEFORE the rehearse snapshot: the
+    // revert discards nothing, and without it the preview would run against
+    // bytes the committing run — which does revert — won't use, so preview
+    // and commit could legitimately disagree.
     let dir = temp_dir("rehearse-revert");
     let file = dir.join("doc.txt");
     std::fs::write(&file, "original\n").unwrap();
@@ -676,10 +678,18 @@ fn rehearse_does_not_auto_revert_a_clean_drifted_buffer() {
 
     // Drift the file (different length) while the buffer is clean.
     std::fs::write(&file, "changed on disk and longer\n").unwrap();
-    s.call_ok(2, "rehearse", json!({ "path": p, "program": "(point)" }));
+    let preview = s.call_ok(
+        2,
+        "rehearse",
+        json!({ "path": p, "program": r#"(search-forward "changed" nil t) (replace-match "previewed")"# }),
+    );
+    assert!(
+        preview.contains("previewed"),
+        "the preview sees the CURRENT file: {preview}"
+    );
 
-    // session_status reads is_stale directly (no auto-revert): the buffer must
-    // still be stale, proving the rehearse did not silently revert it.
+    // The rehearsal's rollback lands on the reverted (fresh) state: not
+    // stale, text matching the disk.
     let status = s.call_ok(3, "session_status", json!({}));
     let status: Value = serde_json::from_str(&status).unwrap();
     assert!(
@@ -687,13 +697,11 @@ fn rehearse_does_not_auto_revert_a_clean_drifted_buffer() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|sess| sess["stale"] == true),
-        "rehearse must leave the buffer stale (no silent revert): {status}"
+            .all(|sess| sess["stale"] == false),
+        "the clean buffer was re-read: {status}"
     );
-
-    // A real read, by contrast, DOES auto-revert the clean drifted buffer.
     let txt = s.call_ok(4, "read_region", json!({ "path": p, "start": 1, "end": 8 }));
-    assert_eq!(txt, "changed", "a read auto-reverts where rehearse did not");
+    assert_eq!(txt, "changed", "rollback kept the reverted text");
 }
 
 #[test]
