@@ -660,26 +660,74 @@ fn tool_replace_text(
         return Err("replace_text: pattern must not be empty".to_string());
     }
     let all = bool_arg(args, "all");
+    let unique = bool_arg(args, "expect_unique");
+    if unique && all {
+        return Err("expect_unique contradicts all:true (every occurrence is wanted)".to_string());
+    }
     let (pat, rep) = (lisp_literal(&pattern), lisp_literal(&replacement));
     let all_flag = if all { "t" } else { "nil" };
-    // search → delete → insert per hit; `more` counts the matches left after
-    // the last replacement so a single replace can say "N more remain". The
-    // continue-guard runs BEFORE the search so a finished single replace does
-    // not move point past (and so under-count) the next match. A miss restores
-    // point — a failed replace is a no-op, not a stealth (goto-char (point-min)).
-    let program = format!(
-        "(progn (let ((p0 (point)) (n 0))\
-           (goto-char (point-min))\
-           (while (and (or {all_flag} (= n 0)) (search-forward \"{pat}\" nil t))\
-             (delete-region (match-beginning 0) (point))\
-             (insert \"{rep}\")\
-             (setq n (+ n 1)))\
-           (if (= n 0) (goto-char p0))\
-           (report \"n\" n)\
-           (report \"more\" (count-matches (regexp-quote \"{pat}\")))\
-           (report \"point\" (point))))"
-    );
-    let report = run_in_session(sessions, &session, &program)?;
+    // search → delete → insert per hit, tracking the line of the last
+    // replacement so the result can say WHERE it landed; `more` counts the
+    // matches left after the last replacement so a single replace can say
+    // "N more remain". The continue-guard runs BEFORE the search so a
+    // finished single replace does not move point past (and so under-count)
+    // the next match. A miss restores point — a failed replace is a no-op,
+    // not a stealth (goto-char (point-min)).
+    //
+    // expect_unique wraps the same loop in a transaction and errors (rolling
+    // the replacement back) if the pattern still matches afterwards — a
+    // repeated anchor means the FIRST hit may not be the intended one, so
+    // ambiguity is an error, not a silent edit.
+    let program = if unique {
+        format!(
+            "(with-transaction (let ((n 0) (line 0))\
+               (goto-char (point-min))\
+               (while (and (= n 0) (search-forward \"{pat}\" nil t))\
+                 (delete-region (match-beginning 0) (point))\
+                 (insert \"{rep}\")\
+                 (setq line (line-number-at-pos (point)))\
+                 (setq n (+ n 1)))\
+               (if (= n 0) (error \"__miss__\"))\
+               (if (search-forward \"{pat}\" nil t) (error \"__ambiguous__\"))\
+               (report \"n\" n)\
+               (report \"line\" line)\
+               (report \"point\" (point))))"
+        )
+    } else {
+        format!(
+            "(progn (let ((p0 (point)) (n 0) (line 0))\
+               (goto-char (point-min))\
+               (while (and (or {all_flag} (= n 0)) (search-forward \"{pat}\" nil t))\
+                 (delete-region (match-beginning 0) (point))\
+                 (insert \"{rep}\")\
+                 (setq line (line-number-at-pos (point)))\
+                 (setq n (+ n 1)))\
+               (if (= n 0) (goto-char p0))\
+               (report \"n\" n)\
+               (report \"line\" line)\
+               (report \"more\" (count-matches (regexp-quote \"{pat}\")))\
+               (report \"point\" (point))))"
+        )
+    };
+    let report = match run_in_session(sessions, &session, &program) {
+        Ok(r) => r,
+        Err(e) if unique && e.contains("__ambiguous__") => {
+            let lines = match_lines(sessions, &session, &pat);
+            return Err(format!(
+                "replace_text: pattern {:?} matches at lines {lines} — expect_unique \
+                 requires exactly one; nothing was replaced. Refine the anchor \
+                 (occur shows every match in context).",
+                truncate_for_error(&pattern)
+            ));
+        }
+        Err(e) if unique && e.contains("__miss__") => {
+            return Err(format!(
+                "replace_text: no match for the pattern {:?}",
+                truncate_for_error(&pattern)
+            ));
+        }
+        Err(e) => return Err(e),
+    };
     audit_tool(&session, &program, &report);
     let n: usize = report_value(&report, "n")
         .and_then(|v| v.parse().ok())
@@ -694,6 +742,7 @@ fn tool_replace_text(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let point = report_value(&report, "point").unwrap_or_default();
+    let line = report_value(&report, "line").unwrap_or_default();
     let saved = if bool_arg(args, "save") {
         save_visited(sessions, &session)?
     } else {
@@ -701,13 +750,43 @@ fn tool_replace_text(
     };
     let unsaved = unsaved_note(sessions, &session);
     Ok(match (all, more) {
-        (true, _) => format!("replaced {n} occurrence(s); point is now {point}{saved}{unsaved}"),
-        (false, 0) => format!("replaced 1 occurrence; point is now {point}{saved}{unsaved}"),
+        (true, _) => format!(
+            "replaced {n} occurrence(s), last at line {line}; point is now {point}{saved}{unsaved}"
+        ),
+        (false, 0) => {
+            format!("replaced 1 occurrence at line {line}; point is now {point}{saved}{unsaved}")
+        }
         (false, more) => format!(
-            "replaced 1 occurrence; point is now {point}; {more} more match(es) \
-             remain (pass all:true to replace every occurrence){saved}{unsaved}"
+            "replaced 1 occurrence at line {line}; point is now {point}; {more} more \
+             match(es) remain (pass all:true to replace every occurrence, or \
+             expect_unique:true to make ambiguity an error){saved}{unsaved}"
         ),
     })
+}
+
+/// Line numbers of every occurrence of the (already lisp-escaped) literal
+/// `pat`, as "12, 40, 73" clamped to the first eight — the detail an
+/// expect_unique ambiguity error needs to be actionable. Point is preserved.
+fn match_lines(sessions: &mut HashMap<String, Workspace>, session: &str, pat: &str) -> String {
+    let program = format!(
+        "(save-excursion (goto-char (point-min))\
+           (while (search-forward \"{pat}\" nil t)\
+             (report \"line\" (line-number-at-pos (match-beginning 0)))))"
+    );
+    let lines: Vec<String> = run_in_session(sessions, session, &program)
+        .map(|r| {
+            r.reports
+                .iter()
+                .filter(|(k, _)| k == "line")
+                .map(|(_, v)| v.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if lines.len() > 8 {
+        format!("{} … ({} total)", lines[..8].join(", "), lines.len())
+    } else {
+        lines.join(", ")
+    }
 }
 
 /// The `edits: [{pattern, replacement, all?}, …]` form of `replace_text`:
@@ -733,15 +812,37 @@ fn replace_text_batch(
             return Err(format!("edit {}: pattern must not be empty", i + 1));
         }
         let all = bool_arg(item, "all");
+        let unique = bool_arg(item, "expect_unique");
+        if unique && all {
+            return Err(format!(
+                "edit {}: expect_unique contradicts all:true",
+                i + 1
+            ));
+        }
         let (pat, rep) = (lisp_literal(&pattern), lisp_literal(&replacement));
-        // The error message that aborts (and rolls back) the transaction
-        // names the edit; the pattern is echoed clamped.
+        // The error messages that abort (and roll back) the transaction name
+        // the edit; the pattern is echoed clamped.
         let miss = lisp_escape(&format!(
             "edit {}: no match for the pattern {:?}",
             i + 1,
             truncate_for_error(&pattern)
         ));
+        let ambiguous = lisp_escape(&format!(
+            "edit {}: pattern {:?} matches more than once (expect_unique) — \
+             nothing was applied; refine the anchor",
+            i + 1,
+            truncate_for_error(&pattern)
+        ));
         let all_flag = if all { "t" } else { "nil" };
+        // The uniqueness post-check searches on from point (just past the
+        // replacement), so a later genuine occurrence aborts the whole
+        // transaction — evaluated against the buffer as the previous edits
+        // left it, like everything else in the batch.
+        let unique_check = if unique {
+            format!("(if (search-forward \"{pat}\" nil t) (error \"{ambiguous}\"))")
+        } else {
+            String::new()
+        };
         body.push_str(&format!(
             "(goto-char (point-min))\
              (let ((n 0))\
@@ -750,6 +851,7 @@ fn replace_text_batch(
                  (insert \"{rep}\")\
                  (setq n (+ n 1)))\
                (if (= n 0) (error \"{miss}\"))\
+               {unique_check}\
                (report \"n\" n))"
         ));
     }
@@ -761,7 +863,7 @@ fn replace_text_batch(
         Err(e) => {
             let line = e
                 .lines()
-                .find(|l| l.contains("no match for the pattern"))
+                .find(|l| l.contains("no match for the pattern") || l.contains("expect_unique"))
                 .map(|l| l.trim_start_matches("ERR LispError: ").trim().to_string());
             return Err(line.unwrap_or(e));
         }
@@ -1166,7 +1268,8 @@ fn tool_schemas() -> Vec<Value> {
                     "pattern": { "type": "string", "description": "The exact text to find (literal, not regex)." },
                     "replacement": { "type": "string", "description": "The literal replacement text." },
                     "all": { "type": "boolean", "description": "Replace every occurrence (default false: first only)." },
-                    "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?}, …] applied in order inside ONE transaction — all-or-nothing; a miss rolls everything back and names the failed edit.", "items": { "type": "object" } },
+                    "expect_unique": { "type": "boolean", "description": "Require the pattern to match exactly once: more than one match is an error (listing the match lines) and nothing is replaced. RECOMMENDED whenever the anchor text could plausibly repeat — first-match semantics would silently edit the wrong site. Default false." },
+                    "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?}, …] applied in order inside ONE transaction — all-or-nothing; a miss (or a failed uniqueness check) rolls everything back and names the failed edit.", "items": { "type": "object" } },
                     "session": session,
                     "path": path,
                     "save": save,

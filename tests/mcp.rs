@@ -1133,3 +1133,56 @@ fn undo_last_rewinds_one_mutating_call_at_a_time() {
     let err = s.call_err(9, "undo_last", json!({}));
     assert!(err.contains("nothing to undo"), "got: {err}");
 }
+
+#[test]
+fn expect_unique_makes_ambiguous_anchors_an_error() {
+    let mut s = Server::spawn();
+    s.call_ok(
+        1,
+        "open_text",
+        json!({ "text": "use a;\nuse b;\nuse a;\n" }),
+    );
+
+    // Two occurrences: the unique replace refuses and lists the lines,
+    // and nothing changes.
+    let err = s.call_err(
+        2,
+        "replace_text",
+        json!({ "pattern": "use a;", "replacement": "use z;", "expect_unique": true }),
+    );
+    assert!(err.contains("matches at lines 1, 3"), "got: {err}");
+    let txt = s.call_ok(3, "read_region", json!({ "start": 1, "end": 8 }));
+    assert_eq!(txt, "use a;\n", "nothing replaced: {txt}");
+
+    // A genuinely unique anchor goes through and reports its line.
+    let ok = s.call_ok(
+        4,
+        "replace_text",
+        json!({ "pattern": "use b;", "replacement": "use y;", "expect_unique": true }),
+    );
+    assert!(ok.contains("at line 2"), "got: {ok}");
+
+    // expect_unique + all is a contradiction.
+    let err = s.call_err(
+        5,
+        "replace_text",
+        json!({ "pattern": "use", "replacement": "USE", "expect_unique": true, "all": true }),
+    );
+    assert!(err.contains("contradicts"), "got: {err}");
+
+    // In a batch, a failed uniqueness check rolls the whole batch back.
+    let err = s.call_err(
+        6,
+        "replace_text",
+        json!({ "edits": [
+            { "pattern": "use y;", "replacement": "use x;" },
+            { "pattern": "use a;", "replacement": "use w;", "expect_unique": true },
+        ] }),
+    );
+    assert!(
+        err.contains("edit 2") && err.contains("expect_unique"),
+        "got: {err}"
+    );
+    let txt = s.call_ok(7, "read_region", json!({ "start": 8, "end": 15 }));
+    assert_eq!(txt, "use y;\n", "batch rolled back: {txt}");
+}
