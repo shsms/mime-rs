@@ -1319,3 +1319,27 @@ fn search_reports_direction_line_echo_and_case_folding() {
         "got: {oc}"
     );
 }
+
+#[test]
+fn view_echo_appends_a_viewport_to_edit_results() {
+    let mut s = Server::spawn();
+    s.call_ok(
+        1,
+        "open_text",
+        json!({ "text": "one\ntwo\nthree\nfour\nfive\n" }),
+    );
+    let ok = s.call_ok(
+        2,
+        "replace_text",
+        json!({ "pattern": "three", "replacement": "THREE", "view": 1 }),
+    );
+    assert!(ok.contains("— view —"), "got: {ok}");
+    assert!(ok.contains("THREE"), "the viewport shows the edit: {ok}");
+    // Not requested → not present.
+    let ok = s.call_ok(
+        3,
+        "replace_text",
+        json!({ "pattern": "four", "replacement": "FOUR" }),
+    );
+    assert!(!ok.contains("— view —"), "got: {ok}");
+}

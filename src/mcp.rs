@@ -576,6 +576,10 @@ fn tool_run_program(
     if is_unsaved(sessions, &session) {
         json["unsaved"] = Value::Bool(true);
     }
+    let view = view_echo(args, sessions, &session);
+    if !view.is_empty() {
+        json["view"] = Value::String(view.trim_start_matches('\n').to_string());
+    }
     Ok(pretty(&json))
 }
 
@@ -720,8 +724,9 @@ fn tool_insert_text(
         String::new()
     };
     let unsaved = unsaved_note(sessions, &session);
+    let view = view_echo(args, sessions, &session);
     Ok(format!(
-        "inserted {chars} chars; point is now {point}{saved}{unsaved}"
+        "inserted {chars} chars; point is now {point}{saved}{unsaved}{view}"
     ))
 }
 
@@ -852,17 +857,18 @@ fn tool_replace_text(
         String::new()
     };
     let unsaved = unsaved_note(sessions, &session);
+    let view = view_echo(args, sessions, &session);
     Ok(match (all, more) {
         (true, _) => format!(
-            "replaced {n} occurrence(s), last at line {line}; point is now {point}{saved}{unsaved}"
+            "replaced {n} occurrence(s), last at line {line}; point is now {point}{saved}{unsaved}{view}"
         ),
-        (false, 0) => {
-            format!("replaced 1 occurrence at line {line}; point is now {point}{saved}{unsaved}")
-        }
+        (false, 0) => format!(
+            "replaced 1 occurrence at line {line}; point is now {point}{saved}{unsaved}{view}"
+        ),
         (false, more) => format!(
             "replaced 1 occurrence at line {line}; point is now {point}; {more} more \
              match(es) remain (pass all:true to replace every occurrence, or \
-             expect_unique:true to make ambiguity an error){saved}{unsaved}"
+             expect_unique:true to make ambiguity an error){saved}{unsaved}{view}"
         ),
     })
 }
@@ -1081,8 +1087,9 @@ fn replace_text_batch(
         String::new()
     };
     let unsaved = unsaved_note(sessions, session);
+    let view = view_echo(args, sessions, session);
     Ok(format!(
-        "applied {} edit(s), {total} replacement(s){saved}{unsaved}",
+        "applied {} edit(s), {total} replacement(s){saved}{unsaved}{view}",
         items.len()
     ))
 }
@@ -1419,6 +1426,23 @@ fn audit_tool(session: &str, program: &str, report: &crate::RunReport) {
     );
 }
 
+/// Render the viewport around point when the caller asked for it (`view: N`
+/// lines of context, or `true` for the default 4) — visual confirmation that
+/// an edit landed where intended, without a follow-up call. Empty when not
+/// requested.
+fn view_echo(args: &Value, sessions: &mut HashMap<String, Workspace>, session: &str) -> String {
+    let lines = match args.get("view") {
+        Some(Value::Bool(true)) => 4,
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(4).max(0),
+        _ => return String::new(),
+    };
+    run_in_session(sessions, session, &format!("(message (window {lines}))"))
+        .ok()
+        .and_then(|r| r.log.into_iter().next())
+        .map(|t| format!("\n— view —\n{t}"))
+        .unwrap_or_default()
+}
+
 /// A pattern echoed into an error message, clamped so a pathological pattern
 /// cannot flood the result.
 fn truncate_for_error(s: &str) -> String {
@@ -1493,6 +1517,7 @@ fn tool_schemas() -> Vec<Value> {
                 "properties": {
                     "program": { "type": "string", "description": "Emacs-Lisp program, e.g. (while (re-search-forward \"foo\" nil t) (replace-match \"bar\"))." },
                     "full_diff": { "type": "boolean", "description": "Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count." },
+                    "view": { "type": ["boolean", "integer"], "description": "Add a rendered viewport around point to the report (true = 4 context lines, or a line count)." },
                     "session": session,
                     "path": path,
                     "save": save,
@@ -1550,6 +1575,7 @@ fn tool_schemas() -> Vec<Value> {
                     "text": { "type": "string", "description": "The literal text to insert." },
                     "pos": { "type": "integer", "description": "1-based position to insert at (default: current point)." },
                     "anchor": { "type": "object", "description": "Insert relative to a named defun instead of a position: {\"defun\": \"name\", \"where\": \"after\"|\"before\"} (default after — lands at the defun's end; include separating newlines in the text). Rust note: a defun excludes its preceding #[attributes], so \"before\" lands between them and the item. Not combinable with pos.", "properties": { "defun": { "type": "string" }, "where": { "type": "string", "enum": ["after", "before"] } } },
+                    "view": { "type": ["boolean", "integer"], "description": "Append a rendered viewport around point after the edit (true = 4 context lines, or a line count) — confirm the insert landed right without a follow-up view call." },
                     "session": session,
                     "path": path,
                     "save": save,
@@ -1568,6 +1594,7 @@ fn tool_schemas() -> Vec<Value> {
                     "all": { "type": "boolean", "description": "Replace every occurrence (default false: first only)." },
                     "expect_unique": { "type": "boolean", "description": "Require the pattern to match exactly once: more than one match is an error (listing the match lines) and nothing is replaced. RECOMMENDED whenever the anchor text could plausibly repeat — first-match semantics would silently edit the wrong site. Default false." },
                     "scope": scope,
+                    "view": { "type": ["boolean", "integer"], "description": "Append a rendered viewport around point after the edit (true = 4 context lines, or a line count)." },
                     "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?}, …] applied in order inside ONE transaction — all-or-nothing; a miss (or a failed uniqueness check) rolls everything back and names the failed edit.", "items": { "type": "object" } },
                     "session": session,
                     "path": path,
