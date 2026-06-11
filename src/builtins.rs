@@ -412,10 +412,23 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         ctx.defun(
             "replace-match",
-            move |newtext: String| -> Result<TulispObject, Error> {
+            // (replace-match NEWTEXT &optional FIXEDCASE LITERAL). LITERAL
+            // non-nil inserts NEWTEXT verbatim — no `\&`/`\N` expansion, so
+            // backslash-heavy replacements need no double escaping. FIXEDCASE
+            // is accepted for parity but ignored: mime never case-adjusts a
+            // replacement (it always behaves as FIXEDCASE = t).
+            move |newtext: String,
+                  _fixedcase: Option<TulispObject>,
+                  literal: Option<TulispObject>|
+                  -> Result<TulispObject, Error> {
+                let text = if literal.is_some_and(|o| o.is_truthy()) {
+                    newtext.replace('\\', "\\\\")
+                } else {
+                    newtext
+                };
                 s.borrow_mut()
                     .buffer
-                    .replace_match(&newtext)
+                    .replace_match(&text)
                     .map_err(Error::lisp_error)?;
                 Ok(TulispObject::nil())
             },

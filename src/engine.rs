@@ -2011,4 +2011,16 @@ mod tests {
         // "indented line" (char 19: 17 line chars + its newline).
         assert_eq!(report(&r, "para"), "19");
     }
+
+    #[test]
+    fn replace_match_literal_skips_backref_expansion() {
+        let r = run(
+            "ab ab",
+            r#"(re-search-forward "(a)(b)")
+               (replace-match "\\1-\\2")          ; expands: a-b
+               (re-search-forward "(a)(b)")
+               (replace-match "\\1-\\2" nil t)"#, // literal: \1-\2
+        );
+        assert_eq!(r.final_text.as_deref(), Some("a-b \\1-\\2"));
+    }
 }
