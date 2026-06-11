@@ -63,23 +63,14 @@ a defun/node" convenience (or a ~save~-by-default flag) would close the common
 further step: a warm buffer with unsaved edits AND a drifted file is the genuine
 conflict — could surface it more loudly than the per-tool flag.
 
-** TODO Dogfooding friction (tradingsim review fixes, 2026-06) [#C]
-Three from a ~30-call editing session, all minor:
-- ~re-search-backward~ is void ("Variable definition is void") while
-  ~search-backward~ (literal) exists — the regex-backward sibling is
-  the natural reach when anchoring "the thing just above point"
-  (here: a ~#[tokio::test]~ attribute above a defun).
-- Rust "defun" excludes preceding ~attribute_item~s, so
-  delete/replace-a-test needs a manual ~search-backward~ to the
-  attribute line before ~delete-region~. An attribute-inclusive
-  defun span (or a ~treesit-defun-with-attrs~ range helper) would
-  make "remove/replace this test" a one-liner.
-- Passing ~session: "default"~ after a path-keyed open errors with
-  "no such session: default"; when other sessions are warm, the
-  error could list the live session names (the path) as a hint.
-Otherwise smooth: transactional ~edits~ batches (up to 6 per call)
-plus the save-time tree-sitter warning carried the whole session;
-zero rollbacks needed.
+** TODO Attribute-inclusive Rust defun spans [#C]
+The survivor of the 2026-06 friction list (~re-search-backward~ and
+the session-miss hint landed): a Rust "defun" excludes its preceding
+~attribute_item~s, so delete/replace-a-test needs a manual hop to the
+~#[…]~ line, and insert_text's ~anchor: {where: "before"}~ lands
+between the attributes and the item (documented on the schema). An
+attribute-inclusive defun span (or a ~treesit-defun-with-attrs~ range
+helper) would make "remove/replace this test" a one-liner.
 
 ** TODO Bytecode-compile hot programs [#C]
 
@@ -108,104 +99,31 @@ line beginning" is a complete move.
 A wall-clock/CPU bound per program — blocked on tulisp cooperative
 cancellation (eval interruption), see the wishlist below.
 
-** TODO Vocabulary: keep-lines / flush-lines / sort-lines / case-fold [#C]
-Classic Emacs bulk ops agents reach for constantly: "delete every
-line matching X" is a hand-rolled loop today; ~keep-lines~ /
-~flush-lines~ are one-liners over the streaming search. ~sort-lines~
-(region) and a ~case-fold-search~ knob (or ~:case-insensitive~ on the
-search/occur tools) round it out. Smaller parity: ~kill-whole-line~,
-~forward-paragraph~, ~back-to-indentation~, ~current-indentation~.
-
-** TODO Auto-revert before rehearse takes its snapshot [#C]
-~rehearse~ skips auto-revert (the revert would land before the
-rollback snapshot), so a rehearsal on a CLEAN but stale buffer
-previews the edit against bytes that the committing ~run_program~
-will then apply against the re-read file — preview and commit can
-disagree. Auto-reverting a clean buffer first (then snapshotting)
-is side-effect-free and closes the gap.
-
 * MCP / agent UX
 
 The agent-facing tool surface. Recurring lens: conveniences that
 matter MOST for less capable models — defaults that make wrong edits
 an error instead of a silent outcome, one-call recovery, and
-discoverability over memorized conventions.
+discoverability over memorized conventions. The 2026-06 review batch
+(uniform path addressing, undo_last, expect_unique, close_session,
+outline + scope/anchor, help + describe-mcp, diff clamping, search
+direction/echo/case-folding, viewport echo) has landed; what follows
+is the remainder.
 
-** TODO Uniform session addressing on every tool [#A]
-~checkpoint~ / ~restore_checkpoint~ / ~list_checkpoints~ /
-~save_buffer~ take only ~session~ — the path-keyed one-call flow
-breaks exactly at the safety tools (after editing via ~{path}~, a
-checkpoint needs the canonical-path session id). Route them through
-~resolve_session~ like everything else, and rename ~save_buffer~'s
-destination to ~to~: today ~path~ means "which session" on every
-tool except save_buffer where it means "destination file" — one
-parameter name with two meanings is a trap weaker models will hit
-every time.
+** TODO Consider expect_unique as replace_text's DEFAULT [#B]
+The flag exists and errors with the match lines; for weaker models
+ambiguity-as-error is arguably the right default. Measure the token
+/ ergonomics cost on real sessions before flipping (a default flip
+breaks "replace the first TODO" one-shots).
 
-** TODO Auto-checkpoint each mutating call + an undo_last tool [#A]
-Snapshots are O(1): capture one implicitly before every mutating
-tool call (bounded ring, ~8 per session) and expose
-~undo_last {path}~. Makes "oops, wrong anchor" a one-call recovery
-instead of requiring checkpoint/rehearse discipline up front —
-discipline less capable models won't have. Complements (does not
-replace) the TUI section's granular-undo question.
+** TODO LRU eviction of clean idle sessions [#C]
+~close_session~ covers deliberate release; a bounded-count fallback
+would cap fd use when an agent never closes anything.
 
-** TODO expect_unique on replace_text; consider making it the default [#A]
-First-match semantics silently edits the wrong site when the anchor
-text also occurs earlier in the buffer. An ~expect_unique: true~
-flag (per edit in ~edits~ batches too) errors with the match
-positions when the pattern hits more than once — the built-in Edit
-tool's one safety property mime lacks. Also report the match's line
-number in the success message ("replaced at line 312") so a
-misanchored edit is visible without a follow-up view. For weaker
-models ambiguity-as-error is the right DEFAULT; bake the flag in,
-then consider flipping it.
-
-** TODO close_session tool + bounded warm sessions [#B]
-Sessions accumulate forever, each holding an open fd (see the
-paged-reader fd item) and a warm buffer; an agent can neither
-release a finished file nor force a clean re-open.
-~close_session {path|session, force?}~ — refuse on unsaved edits
-without ~force~ — plus optional LRU eviction of clean idle sessions.
-
-** TODO outline tool + defun-scoped edit addressing [#B]
-~outline {path}~ = ~treesit-list-defuns~ as a first-class tool: the
-natural first move on any code file, discoverable from the schema
-instead of requiring lisp boilerplate. Then ~scope: {defun: "name"}~
-on replace_text/occur (goto + narrow + edit + widen internally) so
-"replace X inside function Y" needs no program at all — and fold the
-older "insert relative to a defun/node" item in as an ~anchor~
-parameter on insert_text. This is the path by which weaker models
-get structural editing without learning the treesit vocabulary.
-
-** TODO help tool + schema-generated docs [#B]
-~help {topic}~ returning the canonical cheat-sheets (regex dialect,
-treesit vocabulary, conflict workflow, a builtin's doc) lets the
-always-loaded skill prompt shrink to a pointer, and lets a model
-look details up instead of guessing. Builtin-level help wants the
-obarray introspection on the tulisp wishlist. Pair with
-~mime mcp --describe-md~ emitting the tool table, so the README and
-the user's skill file embed by generation — the tool contract
-currently lives in three hand-synced places and drifts.
-
-** TODO Clamp huge diffs in run reports [#B]
-The canonical bulk edit (~replace-regexp~, 200k replacements)
-returns a unified diff proportional to the whole change — megabytes
-straight into the agent's context. Serialize head + tail (~200
-lines) around an elision line carrying the suppressed hunk/line
-count; ~full_diff: true~ opts out.
-
-** TODO search tool: direction + matched-line echo [#C]
-A ~direction: backward~ option (and registering ~re-search-backward~
-/ ~looking-back~ in the lisp layer — see the 2026-06 friction entry)
-plus echoing the matched line occur-style (~LINE @POS: text~): today
-nearly every search is followed by a view just to see what matched.
-
-** TODO Opt-in viewport echo on mutating tools [#C]
-~view: N~ on run_program/insert_text/replace_text appends the
-~window~ render around point after the edit — confirms a multi-line
-insert landed where intended without a second call; costs tokens
-only when asked for.
+** TODO Regenerate README/skill tool tables from describe-mcp [#C]
+~mime describe-mcp~ emits the catalogue; wire it into the README
+(and the user skill file) so the three copies stop drifting — a
+Makefile target that splices the output would do.
 
 ** TODO Multi-file batch edits (design pass first) [#C]
 ~replace_text {files: [path…], edits: […]}~ — explicit path list
