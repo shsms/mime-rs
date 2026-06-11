@@ -1706,7 +1706,20 @@ impl Quire {
                 match found {
                     Some(start) => self.point = start,
                     None => {
-                        self.point = self.point_min();
+                        let clamped = self.point_min();
+                        let moved = self.point != clamped;
+                        self.point = clamped;
+                        // Same genuine-line-beginning rule as the oracle (see
+                        // Buffer::forward_line): the buffer start, or a
+                        // restriction starting just after a newline, is a
+                        // real line beginning — reaching it completes the
+                        // move; a mid-line restriction start stays short.
+                        let genuine =
+                            clamped == min && (min == 1 || self.char_at(min - 1) == Some('\n'));
+                        if genuine && moved {
+                            left -= 1;
+                            continue;
+                        }
                         return left;
                     }
                 }

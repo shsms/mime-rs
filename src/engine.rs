@@ -2023,4 +2023,46 @@ mod tests {
         );
         assert_eq!(r.final_text.as_deref(), Some("a-b \\1-\\2"));
     }
+
+    #[test]
+    fn forward_line_to_a_genuine_top_boundary_is_a_complete_move() {
+        let path = std::env::temp_dir().join(format!("mime-fl-{}.txt", std::process::id()));
+        let text = "one\ntwo\nthree\n";
+        std::fs::write(&path, text).unwrap();
+        let mut oracle = Workspace::new(Box::new(Buffer::from_string("t", text)));
+        let mut quire = Workspace::new(Box::new(Quire::open(&path).unwrap()));
+        let prog = r#"(goto-char 9) ; on "three"
+            (report "full" (forward-line -2))   ; lands on line 1 → complete
+            (report "stuck" (forward-line -1))  ; already at the start → short
+            (report "p" (point))
+            (narrow-to-region 5 14)             ; starts at "two" — a real line beginning
+            (goto-char 9)
+            (report "narrowed" (forward-line -1))
+            (report "p2" (point))
+            (widen)
+            (narrow-to-region 6 14)             ; starts MID-line — unreachable beginning
+            (goto-char 9)
+            (report "midline" (forward-line -1))
+            (widen)"#;
+        let o = oracle.run(prog).unwrap();
+        let q = quire.run(prog).unwrap();
+        std::fs::remove_file(&path).ok();
+        for key in ["full", "stuck", "p", "narrowed", "p2", "midline"] {
+            assert_eq!(report(&o, key), report(&q, key), "stores agree on {key}");
+        }
+        assert_eq!(report(&o, "full"), "0", "reaching the buffer start counts");
+        assert_eq!(report(&o, "stuck"), "1");
+        assert_eq!(report(&o, "p"), "1");
+        assert_eq!(
+            report(&o, "narrowed"),
+            "0",
+            "a restriction at a line beginning counts"
+        );
+        assert_eq!(report(&o, "p2"), "5");
+        assert_eq!(
+            report(&o, "midline"),
+            "1",
+            "a mid-line restriction stays short"
+        );
+    }
 }

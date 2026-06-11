@@ -363,7 +363,22 @@ impl Buffer {
                     None => 1,
                 };
                 if target <= self.point_min() {
-                    self.point = self.point_min();
+                    let clamped = self.point_min();
+                    let moved = self.point != clamped;
+                    self.point = clamped;
+                    // Reaching a GENUINE line beginning that coincides with
+                    // point-min — the buffer start, or a restriction starting
+                    // just after a newline — is a complete move (Emacs
+                    // reports 0). Clamping to a mid-line restriction start,
+                    // or not moving at all, stays short. The check peeks the
+                    // RAW text (char_before is narrowing-clamped and would
+                    // hide the newline just outside the restriction).
+                    let genuine = target == clamped
+                        && (clamped == 1 || self.text[..self.byte_of(clamped)].ends_with('\n'));
+                    if genuine && moved {
+                        left -= 1;
+                        continue;
+                    }
                     return left;
                 }
                 self.point = target;
