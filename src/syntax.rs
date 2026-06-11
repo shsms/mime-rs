@@ -33,7 +33,6 @@
 
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
 use tree_sitter_md::{MarkdownParser, MarkdownTree};
-
 /// A language the syntax layer can parse. Detected from the buffer name
 /// (extension) or set explicitly; Markdown is the fallback for nameless /
 /// extension-less buffers (stdin pipes, `open_text` scratch buffers).
@@ -42,6 +41,12 @@ pub enum Lang {
     Markdown,
     Rust,
     Python,
+    Html,
+    Javascript,
+    Css,
+    Toml,
+    Yaml,
+    Elisp,
 }
 
 impl Lang {
@@ -59,6 +64,13 @@ impl Lang {
             "markdown" | "md" => Some(Lang::Markdown),
             "rust" | "rs" => Some(Lang::Rust),
             "python" | "py" | "pyi" => Some(Lang::Python),
+            "html" | "htm" => Some(Lang::Html),
+            "javascript" | "js" | "mjs" | "cjs" | "jsx" => Some(Lang::Javascript),
+            "css" => Some(Lang::Css),
+            "toml" => Some(Lang::Toml),
+            "yaml" | "yml" => Some(Lang::Yaml),
+            // .tl is tulisp — mime-rs's own script dialect parses as elisp.
+            "elisp" | "el" | "tl" => Some(Lang::Elisp),
             _ => None,
         }
     }
@@ -69,6 +81,12 @@ impl Lang {
             Lang::Markdown => "markdown",
             Lang::Rust => "rust",
             Lang::Python => "python",
+            Lang::Html => "html",
+            Lang::Javascript => "javascript",
+            Lang::Css => "css",
+            Lang::Toml => "toml",
+            Lang::Yaml => "yaml",
+            Lang::Elisp => "elisp",
         }
     }
 
@@ -79,6 +97,12 @@ impl Lang {
             Lang::Markdown => tree_sitter_md::LANGUAGE.into(),
             Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
             Lang::Python => tree_sitter_python::LANGUAGE.into(),
+            Lang::Html => tree_sitter_html::LANGUAGE.into(),
+            Lang::Javascript => tree_sitter_javascript::LANGUAGE.into(),
+            Lang::Css => tree_sitter_css::LANGUAGE.into(),
+            Lang::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
+            Lang::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+            Lang::Elisp => tree_sitter_elisp::LANGUAGE.into(),
         }
     }
 
@@ -98,6 +122,20 @@ impl Lang {
                 "mod_item",
             ],
             Lang::Python => &["function_definition", "class_definition"],
+            Lang::Html => &["element", "script_element", "style_element"],
+            Lang::Javascript => &[
+                "function_declaration",
+                "generator_function_declaration",
+                "class_declaration",
+                "method_definition",
+            ],
+            Lang::Css => &["rule_set", "media_statement", "keyframes_statement"],
+            Lang::Toml => &["table", "table_array_element"],
+            // Every key-value pair: innermost-wins narrowing addresses any
+            // nesting level, and the outline doubles as the document's key
+            // tree.
+            Lang::Yaml => &["block_mapping_pair"],
+            Lang::Elisp => &["function_definition", "macro_definition"],
         }
     }
 }
@@ -166,7 +204,7 @@ impl Syntax {
                     .unwrap_or_else(|| parser.parse(b"", None).expect("empty parse"));
                 ParseTree::Md(tree)
             }
-            Lang::Rust | Lang::Python => {
+            _ => {
                 let mut parser = tree_sitter::Parser::new();
                 parser
                     .set_language(&lang.grammar())
@@ -290,7 +328,7 @@ impl Syntax {
                     start = parent.start_byte();
                 }
             }
-            Lang::Markdown => {}
+            _ => {}
         }
         (start, end)
     }
@@ -394,10 +432,46 @@ impl Syntax {
                     .map(|c| self.text_of(c).trim().to_string())
                     .unwrap_or_default()
             }
-            Lang::Rust | Lang::Python => node
+            Lang::Rust | Lang::Python | Lang::Javascript | Lang::Elisp => node
                 .child_by_field_name("name")
                 .or_else(|| node.child_by_field_name("type"))
                 .map(|n| self.text_of(n).to_string())
+                .unwrap_or_default(),
+            Lang::Html => {
+                // element → start_tag/self_closing_tag → tag_name.
+                let mut c = node.walk();
+                node.named_children(&mut c)
+                    .find(|n| matches!(n.kind(), "start_tag" | "self_closing_tag"))
+                    .and_then(|st| {
+                        let mut sc = st.walk();
+                        st.named_children(&mut sc)
+                            .find(|n| n.kind() == "tag_name")
+                            .map(|n| self.text_of(n).to_string())
+                    })
+                    .unwrap_or_default()
+            }
+            Lang::Css => {
+                // rule_set → selectors text; @media → its query; @keyframes
+                // → its name — i.e. everything before the block, joined.
+                let mut c = node.walk();
+                let head: Vec<String> = node
+                    .named_children(&mut c)
+                    .take_while(|n| !n.kind().contains("block"))
+                    .map(|n| self.text_of(n).trim().to_string())
+                    .collect();
+                head.join(" ")
+            }
+            Lang::Toml => {
+                // [table] / [[table_array_element]] → the bracketed key.
+                let mut c = node.walk();
+                node.named_children(&mut c)
+                    .find(|n| n.kind().ends_with("_key") || n.kind() == "key")
+                    .map(|n| self.text_of(n).to_string())
+                    .unwrap_or_default()
+            }
+            Lang::Yaml => node
+                .child_by_field_name("key")
+                .map(|n| self.text_of(n).trim().to_string())
                 .unwrap_or_default(),
         }
     }
@@ -847,5 +921,100 @@ mod tests {
         let second = syn.find_defun("second").expect("second");
         // "fn first() {}\n\n/// doc\n" = 13 + 1 + 1 + 8 chars → #[test] at 24.
         assert_eq!(second.start, 24, "starts at #[test], not the doc comment");
+    }
+
+    #[test]
+    fn html_outline_names_elements_by_tag() {
+        let src = "<html><body><div id=\"m\"><p>hi</p></div><script>1</script></body></html>";
+        let syn = Syntax::parse(src, Lang::Html);
+        let names: Vec<String> = syn
+            .defuns()
+            .iter()
+            .map(|d| format!("{} {}", d.kind, d.name))
+            .collect();
+        assert!(names.contains(&"element html".to_string()), "{names:?}");
+        assert!(names.contains(&"element div".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"script_element script".to_string()),
+            "{names:?}"
+        );
+        // Mid-<p>, the innermost element wins.
+        let p = src.find("hi").unwrap() + 1;
+        assert_eq!(syn.enclosing_defun_name(p).as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn javascript_outline_and_enclosing() {
+        let src = "function foo(a) { return a; }\nclass C { bar() {} }\n";
+        let syn = Syntax::parse(src, Lang::Javascript);
+        assert!(syn.find_defun("foo").is_some());
+        assert!(syn.find_defun("C").is_some());
+        assert!(syn.find_defun("bar").is_some());
+        let inner = src.find("{}").unwrap() + 1;
+        assert_eq!(syn.enclosing_defun_name(inner + 1).as_deref(), Some("bar"));
+    }
+
+    #[test]
+    fn css_outline_names_rules_by_selector() {
+        let src = ".a, p { color: red; }\n@media print { body { margin: 0; } }\n@keyframes spin { from { left: 0; } }\n";
+        let syn = Syntax::parse(src, Lang::Css);
+        let names: Vec<String> = syn.defuns().into_iter().map(|d| d.name).collect();
+        assert!(names.iter().any(|n| n == ".a, p"), "{names:?}");
+        assert!(names.iter().any(|n| n == "print"), "{names:?}");
+        assert!(names.iter().any(|n| n == "spin"), "{names:?}");
+        assert!(names.iter().any(|n| n == "body"), "nested rule: {names:?}");
+    }
+
+    #[test]
+    fn toml_outline_names_tables() {
+        let src = "top = 1\n[server]\nport = 80\n[[bin]]\nname = \"x\"\n[a.b]\nc = 2\n";
+        let syn = Syntax::parse(src, Lang::Toml);
+        let names: Vec<String> = syn.defuns().into_iter().map(|d| d.name).collect();
+        assert_eq!(names, vec!["server", "bin", "a.b"]);
+        let p = src.find("port").unwrap() + 1;
+        assert_eq!(syn.enclosing_defun_name(p).as_deref(), Some("server"));
+    }
+
+    #[test]
+    fn yaml_outline_is_the_key_tree() {
+        let src = "top: 1\nserver:\n  port: 80\n  hosts:\n    - a\n";
+        let syn = Syntax::parse(src, Lang::Yaml);
+        let names: Vec<String> = syn.defuns().into_iter().map(|d| d.name).collect();
+        assert_eq!(names, vec!["top", "server", "port", "hosts"]);
+        let p = src.find("80").unwrap() + 1;
+        assert_eq!(syn.enclosing_defun_name(p).as_deref(), Some("port"));
+    }
+
+    #[test]
+    fn elisp_outline_names_defuns_and_macros() {
+        let src = "(defun foo (x) (+ x 1))\n(defmacro baz () nil)\n";
+        let syn = Syntax::parse(src, Lang::Elisp);
+        let names: Vec<(String, String)> =
+            syn.defuns().into_iter().map(|d| (d.kind, d.name)).collect();
+        assert_eq!(
+            names,
+            vec![
+                ("function_definition".to_string(), "foo".to_string()),
+                ("macro_definition".to_string(), "baz".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn new_language_extension_detection() {
+        for (file, lang) in [
+            ("a.html", Lang::Html),
+            ("a.htm", Lang::Html),
+            ("a.js", Lang::Javascript),
+            ("a.mjs", Lang::Javascript),
+            ("a.css", Lang::Css),
+            ("a.toml", Lang::Toml),
+            ("a.yaml", Lang::Yaml),
+            ("a.yml", Lang::Yaml),
+            ("a.el", Lang::Elisp),
+            ("a.tl", Lang::Elisp),
+        ] {
+            assert_eq!(Lang::from_buffer_name(file), Some(lang), "{file}");
+        }
     }
 }

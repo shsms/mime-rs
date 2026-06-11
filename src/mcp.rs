@@ -333,8 +333,12 @@ fn save_visited(
 /// almost never errors, and huge prose buffers should not pay a parse): a
 /// non-empty warning when the buffer no longer parses. Warns, never blocks.
 fn parse_warning(sessions: &mut HashMap<String, Workspace>, session: &str) -> &'static str {
-    let program = "(if (or (equal (treesit-language) \"rust\")\
-                           (equal (treesit-language) \"python\"))\
+    // Markdown and HTML are forgiving grammars (almost nothing errors);
+    // everything else is strict enough that a parse error after a save
+    // very likely means the edit broke the file.
+    let program = "(if (member (treesit-language)\
+                               '(\"rust\" \"python\" \"javascript\" \"css\"\
+                                 \"toml\" \"yaml\" \"elisp\"))\
                        (report \"err\" (if (treesit-has-error) 1 0)))";
     match run_in_session(sessions, session, program) {
         Ok(report) if report_value(&report, "err").as_deref() == Some("1") => {
@@ -1405,7 +1409,8 @@ fn tool_outline(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Resu
     if lines.is_empty() {
         return Ok(format!(
             "no defuns found (language: {lang}) — for an extension-less buffer, \
-             (treesit-set-language \"rust\"|\"python\"|\"markdown\") overrides detection{note}"
+             treesit-set-language (rust|python|javascript|html|css|toml|yaml|elisp|markdown) \
+             overrides detection{note}"
         ));
     }
     Ok(format!(

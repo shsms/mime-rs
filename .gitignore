@@ -1,1 +1,5 @@
 /target
+
+# NFS silly-rename files: a warm mime-rs buffer holding an fd to a
+# replaced file pins the old inode as .nfsXXXX until the session drops.
+.nfs*

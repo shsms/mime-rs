@@ -64,10 +64,14 @@ bulk edit is a single streaming pass:
 (count-matches counts from POINT to the end — goto point-min first.)"#;
 
 const TREESIT: &str = r#"— structural editing (tree-sitter) —
-Languages: rust, python, markdown — detected from the buffer name's
+Languages: rust, python, markdown, html, javascript, css, toml, yaml,
+elisp (.el and .tl — tulisp scripts) — detected from the buffer name's
 extension; (treesit-set-language "rust") overrides (extension-less buffers
 default to markdown). A "defun" = Rust function/impl/struct/enum/trait/mod,
-Python function/class, Markdown section; innermost wins.
+Python function/class, Markdown section, HTML element (named by tag),
+JS function/class/method, CSS rule/@media/@keyframes (named by selector),
+TOML [table], YAML key (every mapping pair — the outline is the key tree),
+elisp defun/defmacro; innermost wins.
 
 Survey:    the outline MCP tool, or (treesit-list-defuns) — one
            "KIND START END NAME" line per defun.
