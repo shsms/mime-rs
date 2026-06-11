@@ -1,4 +1,5 @@
 #+title: mime-rs — pending work
+#+startup: logdrawer
 
 * Engine
 
@@ -83,6 +84,30 @@ The flag exists and errors with the match lines; for weaker models
 ambiguity-as-error is arguably the right default. Measure the token
 / ergonomics cost on real sessions before flipping (a default flip
 breaks "replace the first TODO" one-shots).
+
+** TODO Pattern translation misses: escaped metachars and alternation :dogfooding:
+:LOGBOOK:
+- State "TODO"       from              [2026-06-11 Do 23:45]
+:END:
+From an agent session (2026-06-11) driving git-conflict resolution
+and TOML/Rust edits via MCP: ~replace_text~ patterns
+with RE2-style escapes (~\[features\]~) and ~occur~ with ~|~
+alternation returned "no match" where the literal text (and ~search~
+exact mode) matched fine — occur even echoed the translated emacs
+regex ~features\|dependencies~ yet found nothing. Agents fall back to
+literal patterns, losing regex entirely. Reproduce, fix the RE2→emacs
+translation (or document the supported dialect precisely), and add
+round-trip tests for escaped metachars + alternation.
+
+** TODO conflict-replace eats the trailing newline               :dogfooding:
+:LOGBOOK:
+- State "TODO"       from              [2026-06-11 Do 23:45]
+:END:
+Twice in the same session ~(conflict-replace TEXT N)~ joined the
+replacement onto the line following the conflict block
+(~mod a;mod b;~) because TEXT lacked a trailing newline.
+Replacing a conflict hunk is line-oriented; ensure a final newline on
+the replacement (or take lines, not raw text).
 
 * Structural editing
 
