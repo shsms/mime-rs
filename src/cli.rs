@@ -205,8 +205,13 @@ fn run_local(args: &Args, verb: &str) {
             if args.write_back && rehearse {
                 eprintln!("note: --write ignored for a rehearsal (a rehearsal never writes)");
             } else if args.write_back {
-                match &args.file {
-                    Some(f) => {
+                match (&args.file, &report.final_text) {
+                    // A clean run carries no final_text (nothing changed) —
+                    // skip the write and keep the file's mtime untouched.
+                    (Some(f), None) => {
+                        eprintln!("note: no changes; {f} left untouched");
+                    }
+                    (Some(f), Some(text)) => {
                         let path = match crate::safety::check_path(std::path::Path::new(f)) {
                             Ok(p) => p,
                             Err(e) => {
@@ -214,14 +219,12 @@ fn run_local(args: &Args, verb: &str) {
                                 exit(1);
                             }
                         };
-                        if let Err(e) =
-                            crate::safety::write_atomic(&path, report.final_text.as_bytes())
-                        {
+                        if let Err(e) = crate::safety::write_atomic(&path, text.as_bytes()) {
                             eprintln!("cannot write {f}: {e}");
                             exit(1);
                         }
                     }
-                    None => eprintln!("--write needs --file (stdin has nowhere to go)"),
+                    (None, _) => eprintln!("--write needs --file (stdin has nowhere to go)"),
                 }
             }
         }

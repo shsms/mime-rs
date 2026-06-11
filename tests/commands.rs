@@ -5,6 +5,7 @@ fn run(text: &str, program: &str) -> String {
     run_program(Box::new(Buffer::from_string("t", text)), program)
         .expect("program should run")
         .final_text
+        .expect("these programs all change the text")
 }
 
 #[test]

@@ -405,25 +405,36 @@ impl Workspace {
         program: &str,
         rehearsed: bool,
     ) -> Result<(RunReport, String), String> {
-        let (before, name) = {
+        // Pre-state: a cheap snapshot (structural sharing for Quire; a clone
+        // for the in-memory Buffer) is the diff baseline, and the version
+        // stamp decides whether any text changed at all — "equal versions
+        // imply equal text" (store.rs) — so a CLEAN run (every view / search /
+        // occur / read_region) never materializes, copies, or diffs the
+        // document. A clean run never grows the add buffer either, so the
+        // snapshot costs no copy-on-write there.
+        let (snap, version_before, len_before, name) = {
             let mut s = self.session.borrow_mut();
             s.reports.clear();
             s.log.clear();
-            (s.buffer.text().to_string(), s.buffer.name().to_string())
+            (
+                s.buffer.snapshot(),
+                s.buffer.version(),
+                s.buffer.char_len(),
+                s.buffer.name().to_string(),
+            )
         };
-        let len_before = before.chars().count();
 
         let value = match self.ctx.eval_string(program) {
             Ok(v) => v.to_string(),
             // Record whether the dying program left edits behind in the
             // primary buffer (a warm run does not roll back), so the failure
-            // JSON can say so. The length check short-circuits the full-text
-            // compare for the common case of a size-changing edit on a large
-            // buffer.
+            // JSON can say so. An unmoved version proves clean without
+            // touching the text; a moved one falls back to the exact compare
+            // (an edit-then-revert program is NOT dirty — nothing persists).
             Err(e) => {
                 let s = self.session.borrow();
                 let b = primary_buffer(&s, &name);
-                let dirty = b.char_len() != len_before || b.text() != before;
+                let dirty = b.version() != version_before && b.text() != snap.text();
                 drop(s);
                 self.last_failure_dirty.set(dirty);
                 return Err(e.format(&self.ctx));
@@ -432,22 +443,34 @@ impl Workspace {
 
         let s = self.session.borrow();
         let primary = primary_buffer(&s, &name);
-        let after = primary.text().to_string();
-        let len_after = after.chars().count();
+        // Same ladder as the failure path: version unmoved ⇒ clean fast path;
+        // moved ⇒ exact compare, and only a real text change pays for the
+        // diff + the final_text copy.
+        let (dirty, diff, final_text) = if primary.version() == version_before {
+            (false, String::new(), None)
+        } else {
+            let before = snap.text();
+            let after = primary.text().to_string();
+            if after == before {
+                (false, String::new(), None)
+            } else {
+                (true, unified_diff(before, &after), Some(after))
+            }
+        };
         let report = RunReport {
             buffer_name: name,
-            dirty: after != before,
+            dirty,
             rehearsed,
-            diff: unified_diff(&before, &after),
+            diff,
             // The PRIMARY's point, like every other field — pairing the exit
             // buffer's point with the primary's final_text handed consumers a
             // position in a different buffer (possibly out of range).
             point: primary.point(),
             len_before,
-            len_after,
+            len_after: primary.char_len(),
             reports: s.reports.clone(),
             log: s.log.clone(),
-            final_text: after,
+            final_text,
         };
         Ok((report, value))
     }
@@ -747,7 +770,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(r.buffer_name, "main");
-        assert_eq!(r.final_text, "primary text!", "primary's text, not side's");
+        assert_eq!(
+            r.final_text.as_deref(),
+            Some("primary text!"),
+            "primary's text, not side's"
+        );
         assert_eq!(r.len_before, 12);
         assert_eq!(r.len_after, 13);
         assert_eq!(r.point, 14, "the PRIMARY's point, not the exit buffer's");
@@ -762,7 +789,11 @@ mod tests {
         assert_eq!(r.buffer_name, "main");
         assert!(!r.dirty, "main untouched");
         assert_eq!(r.diff, "");
-        assert_eq!(r.final_text, "primary text!");
+        // A clean run carries no final_text (the fast path never
+        // materializes the document); the workspace still has it.
+        assert_eq!(r.final_text, None);
+        ws.run(r#"(set-buffer "main")"#).unwrap();
+        assert_eq!(ws.text(), "primary text!");
     }
 
     #[test]
@@ -1038,7 +1069,7 @@ mod tests {
             .run_value(r#"(goto-char (point-max)) (insert "!") (+ 1 2)"#)
             .unwrap();
         assert_eq!(v1, "3");
-        assert_eq!(r1.final_text, "hi!");
+        assert_eq!(r1.final_text.as_deref(), Some("hi!"));
         // A string result renders quoted; a later run sees the persisted edit.
         let (_r2, v2) = ws.run_value(r#"(buffer-string)"#).unwrap();
         assert_eq!(v2, "\"hi!\"");
@@ -1050,10 +1081,10 @@ mod tests {
         let r1 = ws
             .run(r#"(goto-char (point-max)) (insert " world")"#)
             .unwrap();
-        assert_eq!(r1.final_text, "hello world");
+        assert_eq!(r1.final_text.as_deref(), Some("hello world"));
         // The 2nd run sees the 1st's edit and diffs against it (not the original).
         let r2 = ws.run(r#"(upcase-region 1 6)"#).unwrap();
-        assert_eq!(r2.final_text, "HELLO world");
+        assert_eq!(r2.final_text.as_deref(), Some("HELLO world"));
         assert_eq!(r2.len_before, 11);
         assert!(r2.diff.contains("-hello world"));
         assert!(r2.diff.contains("+HELLO world"));
@@ -1067,7 +1098,7 @@ mod tests {
         assert!(!r1.dirty);
         // 2nd run calls the warm defun.
         let r2 = ws.run(r#"(goto-char (point-max)) (shout "xyz")"#).unwrap();
-        assert_eq!(r2.final_text, "abcXYZ");
+        assert_eq!(r2.final_text.as_deref(), Some("abcXYZ"));
     }
 
     #[test]
@@ -1085,7 +1116,7 @@ mod tests {
         let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "hello world")));
         ws.run(r#"(kill-region 1 7)"#).unwrap(); // "hello " into the kill-ring
         let r2 = ws.run(r#"(goto-char (point-max)) (yank)"#).unwrap();
-        assert_eq!(r2.final_text, "worldhello ");
+        assert_eq!(r2.final_text.as_deref(), Some("worldhello "));
     }
 
     #[test]
@@ -1097,7 +1128,7 @@ mod tests {
             .unwrap();
         assert!(r.rehearsed);
         assert!(r.dirty);
-        assert_eq!(r.final_text, "hello world");
+        assert_eq!(r.final_text.as_deref(), Some("hello world"));
         assert_eq!(r.len_before, 5);
         assert_eq!(r.len_after, 11);
         assert!(r.diff.contains("-hello"));
@@ -1119,7 +1150,7 @@ mod tests {
             .run(r#"(goto-char (point-max)) (insert " world")"#)
             .unwrap();
         assert!(!r.rehearsed);
-        assert_eq!(r.final_text, "hello world");
+        assert_eq!(r.final_text.as_deref(), Some("hello world"));
         assert_eq!(ws.text(), "hello world");
     }
 
@@ -1154,7 +1185,7 @@ mod tests {
         // Only the pre-rehearsal checkpoint remains.
         assert_eq!(report(&r, "cps"), "(\"keep\")");
         // The yank pulled the pre-rehearsal kill ("hello "), not the rehearsal's.
-        assert_eq!(r.final_text, "worldhello ");
+        assert_eq!(r.final_text.as_deref(), Some("worldhello "));
     }
 
     #[test]
@@ -1177,7 +1208,7 @@ mod tests {
             .unwrap();
         assert!(r.rehearsed);
         assert!(r.dirty);
-        assert_eq!(r.final_text, "keep me EDITED");
+        assert_eq!(r.final_text.as_deref(), Some("keep me EDITED"));
         assert_eq!(ws.text(), "keep me");
     }
 
@@ -1187,7 +1218,7 @@ mod tests {
             "a world b world",
             r#"(while (re-search-forward "world" nil t) (replace-match "W"))"#,
         );
-        assert_eq!(r.final_text, "a W b W");
+        assert_eq!(r.final_text.as_deref(), Some("a W b W"));
         assert!(r.dirty);
     }
 
@@ -1206,7 +1237,7 @@ mod tests {
                  (report "is-marker" (if (markerp m) 1 0))
                  (report "not-marker" (if (markerp 5) 1 0)))"#,
         );
-        assert_eq!(r.final_text, "XXhello world");
+        assert_eq!(r.final_text.as_deref(), Some("XXhello world"));
         assert_eq!(report(&r, "pos"), "11"); // 9, shifted right by the 2-char insert
         assert_eq!(report(&r, "point"), "11"); // goto-char followed the marker
         assert_eq!(report(&r, "is-marker"), "1");
@@ -1219,7 +1250,7 @@ mod tests {
             "foo bar foo",
             r#"(while (search-forward "foo" nil t) (replace-match "X"))"#,
         );
-        assert_eq!(r.final_text, "X bar X");
+        assert_eq!(r.final_text.as_deref(), Some("X bar X"));
     }
 
     #[test]
@@ -1261,7 +1292,7 @@ mod tests {
         assert_eq!(report(&r, "bol"), "1", "point-min is a line beginning");
         // Both the restriction-start "foo" and the real line-start one.
         assert_eq!(report(&r, "n"), "2");
-        assert_eq!(r.final_text, "xxF\nF bar\n");
+        assert_eq!(r.final_text.as_deref(), Some("xxF\nF bar\n"));
         // Three ^ positions (two line starts + the position after the final
         // newline), three $ positions — each zero-width match counted once.
         assert_eq!(report(&r, "starts"), "3");
@@ -1367,13 +1398,13 @@ mod tests {
             "hello world",
             r#"(kill-region 1 7) (goto-char (point-max)) (yank)"#,
         );
-        assert_eq!(r.final_text, "worldhello ");
+        assert_eq!(r.final_text.as_deref(), Some("worldhello "));
     }
 
     #[test]
     fn erase_buffer_clears() {
         let r = run("abc", "(erase-buffer)");
-        assert_eq!(r.final_text, "");
+        assert_eq!(r.final_text.as_deref(), Some(""));
     }
 
     #[test]
@@ -1388,7 +1419,7 @@ mod tests {
     #[test]
     fn insert_char_and_newline() {
         let r = run("", r#"(insert-char 65 3) (newline) (insert-char 66 2)"#);
-        assert_eq!(r.final_text, "AAA\nBB");
+        assert_eq!(r.final_text.as_deref(), Some("AAA\nBB"));
     }
 
     #[test]
@@ -1399,7 +1430,7 @@ mod tests {
                (let ((a (match-string 1)) (b (match-string 2)))
                  (erase-buffer) (insert b) (insert " ") (insert a))"#,
         );
-        assert_eq!(r.final_text, "Doe John");
+        assert_eq!(r.final_text.as_deref(), Some("Doe John"));
     }
 
     #[test]
@@ -1408,7 +1439,7 @@ mod tests {
             "a1 b2 c3",
             r##"(goto-char (point-min)) (report "n" (replace-regexp "[0-9]" "#"))"##,
         );
-        assert_eq!(r.final_text, "a# b# c#");
+        assert_eq!(r.final_text.as_deref(), Some("a# b# c#"));
         assert_eq!(r.reports[0], ("n".to_string(), "3".to_string()));
     }
 
@@ -1418,7 +1449,7 @@ mod tests {
             "foo.bar.baz",
             r#"(goto-char (point-min)) (replace-string "." "/")"#,
         );
-        assert_eq!(r.final_text, "foo/bar/baz");
+        assert_eq!(r.final_text.as_deref(), Some("foo/bar/baz"));
     }
 
     #[test]
@@ -1434,7 +1465,7 @@ mod tests {
         );
         // Only the two line-start "foo"s — the third is mid-line.
         assert_eq!(report(&r, "n"), "2");
-        assert_eq!(r.final_text, "F x\nF y\nbar foo\n");
+        assert_eq!(r.final_text.as_deref(), Some("F x\nF y\nbar foo\n"));
         assert_eq!(report(&r, "point"), "6"); // after the second replacement
         assert_eq!(report(&r, "marker"), "15"); // tracked both shrinks
         assert_eq!(report(&r, "none"), "0");
@@ -1450,7 +1481,7 @@ mod tests {
         // The two matches after point each expand; the "ab"s inside the
         // replacements are not re-matched.
         assert_eq!(report(&r, "n"), "2");
-        assert_eq!(r.final_text, "ab ab-ab ab-ab");
+        assert_eq!(r.final_text.as_deref(), Some("ab ab-ab ab-ab"));
     }
 
     #[test]
@@ -1471,28 +1502,39 @@ mod tests {
 
     #[test]
     fn checkpoint_and_restore() {
-        let r = run(
-            "original",
-            r#"(checkpoint "c1") (erase-buffer) (insert "changed") (restore-checkpoint "c1")"#,
-        );
-        assert_eq!(r.final_text, "original");
+        // Restoring the pre-edit checkpoint reinstates the snapshot's
+        // version stamp, so the run as a whole reports CLEAN: no diff,
+        // no final_text — and the buffer text is back to the original.
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "original")));
+        let r = ws
+            .run(r#"(checkpoint "c1") (erase-buffer) (insert "changed") (restore-checkpoint "c1")"#)
+            .unwrap();
+        assert!(!r.dirty);
+        assert_eq!(r.final_text, None);
+        assert_eq!(ws.text(), "original");
     }
 
     #[test]
     fn transaction_rolls_back_on_error() {
-        let r = run(
-            "keep",
-            r#"(condition-case e
+        // The rollback swaps the pre-transaction snapshot (and its version
+        // stamp) back in — the run reports clean and the text is intact.
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "keep")));
+        let r = ws
+            .run(
+                r#"(condition-case e
                   (with-transaction (erase-buffer) (insert "gone") (error "boom"))
                 (error nil))"#,
-        );
-        assert_eq!(r.final_text, "keep");
+            )
+            .unwrap();
+        assert!(!r.dirty);
+        assert_eq!(r.final_text, None);
+        assert_eq!(ws.text(), "keep");
     }
 
     #[test]
     fn transaction_keeps_on_success() {
         let r = run("a", r#"(goto-char 2) (with-transaction (insert "b"))"#);
-        assert_eq!(r.final_text, "ab");
+        assert_eq!(r.final_text.as_deref(), Some("ab"));
     }
 
     #[test]
@@ -1511,7 +1553,7 @@ mod tests {
     #[test]
     fn upcase_region_works() {
         let r = run("hello world", r#"(upcase-region 1 6)"#);
-        assert_eq!(r.final_text, "HELLO world");
+        assert_eq!(r.final_text.as_deref(), Some("HELLO world"));
     }
 
     #[test]
@@ -1657,8 +1699,8 @@ mod tests {
                (replace-string "1" "42") (widen)"#,
         );
         assert_eq!(
-            r.final_text,
-            "fn alpha() -> i64 {\n    42\n}\n\nfn beta() -> i64 {\n    alpha() + 1\n}\n"
+            r.final_text.as_deref(),
+            Some("fn alpha() -> i64 {\n    42\n}\n\nfn beta() -> i64 {\n    alpha() + 1\n}\n")
         );
     }
 
@@ -1703,5 +1745,62 @@ mod tests {
             r#"(treesit-query "(unbalanced")"#,
         );
         assert!(e.is_err());
+    }
+
+    #[test]
+    fn clean_runs_report_no_diff_and_no_final_text() {
+        // The version-stamp fast path: a run that only navigates / reads
+        // must not report a diff or carry final_text — for a warm Quire
+        // this is what keeps view/search/occur O(viewport) instead of
+        // O(document).
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "hello world")));
+        let r = ws
+            .run(r#"(goto-char 4) (report "found" (if (search-forward "world" nil t) 1 0))"#)
+            .unwrap();
+        assert!(!r.dirty);
+        assert_eq!(r.diff, "");
+        assert_eq!(r.final_text, None);
+        assert_eq!(r.len_before, 11);
+        assert_eq!(r.len_after, 11);
+    }
+
+    #[test]
+    fn edit_then_revert_within_one_run_reports_clean() {
+        // The version moves (two mutations) but the text round-trips —
+        // the exact-compare fallback must report clean, like the old
+        // full-text compare did.
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "stable")));
+        let r = ws
+            .run(r#"(goto-char (point-max)) (insert "x") (delete-region (- (point) 1) (point))"#)
+            .unwrap();
+        assert!(!r.dirty);
+        assert_eq!(r.final_text, None);
+        assert_eq!(ws.text(), "stable");
+    }
+
+    #[test]
+    fn quire_clean_and_dirty_runs_match_the_oracle_reports() {
+        // Differential guard for the fast path over the file-backed store:
+        // Quire and the in-memory oracle must agree on dirty/diff/lens/
+        // final_text for a clean read, a real edit, and an edit-and-revert.
+        let path = std::env::temp_dir().join(format!("mime-fastpath-{}.txt", std::process::id()));
+        std::fs::write(&path, "alpha\nbeta — gamma\n").unwrap();
+        let mut oracle =
+            Workspace::new(Box::new(Buffer::from_string("t", "alpha\nbeta — gamma\n")));
+        let mut quire = Workspace::new(Box::new(Quire::open(&path).unwrap()));
+        for prog in [
+            r#"(report "hit" (if (search-forward "beta" nil t) 1 0))"#,
+            r#"(goto-char (point-min)) (search-forward "alpha" nil t) (insert "!")"#,
+            r#"(goto-char (point-max)) (insert "x") (delete-region (- (point) 1) (point))"#,
+        ] {
+            let o = oracle.run(prog).unwrap();
+            let q = quire.run(prog).unwrap();
+            assert_eq!(q.dirty, o.dirty, "prog: {prog}");
+            assert_eq!(q.diff, o.diff, "prog: {prog}");
+            assert_eq!(q.len_before, o.len_before, "prog: {prog}");
+            assert_eq!(q.len_after, o.len_after, "prog: {prog}");
+            assert_eq!(q.final_text, o.final_text, "prog: {prog}");
+        }
+        std::fs::remove_file(&path).ok();
     }
 }

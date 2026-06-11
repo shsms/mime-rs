@@ -18,7 +18,11 @@ pub struct RunReport {
     /// `false` for a normal `run`.
     pub rehearsed: bool,
     /// Final buffer text — not serialized into the JSON; used by `--write`.
-    pub final_text: String,
+    /// `Some` only when the run actually changed the text (`dirty`): a clean
+    /// run never materializes the document (the version-stamp fast path), so
+    /// there is nothing to copy here. Callers that need the text of a clean
+    /// buffer ask the workspace ([`Workspace::text`](crate::Workspace::text)).
+    pub final_text: Option<String>,
 }
 
 impl RunReport {
@@ -111,7 +115,7 @@ mod tests {
             ],
             log: vec![],
             rehearsed: false,
-            final_text: String::new(),
+            final_text: None,
         };
         let j = r.to_json();
         assert_eq!(j["reports"]["once"], "a");
