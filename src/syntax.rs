@@ -251,7 +251,48 @@ impl Syntax {
     /// if `pos` is inside no defun (module top level, leading blank lines, an
     /// empty buffer).
     pub fn enclosing_defun(&self, pos: usize) -> Option<NodeSpan> {
-        self.enclosing_defun_node(pos).map(|n| self.span_of(n))
+        self.enclosing_defun_node(pos).map(|n| {
+            let (start_b, end_b) = self.defun_extent(n);
+            NodeSpan {
+                kind: n.kind().to_string(),
+                start: self.char_of(start_b),
+                end: self.char_of(end_b),
+            }
+        })
+    }
+
+    /// The full extent of a defun INCLUDING its decoration: Rust outer
+    /// `#[attributes]` are preceding siblings of the item node, Python
+    /// decorators live on a wrapping `decorated_definition` — both belong to
+    /// the defun an agent means by "delete / replace / narrow to / anchor on
+    /// this function". Returns byte offsets. Raw node accessors
+    /// (`treesit-node-start` etc.) stay faithful to the tree-sitter node;
+    /// only the defun-level views (outline, goto, narrow, begin/end) use
+    /// this.
+    fn defun_extent(&self, node: Node<'_>) -> (usize, usize) {
+        let mut start = node.start_byte();
+        let end = node.end_byte();
+        match self.lang {
+            Lang::Rust => {
+                let mut prev = node.prev_named_sibling();
+                while let Some(p) = prev {
+                    if p.kind() != "attribute_item" {
+                        break;
+                    }
+                    start = p.start_byte();
+                    prev = p.prev_named_sibling();
+                }
+            }
+            Lang::Python => {
+                if let Some(parent) = node.parent()
+                    && parent.kind() == "decorated_definition"
+                {
+                    start = parent.start_byte();
+                }
+            }
+            Lang::Markdown => {}
+        }
+        (start, end)
     }
 
     /// Name of the nearest enclosing defun at `pos` — `None` if there is no
@@ -269,6 +310,30 @@ impl Syntax {
             if kinds.contains(&node.kind()) {
                 return Some(node);
             }
+            // Decoration belongs to the defun it decorates: a position on a
+            // Rust outer attribute resolves to the item the attribute chain
+            // ends at, one on a Python decorator to the wrapped definition.
+            if node.kind() == "attribute_item" {
+                let mut next = node.next_named_sibling();
+                while let Some(n) = next {
+                    if kinds.contains(&n.kind()) {
+                        return Some(n);
+                    }
+                    if n.kind() != "attribute_item" {
+                        break;
+                    }
+                    next = n.next_named_sibling();
+                }
+            }
+            if node.kind() == "decorated_definition" {
+                let mut cursor = node.walk();
+                let inner = node
+                    .named_children(&mut cursor)
+                    .find(|c| kinds.contains(&c.kind()));
+                if let Some(c) = inner {
+                    return Some(c);
+                }
+            }
             node = node.parent()?;
         }
     }
@@ -282,12 +347,12 @@ impl Syntax {
         let mut stack = vec![self.root()];
         while let Some(node) = stack.pop() {
             if kinds.contains(&node.kind()) {
-                let span = self.span_of(node);
+                let (start_b, end_b) = self.defun_extent(node);
                 out.push(Defun {
                     name: self.name_of(node),
-                    kind: span.kind,
-                    start: span.start,
-                    end: span.end,
+                    kind: node.kind().to_string(),
+                    start: self.char_of(start_b),
+                    end: self.char_of(end_b),
                 });
             }
             // Push named children in reverse so the stack pops them in
@@ -741,5 +806,46 @@ mod tests {
         let chars: Vec<char> = doc.chars().collect();
         let got: String = chars[span.start - 1..span.end - 1].iter().collect();
         assert_eq!(got, "body");
+    }
+
+    #[test]
+    fn rust_defun_extent_includes_preceding_attributes() {
+        let src = "#[cfg(test)]\n#[test]\nfn check() {\n    assert!(true);\n}\n";
+        let syn = Syntax::parse(src, Lang::Rust);
+        // The outline span starts at the first attribute, so "delete this
+        // test" is the defun span with no manual hop to the #[…] lines.
+        let d = syn.find_defun("check").expect("check");
+        assert_eq!(d.start, 1, "span starts at #[cfg(test)]");
+        // A position ON an attribute resolves to the decorated defun:
+        // narrowing / defun-at from the attribute line works.
+        let span = syn.enclosing_defun(3).expect("from the attribute line");
+        assert_eq!(span.kind, "function_item");
+        assert_eq!(span.start, 1);
+        assert_eq!(syn.enclosing_defun_name(3).as_deref(), Some("check"));
+    }
+
+    #[test]
+    fn python_defun_extent_includes_decorators() {
+        let src = "@wraps(f)\n@cached\ndef g():\n    pass\n";
+        let syn = Syntax::parse(src, Lang::Python);
+        let d = syn.find_defun("g").expect("g");
+        assert_eq!(d.start, 1, "span starts at @wraps");
+        // From a decorator line, the enclosing defun is the decorated def.
+        let span = syn.enclosing_defun(2).expect("from the decorator");
+        assert_eq!(span.kind, "function_definition");
+        assert_eq!(span.start, 1);
+    }
+
+    #[test]
+    fn attribute_extent_stops_at_non_attribute_siblings() {
+        // The doc comment above the attribute chain is NOT pulled in, and
+        // the previous item's span is untouched.
+        let src = "fn first() {}\n\n/// doc\n#[test]\nfn second() {}\n";
+        let syn = Syntax::parse(src, Lang::Rust);
+        let first = syn.find_defun("first").expect("first");
+        assert_eq!((first.start, first.end), (1, 14));
+        let second = syn.find_defun("second").expect("second");
+        // "fn first() {}\n\n/// doc\n" = 13 + 1 + 1 + 8 chars → #[test] at 24.
+        assert_eq!(second.start, 24, "starts at #[test], not the doc comment");
     }
 }

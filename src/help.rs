@@ -83,11 +83,13 @@ Edit ops: (treesit-replace-node N "text"), (treesit-wrap-node N "pre" "post"),
 (treesit-insert-sibling N "text" BEFORE).
 Query: (treesit-query "(call_expression) @c") — tree-sitter .scm patterns;
 reports "@capture KIND START END" and returns the nodes.
+Defun spans INCLUDE decoration: Rust #[attributes] and Python decorators
+belong to the defun for outline/goto/narrow/anchor purposes (raw node
+accessors like treesit-node-start stay faithful to the bare node).
 Gotchas: editing OUTDATES nodes from the old parse (re-fetch after edits);
-treesit positions are whole-document even under narrowing; a Rust defun
-node EXCLUDES its preceding #[attributes] — anchor/delete with the
-attribute line in mind. (treesit-has-error) must be nil before saving code
-(save: true warns automatically)."#;
+treesit positions are whole-document even under narrowing.
+(treesit-has-error) must be nil before saving code (save: true warns
+automatically)."#;
 
 const CONFLICTS: &str = r#"— merge-conflict workflow —
 Never hand-edit conflict markers; drive the vocabulary. The conflicts MCP

@@ -876,10 +876,9 @@ fn tool_replace_text(
 
 /// Parse `anchor: {defun: NAME, where?: "after"|"before"}` into the motion
 /// prelude for insert_text — "add this block right after function X" without
-/// hand-writing a program. `after` (the default) lands at the defun node's
-/// end; `before` at its start. NOTE: a Rust defun node excludes its preceding
-/// #[attributes], so `before` lands between them and the item — include the
-/// attributes in the inserted text or anchor on the previous defun instead.
+/// hand-writing a program. `after` (the default) lands at the defun's end;
+/// `before` at its start — which includes any Rust `#[attributes]` / Python
+/// decorators, so the insert lands above the whole decorated item.
 fn anchor_prelude(args: &Value) -> Result<Option<(String, String)>, String> {
     let Some(anchor) = args.get("anchor") else {
         return Ok(None);
@@ -1595,7 +1594,7 @@ pub(crate) fn tool_schemas() -> Vec<Value> {
                 "properties": {
                     "text": { "type": "string", "description": "The literal text to insert." },
                     "pos": { "type": "integer", "description": "1-based position to insert at (default: current point)." },
-                    "anchor": { "type": "object", "description": "Insert relative to a named defun instead of a position: {\"defun\": \"name\", \"where\": \"after\"|\"before\"} (default after — lands at the defun's end; include separating newlines in the text). Rust note: a defun excludes its preceding #[attributes], so \"before\" lands between them and the item. Not combinable with pos.", "properties": { "defun": { "type": "string" }, "where": { "type": "string", "enum": ["after", "before"] } } },
+                    "anchor": { "type": "object", "description": "Insert relative to a named defun instead of a position: {\"defun\": \"name\", \"where\": \"after\"|\"before\"} (default after — lands at the defun's end; include separating newlines in the text). \"before\" lands above the whole decorated item (Rust #[attributes] / Python decorators included). Not combinable with pos.", "properties": { "defun": { "type": "string" }, "where": { "type": "string", "enum": ["after", "before"] } } },
                     "view": { "type": ["boolean", "integer"], "description": "Append a rendered viewport around point after the edit (true = 4 context lines, or a line count) — confirm the insert landed right without a follow-up view call." },
                     "session": session,
                     "path": path,
