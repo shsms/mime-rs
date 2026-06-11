@@ -13,28 +13,17 @@ place-diff / upd-epub-to-jp on ulysses-annotated's ~mime-rs~ branch can
 drop their end-of-run ~set-buffer~ dance.
 
 ** TODO Streaming search [#C]
-DONE so far: literal ~search_forward~ streams the range a chunk at a time
-(needle-1 overlap), stopping at the first hit; ~re_search_forward~ and
-~looking_at~ are ADAPTIVELY WINDOWED — the window grows from a small start and
-settles as soon as the match ends inside it, so a hit near point never copies
-the document tail (was point→EOF, unconditionally for ~looking_at~). Together
-these retire the conflict builtins' full-buffer ~scan~ cost.
-Remaining: a resumable streaming DFA (~regex-automata~) to close the residual —
-a regex MISS still grows the window to the bound (the engine must see every
-byte to say "no"); streaming ~search_backward~ (still materializes [bound,
-point)); and global-replace a multi-GB file across cores. Also: ~find_forward~
-matches with a naive ~windows().position()~ — swap in ~memchr::memmem~ (SIMD
-two-way) for long/common-prefix needles.
+DONE so far: literal ~search_forward~ streams the range chunk-at-a-time on
+a ~memchr::memmem~ finder (SIMD two-way), stopping at the first hit;
+literal ~search_backward~ streams 16K-char chunks DOWNWARD from point with
+a needle-sized overlap (was: materialize the whole [bound, point) window);
+~re_search_forward~ / ~re_search_backward~ / ~looking_at~ are adaptively
+windowed. Remaining: a resumable streaming DFA (~regex-automata~) to close
+the residual — a regex MISS still grows the window to the bound (the
+engine must see every byte to say "no"); and global-replace a multi-GB
+file across cores.
 /Exit: global-replace a multi-GB file across cores; ulysses bench beats
 legacy ~mime~./
-
-** TODO Paged reader: parallel fan-out for the fused open scan [#C]
-The residual of the open-scan item (the fused validate+count pass and the
-once-per-read-op drift stat landed 2026-06): the open-time scan is
-sequential where the owned-text count fans out across cores above
-~PARALLEL_INDEX_THRESHOLD~. Threads can ~read_at~ disjoint ranges; the
-UTF-8 carry needs per-chunk boundary fixups (validate each chunk, stitch
-the split chars at the seams).
 
 ** TODO Paged reader holds an open fd per buffer [#C]
 DECIDED (2026-06): a drifted paged buffer must NOT re-open the path
