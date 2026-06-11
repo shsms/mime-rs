@@ -150,6 +150,7 @@ fn full_session_round_trip_over_stdio() {
         "conflicts",
         "checkpoint",
         "restore_checkpoint",
+        "undo_last",
         "list_checkpoints",
         "save_buffer",
         "session_status",
@@ -1099,4 +1100,36 @@ fn session_miss_error_names_the_warm_sessions() {
         err.contains("alpha") && err.contains("beta"),
         "the miss should list the warm sessions: {err}"
     );
+}
+
+#[test]
+fn undo_last_rewinds_one_mutating_call_at_a_time() {
+    let mut s = Server::spawn();
+    s.call_ok(1, "open_text", json!({ "text": "v0" }));
+
+    // Two separate mutating calls, then a read (which must not consume
+    // an undo step).
+    s.call_ok(
+        2,
+        "replace_text",
+        json!({ "pattern": "v0", "replacement": "v1" }),
+    );
+    s.call_ok(
+        3,
+        "replace_text",
+        json!({ "pattern": "v1", "replacement": "v2" }),
+    );
+    let txt = s.call_ok(4, "read_region", json!({ "start": 1, "end": 3 }));
+    assert_eq!(txt, "v2");
+
+    // First undo: back to v1. Second: back to v0. Then the ring is dry.
+    let u1 = s.call_ok(5, "undo_last", json!({}));
+    assert!(u1.contains("rewound"), "undo said: {u1}");
+    let txt = s.call_ok(6, "read_region", json!({ "start": 1, "end": 3 }));
+    assert_eq!(txt, "v1");
+    s.call_ok(7, "undo_last", json!({}));
+    let txt = s.call_ok(8, "read_region", json!({ "start": 1, "end": 3 }));
+    assert_eq!(txt, "v0");
+    let err = s.call_err(9, "undo_last", json!({}));
+    assert!(err.contains("nothing to undo"), "got: {err}");
 }

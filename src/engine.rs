@@ -32,6 +32,11 @@ impl Checkpoint {
     pub fn restore(&self) -> Box<dyn TextStore> {
         self.snap.snapshot()
     }
+    /// The content version of the captured state ("equal versions imply equal
+    /// text") — lets the undo ring skip duplicate captures.
+    pub fn version(&self) -> u64 {
+        self.snap.version()
+    }
     pub fn text(&self) -> String {
         self.snap.text().to_string()
     }
@@ -221,7 +226,18 @@ pub struct Workspace {
     /// JSON can say whether partial edits persist (a warm run does not roll
     /// back on error; read-only and rehearse sessions do).
     last_failure_dirty: std::cell::Cell<bool>,
+    /// Automatic restore points, newest last — one per distinct text state
+    /// captured just before a program runs, so [`undo_last`](Self::undo_last)
+    /// can rewind a misfired edit in one call without any checkpoint
+    /// discipline up front. Held apart from the session's user checkpoints:
+    /// it neither shows in `list-checkpoints` nor is touched by rehearse's
+    /// rollback. Bounded to [`UNDO_RING_CAP`]; no redo.
+    undo_ring: Vec<Checkpoint>,
 }
+
+/// Depth of the automatic undo ring. Snapshots are O(1) for Quire and the
+/// states are version-deduped, so this is a safety-net depth, not a cost knob.
+const UNDO_RING_CAP: usize = 8;
 
 /// The trust tier a workspace runs at, chosen by the front-end MODE at launch
 /// (not by the program). `Sandboxed` (the agent-facing MCP / daemon) registers
@@ -301,7 +317,52 @@ impl Workspace {
             read_only,
             capabilities,
             last_failure_dirty: std::cell::Cell::new(false),
+            undo_ring: Vec::new(),
         }
+    }
+
+    /// Capture the current buffer state onto the undo ring unless its top
+    /// already holds this exact text state (same version) — so read-only
+    /// programs and repeated probes don't churn the ring. The MCP front-end
+    /// calls this before every (non-rehearse) program.
+    pub fn push_undo(&mut self) {
+        let v = self.session.borrow().buffer.version();
+        if self.undo_ring.last().is_some_and(|c| c.version() == v) {
+            return;
+        }
+        let cp = {
+            let s = self.session.borrow();
+            Checkpoint::capture(format!("undo-{v}"), s.buffer.as_ref())
+        };
+        self.undo_ring.push(cp);
+        if self.undo_ring.len() > UNDO_RING_CAP {
+            self.undo_ring.remove(0);
+        }
+    }
+
+    /// Rewind the buffer to the most recent undo-ring state and pop it — each
+    /// call steps one mutating program further back. The restored snapshot
+    /// carries point/mark/narrowing; there is no redo. `Err` when the ring is
+    /// empty.
+    pub fn undo_last(&mut self) -> Result<(), String> {
+        // The top may BE the current state — captured before a read or a
+        // program that ended up clean; rewinding to it would be a no-op
+        // that burns a step, so skip those first.
+        let cur = self.session.borrow().buffer.version();
+        while self.undo_ring.last().is_some_and(|c| c.version() == cur) {
+            self.undo_ring.pop();
+        }
+        let cp = self
+            .undo_ring
+            .pop()
+            .ok_or("nothing to undo (no earlier state on the undo ring)")?;
+        self.session.borrow_mut().buffer = cp.restore();
+        Ok(())
+    }
+
+    /// The current buffer's length in chars (whole document).
+    pub fn char_len(&self) -> usize {
+        self.session.borrow().buffer.char_len()
     }
 
     /// Whether this session refuses buffer mutations.

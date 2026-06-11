@@ -164,6 +164,7 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         "conflicts" => tool_conflicts(&args, sessions),
         "checkpoint" => tool_checkpoint(&args, sessions),
         "restore_checkpoint" => tool_restore_checkpoint(&args, sessions),
+        "undo_last" => tool_undo_last(&args, sessions),
         "list_checkpoints" => tool_list_checkpoints(&args, sessions),
         "save_buffer" => tool_save_buffer(&args, sessions),
         "session_status" => tool_session_status(sessions),
@@ -350,6 +351,11 @@ fn run_or_rehearse(
     // (a buffer swap) would land before rehearse takes its rollback snapshot.
     if !rehearse {
         ws.auto_revert_if_clean();
+        // Auto-capture the pre-program state (version-deduped, bounded) so
+        // undo_last can rewind a misfired edit without prior checkpoint
+        // discipline. After the auto-revert, so undo never resurrects bytes
+        // an external writer already replaced.
+        ws.push_undo();
     }
     if rehearse {
         ws.rehearse(program)
@@ -885,6 +891,26 @@ fn tool_restore_checkpoint(
     Ok(format!("restored to checkpoint \"{label}\"{unsaved}"))
 }
 
+/// `undo_last {session?|path?}` — rewind to the state before the most recent
+/// mutating call (each call steps one further back; no redo). The automatic
+/// safety net: unlike restore_checkpoint it needs no label captured up front.
+fn tool_undo_last(
+    args: &Value,
+    sessions: &mut HashMap<String, Workspace>,
+) -> Result<String, String> {
+    let session = resolve_session(args, sessions)?;
+    if !sessions.contains_key(&session) {
+        return Err(no_such_session(sessions, &session));
+    }
+    let ws = sessions.get_mut(&session).expect("checked above");
+    ws.undo_last()?;
+    let len = ws.char_len();
+    let unsaved = unsaved_note(sessions, &session);
+    Ok(format!(
+        "rewound to the state before the last mutating call ({len} chars){unsaved}"
+    ))
+}
+
 /// `list_checkpoints {session?}` — the labels currently captured.
 fn tool_list_checkpoints(
     args: &Value,
@@ -1205,6 +1231,18 @@ fn tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "label": { "type": "string", "description": "Optional label; auto-generated (auto-N) when omitted." },
+                    "session": session,
+                    "path": path,
+                },
+                "required": [],
+            },
+        }),
+        json!({
+            "name": "undo_last",
+            "description": "Rewind the buffer to its state before the most recent mutating call — the automatic safety net for a misfired edit (every mutating tool call captures a restore point first; bounded ring of 8, no redo). Each call steps one mutating call further back. Unlike restore_checkpoint, nothing needs to have been captured up front.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
                     "session": session,
                     "path": path,
                 },
