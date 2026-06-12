@@ -79,6 +79,20 @@ follow-up round (multi-file ~files:~ batches, clean-LRU session cap,
 decorated defun spans, ~make docs~ generation); what follows is the
 remainder.
 
+** TODO Cross-file search: a grep tool (or occur over files/glob) [#B] :dogfooding:
+
+The biggest reason the agent still shells out to =grep -rn= / =sed -n=
+mid-edit: =occur= is per-buffer, so "which files mention X" and "show
+me that region in three files" have no MCP answer — every multi-file
+question drops to Bash, then comes BACK to mime for the edit. The
+sandbox already confines paths to =$MIME_ROOTS=, so a read-only
+=grep {pattern, files | glob, mode, nlines}= tool (occur's output
+shape, one header per file, hit cap) fits the tier. Bonus: its file
+list feeds =replace_text {files: …}= directly — search and cross-file
+edit would share one vocabulary. A =read_region {path, start_line,
+end_line}= alias for "lines 120–140 of X" already exists; the gap is
+purely the multi-file fan-out.
+
 ** TODO save_buffer {to:} rebinds the visited file — a footgun for path-keyed sessions [#B] :dogfooding:
 
 Hit during the 2026-06-11 switchyard session. Recovery sequence after a
