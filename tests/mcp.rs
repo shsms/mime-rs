@@ -1490,3 +1490,52 @@ fn run_program_surfaces_the_final_form_value() {
     .unwrap();
     assert!(out.get("value").is_none(), "nil value is omitted: {out}");
 }
+
+/// An argument the tool doesn't declare is rejected (naming it and the valid
+/// arguments), not silently dropped — e.g. `view {offset}` for its `pos`.
+#[test]
+fn unknown_argument_is_rejected_not_ignored() {
+    let mut s = Server::spawn();
+    s.request(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }));
+    s.call_ok(
+        2,
+        "open_text",
+        json!({ "text": "line one\nline two\nline three" }),
+    );
+
+    let err = s.call_err(3, "view", json!({ "offset": 2 }));
+    assert!(err.contains("offset"), "names the offender: {err}");
+    assert!(err.contains("pos"), "lists valid arguments: {err}");
+
+    // A declared argument still works.
+    s.call_ok(4, "view", json!({ "pos": 1 }));
+}
+
+/// `rehearse` shares run_program's handler and reads `full_diff`/`view`, so its
+/// schema must declare them — otherwise arg-validation rejects valid rehearse
+/// calls. A rehearsed bulk edit is exactly when the full preview diff matters.
+/// Regression guard for the schema/handler mismatch.
+#[test]
+fn rehearse_accepts_full_diff_and_view() {
+    let mut s = Server::spawn();
+    s.request(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }));
+    s.call_ok(2, "open_text", json!({ "text": "alpha\nbeta\ngamma" }));
+
+    // full_diff + view are run_program args; rehearse must accept them, not
+    // reject them as unknown.
+    let out: Value = serde_json::from_str(&s.call_ok(
+        3,
+        "rehearse",
+        json!({
+            "program": r#"(goto-char (point-min)) (while (re-search-forward "a" nil t) (replace-match "A"))"#,
+            "full_diff": true,
+            "view": 4,
+        }),
+    ))
+    .unwrap();
+    assert_eq!(out["rehearsed"], json!(true), "rehearse rolls back: {out}");
+    assert!(
+        out["diff"].as_str().is_some_and(|d| !d.is_empty()),
+        "full_diff returns the preview: {out}"
+    );
+}

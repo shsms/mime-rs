@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::Path;
+use std::sync::LazyLock;
 
 use crate::{Buffer, Quire, TextStore, Workspace};
 use serde_json::{Value, json};
@@ -183,6 +184,14 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
+    // Reject arguments the tool doesn't declare, instead of silently dropping
+    // them (a `view {offset: N}` typo for `pos` would otherwise render the
+    // wrong place with no signal). Driven by the same schemas tools/list
+    // advertises, so it can never drift from what's accepted.
+    if let Err(message) = validate_args(name, &args) {
+        return tool_text(message, true);
+    }
+
     let outcome: Result<String, String> = match name {
         "open_file" => tool_open_file(&args, sessions),
         "open_text" => tool_open_text(&args, sessions),
@@ -211,6 +220,34 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         Ok(text) => tool_text(text, false),
         Err(message) => tool_text(message, true),
     }
+}
+
+/// Reject any argument key the named tool does not declare in its
+/// `inputSchema.properties`. An unknown key is far more likely a typo or a
+/// borrowed spelling (e.g. `offset` for `view`'s `pos`) than something the tool
+/// should silently ignore — so name the offender and list what is accepted.
+/// Tools absent from the schema list, or declaring no properties, are not
+/// constrained (nothing to validate against).
+fn validate_args(name: &str, args: &Value) -> Result<(), String> {
+    let Some(obj) = args.as_object() else {
+        return Ok(());
+    };
+    let schemas = tool_schemas();
+    let Some(schema) = schemas.iter().find(|t| t["name"] == name) else {
+        return Ok(());
+    };
+    let Some(props) = schema["inputSchema"]["properties"].as_object() else {
+        return Ok(());
+    };
+    if let Some(key) = obj.keys().find(|k| !props.contains_key(*k)) {
+        let mut valid: Vec<&str> = props.keys().map(String::as_str).collect();
+        valid.sort_unstable();
+        return Err(format!(
+            "unknown argument \"{key}\" for tool \"{name}\"; valid arguments: {}",
+            valid.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// Build the `{content, isError}` envelope MCP expects for a tool result.
@@ -618,10 +655,9 @@ fn tool_run_program(
     if sessions.get(&session).is_some_and(|ws| ws.is_stale()) {
         json["stale"] = Value::Bool(true);
     }
+    // `save` is rejected on rehearse upstream by `validate_args` (rehearse's
+    // schema declares no `save`), so only a real run reaches here.
     if bool_arg(args, "save") {
-        if rehearse {
-            return Err("save is not available on rehearse (nothing persists)".to_string());
-        }
         let note = save_visited(sessions, &session)?;
         json["saved"] = Value::String(note.trim_start_matches("; ").to_string());
     }
@@ -1667,7 +1703,16 @@ fn tools_list_result() -> Value {
     json!({ "tools": tool_schemas() })
 }
 
-pub(crate) fn tool_schemas() -> Vec<Value> {
+/// The MCP tool catalogue, built once and shared. `validate_args` reads it on
+/// every dispatch, so the ~20-entry Vec is held behind a `LazyLock` rather than
+/// rebuilt per call; `tools/list`, `describe-mcp`, and argument validation all
+/// borrow this single source.
+pub(crate) fn tool_schemas() -> &'static [Value] {
+    static SCHEMAS: LazyLock<Vec<Value>> = LazyLock::new(build_tool_schemas);
+    &SCHEMAS
+}
+
+fn build_tool_schemas() -> Vec<Value> {
     // A reusable optional `session` property.
     let session = json!({
         "type": "string",
@@ -1737,6 +1782,8 @@ pub(crate) fn tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "program": { "type": "string", "description": "Emacs-Lisp program to rehearse (run then roll back)." },
+                    "full_diff": { "type": "boolean", "description": "Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count." },
+                    "view": { "type": ["boolean", "integer"], "description": "Add a rendered viewport around point to the report (true = 4 context lines, or a line count)." },
                     "session": session,
                     "path": path,
                 },

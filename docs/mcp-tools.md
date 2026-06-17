@@ -34,9 +34,11 @@ Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and retu
 
 Dry-run an Emacs-Lisp (tulisp) edit program and return the same RunReport run_program would (unified diff, length before/after, reports), showing what WOULD happen — then roll the session back so nothing persists: the buffer, point/mark/narrowing, kill-ring, and checkpoints are all left exactly as before (the report carries rehearsed=true). The 'try before you commit' preview; follow up with run_program to actually apply it.
 
+- `full_diff` — Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count.
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `program` (required) — Emacs-Lisp program to rehearse (run then roll back).
 - `session` — Warm session id; defaults to "default" when omitted.
+- `view` — Add a rendered viewport around point to the report (true = 4 context lines, or a line count).
 
 ## read_region
 
