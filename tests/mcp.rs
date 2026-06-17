@@ -1460,3 +1460,33 @@ fn warm_sessions_are_bounded_with_clean_lru_eviction() {
         "an idle clean session was evicted: {ids:?}"
     );
 }
+
+/// A program's final form value is surfaced as `value` (tulisp-printed), so a
+/// read-only inspector like `(conflict-diff N)` is readable without wrapping it
+/// in `(message …)`; a `nil` value is omitted, like `stale`/`unsaved`.
+#[test]
+fn run_program_surfaces_the_final_form_value() {
+    let mut s = Server::spawn();
+    s.request(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }));
+    s.call_ok(2, "open_text", json!({ "text": "hello" }));
+
+    // A non-nil value (a string comes back quoted) rides alongside an empty
+    // read-only `diff`.
+    let out: Value = serde_json::from_str(&s.call_ok(
+        3,
+        "run_program",
+        json!({ "program": r#"(upcase "hi")"# }),
+    ))
+    .unwrap();
+    assert_eq!(out["value"], json!("\"HI\""));
+    assert_eq!(out["diff"], json!(""));
+
+    // A final nil omits the field entirely.
+    let out: Value = serde_json::from_str(&s.call_ok(
+        4,
+        "run_program",
+        json!({ "program": "(goto-char (point-min)) nil" }),
+    ))
+    .unwrap();
+    assert!(out.get("value").is_none(), "nil value is omitted: {out}");
+}

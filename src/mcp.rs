@@ -372,7 +372,7 @@ fn run_in_session(
     session: &str,
     program: &str,
 ) -> Result<crate::RunReport, String> {
-    run_or_rehearse(sessions, session, program, false)
+    run_or_rehearse(sessions, session, program, false).map(|(report, _value)| report)
 }
 
 /// Like [`run_in_session`], but `rehearse` selects a dry-run that rolls the
@@ -382,7 +382,7 @@ fn run_or_rehearse(
     session: &str,
     program: &str,
     rehearse: bool,
-) -> Result<crate::RunReport, String> {
+) -> Result<(crate::RunReport, String), String> {
     if !sessions.contains_key(session) {
         return Err(no_such_session(sessions, session));
     }
@@ -404,9 +404,9 @@ fn run_or_rehearse(
         ws.push_undo();
     }
     if rehearse {
-        ws.rehearse(program)
+        ws.rehearse_value(program)
     } else {
-        ws.run(program)
+        ws.run_value(program)
     }
 }
 
@@ -574,8 +574,8 @@ fn tool_run_program(
     let program = str_arg(args, "program")?;
     // TODO: resource limits (needs tulisp eval interruption) — a per-program
     // wall-clock/CPU bound can't be enforced until tulisp eval is cancellable.
-    let report = match run_or_rehearse(sessions, &session, &program, rehearse) {
-        Ok(report) => report,
+    let (report, value) = match run_or_rehearse(sessions, &session, &program, rehearse) {
+        Ok(rv) => rv,
         // A failed program still said things before it died: the error
         // content is the failure JSON carrying its reports/log, not just the
         // bare error string.
@@ -599,6 +599,15 @@ fn tool_run_program(
         report.len_after,
     );
     let mut json = report.to_json();
+    // Surface the program's final value (rendered the way tulisp prints it, as
+    // the repl verb does) — present only when it is not `nil`, like `stale` /
+    // `unsaved`. This is what makes a bare read-only inspector readable: e.g.
+    // `(conflict-diff 1)` returns its unified diff here without the caller
+    // having to wrap it in `(message …)`; the buffer `diff` field stays empty
+    // for a read-only call.
+    if value != "nil" {
+        json["value"] = Value::String(value);
+    }
     // A bulk edit's diff can run to megabytes; clamp it for transport unless
     // the caller asked for everything. 200 lines ≈ a large hand-made edit.
     if !bool_arg(args, "full_diff") {
@@ -1707,7 +1716,7 @@ pub(crate) fn tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "run_program",
-            "description": "Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and return a structured RunReport (unified diff, point, length before/after, and any (report ...)/(message ...) output). This is the core, general-purpose editing tool; the buffer and any defined functions persist for the next call. On failure the error content is a JSON object {ok:false, error, dirty, reports, log} carrying the diagnostics the program emitted before dying; dirty=true means its pre-error edits persist (a run does not roll back on error — use rehearse, or with-transaction inside the program, for atomicity).",
+            "description": "Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and return a structured RunReport (unified diff, point, length before/after, any (report ...)/(message ...) output, and `value`: the final form's result rendered the way tulisp prints it — present only when non-nil, so a read-only inspector like (conflict-diff N) is readable without wrapping it in (message ...)). This is the core, general-purpose editing tool; the buffer and any defined functions persist for the next call. On failure the error content is a JSON object {ok:false, error, dirty, reports, log} carrying the diagnostics the program emitted before dying; dirty=true means its pre-error edits persist (a run does not roll back on error — use rehearse, or with-transaction inside the program, for atomicity).",
             "inputSchema": {
                 "type": "object",
                 "properties": {

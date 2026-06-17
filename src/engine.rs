@@ -451,6 +451,14 @@ impl Workspace {
     /// (callable, but inert until something runs them), and keeping them lets an
     /// agent rehearse a helper definition and then a `run` that uses it.
     pub fn rehearse(&mut self, program: &str) -> Result<RunReport, String> {
+        self.rehearse_value(program).map(|(report, _value)| report)
+    }
+
+    /// Like [`rehearse`], but also returns the program's final value rendered the
+    /// way tulisp prints it — the read-only counterpart of [`run_value`], so an
+    /// inspector run as a dry-run still surfaces what it returned. Everything is
+    /// rolled back exactly as in [`rehearse`]; only the extra value differs.
+    pub fn rehearse_value(&mut self, program: &str) -> Result<(RunReport, String), String> {
         // Snapshot everything a rehearsal must restore *before* the program runs.
         let (snap, kill_len, cp_len) = {
             let s = self.session.borrow();
@@ -468,7 +476,7 @@ impl Workspace {
         // The rollback above means a failed rehearsal never leaves edits; its
         // reports/log DO remain readable via `failure_context`, by design.
         self.last_failure_dirty.set(false);
-        result.map(|(report, _value)| report)
+        result
     }
 
     /// Shared core of [`run`]/[`rehearse`]: clear the per-program `reports`/`log`,
