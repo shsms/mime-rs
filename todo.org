@@ -143,6 +143,34 @@ replacement onto the line following the conflict block
 Replacing a conflict hunk is line-oriented; ensure a final newline on
 the replacement (or take lines, not raw text).
 
+** TODO Rebase / cherry-pick driver                                     :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-06-18 Do 09:27]
+:END:
+
+Agent-driven interactive rebase / cherry-pick belongs here, not as a
+separate MCP server: the hard, agent-hostile 80% is conflict resolution
+during replay, which mime already owns (~conflicts~, ~conflict-resolve-trivial~,
+~conflict-keep~, …). A clean rebase needs no editing tool; a conflicted one
+needs exactly this surface.
+
+Shape: a driver that orchestrates the git op non-interactively and, at each
+conflict stop, routes the hunks through the existing conflict tools. Two
+separable pieces — (1) history manipulation (build/edit the rebase todo:
+reorder / squash / drop / reword; run the cherry-pick) is git plumbing that
+wraps ~git rebase~/~cherry-pick~; (2) conflict resolution during replay is
+already built.
+
+Why mime specifically:
+- The overlap is real and already implemented — conflict resolution is the
+  bulk of the agent pain.
+- ~rehearse~ the plan -> apply -> clean ~abort~, with the transaction/undo
+  model, is the missing safety net: ~git rebase -i~ is undrivable by agents
+  today (opens ~$EDITOR~, expects a human) and easy to botch with no recovery.
+- One authority over the working tree: if mime DRIVES the rebase it knows when
+  to revert/reload its warm buffers as HEAD moves; an external server racing
+  mime over the same files would leave every buffer stale each step.
+
 * Structural editing
 
 ** TODO Incremental re-parse (~InputEdit~s) [#C]
