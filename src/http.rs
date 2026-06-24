@@ -3,13 +3,20 @@
 //! transport-agnostic [`crate::mcp::handle_line`] dispatch and answers with
 //! plain JSON: mime never sends a server-initiated message, so there is no SSE
 //! stream to open (a spec-valid choice — a server MAY return `application/json`
-//! for any request). Security per the MCP guidance: bind localhost by default
-//! and reject a non-local browser `Origin` (anti-DNS-rebinding). Each client's
-//! warm sessions are isolated by the `Mcp-Session-Id` it is issued on
-//! `initialize`, so concurrent clients don't share buffers.
+//! for any request).
+//!
+//! Security, per the MCP guidance: bind localhost by default and reject a
+//! non-local browser `Origin` (anti-DNS-rebinding). `initialize` mints an
+//! unguessable, random `Mcp-Session-Id` and isolates that client's warm
+//! sessions under it; the id is the client's bearer token, so every later
+//! request MUST carry it (an absent/unknown one is a 404 — re-initialize). The
+//! session store is capped and FIFO-evicted so an initialize flood can't
+//! exhaust memory or file descriptors. Requests are served one at a time (like
+//! the daemon): simple and race-free, at the cost of head-of-line blocking if a
+//! single op runs long.
 
 use crate::Workspace;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::sync::Mutex;
 use tiny_http::{Header, Method, Request, Response, Server};
@@ -17,8 +24,46 @@ use tiny_http::{Header, Method, Request, Response, Server};
 /// Cap on a request body — programs and buffers can be large, but not unbounded.
 const MAX_BODY: u64 = 64 * 1024 * 1024;
 
+/// Cap on concurrent client sessions (oldest FIFO-evicted past this). Bounds
+/// memory and open file descriptors against an `initialize` flood.
+const SESSION_CAP: usize = 256;
+
 /// One client's warm-session map (the same type the stdio server holds).
 type Sessions = HashMap<String, Workspace>;
+
+/// Bounded set of per-client session maps, keyed by an unguessable
+/// `Mcp-Session-Id`. `order` tracks creation order for FIFO eviction.
+struct Store {
+    map: HashMap<String, Sessions>,
+    order: VecDeque<String>,
+}
+
+impl Store {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+    /// Create a fresh empty session, evicting the oldest while at capacity.
+    fn insert(&mut self, id: String) {
+        while self.map.len() >= SESSION_CAP {
+            match self.order.pop_front() {
+                Some(old) => {
+                    self.map.remove(&old);
+                }
+                None => break,
+            }
+        }
+        self.order.push_back(id.clone());
+        self.map.entry(id).or_default();
+    }
+    /// Drop a session by id; returns whether it existed.
+    fn remove(&mut self, id: &str) -> bool {
+        self.order.retain(|x| x != id);
+        self.map.remove(id).is_some()
+    }
+}
 
 /// Serve the MCP protocol over Streamable HTTP at `addr` until killed.
 pub fn run(addr: &str) {
@@ -34,23 +79,13 @@ pub fn run(addr: &str) {
         crate::mcp::PROTOCOL_VERSION
     );
 
-    // Per-client session maps keyed by Mcp-Session-Id, plus a counter that mints
-    // ids on initialize. Requests are served one at a time (like the daemon), so
-    // a single lock around the store is all the synchronization needed.
-    let store: Mutex<HashMap<String, Sessions>> = Mutex::new(HashMap::new());
-    let mut next_id: u64 = 0;
-    let seed = id_seed();
+    let store = Mutex::new(Store::new());
     for request in server.incoming_requests() {
-        serve(request, &store, &mut next_id, seed);
+        serve(request, &store);
     }
 }
 
-fn serve(
-    mut request: Request,
-    store: &Mutex<HashMap<String, Sessions>>,
-    next_id: &mut u64,
-    seed: u64,
-) {
+fn serve(mut request: Request, store: &Mutex<Store>) {
     // Anti-DNS-rebinding: a browser-set Origin must be localhost. A missing
     // Origin (curl, an SDK, a CLI harness) is allowed — the attack is browser-only.
     if let Some(origin) = header(&request, "origin")
@@ -65,13 +100,17 @@ fn serve(
         return;
     }
 
+    let id_header = header(&request, "mcp-session-id");
+
     match request.method() {
         Method::Post => {}
+        // Ending a session needs its id — the id is the bearer token, so this
+        // can only drop a session the caller already holds.
         Method::Delete => {
-            if let Some(id) = header(&request, "mcp-session-id") {
-                store.lock().unwrap().remove(&id);
-            }
-            let _ = request.respond(empty(204));
+            let dropped = id_header
+                .as_deref()
+                .is_some_and(|id| store.lock().unwrap().remove(id));
+            let _ = request.respond(empty(if dropped { 204 } else { 404 }));
             return;
         }
         // No server-initiated messages, so no SSE stream to open on GET.
@@ -85,43 +124,61 @@ fn serve(
         }
     }
 
+    // Refuse an over-cap body rather than silently truncating it (which would
+    // surface later as a misleading JSON parse error).
+    if request.body_length().is_some_and(|n| n as u64 > MAX_BODY) {
+        let _ = request.respond(text(413, "request body too large"));
+        return;
+    }
     let mut body = String::new();
-    if request
+    let read = request
         .as_reader()
-        .take(MAX_BODY)
-        .read_to_string(&mut body)
-        .is_err()
-    {
-        let _ = request.respond(text(400, "could not read request body"));
+        .take(MAX_BODY + 1)
+        .read_to_string(&mut body);
+    if read.is_err() || body.len() as u64 > MAX_BODY {
+        let _ = request.respond(text(413, "request body too large or unreadable"));
         return;
     }
 
-    // Pick the client's session map; mint an id on initialize when the client
-    // didn't supply one. A non-initialize request without an id shares "default"
-    // (lenient — a simple client that ignores Mcp-Session-Id still works).
-    let header_id = header(&request, "mcp-session-id");
     let is_init = is_initialize(&body);
-    let session_id = match (&header_id, is_init) {
-        (Some(id), _) => id.clone(),
-        (None, true) => {
-            *next_id += 1;
-            format!("{seed:x}-{}", *next_id)
-        }
-        (None, false) => "default".to_string(),
-    };
 
-    let reply = {
+    // Resolve the client's session map under the lock, then respond outside it.
+    // initialize starts a new session (fresh random id); every other request
+    // must name an existing one.
+    let (reply, new_id) = {
         let mut store = store.lock().unwrap();
-        let sessions = store.entry(session_id.clone()).or_default();
-        crate::mcp::handle_line(&body, sessions)
+        if is_init {
+            let id = new_session_id();
+            store.insert(id.clone());
+            let sessions = store.map.get_mut(&id).expect("just inserted");
+            (crate::mcp::handle_line(&body, sessions), Some(id))
+        } else {
+            match id_header
+                .as_deref()
+                .filter(|id| store.map.contains_key(*id))
+            {
+                Some(id) => {
+                    let sessions = store.map.get_mut(id).expect("checked present");
+                    (crate::mcp::handle_line(&body, sessions), None)
+                }
+                None => {
+                    drop(store);
+                    let _ = request.respond(text(
+                        404,
+                        "unknown or missing Mcp-Session-Id — send initialize first",
+                    ));
+                    return;
+                }
+            }
+        }
     };
 
     match reply {
         Some(value) => {
             let json = serde_json::to_string(&value).unwrap_or_else(|_| value.to_string());
             let mut resp = Response::from_string(json).with_header(json_header());
-            if is_init {
-                resp = resp.with_header(session_header(&session_id));
+            if let Some(id) = new_id {
+                resp = resp.with_header(session_header(&id));
             }
             let _ = request.respond(resp);
         }
@@ -165,12 +222,18 @@ fn is_initialize(body: &str) -> bool {
         .is_some_and(|m| m == "initialize")
 }
 
-fn id_seed() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+/// A 128-bit random session id (hex). The id is the client's bearer token, so
+/// it must not be guessable — read it from the OS CSPRNG, failing closed if
+/// that is somehow unavailable rather than minting a predictable id.
+fn new_session_id() -> String {
+    let mut buf = [0u8; 16];
+    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)) {
+        Ok(()) => buf.iter().map(|b| format!("{b:02x}")).collect(),
+        Err(e) => {
+            eprintln!("mime-http: cannot read /dev/urandom for a session id: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn json_header() -> Header {
@@ -221,5 +284,30 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#
         ));
         assert!(!is_initialize("not json"));
+    }
+
+    #[test]
+    fn session_ids_are_random_hex_and_distinct() {
+        let a = new_session_id();
+        let b = new_session_id();
+        assert_eq!(a.len(), 32, "128 bits as hex");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "two ids must differ");
+    }
+
+    #[test]
+    fn store_caps_at_session_cap_and_evicts_oldest() {
+        let mut s = Store::new();
+        for i in 0..SESSION_CAP + 5 {
+            s.insert(format!("id{i}"));
+        }
+        assert_eq!(s.map.len(), SESSION_CAP);
+        assert!(!s.map.contains_key("id0"), "oldest evicted");
+        assert!(
+            s.map.contains_key(&format!("id{}", SESSION_CAP + 4)),
+            "newest kept"
+        );
+        assert!(s.remove(&format!("id{}", SESSION_CAP + 4)));
+        assert!(!s.remove("nope"));
     }
 }
