@@ -1755,6 +1755,15 @@ fn str_list_arg(args: &Value, key: &str) -> Result<Vec<String>, String> {
 
 fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
     use crate::sequencer as seq;
+    // History rewriting is high-consequence, so require an explicit root rather
+    // than falling back to the cwd: refuse if MIME_ROOTS is unset (the editing
+    // tools tolerate the cwd default; git ops should not).
+    if std::env::var_os("MIME_ROOTS").is_none() {
+        return Err(
+            "git tools require MIME_ROOTS to be set (refusing to rewrite history under an implicit cwd)"
+                .to_string(),
+        );
+    }
     let repo = repo_path(args)?;
     match name {
         "git_rebase" => seq::cmd_rebase(
