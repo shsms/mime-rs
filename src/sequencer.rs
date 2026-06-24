@@ -29,8 +29,9 @@ fn estr(msg: &str) -> Error {
     Error::from_str(msg)
 }
 
-/// What to do with a planned commit. `Squash`/`Fixup` are parsed but not yet
-/// driven (they need re-parenting + message melding — a separate increment).
+/// What to do with a planned commit. `Squash`/`Fixup` meld into the preceding
+/// commit (squash concatenates messages, fixup keeps the first); a leading
+/// squash/fixup is rejected.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     Pick,
@@ -191,14 +192,10 @@ fn diff3_checkout() -> CheckoutBuilder<'static> {
 /// Begin a rebase: detach HEAD to `onto`, then replay the plan. Returns once
 /// the plan completes or a step conflicts.
 pub fn start(repo: &Repository, plan: Plan) -> Result<Outcome, Error> {
-    if plan
-        .steps
-        .iter()
-        .any(|s| matches!(s.action, Action::Squash | Action::Fixup))
+    if let Some(first) = plan.steps.iter().find(|s| s.action != Action::Drop)
+        && matches!(first.action, Action::Squash | Action::Fixup)
     {
-        return Err(estr(
-            "squash/fixup are not yet driven by the sequencer (todo.org)",
-        ));
+        return Err(estr("the first applied step cannot be squash/fixup"));
     }
     if state_path(repo).exists() {
         return Err(estr(
@@ -249,18 +246,7 @@ pub fn continue_op(repo: &Repository) -> Result<Outcome, Error> {
     }
     let tree = repo.find_tree(index.write_tree()?)?;
     index.write()?;
-
-    let pick = repo.find_commit(step.commit)?;
-    let current = repo.find_commit(st.current)?;
-    let msg = commit_message(&pick, &step);
-    let new = repo.commit(
-        Some("HEAD"),
-        &pick.author(),
-        &pick.committer(),
-        &msg,
-        &tree,
-        &[&current],
-    )?;
+    let new = land_step(repo, &st, &step, &tree)?;
     repo.cleanup_state()?;
     st.current = new;
     st.next += 1;
@@ -293,16 +279,45 @@ pub fn status(repo: &Repository) -> Result<Option<Status>, Error> {
     }))
 }
 
-/// The message a step's new commit carries: reword swaps it, everyone else
-/// keeps the picked commit's own message.
-fn commit_message(pick: &git2::Commit, step: &Step) -> String {
-    match step.action {
-        Action::Reword => step
-            .message
-            .clone()
-            .unwrap_or_else(|| pick.message().unwrap_or("").to_string()),
-        _ => pick.message().unwrap_or("").to_string(),
-    }
+/// Commit the merged `tree` for `step` and move HEAD onto it. Pick/reword add a
+/// new commit on `current` (reword swaps the message); squash/fixup REPLACE
+/// `current` with a commit on `current`'s parent, melding the message (squash
+/// concatenates, fixup keeps `current`'s) — so the step folds into the
+/// preceding one. Authorship follows git: the picked commit's for pick/reword,
+/// the kept (earlier) commit's for squash/fixup.
+fn land_step(repo: &Repository, st: &State, step: &Step, tree: &git2::Tree) -> Result<Oid, Error> {
+    let current = repo.find_commit(st.current)?;
+    let pick = repo.find_commit(step.commit)?;
+    let pick_msg = || pick.message().unwrap_or("").to_string();
+    // Commit detached (not via "HEAD"): squash/fixup parent on `current`'s
+    // parent, which the "HEAD" path would reject (first-parent != HEAD). Move
+    // HEAD afterwards; the worktree already matches the merged tree.
+    let new = match step.action {
+        Action::Pick => {
+            repo.commit(None, &pick.author(), &pick.committer(), &pick_msg(), tree, &[&current])?
+        }
+        Action::Reword => {
+            let msg = step.message.clone().unwrap_or_else(pick_msg);
+            repo.commit(None, &pick.author(), &pick.committer(), &msg, tree, &[&current])?
+        }
+        Action::Squash | Action::Fixup => {
+            if st.current == st.onto {
+                return Err(estr("squash/fixup needs a preceding pick"));
+            }
+            let parent = current.parent(0)?;
+            let cur_msg = current.message().unwrap_or("").to_string();
+            let msg = match step.action {
+                Action::Fixup => cur_msg,
+                _ => step.message.clone().unwrap_or_else(|| {
+                    format!("{}\n\n{}", cur_msg.trim_end(), pick_msg().trim_end())
+                }),
+            };
+            repo.commit(None, &current.author(), &current.committer(), &msg, tree, &[&parent])?
+        }
+        Action::Drop => unreachable!("drop is handled before land_step"),
+    };
+    repo.set_head_detached(new)?;
+    Ok(new)
 }
 
 /// Replay steps from `st.next` until the plan completes or a step conflicts.
@@ -331,16 +346,7 @@ fn drive(repo: &Repository, mut st: State) -> Result<Outcome, Error> {
         }
 
         let tree = repo.find_tree(index.write_tree()?)?;
-        let current = repo.find_commit(st.current)?;
-        let msg = commit_message(&pick, &step);
-        let new = repo.commit(
-            Some("HEAD"),
-            &pick.author(),
-            &pick.committer(),
-            &msg,
-            &tree,
-            &[&current],
-        )?;
+        let new = land_step(repo, &st, &step, &tree)?;
         repo.cleanup_state()?;
         st.current = new;
         st.next += 1;
@@ -563,5 +569,75 @@ mod tests {
         assert_eq!(tip.id(), f1, "branch restored to its original tip");
         assert_eq!(read(&repo, "a"), "10\n", "worktree restored");
         assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn squash_melds_two_commits_into_one() {
+        let dir = tmp("squash");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        let f2 = commit(&repo, &[f1], &[("a", "1\n"), ("b", "1\n"), ("c", "1\n")], "add c");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f2);
+
+        start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Pick, None), step(f2, Action::Squash, None)],
+            },
+        )
+        .unwrap();
+        // One commit on m1 carrying both changes plus the new base.
+        assert_eq!(read(&repo, "a"), "2\n");
+        assert_eq!(read(&repo, "b"), "1\n");
+        assert_eq!(read(&repo, "c"), "1\n");
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(tip.parent(0).unwrap().id(), m1, "squashed onto m1");
+        let msg = tip.message().unwrap();
+        assert!(msg.contains("add b") && msg.contains("add c"), "melded message: {msg}");
+    }
+
+    #[test]
+    fn fixup_keeps_the_first_message() {
+        let dir = tmp("fixup");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "keep me");
+        let f2 = commit(&repo, &[f1], &[("a", "1\n"), ("b", "1\n"), ("c", "1\n")], "discard me");
+        on_branch(&repo, "topic", f2);
+
+        start(
+            &repo,
+            Plan {
+                onto: base,
+                steps: vec![step(f1, Action::Pick, None), step(f2, Action::Fixup, None)],
+            },
+        )
+        .unwrap();
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(tip.message().unwrap(), "keep me");
+        assert_eq!(read(&repo, "c"), "1\n", "fixup's changes still applied");
+    }
+
+    #[test]
+    fn squash_as_first_applied_step_is_rejected() {
+        let dir = tmp("squash-first");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        on_branch(&repo, "topic", f1);
+
+        let err = start(
+            &repo,
+            Plan {
+                onto: base,
+                steps: vec![step(f1, Action::Squash, None)],
+            },
+        )
+        .unwrap_err();
+        assert!(err.message().contains("first applied step"));
+        assert!(!state_path(&repo).exists(), "rejected before any mutation");
     }
 }
