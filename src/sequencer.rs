@@ -19,7 +19,9 @@
 //! remotes/transports, no hooks or filters; repos are confined to `MIME_ROOTS`
 //! at the tool boundary (see todo.org for the security checklist).
 
-use git2::{CherrypickOptions, Index, Oid, Repository, ResetType, build::CheckoutBuilder};
+use git2::{
+    CherrypickOptions, Index, Oid, Repository, ResetType, RevertOptions, build::CheckoutBuilder,
+};
 use serde_json::json;
 use std::path::Path;
 
@@ -78,6 +80,29 @@ pub struct Plan {
     pub steps: Vec<Step>,
 }
 
+/// How a step's diff is applied: forward (rebase/cherry-pick) or inverted
+/// (revert). Both stop on conflict and route through the same resolution.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    Pick,
+    Revert,
+}
+
+impl Mode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Mode::Pick => "pick",
+            Mode::Revert => "revert",
+        }
+    }
+    fn parse(s: &str) -> Mode {
+        match s {
+            "revert" => Mode::Revert,
+            _ => Mode::Pick,
+        }
+    }
+}
+
 /// The result of `start`/`continue`: either the operation finished (with the
 /// new tip), or it stopped on a conflict the agent must resolve.
 #[derive(Debug, PartialEq, Eq)]
@@ -103,6 +128,7 @@ struct State {
     current: Oid,
     next: usize,
     steps: Vec<Step>,
+    mode: Mode,
 }
 
 fn state_path(repo: &Repository) -> std::path::PathBuf {
@@ -124,6 +150,7 @@ fn save_state(repo: &Repository, st: &State) -> Result<(), Error> {
         "current": st.current.to_string(),
         "next": st.next,
         "steps": steps,
+        "mode": st.mode.as_str(),
     });
     std::fs::write(state_path(repo), serde_json::to_vec_pretty(&v).unwrap())
         .map_err(|e| estr(&format!("cannot write sequencer state: {e}")))
@@ -159,6 +186,7 @@ fn load_state(repo: &Repository) -> Result<State, Error> {
         current: oid("current")?,
         next: v["next"].as_u64().unwrap_or(0) as usize,
         steps,
+        mode: Mode::parse(v["mode"].as_str().unwrap_or("pick")),
     })
 }
 
@@ -189,9 +217,37 @@ fn diff3_checkout() -> CheckoutBuilder<'static> {
     co
 }
 
-/// Begin a rebase: detach HEAD to `onto`, then replay the plan. Returns once
-/// the plan completes or a step conflicts.
+/// Begin a rebase: replay `plan.steps` onto `plan.onto`, rewriting the current
+/// branch to the result. Returns once the plan completes or a step conflicts.
 pub fn start(repo: &Repository, plan: Plan) -> Result<Outcome, Error> {
+    begin(repo, plan, Mode::Pick)
+}
+
+/// Cherry-pick `commits` (in order) onto the current branch tip — a rebase
+/// whose base is HEAD, so the new commits append rather than rewrite.
+pub fn cherry_pick(repo: &Repository, commits: Vec<Oid>) -> Result<Outcome, Error> {
+    let onto = repo.head()?.peel_to_commit()?.id();
+    let steps = commits.into_iter().map(pick_step).collect();
+    begin(repo, Plan { onto, steps }, Mode::Pick)
+}
+
+/// Revert `commits` (in order) on top of the current branch tip — like
+/// cherry-pick, but each step applies the commit's inverse.
+pub fn revert(repo: &Repository, commits: Vec<Oid>) -> Result<Outcome, Error> {
+    let onto = repo.head()?.peel_to_commit()?.id();
+    let steps = commits.into_iter().map(pick_step).collect();
+    begin(repo, Plan { onto, steps }, Mode::Revert)
+}
+
+fn pick_step(commit: Oid) -> Step {
+    Step {
+        commit,
+        action: Action::Pick,
+        message: None,
+    }
+}
+
+fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
     if let Some(first) = plan.steps.iter().find(|s| s.action != Action::Drop)
         && matches!(first.action, Action::Squash | Action::Fixup)
     {
@@ -209,7 +265,7 @@ pub fn start(repo: &Repository, plan: Plan) -> Result<Outcome, Error> {
         .to_string();
     let orig = head.peel_to_commit()?.id();
 
-    // Detach onto the new base and clean the worktree to it.
+    // Detach onto the base and clean the worktree to it.
     repo.set_head_detached(plan.onto)?;
     repo.reset(&repo.find_object(plan.onto, None)?, ResetType::Hard, None)?;
 
@@ -220,6 +276,7 @@ pub fn start(repo: &Repository, plan: Plan) -> Result<Outcome, Error> {
         current: plan.onto,
         next: 0,
         steps: plan.steps,
+        mode,
     };
     save_state(repo, &st)?;
     drive(repo, st)
@@ -292,6 +349,15 @@ fn land_step(repo: &Repository, st: &State, step: &Step, tree: &git2::Tree) -> R
     // Commit detached (not via "HEAD"): squash/fixup parent on `current`'s
     // parent, which the "HEAD" path would reject (first-parent != HEAD). Move
     // HEAD afterwards; the worktree already matches the merged tree.
+    if st.mode == Mode::Revert {
+        // A revert always appends on `current` with a generated message; the
+        // forward-action vocabulary (reword/squash/fixup) does not apply.
+        let summary = pick.summary().unwrap_or("commit");
+        let msg = format!("Revert \"{summary}\"\n\nThis reverts commit {}.\n", pick.id());
+        let new = repo.commit(None, &pick.committer(), &pick.committer(), &msg, tree, &[&current])?;
+        repo.set_head_detached(new)?;
+        return Ok(new);
+    }
     let new = match step.action {
         Action::Pick => {
             repo.commit(None, &pick.author(), &pick.committer(), &pick_msg(), tree, &[&current])?
@@ -331,9 +397,18 @@ fn drive(repo: &Repository, mut st: State) -> Result<Outcome, Error> {
         }
 
         let pick = repo.find_commit(step.commit)?;
-        let mut opts = CherrypickOptions::new();
-        opts.checkout_builder(diff3_checkout());
-        repo.cherrypick(&pick, Some(&mut opts))?;
+        match st.mode {
+            Mode::Pick => {
+                let mut opts = CherrypickOptions::new();
+                opts.checkout_builder(diff3_checkout());
+                repo.cherrypick(&pick, Some(&mut opts))?;
+            }
+            Mode::Revert => {
+                let mut opts = RevertOptions::new();
+                opts.checkout_builder(diff3_checkout());
+                repo.revert(&pick, Some(&mut opts))?;
+            }
+        }
 
         let mut index = repo.index()?;
         if index.has_conflicts() {
@@ -619,6 +694,39 @@ mod tests {
         let tip = repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(tip.message().unwrap(), "keep me");
         assert_eq!(read(&repo, "c"), "1\n", "fixup's changes still applied");
+    }
+
+    #[test]
+    fn cherry_pick_appends_a_commit_onto_head() {
+        let dir = tmp("cherry");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let c1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "main work");
+        let x = commit(&repo, &[base], &[("a", "1\n"), ("x", "1\n")], "add x");
+        on_branch(&repo, "main", c1);
+
+        let out = cherry_pick(&repo, vec![x]).unwrap();
+        assert!(matches!(out, Outcome::Done { .. }));
+        assert_eq!(read(&repo, "b"), "1\n", "existing work preserved");
+        assert_eq!(read(&repo, "x"), "1\n", "picked change applied");
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(tip.parent(0).unwrap().id(), c1, "appended on the tip");
+    }
+
+    #[test]
+    fn revert_undoes_a_commit_on_top() {
+        let dir = tmp("revert");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let c1 = commit(&repo, &[base], &[("a", "2\n")], "bump a");
+        on_branch(&repo, "main", c1);
+
+        let out = revert(&repo, vec![c1]).unwrap();
+        assert!(matches!(out, Outcome::Done { .. }));
+        assert_eq!(read(&repo, "a"), "1\n", "change undone");
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(tip.parent(0).unwrap().id(), c1, "revert commit on top");
+        assert!(tip.message().unwrap().contains("Revert \"bump a\""));
     }
 
     #[test]
