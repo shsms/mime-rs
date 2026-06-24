@@ -615,6 +615,18 @@ From the mcp-surface-review code review (2026-06-24). ~session_status~ calls
 allocation for a long-lived session with many checkpoints — return a borrow /
 iterator, or skip when empty.
 
+** TODO Structured tool output (structuredContent + outputSchema) [#C] :mcp:
+From the 2026-06-24 surface usability analysis. Every tool returns prose/text
+(only ~run_program~ returns JSON-as-text). MCP 2025-06-18 supports
+~structuredContent~ + per-tool ~outputSchema~; populating them for the
+machine-shaped read tools (~occur~, ~grep~, ~outline~, ~session_status~,
+~git_log~, ~git_status~) would let programmatic/hybrid clients consume results
+without parsing prose. Deliberately deferred: (1) LLM agents — the only client
+today — read prose fine, so there is no consumer yet; (2) ~outputSchema~ adds to
+the always-loaded schema surface, in tension with keeping it lean. Revisit when
+a non-LLM client appears. Note ~structuredContent~ is additive (text stays), so
+it can land incrementally per tool.
+
 * Structural editing
 
 ** TODO Incremental re-parse (~InputEdit~s) [#C]
