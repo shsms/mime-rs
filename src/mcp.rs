@@ -1626,8 +1626,30 @@ fn tool_help(args: &Value) -> Result<String, String> {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    // help {tool: "name"} — per-tool reference projected from the registry, so
+    // it's the same source as tools/list and the instructions index.
+    if let Some(name) = args.get("tool").and_then(Value::as_str) {
+        return catalogue()
+            .into_iter()
+            .find(|d| d.name() == name)
+            .map(|d| {
+                let a = d.annotations;
+                format!(
+                    "{name} — {summary}\n\n{description}\n\nannotations: read_only={ro}, destructive={de}, idempotent={id}",
+                    summary = d.summary,
+                    description = d.schema["description"].as_str().unwrap_or(""),
+                    ro = a.read_only,
+                    de = a.destructive,
+                    id = a.idempotent,
+                )
+            })
+            .ok_or_else(|| format!("unknown tool {name:?}"));
+    }
     match args.get("topic").and_then(Value::as_str) {
-        None => Ok(format!("help topics:\n{}", index())),
+        None => Ok(format!(
+            "help topics:\n{}\n\n(help {{tool: \"name\"}} for a specific tool's reference)",
+            index()
+        )),
         Some(t) => crate::help::topic(t)
             .map(str::to_string)
             .ok_or_else(|| format!("unknown help topic {t:?} — topics:\n{}", index())),
@@ -2467,11 +2489,12 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "help",
-            "description": "Reference briefs served on demand: the regex dialect (RE2 patterns, Emacs anchors/replacements), the treesit structural-editing vocabulary, the merge-conflict workflow, session/saving/undo semantics, and ready-to-adapt edit recipes. Call it with no topic to list the topics; reach for it BEFORE guessing at syntax or vocabulary.",
+            "description": "Reference briefs served on demand: the regex dialect (RE2 patterns, Emacs anchors/replacements), the treesit structural-editing vocabulary, the merge-conflict workflow, session/saving/undo semantics, and ready-to-adapt edit recipes. Call it with no argument to list the topics; pass `tool` for one tool's full reference (description + annotations). Reach for it BEFORE guessing at syntax or vocabulary.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "topic": { "type": "string", "enum": ["regex", "treesit", "conflicts", "sessions", "recipes"], "description": "Which brief to fetch; omit to list them." },
+                    "tool": { "type": "string", "description": "A tool name — return that tool's full description + annotations from the registry." },
                 },
                 "required": [],
             },
