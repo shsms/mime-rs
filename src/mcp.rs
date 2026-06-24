@@ -31,7 +31,11 @@ use crate::{Buffer, Quire, TextStore, Workspace};
 use serde_json::{Value, json};
 
 const DEFAULT_SESSION: &str = "default";
-const PROTOCOL_VERSION: &str = "2024-11-05";
+/// MCP protocol versions mime implements (latest first — the tools surface is
+/// stable across them). `initialize` echoes the client's if it's one of these,
+/// else returns the latest, per the spec.
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+const PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
 
 /// Cap on warm sessions. Each file-backed session pins an open fd and a warm
 /// buffer; agents rarely work more than a handful of files, so past the cap
@@ -162,11 +166,12 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
 }
 
 fn initialize_result(params: &Value) -> Value {
-    // Echo the client's protocolVersion when it sent one; otherwise advertise
-    // ours. Both are valid MCP; echoing avoids a needless mismatch.
+    // Echo the client's requested version when we actually implement it; for an
+    // unknown/absent one, return our latest rather than falsely claiming theirs.
     let version = params
         .get("protocolVersion")
         .and_then(Value::as_str)
+        .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v))
         .unwrap_or(PROTOCOL_VERSION);
     json!({
         "protocolVersion": version,
@@ -2514,6 +2519,81 @@ fn build_tool_schemas() -> Vec<Value> {
 #[cfg(test)]
 mod git_tool_tests {
     use super::*;
+
+    #[test]
+    fn mcp_handshake_is_spec_conformant() {
+        let mut s: HashMap<String, Workspace> = HashMap::new();
+        let call = |line: &str, s: &mut HashMap<String, Workspace>| handle_line(line, s);
+
+        // initialize: a supported version is echoed; capabilities + instructions present.
+        let init = call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+        assert!(init["result"]["capabilities"]["tools"].is_object());
+        assert!(
+            init["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("mime-rs")
+        );
+
+        // an unsupported version clamps to our latest instead of being echoed.
+        let old = call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1999-01-01"}}"#,
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(old["result"]["protocolVersion"], PROTOCOL_VERSION);
+
+        // notifications/initialized is a pure notification — no reply.
+        assert!(
+            call(
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                &mut s
+            )
+            .is_none()
+        );
+
+        // ping → empty result object.
+        assert!(
+            call(r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#, &mut s).unwrap()["result"]
+                .is_object()
+        );
+
+        // tools/list → every tool carries an inputSchema and annotations.
+        let list = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#, &mut s).unwrap();
+        let tools = list["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["name"] == "view"));
+        assert!(
+            tools
+                .iter()
+                .all(|t| t["inputSchema"].is_object() && t["annotations"].is_object())
+        );
+
+        // tools/call → a result envelope (isError:false on success).
+        call(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"open_text","arguments":{"text":"hi\n","session":"c"}}}"#,
+            &mut s,
+        )
+        .unwrap();
+        let view = call(
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"view","arguments":{"session":"c"}}}"#,
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(view["result"]["isError"], false);
+
+        // unknown method → a JSON-RPC error (-32601), not a result.
+        let err = call(r#"{"jsonrpc":"2.0","id":6,"method":"no/such"}"#, &mut s).unwrap();
+        assert_eq!(err["error"]["code"], -32601);
+
+        // unparseable input → parse error (-32700) against a null id.
+        let parse = call("{not json", &mut s).unwrap();
+        assert_eq!(parse["error"]["code"], -32700);
+    }
 
     #[test]
     fn meta_covers_every_tool() {
