@@ -868,7 +868,10 @@ fn open(repo_path: &std::path::Path) -> Result<Repository, String> {
 fn backup_note(repo: &Repository) -> String {
     match repo.head().ok().and_then(|h| h.name().map(str::to_string)) {
         Some(b) if b.starts_with("refs/heads/") => {
-            format!("\n  pre-op tip backed up at {}", backup_ref(&b))
+            format!(
+                "\n  pre-op tip backed up at {} (the next op on this branch overwrites it)",
+                backup_ref(&b)
+            )
         }
         _ => String::new(),
     }
