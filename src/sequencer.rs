@@ -12,8 +12,15 @@
 //! with a diff3 checkout, so a clean step lands a new commit and a conflicted
 //! one leaves markers in the worktree. In-progress state lives in
 //! `.git/mime-sequencer.json` so `continue`/`abort` are re-entrant across
-//! process restarts; the branch ref only moves at `finish`. `abort` is a
-//! `reset --hard` back to the pre-op snapshot.
+//! process restarts; the branch ref only moves at `finish`. `abort` puts HEAD
+//! back on the branch at its current tip.
+//!
+//! Precondition: the operation assumes it is the SOLE writer of the branch for
+//! its duration. `begin` refuses on a dirty/colliding worktree or detached
+//! HEAD; `finish` refuses to land if the branch moved or was deleted under it
+//! (use `abort`). It does NOT defend against a *concurrent* external rewrite
+//! racing a single call — an agent driving its own repo, the intended use, is
+//! single-writer.
 //!
 //! Network and arbitrary-code channels are unused by construction: no
 //! remotes/transports, no hooks or filters; repos are confined to `MIME_ROOTS`
@@ -30,6 +37,19 @@ type Error = git2::Error;
 
 fn estr(msg: &str) -> Error {
     Error::from_str(msg)
+}
+
+/// Hard-reset HEAD/index/worktree to `oid` — the recurring teardown idiom.
+fn hard_reset(repo: &Repository, oid: Oid) -> Result<(), Error> {
+    repo.reset(&repo.find_object(oid, None)?, ResetType::Hard, None)
+}
+
+/// Whether the working tree or index has uncommitted changes to TRACKED files.
+/// Untracked/ignored files are allowed, matching what `git rebase` refuses on.
+fn is_dirty(repo: &Repository) -> Result<bool, Error> {
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(false).include_ignored(false);
+    Ok(!repo.statuses(Some(&mut opts))?.is_empty())
 }
 
 /// What to do with a planned commit. `Squash`/`Fixup` meld into the preceding
@@ -211,6 +231,15 @@ fn conflict_paths(index: &Index) -> Vec<String> {
     out
 }
 
+/// Whether `bytes` has a conflict-marker opener (`<<<<<<<`, ≥7 `<`) at the start
+/// of any line — `git diff --check`'s signal. Byte-level so it works on non-UTF-8
+/// files and on conflicts the diff3 hunk parser can't structure.
+fn has_conflict_markers(bytes: &[u8]) -> bool {
+    bytes
+        .split(|&b| b == b'\n')
+        .any(|line| line.starts_with(b"<<<<<<<"))
+}
+
 /// A diff3-conflict-style checkout builder — the worktree rendering a
 /// conflicted step needs so [`crate::conflict`] can parse it.
 fn diff3_checkout() -> CheckoutBuilder<'static> {
@@ -260,16 +289,45 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
             "a sequencer operation is already in progress (continue or abort it first)",
         ));
     }
+    // git2's head().name() is Some("HEAD") when detached, so the name check
+    // below can't detect it — ask explicitly. We rewrite the current branch, so
+    // a detached HEAD has nothing to land onto.
+    if repo.head_detached()? {
+        return Err(estr("HEAD is detached — check out a branch first"));
+    }
+    // Like `git rebase`, refuse to start over uncommitted work the hard reset
+    // below would silently destroy.
+    if is_dirty(repo)? {
+        return Err(estr(
+            "the working tree has uncommitted changes — commit or stash them first",
+        ));
+    }
+    // is_dirty ignores untracked files, but the hard reset to `onto` would still
+    // clobber an untracked file colliding with a path in onto's tree — git rebase
+    // refuses that, so we do too.
+    let onto_tree = repo.find_commit(plan.onto)?.tree()?;
+    let mut uopts = git2::StatusOptions::new();
+    uopts.include_untracked(true).include_ignored(false);
+    for e in repo.statuses(Some(&mut uopts))?.iter() {
+        if e.status().contains(git2::Status::WT_NEW)
+            && let Some(p) = e.path()
+            && onto_tree.get_path(Path::new(p)).is_ok()
+        {
+            return Err(estr(&format!(
+                "untracked file {p} would be overwritten by the checkout — move or remove it first"
+            )));
+        }
+    }
     let head = repo.head()?;
     let branch = head
         .name()
-        .ok_or_else(|| estr("HEAD has no name (detached) — cannot rebase"))?
+        .ok_or_else(|| estr("HEAD has no branch name"))?
         .to_string();
     let orig = head.peel_to_commit()?.id();
 
     // Detach onto the base and clean the worktree to it.
     repo.set_head_detached(plan.onto)?;
-    repo.reset(&repo.find_object(plan.onto, None)?, ResetType::Hard, None)?;
+    hard_reset(repo, plan.onto)?;
 
     let st = State {
         branch,
@@ -294,13 +352,37 @@ pub fn continue_op(repo: &Repository) -> Result<Outcome, Error> {
         .ok_or_else(|| estr("nothing to continue"))?
         .clone();
 
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| estr("a bare repo has no worktree to resolve in"))?
+        .to_path_buf();
+    // Stage exactly the conflicted paths from the worktree (like `git add` on
+    // the resolved files) — NOT the whole worktree, so unrelated edits or
+    // stray markers elsewhere never get folded into this commit.
     let mut index = repo.index()?;
     for path in conflict_paths(&index) {
-        index.add_path(Path::new(&path))?;
+        let full = workdir.join(&path);
+        if full.exists() {
+            // Refuse to commit a file that still carries conflict markers. A
+            // byte-level opener check (git diff --check's signal) is encoding-
+            // agnostic and catches malformed runs a hunk parser would miss; the
+            // earlier add_path-then-has_conflicts check was dead (add_path
+            // clears the conflict, so the guard never fired).
+            if has_conflict_markers(&std::fs::read(&full).unwrap_or_default()) {
+                return Err(estr(&format!(
+                    "unresolved conflict markers remain in {path} — resolve them, then continue"
+                )));
+            }
+            index.add_path(Path::new(&path))?;
+        } else {
+            // Resolved by removing the file (e.g. a modify/delete conflict kept
+            // as a deletion) — add_path would error on the missing file.
+            index.remove_path(Path::new(&path))?;
+        }
     }
     if index.has_conflicts() {
         return Err(estr(
-            "unresolved conflict markers remain — resolve them, then continue",
+            "unresolved conflicts remain in the index — resolve them, then continue",
         ));
     }
     let tree = repo.find_tree(index.write_tree()?)?;
@@ -321,18 +403,24 @@ pub fn skip(repo: &Repository) -> Result<Outcome, Error> {
         return Err(estr("nothing to skip"));
     }
     // Discard the in-progress merge residue, back to the last good tip.
-    repo.reset(&repo.find_object(st.current, None)?, ResetType::Hard, None)?;
+    hard_reset(repo, st.current)?;
     let _ = repo.cleanup_state();
     st.next += 1;
     save_state(repo, &st)?;
     drive(repo, st)
 }
 
-/// Abort: restore HEAD/refs/worktree to the pre-op snapshot, drop the state.
+/// Abort: drop the replay and put HEAD back on the branch at its CURRENT tip.
+/// We never move the branch ref during an op (only `finish` does), so resetting
+/// to the branch's present tip — not the recorded `orig` — preserves any commits
+/// another process added while we were paused, instead of clobbering them.
 pub fn abort(repo: &Repository) -> Result<(), Error> {
     let st = load_state(repo)?;
+    let tip = repo
+        .refname_to_id(&st.branch)
+        .map_err(|_| estr(&format!("{} no longer exists — cannot restore", st.branch)))?;
     repo.set_head(&st.branch)?;
-    repo.reset(&repo.find_object(st.orig, None)?, ResetType::Hard, None)?;
+    hard_reset(repo, tip)?;
     let _ = repo.cleanup_state();
     let _ = std::fs::remove_file(state_path(repo));
     Ok(())
@@ -471,6 +559,8 @@ fn drive(repo: &Repository, mut st: State) -> Result<Outcome, Error> {
         repo.cleanup_state()?;
         st.current = new;
         st.next += 1;
+        // Persist after each landed step: a crash mid-run otherwise leaves HEAD
+        // ahead of a stale next=0/current=onto state that would re-apply commits.
         save_state(repo, &st)?;
     }
     finish(repo, &st)?;
@@ -480,9 +570,28 @@ fn drive(repo: &Repository, mut st: State) -> Result<Outcome, Error> {
 /// Land the rebased history: move the branch ref to the new tip, reattach
 /// HEAD, clean the worktree, drop the state.
 fn finish(repo: &Repository, st: &State) -> Result<(), Error> {
+    // Only land if the branch still points where `begin` left it. If another
+    // process moved it (would drop their commits) or deleted it (recreating it
+    // would resurrect a ref the user removed), refuse and leave the replay for
+    // git_abort to discard.
+    match repo.find_reference(&st.branch) {
+        Ok(r) if r.target() != Some(st.orig) => {
+            return Err(estr(&format!(
+                "{} moved during the operation — leaving it untouched; git_abort to discard the replay",
+                st.branch
+            )));
+        }
+        Err(_) => {
+            return Err(estr(&format!(
+                "{} was deleted during the operation — git_abort to discard the replay",
+                st.branch
+            )));
+        }
+        _ => {}
+    }
     repo.reference(&st.branch, st.current, true, "rebase (mime sequencer)")?;
     repo.set_head(&st.branch)?;
-    repo.reset(&repo.find_object(st.current, None)?, ResetType::Hard, None)?;
+    hard_reset(repo, st.current)?;
     let _ = repo.cleanup_state();
     let _ = std::fs::remove_file(state_path(repo));
     Ok(())
@@ -714,6 +823,7 @@ mod tests {
     use super::*;
     use crate::buffer::Buffer;
     use git2::Signature;
+    use std::path::Path;
 
     fn tmp(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("mime-seq-{tag}-{}", std::process::id()));
@@ -1089,5 +1199,190 @@ mod tests {
         .unwrap_err();
         assert!(err.message().contains("first applied step"));
         assert!(!state_path(&repo).exists(), "rejected before any mutation");
+    }
+
+    /// A conflicting plan, stopped at the conflict, for the continue/guard tests.
+    fn conflict_repo(dir: &std::path::Path) -> (Repository, Oid) {
+        let repo = Repository::init(dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n"), ("b", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "10\n"), ("b", "1\n")], "ours a");
+        let m1 = commit(&repo, &[base], &[("a", "20\n"), ("b", "1\n")], "their a");
+        on_branch(&repo, "topic", f1);
+        let out = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Pick, None)],
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, Outcome::Conflict { .. }));
+        (repo, f1)
+    }
+
+    #[test]
+    fn continue_refuses_while_markers_remain() {
+        let dir = tmp("markers");
+        let (repo, _) = conflict_repo(&dir);
+        // The worktree still carries the diff3 markers; continue must refuse to
+        // bake them into history rather than silently committing them.
+        let err = continue_op(&repo).unwrap_err();
+        assert!(
+            err.message().contains("unresolved conflict markers"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn continue_commits_only_the_conflicted_paths() {
+        let dir = tmp("outofset");
+        let (repo, _) = conflict_repo(&dir);
+        // Resolve the conflicted file AND scribble on an unrelated tracked file.
+        std::fs::write(dir.join("a"), "resolved\n").unwrap();
+        std::fs::write(dir.join("b"), "also changed\n").unwrap();
+        assert!(matches!(continue_op(&repo).unwrap(), Outcome::Done { .. }));
+        // Only the conflicted path is committed; the unrelated edit is NOT folded
+        // into the cherry-picked commit (it stays uncommitted in the worktree).
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        let entry = tip.tree().unwrap().get_path(Path::new("b")).unwrap();
+        let blob = repo.find_blob(entry.id()).unwrap();
+        assert_eq!(blob.content(), b"1\n", "out-of-set edit not committed");
+    }
+
+    #[test]
+    fn continue_resolves_a_modify_delete_conflict_by_deletion() {
+        let dir = tmp("moddel");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n"), ("f", "x\n")], "base");
+        let f1 = commit(
+            &repo,
+            &[base],
+            &[("a", "1\n"), ("f", "edited\n")],
+            "modify f",
+        );
+        let m1 = commit(&repo, &[base], &[("a", "1\n")], "delete f");
+        on_branch(&repo, "topic", f1);
+        let out = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Pick, None)],
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, Outcome::Conflict { .. }));
+        // Resolve by keeping the deletion — add_path on a missing file would error.
+        let _ = std::fs::remove_file(dir.join("f"));
+        assert!(matches!(continue_op(&repo).unwrap(), Outcome::Done { .. }));
+        assert!(!dir.join("f").exists(), "deletion landed");
+    }
+
+    #[test]
+    fn start_refuses_on_a_dirty_worktree() {
+        let dir = tmp("dirty");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "2\n")], "f1");
+        on_branch(&repo, "topic", f1);
+        std::fs::write(dir.join("a"), "uncommitted\n").unwrap();
+        let err = start(
+            &repo,
+            Plan {
+                onto: base,
+                steps: vec![step(f1, Action::Pick, None)],
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.message().contains("uncommitted changes"),
+            "{}",
+            err.message()
+        );
+        assert!(!state_path(&repo).exists());
+        assert_eq!(
+            read(&repo, "a"),
+            "uncommitted\n",
+            "dirty edit not destroyed"
+        );
+    }
+
+    #[test]
+    fn abort_preserves_a_concurrent_branch_advance() {
+        let dir = tmp("abort-concurrent");
+        let (repo, _) = conflict_repo(&dir);
+        // While paused at the conflict, another writer advances the branch.
+        let extra = {
+            let tip = repo.refname_to_id("refs/heads/topic").unwrap();
+            commit(
+                &repo,
+                &[tip],
+                &[("a", "10\n"), ("c", "new\n")],
+                "concurrent",
+            )
+        };
+        repo.reference("refs/heads/topic", extra, true, "concurrent advance")
+            .unwrap();
+        // Aborting must NOT roll the branch back to the pre-op tip and lose it.
+        abort(&repo).unwrap();
+        assert_eq!(
+            repo.refname_to_id("refs/heads/topic").unwrap(),
+            extra,
+            "abort kept the concurrent commit"
+        );
+    }
+
+    #[test]
+    fn start_refuses_when_an_untracked_file_would_be_overwritten() {
+        let dir = tmp("untracked");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        // `onto` introduces file `u`; the worktree has an untracked `u`.
+        let f1 = commit(&repo, &[base], &[("a", "2\n")], "f1");
+        let m1 = commit(
+            &repo,
+            &[base],
+            &[("a", "1\n"), ("u", "from onto\n")],
+            "adds u",
+        );
+        on_branch(&repo, "topic", f1);
+        std::fs::write(dir.join("u"), "my untracked work\n").unwrap();
+        let err = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Pick, None)],
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.message().contains("would be overwritten"),
+            "{}",
+            err.message()
+        );
+        assert_eq!(
+            read(&repo, "u"),
+            "my untracked work\n",
+            "untracked file untouched"
+        );
+    }
+
+    #[test]
+    fn start_refuses_on_detached_head() {
+        let dir = tmp("detached");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "2\n")], "f1");
+        on_branch(&repo, "topic", f1);
+        repo.set_head_detached(f1).unwrap();
+        let err = start(
+            &repo,
+            Plan {
+                onto: base,
+                steps: vec![step(f1, Action::Pick, None)],
+            },
+        )
+        .unwrap_err();
+        assert!(err.message().contains("detached"), "{}", err.message());
     }
 }
