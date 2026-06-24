@@ -114,11 +114,16 @@ linear-time, no backreferences in patterns. The full table lives in
 make claude   # cargo install + register `mime --mcp` with Claude Code (MIME_ROOTS)
 ```
 
-That registers a sandboxed MCP server. Each tool takes a `path` and auto-opens
-the file into a warm session keyed by its canonical path; mutating tools take
-`save: true` for an atomic, stale-guarded write-back. The catalogue is
-generated from the live schemas into [docs/mcp-tools.md](docs/mcp-tools.md)
-(`make docs`), so the docs can't drift from the code. The edits that matter:
+That registers a sandboxed MCP server with Claude Code; **any** MCP client works
+the same way (`mime --mcp` over stdio) — see [docs/clients.md](docs/clients.md)
+for Cursor, Cline, Continue, VS Code, and others. The server is self-describing:
+`initialize` returns how-to-drive `instructions` and a tool index, and every
+tool carries MCP `annotations` (read-only vs destructive), so a client onboards
+its model from the protocol. Each tool takes a `path` and auto-opens the file
+into a warm session keyed by its canonical path; mutating tools take `save: true`
+for an atomic, stale-guarded write-back. The catalogue is generated from the live
+schemas into [docs/mcp-tools.md](docs/mcp-tools.md) (`make docs`), so the docs
+can't drift from the code. The edits that matter:
 
 ```json
 replace_text {path, pattern, replacement, expect_unique: true, save: true}

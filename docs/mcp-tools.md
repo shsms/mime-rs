@@ -172,8 +172,9 @@ Drop a warm session: releases its buffer and the open file handle a file-backed 
 
 ## help
 
-Reference briefs served on demand: the regex dialect (RE2 patterns, Emacs anchors/replacements), the treesit structural-editing vocabulary, the merge-conflict workflow, session/saving/undo semantics, and ready-to-adapt edit recipes. Call it with no topic to list the topics; reach for it BEFORE guessing at syntax or vocabulary.
+Reference briefs served on demand: the regex dialect (RE2 patterns, Emacs anchors/replacements), the treesit structural-editing vocabulary, the merge-conflict workflow, session/saving/undo semantics, and ready-to-adapt edit recipes. Call it with no argument to list the topics; pass `tool` for one tool's full reference (description + annotations). Reach for it BEFORE guessing at syntax or vocabulary.
 
+- `tool` — A tool name — return that tool's full description + annotations from the registry.
 - `topic` — Which brief to fetch; omit to list them.
 
 ## session_status
@@ -206,8 +207,9 @@ Apply the inverse of `commits` (in order) on top of the current branch tip. Stop
 
 ## git_continue
 
-After resolving the stopped step's conflicts in the worktree (and saving), commit the resolution and continue the operation. Errors if unresolved markers remain.
+After resolving the stopped step's conflicts in the worktree (and saving), commit the resolution and continue the operation. Errors if a resolved file still contains conflict-marker lines; pass force: true to override (e.g. the resolution legitimately contains marker-like text).
 
+- `force` — Commit even if a resolved file still has conflict-marker lines. Default false.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 
 ## git_skip

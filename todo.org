@@ -173,6 +173,32 @@ the read-only set; gate the destructive set).
 3. Streamable HTTP transport.
 4. crates.io publish + ~docs/clients.md~ cookbook + thin-skill regeneration.
 
+*** Progress
+
+- [X] Registry spine: ~ToolDoc~ + ~catalogue()~; tools/list / validate_args /
+  describe-mcp all project from it (mcp.rs).
+- [X] Annotations on every tool, via one centralized ~meta()~ (category +
+  annotations + summary), drift-guarded by ~meta_covers_every_tool~.
+- [X] ~instructions~ field on ~initialize~: curated preamble + a category-grouped
+  tool index generated from the catalogue (client-agnostic onboarding).
+- [X] ~help {tool}~ projects a tool's reference from the registry; topic briefs
+  unchanged.
+- [X] protocolVersion clamped to a supported set; full-handshake conformance
+  test (~mcp_handshake_is_spec_conformant~) — initialize/version-clamp,
+  initialized, ping, tools/list, tools/call, -32601/-32700.
+- [X] ~docs/clients.md~ registration cookbook (Claude Code / Cursor / Cline /
+  VS Code / Continue / generic); README points at it. Cargo.toml is
+  publish-ready.
+- [ ] Per-tool ~examples~/~topics~ in ToolDoc so ~help {topic}~ also lists its
+  tools — deferred (lower value than the above).
+- [ ] MCP Inspector pass (~npx @modelcontextprotocol/inspector mime --mcp~) +
+  try one non-Claude client — manual, needs node/that client.
+- [ ] Streamable HTTP transport (daemon.rs is a head start) — for
+  hosted/multi-client harnesses; stdio already covers every CLI.
+- [ ] Publish to crates.io — outward/irreversible; the user runs it.
+- [ ] Thin the out-of-band client skill now that ~instructions~ carries the
+  driving knowledge in-protocol.
+
 /Exit: a fresh MCP client (the Inspector, plus one non-Claude harness) connects,
 reads ~instructions~, and an agent drives a rule-shaped edit AND a rebase using
 only what the protocol surfaces — no external skill file./
