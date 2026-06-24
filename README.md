@@ -41,12 +41,13 @@ Built for two users at once:
   (full orchestration, like `emacs --batch`); the MCP/daemon tier is
   sandboxed — filesystem confined to `$MIME_ROOTS`, every run audited, no
   shell, no network.
-- **Git history editing, in-process.** An opt-in `git_*` tool group drives
-  rebase / cherry-pick / revert as an agent-friendly sequencer (`git2` /
-  vendored libgit2): plan steps are data, conflicts surface through the same
+- **Git history editing, in-process.** A `git_*` tool group drives rebase /
+  cherry-pick / revert as an agent-friendly sequencer (`git2` / vendored
+  libgit2): plan steps are data, conflicts surface through the same
   merge-conflict vocabulary (resolve, then `git_continue`), and `git_rebase`
   can `rehearse` a plan first. No `git` subprocess, no network, no hooks or
-  exec — gated behind `MIME_ENABLE_GIT`.
+  exec; repos stay confined to `$MIME_ROOTS`, and every destructive op first
+  stamps a `refs/mime-backup/<branch>` recovery ref.
 - **Honest results.** Token-frugal diffs (clamped when huge), per-call
   reports, `stale`/`unsaved` flags only when true, and a save-time syntax
   check for code buffers.
@@ -89,11 +90,12 @@ an edit to one function; warm sessions are bounded and never evicted with
 unsaved work. The full catalogue is generated from the live schemas into
 [docs/mcp-tools.md](docs/mcp-tools.md) (`make docs`), so it can't drift.
 
-With `MIME_ENABLE_GIT` set, a gated `git_*` group joins them — `git_rebase`
-(with `rehearse`), `git_cherry_pick`, `git_revert`, `git_continue`, `git_skip`,
-`git_abort`, `git_status`, `git_log`, `git_show` — for agent-driven history
-editing. A conflicted step stops with diff3 markers in the worktree; resolve
-with the merge-conflict tools above, then `git_continue` (or `git_abort`).
+A `git_*` group adds agent-driven history editing — `git_rebase` (with
+`rehearse`), `git_cherry_pick`, `git_revert`, `git_continue`, `git_skip`,
+`git_abort`, `git_status`, `git_log`, `git_show`. A conflicted step stops with
+diff3 markers in the worktree; resolve with the merge-conflict tools above, then
+`git_continue` (or `git_abort`). Each op first stamps a `refs/mime-backup/<branch>`
+ref, so the pre-op state is always recoverable.
 
 ## Build & layout
 

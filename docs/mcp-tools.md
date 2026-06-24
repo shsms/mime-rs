@@ -181,3 +181,64 @@ Reference briefs served on demand: the regex dialect (RE2 patterns, Emacs anchor
 Report engine status: per live session the current buffer, its visited file, and whether it is narrowed, stale (its file drifted on disk), or unsaved (has edits not yet written to that file — so a forgotten save is visible); plus the allowed filesystem roots that open_file/save_buffer are confined to (MIME_ROOTS, default cwd), and whether the audit journal is on. Check the roots before opening or saving to learn the writable sandbox up front.
 
 
+## git_rebase
+
+Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`. Each step picks/rewords/squashes/fixups/drops a commit; reorder by listing in the new order. Stops on a conflict for the conflict tools + git_continue. No network, hooks, or exec.
+
+- `onto` (required) — The new base — oid/ref/revspec the commits are replayed onto.
+- `plan` — Explicit steps (omit to pick all of onto..HEAD in order). List order is the new commit order.
+- `rehearse` — Dry-run: preview the resulting commits and whether the tree is unchanged (a pure reorder/fold), applying nothing. Default false.
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+
+## git_cherry_pick
+
+Apply `commits` (in order) on top of the current branch tip. Stops on conflict for the conflict tools + git_continue.
+
+- `commits` (required) — Commits to apply, in order — each an oid, ref, or revspec (e.g. HEAD~2).
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+
+## git_revert
+
+Apply the inverse of `commits` (in order) on top of the current branch tip. Stops on conflict for the conflict tools + git_continue.
+
+- `commits` (required) — Commits to apply, in order — each an oid, ref, or revspec (e.g. HEAD~2).
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+
+## git_continue
+
+After resolving the stopped step's conflicts in the worktree (and saving), commit the resolution and continue the operation. Errors if unresolved markers remain.
+
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+
+## git_skip
+
+Drop the stopped step and continue the operation as if that commit had been omitted.
+
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+
+## git_abort
+
+Abort the in-progress operation, restoring HEAD/branch/worktree to the pre-operation state.
+
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+
+## git_status
+
+Report the in-progress operation: which step, of how many, the current tip, and any unresolved conflict files (or that nothing is in progress).
+
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+
+## git_log
+
+One line per commit (oid + summary), for `range` (e.g. main..HEAD) or from HEAD; capped at 50. Use to build a rebase plan.
+
+- `range` — A revision range like main..HEAD; omit for HEAD's history.
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+
+## git_show
+
+A commit's metadata, message, and the files it changed vs its first parent.
+
+- `commit` (required) — oid/ref/revspec of the commit.
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+
