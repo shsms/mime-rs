@@ -2357,18 +2357,23 @@ fn catalogue() -> Vec<ToolDoc> {
 /// The index is generated from the catalogue, so it can't drift from the tools.
 fn instructions() -> String {
     let mut s = String::from(
-        "mime-rs is a transactional text-editing engine. Opening is implicit: pass `path` to \
-         any tool and the file becomes a warm session (or `session` for an in-memory buffer); \
-         buffers stay warm and NOTHING is written until you save (`save: true` on an edit, or \
-         save_buffer). Prefer one call: replace_text / insert_text for literal edits — set \
-         `expect_unique: true` when the anchor text could repeat, so an ambiguous match is an \
-         error, not a silent wrong edit — and run_program (Emacs-Lisp) when you need regex or \
-         structure. Three persistence levels: `rehearse` previews a program then \
-         rolls the buffer back (nothing persists); `run_program`/the edit tools \
-         persist to the warm buffer for later calls but NOT to disk; `save` (or \
-         save_buffer) writes to disk. `undo_last` rewinds a misfire. Positions: @N \
-         and point are ABSOLUTE (goto-char); line \
-         numbers are narrowing-relative (goto-line).\n\nTools:\n",
+        "mime-rs is a transactional text-editing engine — reach for it for rule-shaped, \
+         bulk, regex, structural (tree-sitter), cross-file, or very large edits, and for \
+         in-process git rebase/cherry-pick/revert; a single unique-string change may be \
+         simpler in your own editor. Opening is implicit: pass `path` to any tool and the \
+         file becomes a warm session (or `session` for an in-memory buffer); buffers stay \
+         warm and NOTHING is written until you save (`save: true` on an edit, or save_buffer). \
+         Typical flow: orient with outline / occur / grep → rehearse → run_program or \
+         replace_text {save:true} → undo_last if it misfired. Prefer one call: replace_text / \
+         insert_text for literal edits — set `expect_unique: true` when the anchor text could \
+         repeat, so an ambiguous match is an error, not a silent wrong edit — and run_program \
+         (Emacs-Lisp) when you need regex or structure. Three persistence levels: `rehearse` \
+         previews a program then rolls the buffer back (nothing persists); `run_program`/the \
+         edit tools persist to the warm buffer for later calls but NOT to disk; `save` (or \
+         save_buffer) writes to disk. Note a FAILED run_program does NOT roll back — its \
+         partial edits persist (undo_last reverts them); rehearse first when unsure. Positions: \
+         @N and point are ABSOLUTE (goto-char); line numbers are narrowing-relative \
+         (goto-line).\n\nTools:\n",
     );
     let cat = catalogue();
     for category in Category::ORDER {
@@ -2421,7 +2426,7 @@ fn build_tool_schemas() -> Vec<Value> {
     vec![
         json!({
             "name": "open_file",
-            "description": "Open a file from disk into a warm session (replacing any existing session of that name). The buffer stays resident so later tools need no file re-reads. The path must resolve inside an allowed root (MIME_ROOTS, default cwd).",
+            "description": "Open a file from disk into a warm session (replacing any existing session of that name). The buffer stays resident so later tools need no file re-reads. The path must resolve inside an allowed root (MIME_ROOTS, default cwd). You rarely need this: every tool's `path` argument auto-opens the file the same way — reach for open_file only to attach it read-only (`read_only: true`) or under a specific session id.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
