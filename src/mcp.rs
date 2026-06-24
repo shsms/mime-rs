@@ -2178,8 +2178,11 @@ fn instructions() -> String {
          save_buffer). Prefer one call: replace_text / insert_text for literal edits — set \
          `expect_unique: true` when the anchor text could repeat, so an ambiguous match is an \
          error, not a silent wrong edit — and run_program (Emacs-Lisp) when you need regex or \
-         structure. `rehearse` dry-runs any program (preview the diff, change nothing); \
-         `undo_last` rewinds a misfire. Positions: @N and point are ABSOLUTE (goto-char); line \
+         structure. Three persistence levels: `rehearse` previews a program then \
+         rolls the buffer back (nothing persists); `run_program`/the edit tools \
+         persist to the warm buffer for later calls but NOT to disk; `save` (or \
+         save_buffer) writes to disk. `undo_last` rewinds a misfire. Positions: @N \
+         and point are ABSOLUTE (goto-char); line \
          numbers are narrowing-relative (goto-line).\n\nTools:\n",
     );
     let cat = catalogue();
@@ -2194,7 +2197,10 @@ fn instructions() -> String {
         }
     }
     s.push_str(
-        "\nCall help {topic} for the regex / treesit / conflicts / sessions / recipes briefs.",
+        "\nThe deep vocabulary — regex, treesit structural editing, and conflict \
+         resolution (conflict-keep / conflict-replace / …) — lives inside run_program \
+         by design: a small tool surface over a deep engine. Call \
+         help {regex|treesit|conflicts|sessions|recipes} (or help {tool: \"name\"}) for it.",
     );
     s
 }
