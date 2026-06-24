@@ -1,122 +1,208 @@
 # mime-rs
 
-Emacs-style batch editing as an engine: you send it a small **Emacs-Lisp
-program** (or one declarative tool call), it edits a buffer and hands back a
-unified diff plus machine-readable reports — and anything can be rewound.
+A scriptable, **transactional** text-editing engine. You hand it a small
+Emacs-Lisp program — or a single declarative tool call — and it edits a buffer
+and hands back a unified diff plus machine-readable reports. Nothing touches
+disk until you save, and anything can be rewound.
 
 ```elisp
+;; prog.tl — the vocabulary is Emacs Lisp
 (goto-char (point-min))
 (report "n" (replace-regexp "world" "WORLD"))
 ```
 
 ```sh
 printf 'hello world, brave world\n' | mime run prog.tl
-# → JSON: { diff: "-hello world…+hello WORLD…", reports: { n: "2" }, … }
+# → { "diff": "-hello world…\n+hello WORLD…", "reports": { "n": "2" }, … }
 ```
 
-Built for two users at once:
+It's `emacs --batch` reimagined as a server: real buffers with point, mark,
+narrowing, the kill-ring, regex **and** structural search — but every run is a
+transaction that reports what it did and can be undone.
 
-- **You**, scripting bulk edits the way you'd reach for `emacs --batch` or
-  `sed` — but with real buffers, regex + structural search, multi-file
-  orchestration, and rollback.
-- **AI agents**, over MCP: a bounded editing surface where the common edit is
-  one call, an ambiguous edit is an *error* instead of a silent mistake, and
-  recovery from a misfire is one call (`undo_last`).
+## Two users at once
 
-## Why it's interesting
+mime-rs is built for two kinds of caller, sharing one engine:
 
-- **Transactional everywhere.** Dry-run any program (`rehearse`), make
-  multi-step edits all-or-nothing (`with-transaction`), checkpoint and
-  rewind. Saves are atomic and refuse to clobber a file an external writer
-  changed — the edit stays warm instead of getting lost.
+- **You**, scripting bulk edits where you'd otherwise reach for `emacs --batch`,
+  `sed`, or a one-off script — but with real buffers, structural (tree-sitter)
+  edits, multi-file orchestration, dry-runs, and rollback.
+- **AI agents**, over [MCP](https://modelcontextprotocol.io): a *bounded*
+  editing surface designed for models. The common edit is one call; an
+  ambiguous edit is an **error**, not a silent mistake; and recovering from a
+  misfire is a single `undo_last`. The hard parts of agent editing — "did that
+  land where I meant?", "is this still the file I read?" — are answered by the
+  tool, not guessed by the model.
+
+The same buffers, vocabulary, and transactional guarantees back both; only the
+front end and the capability tier differ.
+
+## What makes it different
+
+- **Transactional everywhere.** `rehearse` dry-runs any program and returns the
+  diff it *would* make, changing nothing. `(with-transaction …)` makes a
+  multi-step program all-or-nothing. Checkpoints and an undo ring let you rewind.
+  Saves are atomic and **refuse to clobber** a file an external writer changed
+  since you opened it — the edit stays warm in the session instead of vanishing.
+
 - **Structural editing, nine languages.** Outline a file, jump to a function
-  *by name*, scope an edit to one defun, run tree-sitter queries — Rust,
-  Python, Markdown, HTML, JavaScript, CSS, TOML, YAML, Elisp. Defun spans
-  include `#[attributes]` / decorators, so "delete this test" is one motion.
-- **Huge files are fine.** The file-backed store is a persistent B-tree piece
-  table over a paged, read-on-demand original: O(log n) seeks, O(1)
-  snapshots, streaming searches, one parallel validate+index pass at open.
-  Multi-GB files never go fully resident.
-- **Two capability tiers, fixed by the host.** The local CLI is trusted
-  (full orchestration, like `emacs --batch`); the MCP/daemon tier is
-  sandboxed — filesystem confined to `$MIME_ROOTS`, every run audited, no
-  shell, no network.
-- **Git history editing, in-process.** A `git_*` tool group drives rebase /
-  cherry-pick / revert as an agent-friendly sequencer (`git2` / vendored
-  libgit2): plan steps are data, conflicts surface through the same
-  merge-conflict vocabulary (resolve, then `git_continue`), and `git_rebase`
-  can `rehearse` a plan first. No `git` subprocess, no network, no hooks or
-  exec; repos stay confined to `$MIME_ROOTS`, and every destructive op first
-  stamps a `refs/mime-backup/<branch>` recovery ref.
-- **Honest results.** Token-frugal diffs (clamped when huge), per-call
-  reports, `stale`/`unsaved` flags only when true, and a save-time syntax
-  check for code buffers.
+  *by name*, scope an edit to a single defun, or run a tree-sitter query —
+  across Rust, Python, Markdown, HTML, JavaScript, CSS, TOML, YAML, and Elisp.
+  Defun spans include Rust `#[attributes]` and Python decorators, so "delete
+  this test" is one motion, and a save-time parse check warns before you commit
+  a syntactically broken code buffer.
 
-## Quick start
+- **Huge files stay cheap.** The file-backed store is a persistent B-tree piece
+  table over a paged, read-on-demand original: O(log n) seeks, O(1) snapshots,
+  streaming searches, and a single parallel validate-and-index pass at open. A
+  multi-GB file never goes fully resident, and a checkpoint is a pointer copy.
+
+- **In-process git history editing.** A `git_*` tool group drives rebase,
+  cherry-pick, and revert as a sequencer (on `git2` / vendored libgit2): the
+  plan is *data*, a conflicted step surfaces through the very same
+  merge-conflict vocabulary you'd use by hand, and `git_rebase` can `rehearse`
+  a plan before running it. No `git` subprocess, no network, no hooks or exec;
+  every destructive op first stamps a `refs/mime-backup/<branch>` recovery ref.
+
+- **Honest results.** Diffs are token-frugal (clamped with an elision marker
+  when huge), every call returns structured reports, `stale`/`unsaved` flags
+  appear only when actually true, and errors name the session so a misfire is
+  recoverable rather than lost.
+
+- **Two capability tiers, fixed by the host.** The local CLI is *trusted* —
+  full orchestration, unrestricted filesystem, like `emacs --batch`. The
+  MCP/daemon tier is *sandboxed*: the filesystem is confined to `$MIME_ROOTS`,
+  every run is audited, and there is **no shell, no process spawn, and no
+  network** — the git tools included (they work in-process, so they never
+  breach that boundary).
+
+## Install
 
 ```sh
-cargo install --path .            # or: make claude (see below)
+cargo install --path .
+```
+
+A host **C toolchain** is required: the tree-sitter grammars compile C, and
+`git2` builds a vendored libgit2 with `cc` (no system libgit2 needed).
+
+## Using it from the shell
+
+```sh
+# Pipe through a program (stdin → edited stdout as a JSON report)
 printf 'a world\n' | mime run examples/uppercase.tl
+
+# Edit a file in place (omit --write to preview the diff without saving)
 mime run examples/uppercase.tl --file ./in.txt --write
-mime repl --file ./in.txt         # warm interactive session
+
+# A warm, interactive session — point/mark and buffer state persist between forms
+mime repl --file ./in.txt
+
+# Dry-run a program: see the diff it would make, change nothing
+mime rehearse prog.tl --file ./in.txt
 ```
 
-The vocabulary is Emacs: `goto-char`, `re-search-forward`, `replace-match`,
-narrowing, markers, the kill ring, `occur`, merge-conflict resolution,
-`treesit-*` — the full table is in
-[docs/vocabulary.md](docs/vocabulary.md). Regex is RE2 syntax under Emacs
-names (linear-time; no backreferences in patterns).
+The vocabulary is Emacs Lisp (via [tulisp](https://crates.io/crates/tulisp)):
+`goto-char`, `re-search-forward`, `replace-match`, narrowing, markers, the
+kill-ring, `occur`, merge-conflict resolution, the `treesit-*` family, and the
+`replace-regexp` streaming bulk pass. Regex is RE2 syntax under Emacs names —
+linear-time, no backreferences in patterns. The full table lives in
+[docs/vocabulary.md](docs/vocabulary.md).
 
-## For agents (MCP)
+## Using it from an agent (MCP)
 
 ```sh
-make claude    # cargo install + register `mime --mcp` with Claude Code
+make claude   # cargo install + register `mime --mcp` with Claude Code (MIME_ROOTS)
 ```
 
-Twenty tools; the ones that matter:
+That registers a sandboxed MCP server. Each tool takes a `path` and auto-opens
+the file into a warm session keyed by its canonical path; mutating tools take
+`save: true` for an atomic, stale-guarded write-back. The catalogue is
+generated from the live schemas into [docs/mcp-tools.md](docs/mcp-tools.md)
+(`make docs`), so the docs can't drift from the code. The edits that matter:
 
 ```json
 replace_text {path, pattern, replacement, expect_unique: true, save: true}
 replace_text {files: [a, b, c], pattern, replacement, all: true, save: true}
-insert_text  {path, text, anchor: {defun: "parse_args"}}
+insert_text  {path, text, anchor: {defun: "parse_args", where: "after"}}
 outline      {path}            // KIND START END NAME, per defun
-rehearse     {path, program}   // dry-run any lisp program, see the diff
+rehearse     {path, program}   // dry-run any lisp program; inspect the diff
 undo_last    {path}            // rewind the last mutating call
 help         {topic}           // regex | treesit | conflicts | sessions | recipes
 ```
 
-Multi-file edits are atomic across the set; `scope: {defun: "name"}` confines
-an edit to one function; warm sessions are bounded and never evicted with
-unsaved work. The full catalogue is generated from the live schemas into
-[docs/mcp-tools.md](docs/mcp-tools.md) (`make docs`), so it can't drift.
+The design leans on conveniences that matter most for less capable models:
+`expect_unique` turns an ambiguous anchor into an error (with the candidate
+lines) instead of editing the wrong one; `scope: {defun: "name"}` confines an
+edit to one function with no narrowing dance; multi-file `files:` batches are
+all-or-nothing; and warm sessions are bounded but never evicted while they hold
+unsaved work.
 
-A `git_*` group adds agent-driven history editing — `git_rebase` (with
-`rehearse`), `git_cherry_pick`, `git_revert`, `git_continue`, `git_skip`,
-`git_abort`, `git_status`, `git_log`, `git_show`. A conflicted step stops with
-diff3 markers in the worktree; resolve with the merge-conflict tools above, then
-`git_continue` (or `git_abort`). Each op first stamps a `refs/mime-backup/<branch>`
-ref, so the pre-op state is always recoverable.
+A `git_*` group adds history editing: `git_rebase` (with a `rehearse` dry-run),
+`git_cherry_pick`, `git_revert`, `git_continue`, `git_skip`, `git_abort`,
+`git_status`, `git_log`, `git_show`. A conflicted step stops with diff3 markers
+in the worktree; resolve them with the conflict tools above, then `git_continue`
+(or `git_skip` / `git_abort`). Repos are confined to `$MIME_ROOTS`, and each op
+stamps a `refs/mime-backup/<branch>` ref so the pre-op state is recoverable.
 
-## Build & layout
+## How it works
 
-`cargo build` (a C toolchain is needed for the tree-sitter grammars);
-`make test` runs the CI gate — fmt, `clippy -D warnings`, 280+ tests
-including differential suites that pin the file-backed store to an in-memory
-oracle. Pending work: [`todo.org`](todo.org).
+```
+            cli.rs        mcp.rs / daemon.rs        ← three front ends
+          (trusted)          (sandboxed)
+                \              /
+                 engine.rs                          ← sessions, capability tiers,
+              (warm sessions,                          time-travel (checkpoints/undo)
+               transactions)
+                    |
+       builtins.rs · strings.rs · conflict.rs       ← the Emacs-Lisp vocabulary
+       syntax.rs (tree-sitter) · sequencer.rs          + structural + git ops
+                    |
+                store.rs                            ← the TextStore trait
+                /        \
+          buffer.rs     quire.rs                    ← in-memory oracle / the
+        (the oracle)  (piece-tree-over-mmap)           real file-backed store
+                          \
+                       safety.rs                    ← roots, atomic saves, audit
+```
 
-The map: `store.rs` (the buffer trait) · `buffer.rs` / `quire.rs` (the two
-stores) · `builtins.rs` + `strings.rs` + `conflict.rs` + `syntax.rs` (the
-vocabulary) · `engine.rs` (sessions, tiers, time travel) · `sequencer.rs`
-(the git rebase/cherry-pick/revert state machine) · `safety.rs` (roots,
-atomic saves, audit) · `cli.rs` / `daemon.rs` / `mcp.rs` (the three front
-ends).
+- **`store.rs`** defines `TextStore`, the buffer interface every primitive edits
+  through. **`buffer.rs`** is a simple in-memory implementation that doubles as
+  a differential-testing oracle; **`quire.rs`** is the production store — the
+  persistent B-tree piece table over a paged mmap.
+- **`engine.rs`** owns warm sessions, the capability tier, and time travel
+  (checkpoints + the undo ring). The tier is fixed at construction: the CLI gets
+  trusted orchestration; the MCP server and daemon get the sandboxed vocabulary.
+- The vocabulary lives in **`builtins.rs`** / **`strings.rs`**, with
+  **`conflict.rs`** (merge-conflict parsing/resolution), **`syntax.rs`**
+  (tree-sitter integration), and **`sequencer.rs`** (the git rebase/cherry-pick/
+  revert state machine, persisted to `.git/mime-sequencer.json`).
+- **`safety.rs`** is the single filesystem chokepoint: `$MIME_ROOTS` enforcement,
+  atomic writes, and the audit log.
+- **`cli.rs`**, **`mcp.rs`**, and **`daemon.rs`** are the three front ends —
+  one-shot/REPL, stdio MCP, and a long-lived unix-socket daemon.
 
-## Dogfooding
+## Building & testing
 
-mime-rs is largely developed *through* mime-rs, by an agent driving it over
-MCP. If you are an agent using it and something slows you down — a missing
-builtin, a confusing report, an inexpressible query — say so and propose the
-fix; `todo.org` is the list to extend. Much of the agent surface exists
-because an agent hit the gap and said so.
+```sh
+cargo build          # C toolchain required (tree-sitter grammars + vendored libgit2)
+make test            # the CI gate: fmt, clippy -D warnings, the full test suite
+make docs            # regenerate docs/mcp-tools.md from the live tool schemas
+```
+
+`make test` runs 280+ tests, including **differential suites** that pin the
+file-backed `Quire` store to the in-memory `Buffer` oracle — every operation is
+run against both and the results compared, so the fast store can't silently
+diverge from the obvious one. Pending work is tracked in [`todo.org`](todo.org).
+
+## Contributing & dogfooding
+
+mime-rs is largely developed *through* mime-rs — by an agent driving it over
+MCP to edit its own source. That feedback loop is the point: if you are an agent
+using it and something slows you down — a missing builtin, a confusing report,
+an inexpressible query, a tool that should exist — say so and propose the fix.
+Much of the agent-facing surface exists because an agent hit the gap and said
+so; [`todo.org`](todo.org) is the list to extend.
+
+## License
 
 GPL-3.0 — see [`LICENSE`](LICENSE).
