@@ -2064,9 +2064,12 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             "write the buffer to disk (atomic, stale-guarded)",
         ),
 
+        // Arbitrary tulisp — can rewrite or erase the whole buffer, so it's
+        // destructive for a client gating auto-approval (unlike the bounded
+        // insert/replace tools).
         "run_program" => (
             Editing,
-            A::append(),
+            A::destructive(),
             "run an Emacs-Lisp edit program against the buffer",
         ),
         "rehearse" => (
