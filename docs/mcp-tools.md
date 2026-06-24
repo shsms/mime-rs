@@ -86,17 +86,6 @@ Replace the FIRST occurrence of a literal pattern with literal replacement text 
 - `session` — Warm session id; defaults to "default" when omitted.
 - `view` — Append a rendered viewport around point after the edit (true = 4 context lines, or a line count).
 
-## search
-
-Search from point for a pattern; report the resulting position plus the matched line's number and text. Moves point to the match — just after it (forward) or to its start (backward), Emacs semantics.
-
-- `case_insensitive` — Match case-insensitively (both modes). Default false.
-- `direction` — Search direction from point. Default forward. Backward finds the latest match wholly before point.
-- `mode` — exact (literal) or regex (RE2). Defaults to exact.
-- `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
-- `pattern` (required) — What to search for.
-- `session` — Warm session id; defaults to "default" when omitted.
-
 ## occur
 
 Overview of every line matching a pattern in the whole accessible region (composes with narrowing): line number (narrowing-relative, goto-line-able) + char position (absolute, goto-char-able) per hit, optional context lines, long lines clamped. Read-only; point does not move. Your 'grep the buffer' for orientation before editing.

@@ -207,7 +207,6 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         "view" => tool_view(&args, sessions),
         "insert_text" => tool_insert_text(&args, sessions),
         "replace_text" => tool_replace_text(&args, sessions),
-        "search" => tool_search(&args, sessions),
         "occur" => tool_occur(&args, sessions),
         "outline" => tool_outline(&args, sessions),
         "conflicts" => tool_conflicts(&args, sessions),
@@ -1321,73 +1320,6 @@ fn tool_replace_files(
     ))
 }
 
-/// `search {session?, pattern, mode?}` — search forward from point and report
-/// the 1-based position just after the match (Emacs `*-search-forward`
-/// semantics), or report that nothing matched. `mode` ∈ exact|regex
-/// (default exact). Point moves to the match, as in Emacs.
-fn tool_search(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result<String, String> {
-    let session = resolve_session(args, sessions)?;
-    let pattern = str_arg(args, "pattern")?;
-    let mode = args.get("mode").and_then(Value::as_str).unwrap_or("exact");
-    let backward = match args.get("direction").and_then(Value::as_str) {
-        None | Some("forward") => false,
-        Some("backward") => true,
-        Some(other) => return Err(format!("unknown direction: {other} (forward|backward)")),
-    };
-    let ci = bool_arg(args, "case_insensitive");
-    // `search-*` is literal, `re-search-*` is regex; each takes
-    // `(NEEDLE BOUND NOERROR)`, noerror=t making a miss return nil. A
-    // case-insensitive exact search compiles to a regex over the escaped
-    // literal with the (?i) flag.
-    let (lisp_fn, needle) = match (mode, ci) {
-        ("exact", false) if !backward => ("search-forward", lisp_escape(&pattern)),
-        ("exact", false) => ("search-backward", lisp_escape(&pattern)),
-        ("exact", true) | ("regex", _) => {
-            let re = match (mode, ci) {
-                ("exact", _) => format!("(?i){}", regex::escape(&pattern)),
-                (_, true) => format!("(?i){pattern}"),
-                _ => pattern.clone(),
-            };
-            (
-                if backward {
-                    "re-search-backward"
-                } else {
-                    "re-search-forward"
-                },
-                lisp_escape(&re),
-            )
-        }
-        (other, _) => return Err(format!("unknown search mode: {other} (exact|regex)")),
-    };
-    // On a hit, also report the line and echo its text (via the raw message
-    // channel) — a search was almost always followed by a view just to see
-    // what matched.
-    let program = format!(
-        "(let ((p ({lisp_fn} \"{needle}\" nil t)))\
-           (if p (progn (report \"found\" 1) (report \"pos\" p)\
-                        (report \"line\" (line-number-at-pos p))\
-                        (message (buffer-substring (line-beginning-position) (line-end-position))))\
-                 (report \"found\" 0)))"
-    );
-    let report = run_in_session(sessions, &session, &program)?;
-    let note = stale_note(sessions, &session);
-    if report_value(&report, "found").as_deref() == Some("1") {
-        let pos = report_value(&report, "pos").unwrap_or_default();
-        let line = report_value(&report, "line").unwrap_or_default();
-        let text = report.log.first().cloned().unwrap_or_default();
-        let where_ = if backward {
-            "at the match start"
-        } else {
-            "just after the match"
-        };
-        Ok(format!(
-            "match ({mode}): point is now {pos} ({where_}) — line {line}: {text}{note}"
-        ))
-    } else {
-        Ok(format!("no {mode} match for pattern{note}"))
-    }
-}
-
 /// `occur {session?, pattern, mode?, nlines?, limit?}` — every line in the
 /// accessible region matching the pattern, rendered with line numbers + char
 /// positions (and `nlines` of context), via the `occur` builtin. Read-only
@@ -2087,11 +2019,6 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             A::append(),
             "replace literal text (first/all/scoped/cross-file)",
         ),
-        "search" => (
-            Editing,
-            A::append(),
-            "search from point; moves point to the match",
-        ),
 
         "outline" => (
             Structural,
@@ -2356,30 +2283,6 @@ fn build_tool_schemas() -> Vec<Value> {
                     "save": save,
                 },
                 "required": [],
-            },
-        }),
-        json!({
-            "name": "search",
-            "description": "Search from point for a pattern; report the resulting position plus the matched line's number and text. Moves point to the match — just after it (forward) or to its start (backward), Emacs semantics.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "pattern": { "type": "string", "description": "What to search for." },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["exact", "regex"],
-                        "description": "exact (literal) or regex (RE2). Defaults to exact.",
-                    },
-                    "direction": {
-                        "type": "string",
-                        "enum": ["forward", "backward"],
-                        "description": "Search direction from point. Default forward. Backward finds the latest match wholly before point.",
-                    },
-                    "case_insensitive": { "type": "boolean", "description": "Match case-insensitively (both modes). Default false." },
-                    "session": session,
-                    "path": path,
-                },
-                "required": ["pattern"],
             },
         }),
         json!({
