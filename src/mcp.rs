@@ -213,17 +213,7 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         "save_buffer" => tool_save_buffer(&args, sessions),
         "session_status" => tool_session_status(sessions),
         "help" => tool_help(&args),
-        git if git.starts_with("git_") => {
-            if git_enabled() {
-                dispatch_git(git, &args)
-            } else {
-                Err(
-                    "git tools are disabled — set MIME_ENABLE_GIT to enable them \
-                     (history rewriting + checkout, no network/hooks/exec)"
-                        .to_string(),
-                )
-            }
-        }
+        git if git.starts_with("git_") => dispatch_git(git, &args),
         other => Err(format!("unknown tool: {other}")),
     };
 
@@ -1714,21 +1704,14 @@ fn tools_list_result() -> Value {
     json!({ "tools": tool_schemas() })
 }
 
-// ---- git sequencer tools (gated by MIME_ENABLE_GIT) -------------------------
+// ---- git sequencer tools ----------------------------------------------------
 //
-// These rewrite history and check files out, so they stay OFF by default and
-// are exposed only when MIME_ENABLE_GIT is set. They never reach the network and
-// run no hooks/filters/exec (the library does the work in-process). MIME_ENABLE_GIT
-// is a pure on/off switch (its value is unused); confinement is the SAME as every
-// other FS tool — the repo path is `safety::check_path`-bound to MIME_ROOTS — so
-// there is no second, git-specific root list to keep in sync. All git2 use lives
+// These rewrite history and check files out, but add no ambient authority over
+// the plain editing tools: same `MIME_ROOTS` confinement (the repo path runs
+// through `safety::check_path`), and the library does everything in-process —
+// no network, no hooks/filters/exec. Each destructive op first stamps a
+// `refs/mime-backup/<branch>` recovery ref (see `sequencer`). All git2 use lives
 // in `crate::sequencer`.
-
-/// Whether the git sequencer tools are exposed (opt-in via `MIME_ENABLE_GIT`;
-/// presence only — confinement stays with MIME_ROOTS via `repo_path`).
-fn git_enabled() -> bool {
-    std::env::var_os("MIME_ENABLE_GIT").is_some()
-}
 
 /// Resolve + confine the `repo` argument to the allowed roots.
 fn repo_path(args: &Value) -> Result<std::path::PathBuf, String> {
@@ -2206,9 +2189,7 @@ fn build_tool_schemas() -> Vec<Value> {
             },
         }),
     ];
-    if git_enabled() {
-        schemas.extend(git_tool_schemas());
-    }
+    schemas.extend(git_tool_schemas());
     schemas
 }
 
@@ -2245,21 +2226,13 @@ mod git_tool_tests {
     }
 
     #[test]
-    fn git_tools_are_off_unless_opted_in() {
-        // Disabled by default → the catalogue omits git tools, so validation has
-        // no schema for them and the dispatcher reports them disabled.
-        if !git_enabled() {
-            let reply = tools_call_result(
-                &json!({"name": "git_status", "arguments": {"repo": "."}}),
-                &mut HashMap::new(),
-            );
-            assert_eq!(reply["isError"], true);
-            assert!(
-                reply["content"][0]["text"]
-                    .as_str()
-                    .unwrap()
-                    .contains("disabled")
-            );
-        }
+    fn git_tools_are_always_in_the_catalogue() {
+        // Always-on: the git schemas are part of the advertised tool set.
+        let names: Vec<&str> = tool_schemas()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"git_rebase"));
+        assert!(names.contains(&"git_status"));
     }
 }
