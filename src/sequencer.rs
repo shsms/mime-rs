@@ -44,6 +44,16 @@ fn hard_reset(repo: &Repository, oid: Oid) -> Result<(), Error> {
     repo.reset(&repo.find_object(oid, None)?, ResetType::Hard, None)
 }
 
+/// The recovery ref a `begin` stamps with the pre-op tip of `branch` (a full
+/// refname). Lives under `refs/mime-backup/` so it stays out of `git branch` yet
+/// is trivially recoverable (`git reset --hard <ref>`).
+fn backup_ref(branch: &str) -> String {
+    format!(
+        "refs/mime-backup/{}",
+        branch.strip_prefix("refs/heads/").unwrap_or(branch)
+    )
+}
+
 /// Whether the working tree or index has uncommitted changes to TRACKED files.
 /// Untracked/ignored files are allowed, matching what `git rebase` refuses on.
 fn is_dirty(repo: &Repository) -> Result<bool, Error> {
@@ -335,6 +345,16 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
         .ok_or_else(|| estr("HEAD has no branch name"))?
         .to_string();
     let orig = head.peel_to_commit()?.id();
+
+    // Stamp a recovery ref at the pre-op tip BEFORE touching anything, so the
+    // original branch state is always reachable (history rewriting is otherwise
+    // only recoverable via the reflog) — even after a clean finish.
+    repo.reference(
+        &backup_ref(&branch),
+        orig,
+        true,
+        "mime sequencer: pre-op backup",
+    )?;
 
     // Detach onto the base and clean the worktree to it.
     repo.set_head_detached(plan.onto)?;
@@ -839,6 +859,18 @@ fn open(repo_path: &std::path::Path) -> Result<Repository, String> {
     Repository::open(repo_path).map_err(|e| format!("cannot open git repo: {}", e.message()))
 }
 
+/// Where `begin` will stamp the pre-op tip, read from the current branch BEFORE
+/// the op detaches HEAD — appended to a start's output so the recovery ref is
+/// discoverable. Empty when HEAD isn't on a branch.
+fn backup_note(repo: &Repository) -> String {
+    match repo.head().ok().and_then(|h| h.name().map(str::to_string)) {
+        Some(b) if b.starts_with("refs/heads/") => {
+            format!("\n  pre-op tip backed up at {}", backup_ref(&b))
+        }
+        _ => String::new(),
+    }
+}
+
 /// `git_rebase`: replay `onto..HEAD` (or an explicit `plan` of
 /// `(commit, action, message)`) onto `onto`. With `rehearse`, only preview the
 /// result (commit list + whether the tree is unchanged) — no changes applied.
@@ -873,13 +905,16 @@ pub fn cmd_rebase(
         steps,
     };
     if rehearse_only {
-        Ok(preview_text(
+        return Ok(preview_text(
             &repo,
             &rehearse(&repo, &plan, Mode::Pick).map_err(gerr)?,
-        ))
-    } else {
-        Ok(outcome_text(&start(&repo, plan).map_err(gerr)?))
+        ));
     }
+    let note = backup_note(&repo);
+    Ok(format!(
+        "{}{note}",
+        outcome_text(&start(&repo, plan).map_err(gerr)?)
+    ))
 }
 
 fn resolve_all(repo: &Repository, specs: &[String]) -> Result<Vec<Oid>, String> {
@@ -889,13 +924,21 @@ fn resolve_all(repo: &Repository, specs: &[String]) -> Result<Vec<Oid>, String> 
 pub fn cmd_cherry_pick(repo_path: &std::path::Path, commits: &[String]) -> Result<String, String> {
     let repo = open(repo_path)?;
     let oids = resolve_all(&repo, commits)?;
-    Ok(outcome_text(&cherry_pick(&repo, oids).map_err(gerr)?))
+    let note = backup_note(&repo);
+    Ok(format!(
+        "{}{note}",
+        outcome_text(&cherry_pick(&repo, oids).map_err(gerr)?)
+    ))
 }
 
 pub fn cmd_revert(repo_path: &std::path::Path, commits: &[String]) -> Result<String, String> {
     let repo = open(repo_path)?;
     let oids = resolve_all(&repo, commits)?;
-    Ok(outcome_text(&revert(&repo, oids).map_err(gerr)?))
+    let note = backup_note(&repo);
+    Ok(format!(
+        "{}{note}",
+        outcome_text(&revert(&repo, oids).map_err(gerr)?)
+    ))
 }
 
 pub fn cmd_continue(repo_path: &std::path::Path) -> Result<String, String> {
@@ -1491,6 +1534,28 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message().contains("detached"), "{}", err.message());
+    }
+
+    #[test]
+    fn begin_stamps_a_recovery_backup_ref() {
+        let dir = tmp("backup");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+
+        start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Pick, None)],
+            },
+        )
+        .unwrap();
+        // The pre-op tip is recoverable even after a clean finish moved the branch.
+        assert_eq!(repo.refname_to_id("refs/mime-backup/topic").unwrap(), f1);
+        assert_ne!(repo.refname_to_id("refs/heads/topic").unwrap(), f1);
     }
 
     #[test]
