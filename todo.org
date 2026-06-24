@@ -79,6 +79,104 @@ follow-up round (multi-file ~files:~ batches, clean-LRU session cap,
 decorated defun spans, ~make docs~ generation); what follows is the
 remainder.
 
+** TODO Agent-agnostic + self-documenting MCP (branch ~cross-agent-mcp~) :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-06-24 Mi]
+:END:
+
+Goal: mime-mcp works well for ANY MCP client (Cursor, Cline, Continue, VS Code
+agent mode, the Gemini/Codex CLIs, LangChain/LlamaIndex adapters, custom
+harnesses) — not just Claude Code, the only client it's been exercised with.
+
+What's already general: it IS an MCP server with a conformant handshake
+(~initialize~ with capabilities/serverInfo/version, ~notifications/initialized~,
+~ping~, ~tools/list~, ~tools/call~ — mcp.rs:121-128), and the tool DESIGN
+(one-call edits, ambiguity-as-error, ~expect_unique~, unknown-arg rejection,
+~undo_last~, ~rehearse~) was built for less-capable models, so it generalizes by
+construction. What's client-specific is ONBOARDING, not capability: the driving
+knowledge lives out-of-band in a client-specific skill/config file the MCP
+protocol doesn't carry, so no other harness sees it.
+
+*** Centerpiece: a self-documenting tool registry (single source of truth)
+
+Today three things describe the tools and can drift: the hand-built schemas in
+~build_tool_schemas~ (mcp.rs), the separate ~help~ prose (help.rs), and (soon) a
+third copy in ~instructions~. Collapse them: ONE registry entry per tool, every
+doc surface a PROJECTION of it — nothing hand-synced.
+
+Per-tool ~ToolDoc~: ~name~ · ~summary~ (one line) · ~description~ (full) ·
+~input schema~ (properties + required) · ~annotations~ (read_only / destructive /
+idempotent / open_world) · ~examples~ (call + note) · ~topics~ (which ~help~
+briefs it belongs to) · ~category~ (editing / structural / conflicts / git /
+session / introspection) · ~see_also~. A single ~catalogue() -> Vec<ToolDoc>~.
+
+Projections (all derived):
+- ~tools/list~ → {name, description, inputSchema, annotations} per entry.
+- ~initialize.instructions~ → a curated preamble (the engine model: warm
+  sessions + path auto-open + ~save:true~; rehearse → run → save; ~undo_last~;
+  ~expect_unique~; the tier/safety note) + an AUTO-generated compact index
+  grouped by category (~name — summary~) + "call ~help {topic}~ for briefs". Lean
+  (the client injects it into the model's context — keep to ~a screen, push
+  detail to help/examples).
+- ~help {topic}~ → curated topic prose (regex/treesit DIALECT briefs stay
+  hand-written) + the registry entries tagged with that topic (summary +
+  examples). Add a ~help {tool: "name"}~ form → that entry's full description +
+  examples + annotations.
+- ~describe-mcp~ / docs/mcp-tools.md → full catalogue from the registry (already
+  generated; now also carries annotations + examples). ~validate_args~ keeps
+  reading the tools/list projection, so it can't drift from what's accepted.
+
+*** Tool annotations (MCP hints; derived from the registry)
+
+Classify every tool. ~readOnlyHint~: view, read_region, search, occur, outline,
+session_status, list_checkpoints, conflicts, help, rehearse, git_log, git_show,
+git_status. ~destructiveHint~: save_buffer, restore_checkpoint, undo_last, and
+all mutating git_* (rebase/cherry_pick/revert/continue/skip/abort). The plain
+editors (insert_text/replace_text/run_program/open_*/checkpoint/close_session)
+are mutating but non-destructive (warm-buffer only until a save). ~openWorldHint~
+= false everywhere (no external entities — files under MIME_ROOTS, git is local).
+Annotations are untrusted hints; clients use them for allow/confirm UX (auto-run
+the read-only set; gate the destructive set).
+
+*** Protocol conformance hardening
+
+- protocolVersion: mcp.rs:165-172 ECHOES the client's version. Clamp to a set
+  mime actually implements; echo if supported, else return mime's latest. Echoing
+  an unknown version falsely claims support.
+- Audit JSON-RPC error objects for protocol-level errors (bad method/params) vs
+  the tool-level ~isError~ content (which is correct as-is).
+- Decide ~tools/list~ pagination (~29 tools — likely fine with no cursor; say so).
+- Add a CONFORMANCE TEST: drive initialize → initialized → ping → tools/list →
+  tools/call → error cases per spec; run the official MCP Inspector against the
+  stdio server. Turns "tested with Claude Code" into "tested against the spec".
+
+*** Transport, distribution, onboarding
+
+- Transport: stdio (have — covers every CLI) + add Streamable HTTP for
+  hosted/multi-client/web harnesses (daemon.rs's unix socket is a head start).
+- Distribution: publish to crates.io (~cargo install mime-rs~) so any user points
+  any client at the binary; a ~docs/clients.md~ registration cookbook (generic
+  stdio + copy-paste config for Claude Code, Cursor, Cline, Continue, VS Code,
+  Gemini/Codex CLIs).
+- The client-specific skill afterward: the tool-driving content moves into
+  ~instructions~ (in-protocol, all clients). Keep any client-specific skill THIN
+  — just the bits that don't belong in the protocol (the dogfooding standing
+  instruction, when-to-prefer-mime-over-Edit) — ideally generated from the same
+  registry so it can't drift.
+
+*** Phasing
+
+1. Registry + annotations + ~instructions~ + ~help~/describe-mcp as projections
+   (the DRY core — in-process, low risk, highest onboarding leverage) + the
+   conformance test + an Inspector pass.
+2. protocolVersion clamp + error/pagination audit.
+3. Streamable HTTP transport.
+4. crates.io publish + ~docs/clients.md~ cookbook + thin-skill regeneration.
+
+/Exit: a fresh MCP client (the Inspector, plus one non-Claude harness) connects,
+reads ~instructions~, and an agent drives a rule-shaped edit AND a rebase using
+only what the protocol surfaces — no external skill file./
+
 ** TODO Cross-file search: a grep tool (or occur over files/glob) [#B] :dogfooding:
 
 The biggest reason the agent still shells out to =grep -rn= / =sed -n=
