@@ -35,7 +35,7 @@ const DEFAULT_SESSION: &str = "default";
 /// stable across them). `initialize` echoes the client's if it's one of these,
 /// else returns the latest, per the spec.
 const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
-const PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
+pub(crate) const PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
 
 /// Cap on warm sessions. Each file-backed session pins an open fd and a warm
 /// buffer; agents rarely work more than a handful of files, so past the cap
@@ -105,7 +105,7 @@ pub fn run() {
 
 /// Parse one JSON-RPC request line and dispatch it. Returns `Some(response)` for
 /// requests (those with an `id`) and `None` for notifications.
-fn handle_line(line: &str, sessions: &mut HashMap<String, Workspace>) -> Option<Value> {
+pub(crate) fn handle_line(line: &str, sessions: &mut HashMap<String, Workspace>) -> Option<Value> {
     let req: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {

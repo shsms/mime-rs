@@ -13,6 +13,7 @@ pub mod conflict;
 pub mod daemon;
 pub mod engine;
 pub mod help;
+pub mod http;
 pub mod mcp;
 pub mod quire;
 pub mod result;

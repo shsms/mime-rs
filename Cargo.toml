@@ -16,6 +16,10 @@ exclude = ["*.org"]
 # builds libgit2 from source via `cc` so there is no system-libgit2 dependency;
 # we never expose remote/transport ops, so the network surface is unused.
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
+# Streamable HTTP transport for the MCP server (`mime --http`) — a sync, minimal
+# HTTP/1.1 server (no async runtime). The agent never reaches the network; this
+# is a localhost front end, like the daemon's unix socket.
+tiny_http = "0.12"
 regex = "1.12.3"
 serde_json = "1.0.150"
 similar = "3.1.1"

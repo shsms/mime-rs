@@ -6,17 +6,28 @@
 //! * `mime --daemon` — the long-lived warm-session daemon (JSON-lines over
 //!   `$MIME_SOCKET`).
 //! * `mime --mcp` — the MCP server (JSON-RPC 2.0 over stdio).
+//! * `mime --http [ADDR]` — the MCP server over Streamable HTTP (default
+//!   `127.0.0.1:7711`, or `$MIME_HTTP_ADDR`).
 //!
 //! This binary only peeks for the mode flag and dispatches into the matching
-//! library front-end (`mime_rs::{cli,daemon,mcp}`), which re-reads `argv` itself.
-//! The `--mcp`/`--daemon` flags are consumed by the peek; each front-end ignores
-//! them.
+//! library front-end (`mime_rs::{cli,daemon,mcp,http}`), which re-reads `argv`
+//! itself. The mode flags are consumed by the peek; each front-end ignores them.
 fn main() {
-    let mode_mcp = std::env::args().any(|a| a == "--mcp");
-    let mode_daemon = std::env::args().any(|a| a == "--daemon");
-    if mode_mcp {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--mcp") {
         mime_rs::mcp::run();
-    } else if mode_daemon {
+    } else if args.iter().any(|a| a == "--http") {
+        // Optional addr is the token right after --http (anything not a flag).
+        let addr = args
+            .iter()
+            .position(|a| a == "--http")
+            .and_then(|i| args.get(i + 1))
+            .filter(|a| !a.starts_with('-'))
+            .cloned()
+            .or_else(|| std::env::var("MIME_HTTP_ADDR").ok())
+            .unwrap_or_else(|| "127.0.0.1:7711".to_string());
+        mime_rs::http::run(&addr);
+    } else if args.iter().any(|a| a == "--daemon") {
         mime_rs::daemon::run();
     } else {
         mime_rs::cli::run();
