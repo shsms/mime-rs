@@ -676,6 +676,23 @@ Tension: each removes a tool but hides an INTENT (preview-first; grep-the-tree).
 Lean toward KEEPING rehearse (and probably grep) as named tools — visibility
 beats minimalism for agent ergonomics. Options, not decisions.
 
+** TODO vocabulary.md drifts from the registered builtins (hand-written, unguarded) [#C] :mcp:
+~docs/vocabulary.md~ lists the ~run_program~ Emacs-Lisp builtins by group, but it
+is hand-written — ~make docs~ only regenerates ~mcp-tools.md~ — so it drifts. As
+of 2026-06-24 it claims nothing false, but 7 registered builtins (all in
+~builtins.rs~, non-test) are missing:
+- ~backward-char~ (Motion; only ~forward-char~ is listed)
+- ~revert-buffer~ (Sessions; ~help {sessions}~ even references it)
+- ~list-checkpoints~, ~checkpoint-diff~ (Time travel)
+- ~conflicts~ (the bare overview builtin; only the ~conflict-*~ set is listed)
+- ~float-time~ (time)
+- ~args~ (Orchestration; only ~arg~ is listed)
+The intro also names four ~help~ topics but omits ~recipes~ (there are five).
+Fix: add the missing primitives + the ~recipes~ topic, AND add a drift-guard
+test (like ~meta_covers_every_tool~) asserting every registered builtin appears
+in vocabulary.md — so it cannot silently drift again. (~string-trim-left~ /
+~string-trim-right~ are already covered as a compound token; not missing.)
+
 * Structural editing
 
 ** TODO Incremental re-parse (~InputEdit~s) [#C]
