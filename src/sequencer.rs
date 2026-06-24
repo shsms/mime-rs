@@ -26,6 +26,7 @@
 //! remotes/transports, no hooks or filters; repos are confined to `MIME_ROOTS`
 //! at the tool boundary (see todo.org for the security checklist).
 
+use crate::buffer::Buffer;
 use git2::{
     CherrypickOptions, Delta, Index, Oid, Repository, ResetType, RevertOptions, Sort,
     build::CheckoutBuilder,
@@ -252,15 +253,6 @@ fn conflict_paths(index: &Index) -> Vec<String> {
     out
 }
 
-/// Whether `bytes` has a conflict-marker opener (`<<<<<<<`, ≥7 `<`) at the start
-/// of any line — `git diff --check`'s signal. Byte-level so it works on non-UTF-8
-/// files and on conflicts the diff3 hunk parser can't structure.
-fn has_conflict_markers(bytes: &[u8]) -> bool {
-    bytes
-        .split(|&b| b == b'\n')
-        .any(|line| line.starts_with(b"<<<<<<<"))
-}
-
 /// A diff3-conflict-style checkout builder — the worktree rendering a
 /// conflicted step needs so [`crate::conflict`] can parse it.
 fn diff3_checkout() -> CheckoutBuilder<'static> {
@@ -438,12 +430,17 @@ pub fn continue_op(repo: &Repository) -> Result<Outcome, Error> {
     for path in conflict_paths(&index) {
         let full = workdir.join(&path);
         if full.exists() {
-            // Refuse to commit a file that still carries conflict markers. A
-            // byte-level opener check (git diff --check's signal) is encoding-
-            // agnostic and catches malformed runs a hunk parser would miss; the
-            // earlier add_path-then-has_conflicts check was dead (add_path
-            // clears the conflict, so the guard never fired).
-            if has_conflict_markers(&std::fs::read(&full).unwrap_or_default()) {
+            // Refuse to commit a file that still carries a WELL-FORMED conflict
+            // hunk. The structural scanner (matching run length, opener →
+            // separator → closer) is precise — a lone `<<<<<<<` line in a doc or
+            // a diff fixture is NOT a hunk — so it can't false-positive the way a
+            // bare byte check did; lossy decode keeps it working on non-UTF-8
+            // files (markers are ASCII). Reading must succeed (fail closed): a
+            // file we can't verify is not silently staged.
+            let bytes = std::fs::read(&full)
+                .map_err(|e| estr(&format!("cannot read {path} to verify resolution: {e}")))?;
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            if !crate::conflict::scan(&mut Buffer::from_string(path.clone(), text)).is_empty() {
                 return Err(estr(&format!(
                     "unresolved conflict markers remain in {path} — resolve them, then continue"
                 )));
@@ -491,9 +488,15 @@ pub fn skip(repo: &Repository) -> Result<Outcome, Error> {
 /// another process added while we were paused, instead of clobbering them.
 pub fn abort(repo: &Repository) -> Result<(), Error> {
     let st = load_state(repo)?;
+    // Where to land: the branch's current tip if it still exists (preserve a
+    // concurrent advance), else the pre-op backup, else the recorded orig. If
+    // the branch was deleted under us, recreating it here un-wedges the op
+    // rather than erroring with the state file left behind.
     let tip = repo
         .refname_to_id(&st.branch)
-        .map_err(|_| estr(&format!("{} no longer exists — cannot restore", st.branch)))?;
+        .or_else(|_| repo.refname_to_id(&backup_ref(&st.branch)))
+        .unwrap_or(st.orig);
+    repo.reference(&st.branch, tip, true, "mime sequencer: abort")?;
     repo.set_head(&st.branch)?;
     hard_reset(repo, tip)?;
     let _ = repo.cleanup_state();
@@ -1382,6 +1385,36 @@ mod tests {
             "{}",
             err.message()
         );
+    }
+
+    #[test]
+    fn continue_allows_a_resolution_that_contains_a_lone_marker_line() {
+        // A correctly-resolved file may legitimately contain a line starting with
+        // `<<<<<<<` (a diff fixture, docs quoting markers) — that is NOT a
+        // well-formed hunk, so the structural guard must not false-positive.
+        let dir = tmp("lone-marker");
+        let (repo, _) = conflict_repo(&dir);
+        std::fs::write(dir.join("a"), "resolved\n<<<<<<< not a real conflict\n").unwrap();
+        let out = continue_op(&repo).unwrap();
+        assert!(matches!(out, Outcome::Done { .. }));
+        assert_eq!(read(&repo, "a"), "resolved\n<<<<<<< not a real conflict\n");
+    }
+
+    #[test]
+    fn abort_recovers_when_the_branch_was_deleted_mid_op() {
+        let dir = tmp("abort-deleted");
+        let (repo, f1) = conflict_repo(&dir);
+        // Another process deletes the branch while paused at the conflict.
+        repo.find_reference("refs/heads/topic")
+            .unwrap()
+            .delete()
+            .unwrap();
+        // abort must not wedge: it recreates the branch from the backup and
+        // clears the in-progress state.
+        abort(&repo).unwrap();
+        assert_eq!(repo.refname_to_id("refs/heads/topic").unwrap(), f1);
+        assert!(!state_path(&repo).exists());
+        assert!(!repo.head_detached().unwrap());
     }
 
     #[test]
