@@ -1756,9 +1756,11 @@ fn str_list_arg(args: &Value, key: &str) -> Result<Vec<String>, String> {
 fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
     use crate::sequencer as seq;
     // History rewriting is high-consequence, so require an explicit root rather
-    // than falling back to the cwd: refuse if MIME_ROOTS is unset (the editing
-    // tools tolerate the cwd default; git ops should not).
-    if std::env::var_os("MIME_ROOTS").is_none() {
+    // than falling back to the cwd: refuse unless MIME_ROOTS holds a non-empty
+    // value (an empty/whitespace value also falls back to cwd). The editing
+    // tools tolerate the cwd default; git ops should not.
+    let roots_set = std::env::var("MIME_ROOTS").is_ok_and(|v| !v.trim().is_empty());
+    if !roots_set {
         return Err(
             "git tools require MIME_ROOTS to be set (refusing to rewrite history under an implicit cwd)"
                 .to_string(),
@@ -1774,7 +1776,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
         ),
         "git_cherry_pick" => seq::cmd_cherry_pick(&repo, &str_list_arg(args, "commits")?),
         "git_revert" => seq::cmd_revert(&repo, &str_list_arg(args, "commits")?),
-        "git_continue" => seq::cmd_continue(&repo),
+        "git_continue" => seq::cmd_continue(&repo, bool_arg(args, "force")),
         "git_skip" => seq::cmd_skip(&repo),
         "git_abort" => seq::cmd_abort(&repo),
         "git_status" => seq::cmd_status(&repo),
@@ -1842,8 +1844,12 @@ fn git_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "git_continue",
-            "description": "After resolving the stopped step's conflicts in the worktree (and saving), commit the resolution and continue the operation. Errors if unresolved markers remain.",
-            "inputSchema": { "type": "object", "properties": { "repo": repo }, "required": ["repo"] },
+            "description": "After resolving the stopped step's conflicts in the worktree (and saving), commit the resolution and continue the operation. Errors if a resolved file still contains conflict-marker lines; pass force: true to override (e.g. the resolution legitimately contains marker-like text).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "repo": repo, "force": { "type": "boolean", "description": "Commit even if a resolved file still has conflict-marker lines. Default false." } },
+                "required": ["repo"],
+            },
         }),
         json!({
             "name": "git_skip",

@@ -253,6 +253,21 @@ fn conflict_paths(index: &Index) -> Vec<String> {
     out
 }
 
+/// Whether `bytes` still reads as conflicted: a well-formed conflict hunk (the
+/// full `<<<<<<<` → `=======` → `>>>>>>>` combination) OR a stray opener line a
+/// partial cleanup left behind. Reuses `conflict.rs`'s grammar rather than a
+/// substring heuristic, so it understands diff3/run-length and won't fire on,
+/// say, a lone `=======` (a Markdown heading). Decodes lossily — markers are
+/// ASCII, so non-UTF-8 content can't hide them.
+fn has_conflict_markers(bytes: Vec<u8>) -> bool {
+    // Move the Vec into the String on the valid-UTF-8 path (no copy); only the
+    // rare non-UTF-8 file pays a lossy re-decode.
+    let text = String::from_utf8(bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    let (hunks, strays) = crate::conflict::scan_with_strays(&mut Buffer::from_string("", text));
+    !hunks.is_empty() || strays > 0
+}
+
 /// A diff3-conflict-style checkout builder — the worktree rendering a
 /// conflicted step needs so [`crate::conflict`] can parse it.
 fn diff3_checkout() -> CheckoutBuilder<'static> {
@@ -410,8 +425,10 @@ fn rehearse(repo: &Repository, plan: &Plan, mode: Mode) -> Result<Preview, Error
 }
 
 /// Resume after the agent resolved a conflict in the worktree: stage the
-/// resolved paths, commit the stopped step, then continue the plan.
-pub fn continue_op(repo: &Repository) -> Result<Outcome, Error> {
+/// resolved paths, commit the stopped step, then continue the plan. `force`
+/// skips the conflict-marker guard (for a resolution that legitimately contains
+/// marker-like lines, e.g. a diff fixture).
+pub fn continue_op(repo: &Repository, force: bool) -> Result<Outcome, Error> {
     let mut st = load_state(repo)?;
     let step = st
         .steps
@@ -430,20 +447,20 @@ pub fn continue_op(repo: &Repository) -> Result<Outcome, Error> {
     for path in conflict_paths(&index) {
         let full = workdir.join(&path);
         if full.exists() {
-            // Refuse to commit a file that still carries a WELL-FORMED conflict
-            // hunk. The structural scanner (matching run length, opener →
-            // separator → closer) is precise — a lone `<<<<<<<` line in a doc or
-            // a diff fixture is NOT a hunk — so it can't false-positive the way a
-            // bare byte check did; lossy decode keeps it working on non-UTF-8
-            // files (markers are ASCII). Reading must succeed (fail closed): a
-            // file we can't verify is not silently staged.
-            let bytes = std::fs::read(&full)
-                .map_err(|e| estr(&format!("cannot read {path} to verify resolution: {e}")))?;
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            if !crate::conflict::scan(&mut Buffer::from_string(path.clone(), text)).is_empty() {
-                return Err(estr(&format!(
-                    "unresolved conflict markers remain in {path} — resolve them, then continue"
-                )));
+            // Refuse to commit a file that still carries conflict markers. The
+            // byte-level opener check catches partial/stray/glued markers a
+            // structural parser would miss and works on non-UTF-8 files; reading
+            // must succeed (fail closed). `force` overrides it for the rare
+            // legitimate-marker resolution.
+            if !force {
+                let bytes = std::fs::read(&full)
+                    .map_err(|e| estr(&format!("cannot read {path} to verify resolution: {e}")))?;
+                if has_conflict_markers(bytes) {
+                    return Err(estr(&format!(
+                        "unresolved conflict markers remain in {path} — resolve them, then continue \
+                         (or git_continue {{force: true}} if they are intentional)"
+                    )));
+                }
             }
             index.add_path(Path::new(&path))?;
         } else {
@@ -947,8 +964,10 @@ pub fn cmd_revert(repo_path: &std::path::Path, commits: &[String]) -> Result<Str
     ))
 }
 
-pub fn cmd_continue(repo_path: &std::path::Path) -> Result<String, String> {
-    Ok(outcome_text(&continue_op(&open(repo_path)?).map_err(gerr)?))
+pub fn cmd_continue(repo_path: &std::path::Path, force: bool) -> Result<String, String> {
+    Ok(outcome_text(
+        &continue_op(&open(repo_path)?, force).map_err(gerr)?,
+    ))
 }
 
 pub fn cmd_skip(repo_path: &std::path::Path) -> Result<String, String> {
@@ -1156,7 +1175,7 @@ mod tests {
 
         // Resolve and resume.
         std::fs::write(repo.workdir().unwrap().join("a"), "resolved\n").unwrap();
-        let out = continue_op(&repo).unwrap();
+        let out = continue_op(&repo, false).unwrap();
         assert!(matches!(out, Outcome::Done { .. }));
         assert_eq!(read(&repo, "a"), "resolved\n");
         assert!(!state_path(&repo).exists());
@@ -1382,7 +1401,7 @@ mod tests {
         let (repo, _) = conflict_repo(&dir);
         // The worktree still carries the diff3 markers; continue must refuse to
         // bake them into history rather than silently committing them.
-        let err = continue_op(&repo).unwrap_err();
+        let err = continue_op(&repo, false).unwrap_err();
         assert!(
             err.message().contains("unresolved conflict markers"),
             "{}",
@@ -1391,16 +1410,21 @@ mod tests {
     }
 
     #[test]
-    fn continue_allows_a_resolution_that_contains_a_lone_marker_line() {
-        // A correctly-resolved file may legitimately contain a line starting with
-        // `<<<<<<<` (a diff fixture, docs quoting markers) — that is NOT a
-        // well-formed hunk, so the structural guard must not false-positive.
-        let dir = tmp("lone-marker");
+    fn continue_refuses_a_stray_opener_but_force_overrides() {
+        // A partial resolution that deletes the lower markers but leaves the
+        // `<<<<<<<` opener must NOT slip through (a structural parser would miss
+        // it); `force` is the escape hatch when the marker line is intentional.
+        let dir = tmp("stray-opener");
         let (repo, _) = conflict_repo(&dir);
-        std::fs::write(dir.join("a"), "resolved\n<<<<<<< not a real conflict\n").unwrap();
-        let out = continue_op(&repo).unwrap();
+        std::fs::write(dir.join("a"), "resolved\n<<<<<<< leftover opener\n").unwrap();
+        assert!(
+            continue_op(&repo, false).is_err(),
+            "stray opener must block"
+        );
+        // The failed continue committed/advanced nothing, so a forced retry works.
+        let out = continue_op(&repo, true).unwrap();
         assert!(matches!(out, Outcome::Done { .. }));
-        assert_eq!(read(&repo, "a"), "resolved\n<<<<<<< not a real conflict\n");
+        assert_eq!(read(&repo, "a"), "resolved\n<<<<<<< leftover opener\n");
     }
 
     #[test]
@@ -1427,7 +1451,10 @@ mod tests {
         // Resolve the conflicted file AND scribble on an unrelated tracked file.
         std::fs::write(dir.join("a"), "resolved\n").unwrap();
         std::fs::write(dir.join("b"), "also changed\n").unwrap();
-        assert!(matches!(continue_op(&repo).unwrap(), Outcome::Done { .. }));
+        assert!(matches!(
+            continue_op(&repo, false).unwrap(),
+            Outcome::Done { .. }
+        ));
         // Only the conflicted path is committed; the unrelated edit is NOT folded
         // into the cherry-picked commit (it stays uncommitted in the worktree).
         let tip = repo.head().unwrap().peel_to_commit().unwrap();
@@ -1460,7 +1487,10 @@ mod tests {
         assert!(matches!(out, Outcome::Conflict { .. }));
         // Resolve by keeping the deletion — add_path on a missing file would error.
         let _ = std::fs::remove_file(dir.join("f"));
-        assert!(matches!(continue_op(&repo).unwrap(), Outcome::Done { .. }));
+        assert!(matches!(
+            continue_op(&repo, false).unwrap(),
+            Outcome::Done { .. }
+        ));
         assert!(!dir.join("f").exists(), "deletion landed");
     }
 
