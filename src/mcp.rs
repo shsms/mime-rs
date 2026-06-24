@@ -1786,7 +1786,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
     }
 }
 
-/// Schemas for the `git_*` tools, appended to the catalogue only when enabled.
+/// Raw schemas for the `git_*` tools; `catalogue` pairs each with its annotations.
 fn git_tool_schemas() -> Vec<Value> {
     let repo = json!({
         "type": "string",
@@ -1887,12 +1887,108 @@ fn git_tool_schemas() -> Vec<Value> {
     ]
 }
 
-/// The MCP tool catalogue, built once and shared. `validate_args` reads it on
-/// every dispatch, so the Vec is held behind a `LazyLock` rather than rebuilt
-/// per call; `tools/list`, `describe-mcp`, and argument validation all borrow
-/// this single source.
+// ---- the self-documenting tool registry ------------------------------------
+//
+// Every doc surface — tools/list, validate_args, describe-mcp, and (as they
+// land) the MCP `instructions` field and `help` — is a PROJECTION of one
+// `catalogue()` of `ToolDoc`s, so they can't drift. A ToolDoc carries the JSON
+// schema plus cross-cutting metadata; today that's the MCP annotations, with
+// summary/category/examples joining it as `instructions`/`help` consume them.
+
+/// MCP tool annotations — hints a client uses for allow/confirm UX. mime reaches
+/// no external entities, so `openWorldHint` is always false.
+#[derive(Clone, Copy)]
+struct ToolAnnotations {
+    read_only: bool,
+    destructive: bool,
+    idempotent: bool,
+}
+
+impl ToolAnnotations {
+    fn read() -> Self {
+        Self {
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+        }
+    }
+    fn append() -> Self {
+        Self {
+            read_only: false,
+            destructive: false,
+            idempotent: false,
+        }
+    }
+    fn destructive() -> Self {
+        Self {
+            read_only: false,
+            destructive: true,
+            idempotent: false,
+        }
+    }
+    fn to_json(self) -> Value {
+        json!({
+            "readOnlyHint": self.read_only,
+            "destructiveHint": self.destructive,
+            "idempotentHint": self.idempotent,
+            "openWorldHint": false,
+        })
+    }
+}
+
+/// One catalogue entry: the tool's JSON schema plus the metadata the doc
+/// surfaces derive from.
+struct ToolDoc {
+    schema: Value,
+    annotations: Option<ToolAnnotations>,
+}
+
+impl ToolDoc {
+    fn passthrough(schema: Value) -> Self {
+        Self {
+            schema,
+            annotations: None,
+        }
+    }
+    /// The `tools/list` entry: the schema with `annotations` merged in.
+    fn to_list_value(&self) -> Value {
+        let mut v = self.schema.clone();
+        if let Some(a) = self.annotations {
+            v["annotations"] = a.to_json();
+        }
+        v
+    }
+}
+
+/// Annotations for a git tool, by name: rebase/abort rewrite or discard history
+/// (destructive); status/log/show only read; the rest append or advance.
+fn git_annotations(name: &str) -> ToolAnnotations {
+    match name {
+        "git_rebase" | "git_abort" => ToolAnnotations::destructive(),
+        "git_status" | "git_log" | "git_show" => ToolAnnotations::read(),
+        _ => ToolAnnotations::append(),
+    }
+}
+
+/// The single registry every doc surface projects from.
+fn catalogue() -> Vec<ToolDoc> {
+    let core = build_tool_schemas().into_iter().map(ToolDoc::passthrough);
+    let git = git_tool_schemas().into_iter().map(|schema| {
+        let annotations = Some(git_annotations(schema["name"].as_str().unwrap_or("")));
+        ToolDoc {
+            schema,
+            annotations,
+        }
+    });
+    core.chain(git).collect()
+}
+
+/// The MCP tool catalogue as `tools/list` values, built once and shared.
+/// `validate_args`, `tools/list`, and `describe-mcp` all read this projection of
+/// [`catalogue`], so they can't drift from the registry or each other.
 pub(crate) fn tool_schemas() -> &'static [Value] {
-    static SCHEMAS: LazyLock<Vec<Value>> = LazyLock::new(build_tool_schemas);
+    static SCHEMAS: LazyLock<Vec<Value>> =
+        LazyLock::new(|| catalogue().iter().map(ToolDoc::to_list_value).collect());
     &SCHEMAS
 }
 
