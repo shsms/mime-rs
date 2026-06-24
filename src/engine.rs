@@ -1026,6 +1026,11 @@ mod tests {
             Some(orig.as_path()),
             "session stays bound to the original file"
         );
+        assert!(
+            ws.is_modified(),
+            "a save-as copy must NOT reset the modified baseline — the original \
+             file still holds the old bytes, so the buffer is still unsaved wrt it"
+        );
 
         // A later in-place save lands on the ORIGINAL, not the copy target.
         ws.save_to(&orig).unwrap();

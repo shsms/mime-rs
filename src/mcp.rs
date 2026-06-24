@@ -1490,12 +1490,19 @@ fn tool_save_buffer(
                 return Err(no_such_session(sessions, &session));
             }
             let ws = sessions.get_mut(&session).expect("checked above");
-            // save-as to the SAME file as the visited path is an in-place save
-            // (save_to: stale guard + mmap reclaim, rebase is a no-op). To a
-            // DIFFERENT path it's a copy-out that must NOT rebind the session —
-            // otherwise a later plain `save_buffer {path}` would silently retarget
-            // the copy instead of the original file (the footgun this avoids).
-            if ws.visited_path().as_deref() == Some(checked.as_path()) {
+            let visited = ws.visited_path();
+            // Adopt-or-in-place via save_to (which binds + applies the stale
+            // guard) when the session is UNBOUND (an in-memory buffer naming its
+            // first file) or `to` is the file it already visits — compared
+            // canonically, so a non-canonical-but-same path can't skip the guard.
+            // Only a session bound to a DIFFERENT file takes the copy-out branch,
+            // which writes a copy and does NOT rebind (so a later plain save still
+            // targets the original — the footgun this avoids).
+            let in_place = match &visited {
+                None => true,
+                Some(v) => crate::engine::same_file(v, &checked),
+            };
+            if in_place {
                 let bytes = ws
                     .save_to(&checked)
                     .map_err(|e| format!("cannot write {to}: {e}"))?;
@@ -1504,13 +1511,10 @@ fn tool_save_buffer(
                 let bytes = ws
                     .write_copy_to(&checked)
                     .map_err(|e| format!("cannot write {to}: {e}"))?;
-                match ws.visited_path() {
-                    Some(bound) => Ok(format!(
-                        "wrote {bytes} bytes to {to} (session still bound to {})",
-                        bound.display()
-                    )),
-                    None => Ok(format!("wrote {bytes} bytes to {to}")),
-                }
+                Ok(format!(
+                    "wrote {bytes} bytes to {to} (a copy — session still bound to {})",
+                    visited.expect("non-None in this branch").display()
+                ))
             }
         }
     }
