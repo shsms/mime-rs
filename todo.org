@@ -627,6 +627,55 @@ the always-loaded schema surface, in tension with keeping it lean. Revisit when
 a non-LLM client appears. Note ~structuredContent~ is additive (text stays), so
 it can land incrementally per tool.
 
+** TODO MCP surface redesign — possibilities (intent-shaped, depth-discoverable) :mcp:
+Possibilities from a 2026-06-24 from-scratch design discussion — captured for
+consideration, NOT decided. Root insight: both standing reservations (git is ~a
+third of the surface; the editor's real power is hidden behind ~run_program~)
+share one cause — the surface mirrors the IMPLEMENTATION's structure, not the
+agent's INTENT or the engine's actual capability. Principles to redesign by:
+(1) a tool = one agent intent, sized to a decision; (2) surface ∝ value, depth
+DISCOVERABLE not enumerated; (3) clean contracts — never merge read+write or
+reversible+destructive under one tool (the constraint that killed the
+polymorphic-checkpoint idea); (4) group by mental model, outputs compose into
+inputs. Overarching caveat: LLMs use named, richly-described tools better than
+generic dispatchers + introspection, so CURATE, don't genericize — this is
+evolution, not a rewrite (mime is already ~80% there).
+
+*** TODO git: merge the read verbs + fold skip into continue (9 → 6) :mcp:
+Merge ~git_log~/~git_show~/~git_status~ into one ~git_history {query:
+log|show|status}~ (all read-only → one honest annotation). Fold ~git_skip~ into
+~git_continue {skip?: true}~ (one intent "advance the op"; the param says how).
+Keep rebase/cherry_pick/revert distinct (different intents/params; merging guts
+the descriptions LLMs lean on) and ~git_abort~ separate (the one destructive
+transition, annotated apart from continue). Net: git ~a quarter of the surface,
+no coherence loss, annotations stay honest. Do NOT split into a separate
+~mime-git~ server — the shared conflict surface (a rebase conflict resolves
+through the merge-conflict tools) is the reason it's coherent. One of two
+concretely-shippable pieces on the current code.
+
+*** TODO editor: surface structural editing as intents + make the engine introspectable :mcp:
+Curate the 80% case as one named tool — ~edit_defun {name, action:
+replace|wrap|delete|insert-before|insert-after, text}~ — so "rewrite fn foo" /
+"add a method after bar" / "delete the dead struct" stop needing treesit lisp
+(generalizes the tracked insert-relative-to-a-defun/node item). For the long
+tail, add ~help {list: "operations"}~ returning the ~run_program~ vocabulary
+(~conflict-keep~, ~treesit-wrap-node~, …) as STRUCTURED DATA, so an agent
+discovers what's possible by asking, not prose-reading — discoverability with no
+extra always-loaded tool. Keep ~run_program~ central (the "few commands over an
+eval engine" shape is the right design; the fix is visibility, not dethroning
+it). The other concretely-shippable piece.
+
+*** TODO unify read/preview tools via params — weigh, likely keep separate :mcp:
+Power-via-params candidates a from-scratch design would weigh, but which the
+agent-usability goal (make the safe/common move OBVIOUS) argues against:
+- ~find {pattern, in: buffer|files}~ merging ~occur~ (one buffer) + ~grep~
+  (cross-file) — both read-only, clean to merge.
+- ~read {path, around?|range?}~ merging ~view~ + ~read_region~.
+- fold ~rehearse~ into ~run_program {dry_run: true}~.
+Tension: each removes a tool but hides an INTENT (preview-first; grep-the-tree).
+Lean toward KEEPING rehearse (and probably grep) as named tools — visibility
+beats minimalism for agent ergonomics. Options, not decisions.
+
 * Structural editing
 
 ** TODO Incremental re-parse (~InputEdit~s) [#C]
