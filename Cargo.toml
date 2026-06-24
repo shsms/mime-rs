@@ -12,6 +12,10 @@ categories = ["text-editors", "command-line-utilities", "text-processing"]
 exclude = ["*.org"]
 
 [dependencies]
+# Git sequencer (rebase / cherry-pick / revert) — see todo.org. `vendored-libgit2`
+# builds libgit2 from source via `cc` so there is no system-libgit2 dependency;
+# we never expose remote/transport ops, so the network surface is unused.
+git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 regex = "1.12.3"
 serde_json = "1.0.150"
 similar = "3.1.1"
