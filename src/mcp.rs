@@ -172,6 +172,7 @@ fn initialize_result(params: &Value) -> Value {
         "protocolVersion": version,
         "capabilities": { "tools": {} },
         "serverInfo": { "name": "mime-rs", "version": "0.1.0" },
+        "instructions": instructions(),
     })
 }
 
@@ -1936,51 +1937,236 @@ impl ToolAnnotations {
     }
 }
 
-/// One catalogue entry: the tool's JSON schema plus the metadata the doc
-/// surfaces derive from.
+/// Tool grouping, for the `instructions` index and `help`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Category {
+    Session,
+    Editing,
+    Structural,
+    Conflicts,
+    Git,
+    Inspection,
+}
+
+impl Category {
+    /// Display order + headings for the instructions index.
+    const ORDER: [Category; 6] = [
+        Category::Session,
+        Category::Editing,
+        Category::Structural,
+        Category::Conflicts,
+        Category::Git,
+        Category::Inspection,
+    ];
+    fn title(self) -> &'static str {
+        match self {
+            Category::Session => "Sessions",
+            Category::Editing => "Editing",
+            Category::Structural => "Structure",
+            Category::Conflicts => "Merge conflicts",
+            Category::Git => "Git history",
+            Category::Inspection => "Inspection",
+        }
+    }
+}
+
+/// One catalogue entry: the tool's JSON schema plus the cross-cutting metadata
+/// every doc surface derives from.
 struct ToolDoc {
     schema: Value,
-    annotations: Option<ToolAnnotations>,
+    category: Category,
+    annotations: ToolAnnotations,
+    summary: &'static str,
 }
 
 impl ToolDoc {
-    fn passthrough(schema: Value) -> Self {
-        Self {
-            schema,
-            annotations: None,
-        }
+    fn name(&self) -> &str {
+        self.schema["name"].as_str().unwrap_or("")
     }
     /// The `tools/list` entry: the schema with `annotations` merged in.
     fn to_list_value(&self) -> Value {
         let mut v = self.schema.clone();
-        if let Some(a) = self.annotations {
-            v["annotations"] = a.to_json();
-        }
+        v["annotations"] = self.annotations.to_json();
         v
     }
 }
 
-/// Annotations for a git tool, by name: rebase/abort rewrite or discard history
-/// (destructive); status/log/show only read; the rest append or advance.
-fn git_annotations(name: &str) -> ToolAnnotations {
+/// The cross-cutting metadata for a tool, by name — the ONE place category,
+/// annotations, and summary live (the schema literals hold name/description/
+/// inputSchema). A `_` fallthrough has an empty summary; `meta_covers_every_tool`
+/// asserts no tool reaches it, so this can't silently drift from the schemas.
+fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
+    use Category::*;
+    use ToolAnnotations as A;
     match name {
-        "git_rebase" | "git_abort" => ToolAnnotations::destructive(),
-        "git_status" | "git_log" | "git_show" => ToolAnnotations::read(),
-        _ => ToolAnnotations::append(),
+        "open_file" => (
+            Session,
+            A::append(),
+            "open a file from disk into a warm session",
+        ),
+        "open_text" => (
+            Session,
+            A::append(),
+            "open an in-memory buffer into a session",
+        ),
+        "close_session" => (
+            Session,
+            A::append(),
+            "drop a warm session (force discards unsaved edits)",
+        ),
+        "session_status" => (
+            Session,
+            A::read(),
+            "list warm sessions with stale/unsaved flags",
+        ),
+        "checkpoint" => (Session, A::append(), "capture a labelled restore point"),
+        "list_checkpoints" => (Session, A::read(), "list this session's checkpoint labels"),
+        "restore_checkpoint" => (
+            Session,
+            A::destructive(),
+            "rewind the buffer to a checkpoint",
+        ),
+        "undo_last" => (
+            Session,
+            A::destructive(),
+            "rewind the last mutating call (ring of 8)",
+        ),
+        "save_buffer" => (
+            Session,
+            A::destructive(),
+            "write the buffer to disk (atomic, stale-guarded)",
+        ),
+
+        "run_program" => (
+            Editing,
+            A::append(),
+            "run an Emacs-Lisp edit program against the buffer",
+        ),
+        "rehearse" => (
+            Editing,
+            A::read(),
+            "dry-run a program; preview the diff, persist nothing",
+        ),
+        "insert_text" => (
+            Editing,
+            A::append(),
+            "insert literal text at point or a named defun",
+        ),
+        "replace_text" => (
+            Editing,
+            A::append(),
+            "replace literal text (first/all/scoped/cross-file)",
+        ),
+        "search" => (
+            Editing,
+            A::append(),
+            "search from point; moves point to the match",
+        ),
+
+        "outline" => (
+            Structural,
+            A::read(),
+            "structural outline: one line per defun/section",
+        ),
+
+        "conflicts" => (
+            Conflicts,
+            A::read(),
+            "overview of the merge-conflict hunks in the buffer",
+        ),
+
+        "git_rebase" => (
+            Git,
+            A::destructive(),
+            "rebase the branch (or an explicit plan) onto a base",
+        ),
+        "git_cherry_pick" => (Git, A::append(), "apply commits on top of the branch tip"),
+        "git_revert" => (
+            Git,
+            A::append(),
+            "apply the inverse of commits on top of the tip",
+        ),
+        "git_continue" => (Git, A::append(), "commit the resolved step and continue"),
+        "git_skip" => (Git, A::append(), "drop the stopped step and continue"),
+        "git_abort" => (
+            Git,
+            A::destructive(),
+            "abort the operation, restoring the pre-op state",
+        ),
+        "git_status" => (Git, A::read(), "report the in-progress operation"),
+        "git_log" => (Git, A::read(), "one line per commit for a range"),
+        "git_show" => (
+            Git,
+            A::read(),
+            "a commit's metadata, message, and changed files",
+        ),
+
+        "read_region" => (
+            Inspection,
+            A::read(),
+            "read buffer text between two char positions",
+        ),
+        "view" => (Inspection, A::read(), "render a viewport around point"),
+        "occur" => (Inspection, A::read(), "list every line matching a pattern"),
+        "help" => (
+            Inspection,
+            A::read(),
+            "reference briefs: regex/treesit/conflicts/sessions/recipes",
+        ),
+
+        _ => (Inspection, A::append(), ""),
     }
 }
 
-/// The single registry every doc surface projects from.
+/// The single registry every doc surface (tools/list, validate_args,
+/// describe-mcp, the `instructions` field) projects from.
 fn catalogue() -> Vec<ToolDoc> {
-    let core = build_tool_schemas().into_iter().map(ToolDoc::passthrough);
-    let git = git_tool_schemas().into_iter().map(|schema| {
-        let annotations = Some(git_annotations(schema["name"].as_str().unwrap_or("")));
-        ToolDoc {
-            schema,
-            annotations,
+    build_tool_schemas()
+        .into_iter()
+        .chain(git_tool_schemas())
+        .map(|schema| {
+            let (category, annotations, summary) = meta(schema["name"].as_str().unwrap_or(""));
+            ToolDoc {
+                schema,
+                category,
+                annotations,
+                summary,
+            }
+        })
+        .collect()
+}
+
+/// The MCP server `instructions` (returned from `initialize`): how to drive
+/// mime, plus a category-grouped tool index — all client-agnostic, so any
+/// harness onboards its model from the protocol rather than an out-of-band file.
+/// The index is generated from the catalogue, so it can't drift from the tools.
+fn instructions() -> String {
+    let mut s = String::from(
+        "mime-rs is a transactional text-editing engine. Opening is implicit: pass `path` to \
+         any tool and the file becomes a warm session (or `session` for an in-memory buffer); \
+         buffers stay warm and NOTHING is written until you save (`save: true` on an edit, or \
+         save_buffer). Prefer one call: replace_text / insert_text for literal edits — set \
+         `expect_unique: true` when the anchor text could repeat, so an ambiguous match is an \
+         error, not a silent wrong edit — and run_program (Emacs-Lisp) when you need regex or \
+         structure. `rehearse` dry-runs any program (preview the diff, change nothing); \
+         `undo_last` rewinds a misfire. Positions: @N and point are ABSOLUTE (goto-char); line \
+         numbers are narrowing-relative (goto-line).\n\nTools:\n",
+    );
+    let cat = catalogue();
+    for category in Category::ORDER {
+        let mut first = true;
+        for d in cat.iter().filter(|d| d.category == category) {
+            if first {
+                s.push_str(&format!("\n{}:\n", category.title()));
+                first = false;
+            }
+            s.push_str(&format!("  {} — {}\n", d.name(), d.summary));
         }
-    });
-    core.chain(git).collect()
+    }
+    s.push_str(
+        "\nCall help {topic} for the regex / treesit / conflicts / sessions / recipes briefs.",
+    );
+    s
 }
 
 /// The MCP tool catalogue as `tools/list` values, built once and shared.
@@ -2011,7 +2197,7 @@ fn build_tool_schemas() -> Vec<Value> {
         "description": "Restrict this call to one part of the buffer without writing a program. {\"defun\": \"name\"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.",
         "properties": { "defun": { "type": "string" } },
     });
-    let mut schemas = vec![
+    vec![
         json!({
             "name": "open_file",
             "description": "Open a file from disk into a warm session (replacing any existing session of that name). The buffer stays resident so later tools need no file re-reads. The path must resolve inside an allowed root (MIME_ROOTS, default cwd).",
@@ -2299,14 +2485,34 @@ fn build_tool_schemas() -> Vec<Value> {
                 "required": [],
             },
         }),
-    ];
-    schemas.extend(git_tool_schemas());
-    schemas
+    ]
 }
 
 #[cfg(test)]
 mod git_tool_tests {
     use super::*;
+
+    #[test]
+    fn meta_covers_every_tool() {
+        // Every tool must have real metadata — none may hit meta()'s `_`
+        // fallthrough (empty summary). Guards the registry against drift when a
+        // tool is added or renamed.
+        for d in catalogue() {
+            assert!(
+                !d.summary.is_empty(),
+                "tool {} has no entry in meta()",
+                d.name()
+            );
+        }
+    }
+
+    #[test]
+    fn instructions_index_lists_every_tool() {
+        let text = instructions();
+        for d in catalogue() {
+            assert!(text.contains(d.name()), "instructions omit {}", d.name());
+        }
+    }
 
     #[test]
     fn git_schemas_cover_the_expected_tools() {
