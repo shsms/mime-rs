@@ -117,16 +117,20 @@ Every tool takes `path` (auto-opens the file into a warm session keyed by
 its canonical path; relative paths resolve against the server's cwd) OR
 `session` (an explicit id) — never both. Warm sessions persist buffers,
 point, checkpoints, kill-ring, and defuns across calls; session_status
-lists them with narrowed/stale/unsaved flags plus the writable roots.
-close_session drops one (force: true discards unsaved edits).
+lists them with narrowed/stale/unsaved flags and each session's checkpoint
+labels, plus the writable roots. close_session drops one (force: true
+discards unsaved edits).
 
 Saving: edits live in the warm buffer until saved. Pass save:true on an
-edit tool, or call save_buffer ({path} = save the visited file; to:"…" =
-save-as a COPY — it does not rebind the session, so a later plain save
-still targets the original file). Saves are atomic and stale-guarded: if the file changed on disk
-since open, the save refuses and the edit stays warm — re-check, then
-save_buffer elsewhere or (revert-buffer) to discard. A clean-but-drifted
-buffer auto-reverts before reads, programs, and rehearsals.
+edit tool, or call save_buffer ({path} = save the visited file; to:"…" on a
+DIFFERENT file = save-as a COPY — it does not rebind the session, so a later
+plain save still targets the original; to:"…" on the visited file is just an
+in-place save, and an unbound in-memory buffer adopts the file). A visited-file
+save is atomic and stale-guarded: if the file changed on disk since open, the
+save refuses and the edit stays warm — re-check, then save_buffer elsewhere or
+(revert-buffer) to discard. A save-as copy is atomic but NOT stale-guarded (it
+writes a different file). A clean-but-drifted buffer auto-reverts before reads,
+programs, and rehearsals.
 
 Safety ladder: rehearse = dry-run with full report, nothing persists;
 (with-transaction …) = all-or-nothing inside a program; checkpoint /
