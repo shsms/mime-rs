@@ -1774,7 +1774,12 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
     use crate::sequencer as seq;
     let repo = repo_path(args)?;
     match name {
-        "git_rebase" => seq::cmd_rebase(&repo, &str_arg(args, "onto")?, plan_arg(args)),
+        "git_rebase" => seq::cmd_rebase(
+            &repo,
+            &str_arg(args, "onto")?,
+            plan_arg(args),
+            bool_arg(args, "rehearse"),
+        ),
         "git_cherry_pick" => seq::cmd_cherry_pick(&repo, &str_list_arg(args, "commits")?),
         "git_revert" => seq::cmd_revert(&repo, &str_list_arg(args, "commits")?),
         "git_continue" => seq::cmd_continue(&repo),
@@ -1819,7 +1824,8 @@ fn git_tool_schemas() -> Vec<Value> {
                             },
                             "required": ["commit", "action"]
                         }
-                    }
+                    },
+                    "rehearse": { "type": "boolean", "description": "Dry-run: preview the resulting commits and whether the tree is unchanged (a pure reorder/fold), applying nothing. Default false." }
                 },
                 "required": ["repo", "onto"],
             },

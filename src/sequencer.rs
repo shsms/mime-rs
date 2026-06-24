@@ -141,6 +141,17 @@ pub struct Status {
     pub conflicts: Vec<String>,
 }
 
+/// A dry-run of a plan: the commits it WOULD produce (oldest→newest, with
+/// summaries) and the resulting tree, computed entirely in the object DB without
+/// moving HEAD/refs or touching the worktree. `conflict` is set (and the commit
+/// list truncated) at the first step a real run would stop on.
+#[derive(Debug)]
+pub struct Preview {
+    pub commits: Vec<(Oid, String)>,
+    pub final_tree: Oid,
+    pub conflict: Option<(usize, Vec<String>)>,
+}
+
 /// In-progress operation state, persisted to `.git/mime-sequencer.json`.
 struct State {
     branch: String,
@@ -342,6 +353,50 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
     drive(repo, st)
 }
 
+/// Dry-run a plan: compute the commits it would produce, entirely in the object
+/// DB (loose objects, no ref/worktree change), stopping at the first step that
+/// would conflict. Lets a caller preview a reorder/fold — and confirm the result
+/// tree is unchanged — before committing to it.
+fn rehearse(repo: &Repository, plan: &Plan, mode: Mode) -> Result<Preview, Error> {
+    // Mirror begin's leading-squash guard so the preview matches a real run.
+    if let Some(first) = plan.steps.iter().find(|s| s.action != Action::Drop)
+        && matches!(first.action, Action::Squash | Action::Fixup)
+    {
+        return Err(estr("the first applied step cannot be squash/fixup"));
+    }
+    let mut current = plan.onto;
+    let mut commits = Vec::new();
+    for (i, step) in plan.steps.iter().enumerate() {
+        if step.action == Action::Drop {
+            continue;
+        }
+        let pick = repo.find_commit(step.commit)?;
+        let current_commit = repo.find_commit(current)?;
+        // In-memory merge — produces an Index, never touches the worktree.
+        let mut index = match mode {
+            Mode::Pick => repo.cherrypick_commit(&pick, &current_commit, 0, None)?,
+            Mode::Revert => repo.revert_commit(&pick, &current_commit, 0, None)?,
+        };
+        if index.has_conflicts() {
+            return Ok(Preview {
+                commits,
+                final_tree: current_commit.tree_id(),
+                conflict: Some((i, conflict_paths(&index))),
+            });
+        }
+        let tree = repo.find_tree(index.write_tree_to(repo)?)?;
+        let new = make_commit(repo, mode, plan.onto, current, step, &tree)?;
+        let summary = repo.find_commit(new)?.summary().unwrap_or("").to_string();
+        commits.push((new, summary));
+        current = new;
+    }
+    Ok(Preview {
+        commits,
+        final_tree: repo.find_commit(current)?.tree_id(),
+        conflict: None,
+    })
+}
+
 /// Resume after the agent resolved a conflict in the worktree: stage the
 /// resolved paths, commit the stopped step, then continue the plan.
 pub fn continue_op(repo: &Repository) -> Result<Outcome, Error> {
@@ -441,20 +496,26 @@ pub fn status(repo: &Repository) -> Result<Option<Status>, Error> {
     }))
 }
 
-/// Commit the merged `tree` for `step` and move HEAD onto it. Pick/reword add a
-/// new commit on `current` (reword swaps the message); squash/fixup REPLACE
-/// `current` with a commit on `current`'s parent, melding the message (squash
-/// concatenates, fixup keeps `current`'s) — so the step folds into the
-/// preceding one. Authorship follows git: the picked commit's for pick/reword,
-/// the kept (earlier) commit's for squash/fixup.
-fn land_step(repo: &Repository, st: &State, step: &Step, tree: &git2::Tree) -> Result<Oid, Error> {
-    let current = repo.find_commit(st.current)?;
+/// Build the commit for `step` on top of `current_oid` and return its oid,
+/// WITHOUT moving any ref or the worktree. Pick/reword add a new commit on
+/// `current` (reword swaps the message); squash/fixup REPLACE `current` with a
+/// commit on `current`'s parent, melding the message (squash concatenates, fixup
+/// keeps `current`'s) — so the step folds into the preceding one; revert appends
+/// a generated message. Authorship follows git: the picked commit's for
+/// pick/reword/revert, the kept (earlier) commit's for squash/fixup. Shared by
+/// `land_step` (which then moves HEAD) and `rehearse` (which discards the result).
+fn make_commit(
+    repo: &Repository,
+    mode: Mode,
+    onto: Oid,
+    current_oid: Oid,
+    step: &Step,
+    tree: &git2::Tree,
+) -> Result<Oid, Error> {
+    let current = repo.find_commit(current_oid)?;
     let pick = repo.find_commit(step.commit)?;
     let pick_msg = || pick.message().unwrap_or("").to_string();
-    // Commit detached (not via "HEAD"): squash/fixup parent on `current`'s
-    // parent, which the "HEAD" path would reject (first-parent != HEAD). Move
-    // HEAD afterwards; the worktree already matches the merged tree.
-    if st.mode == Mode::Revert {
+    if mode == Mode::Revert {
         // A revert always appends on `current` with a generated message; the
         // forward-action vocabulary (reword/squash/fixup) does not apply.
         let summary = pick.summary().unwrap_or("commit");
@@ -462,18 +523,16 @@ fn land_step(repo: &Repository, st: &State, step: &Step, tree: &git2::Tree) -> R
             "Revert \"{summary}\"\n\nThis reverts commit {}.\n",
             pick.id()
         );
-        let new = repo.commit(
+        return repo.commit(
             None,
             &pick.committer(),
             &pick.committer(),
             &msg,
             tree,
             &[&current],
-        )?;
-        repo.set_head_detached(new)?;
-        return Ok(new);
+        );
     }
-    let new = match step.action {
+    match step.action {
         Action::Pick => repo.commit(
             None,
             &pick.author(),
@@ -481,7 +540,7 @@ fn land_step(repo: &Repository, st: &State, step: &Step, tree: &git2::Tree) -> R
             &pick_msg(),
             tree,
             &[&current],
-        )?,
+        ),
         Action::Reword => {
             let msg = step.message.clone().unwrap_or_else(pick_msg);
             repo.commit(
@@ -491,10 +550,10 @@ fn land_step(repo: &Repository, st: &State, step: &Step, tree: &git2::Tree) -> R
                 &msg,
                 tree,
                 &[&current],
-            )?
+            )
         }
         Action::Squash | Action::Fixup => {
-            if st.current == st.onto {
+            if current_oid == onto {
                 return Err(estr("squash/fixup needs a preceding pick"));
             }
             let parent = current.parent(0)?;
@@ -512,10 +571,18 @@ fn land_step(repo: &Repository, st: &State, step: &Step, tree: &git2::Tree) -> R
                 &msg,
                 tree,
                 &[&parent],
-            )?
+            )
         }
-        Action::Drop => unreachable!("drop is handled before land_step"),
-    };
+        Action::Drop => unreachable!("drop is handled before make_commit"),
+    }
+}
+
+/// Commit the merged `tree` for `step` (via [`make_commit`]) and move the
+/// detached HEAD onto it. Detached, not via "HEAD", so squash/fixup can parent
+/// on `current`'s parent (the "HEAD" path rejects first-parent != HEAD); the
+/// worktree already matches the merged tree.
+fn land_step(repo: &Repository, st: &State, step: &Step, tree: &git2::Tree) -> Result<Oid, Error> {
+    let new = make_commit(repo, st.mode, st.onto, st.current, step, tree)?;
     repo.set_head_detached(new)?;
     Ok(new)
 }
@@ -719,6 +786,41 @@ pub fn status_text(st: Option<Status>) -> String {
     }
 }
 
+/// The agent-facing summary of a rehearsed [`Preview`].
+pub fn preview_text(repo: &Repository, preview: &Preview) -> String {
+    let mut out = String::from("rehearsal — no changes applied:\n");
+    if preview.commits.is_empty() {
+        out.push_str("  (no commits)\n");
+    }
+    for (oid, summary) in &preview.commits {
+        out.push_str(&format!("  {} {summary}\n", short(*oid)));
+    }
+    match &preview.conflict {
+        Some((step, files)) => out.push_str(&format!(
+            "  stops at step {} on a conflict: {}\n",
+            step + 1,
+            files.join(", ")
+        )),
+        None => {
+            let head_tree = repo
+                .head()
+                .ok()
+                .and_then(|h| h.peel_to_tree().ok())
+                .map(|t| t.id());
+            out.push_str(&format!(
+                "  -> {} commit(s); resulting tree {} current HEAD\n",
+                preview.commits.len(),
+                if head_tree == Some(preview.final_tree) {
+                    "IDENTICAL to (pure reorder/fold)"
+                } else {
+                    "DIFFERS from"
+                },
+            ));
+        }
+    }
+    out
+}
+
 // ---- path-facing command wrappers (the MCP tool layer calls these) --------
 //
 // These open the repo, resolve revspecs, and stringify errors so the MCP layer
@@ -738,11 +840,13 @@ fn open(repo_path: &std::path::Path) -> Result<Repository, String> {
 }
 
 /// `git_rebase`: replay `onto..HEAD` (or an explicit `plan` of
-/// `(commit, action, message)`) onto `onto`.
+/// `(commit, action, message)`) onto `onto`. With `rehearse`, only preview the
+/// result (commit list + whether the tree is unchanged) — no changes applied.
 pub fn cmd_rebase(
     repo_path: &std::path::Path,
     onto: &str,
     plan: Option<Vec<(String, String, Option<String>)>>,
+    rehearse_only: bool,
 ) -> Result<String, String> {
     let repo = open(repo_path)?;
     let onto_oid = resolve_s(&repo, onto)?;
@@ -764,15 +868,18 @@ pub fn cmd_rebase(
             .map(pick_step)
             .collect(),
     };
-    let out = start(
-        &repo,
-        Plan {
-            onto: onto_oid,
-            steps,
-        },
-    )
-    .map_err(gerr)?;
-    Ok(outcome_text(&out))
+    let plan = Plan {
+        onto: onto_oid,
+        steps,
+    };
+    if rehearse_only {
+        Ok(preview_text(
+            &repo,
+            &rehearse(&repo, &plan, Mode::Pick).map_err(gerr)?,
+        ))
+    } else {
+        Ok(outcome_text(&start(&repo, plan).map_err(gerr)?))
+    }
 }
 
 fn resolve_all(repo: &Repository, specs: &[String]) -> Result<Vec<Oid>, String> {
@@ -1165,7 +1272,7 @@ mod tests {
         on_branch(&repo, "topic", f1);
 
         // Default plan (onto..HEAD) via the path-facing wrapper, onto by oid string.
-        let out = cmd_rebase(&dir, &m1.to_string(), None).unwrap();
+        let out = cmd_rebase(&dir, &m1.to_string(), None, false).unwrap();
         assert!(out.starts_with("done"), "{out}");
         assert_eq!(
             cmd_status(&dir).unwrap(),
@@ -1384,5 +1491,57 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message().contains("detached"), "{}", err.message());
+    }
+
+    #[test]
+    fn rehearse_previews_without_mutating() {
+        let dir = tmp("rehearse");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+        let before = repo.refname_to_id("refs/heads/topic").unwrap();
+
+        let plan = Plan {
+            onto: m1,
+            steps: vec![step(f1, Action::Pick, None)],
+        };
+        let preview = rehearse(&repo, &plan, Mode::Pick).unwrap();
+        assert_eq!(preview.commits.len(), 1);
+        assert!(preview.conflict.is_none());
+        // Nothing mutated: branch tip, attached HEAD, no state file.
+        assert_eq!(repo.refname_to_id("refs/heads/topic").unwrap(), before);
+        assert!(!repo.head_detached().unwrap());
+        assert!(!state_path(&repo).exists());
+        // The previewed tree matches what a real run then produces.
+        start(&repo, plan).unwrap();
+        assert_eq!(
+            repo.head().unwrap().peel_to_tree().unwrap().id(),
+            preview.final_tree
+        );
+    }
+
+    #[test]
+    fn rehearse_reports_a_conflict_without_mutating() {
+        let dir = tmp("rehearse-conflict");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "10\n")], "ours");
+        let m1 = commit(&repo, &[base], &[("a", "20\n")], "theirs");
+        on_branch(&repo, "topic", f1);
+        let preview = rehearse(
+            &repo,
+            &Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Pick, None)],
+            },
+            Mode::Pick,
+        )
+        .unwrap();
+        assert_eq!(preview.conflict, Some((0, vec!["a".to_string()])));
+        assert!(preview.commits.is_empty());
+        assert!(!repo.head_detached().unwrap(), "no mutation");
+        assert!(!state_path(&repo).exists());
     }
 }
