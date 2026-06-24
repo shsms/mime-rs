@@ -257,8 +257,8 @@ fn conflict_paths(index: &Index) -> Vec<String> {
 /// full `<<<<<<<` → `=======` → `>>>>>>>` combination) OR a stray opener line a
 /// partial cleanup left behind. Reuses `conflict.rs`'s grammar rather than a
 /// substring heuristic, so it understands diff3/run-length and won't fire on,
-/// say, a lone `=======` (a Markdown heading). Decodes lossily — markers are
-/// ASCII, so non-UTF-8 content can't hide them.
+/// say, a lone `=======` (a Markdown heading). Decodes UTF-8 (lossily only if
+/// invalid) — markers are ASCII, so non-UTF-8 content can't hide them.
 fn has_conflict_markers(bytes: Vec<u8>) -> bool {
     // Move the Vec into the String on the valid-UTF-8 path (no copy); only the
     // rare non-UTF-8 file pays a lossy re-decode.
@@ -447,11 +447,10 @@ pub fn continue_op(repo: &Repository, force: bool) -> Result<Outcome, Error> {
     for path in conflict_paths(&index) {
         let full = workdir.join(&path);
         if full.exists() {
-            // Refuse to commit a file that still carries conflict markers. The
-            // byte-level opener check catches partial/stray/glued markers a
-            // structural parser would miss and works on non-UTF-8 files; reading
-            // must succeed (fail closed). `force` overrides it for the rare
-            // legitimate-marker resolution.
+            // Refuse to commit a file that still reads as conflicted —
+            // has_conflict_markers parses it (a full hunk OR a stray opener), so
+            // a partial cleanup doesn't slip through. Reading must succeed (fail
+            // closed); `force` overrides for the rare legitimate-marker resolution.
             if !force {
                 let bytes = std::fs::read(&full)
                     .map_err(|e| estr(&format!("cannot read {path} to verify resolution: {e}")))?;
