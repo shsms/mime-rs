@@ -214,7 +214,6 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         "restore_checkpoint" => tool_restore_checkpoint(&args, sessions),
         "undo_last" => tool_undo_last(&args, sessions),
         "close_session" => tool_close_session(&args, sessions),
-        "list_checkpoints" => tool_list_checkpoints(&args, sessions),
         "save_buffer" => tool_save_buffer(&args, sessions),
         "session_status" => tool_session_status(sessions),
         "help" => tool_help(&args),
@@ -1471,18 +1470,6 @@ fn tool_undo_last(
     ))
 }
 
-/// `list_checkpoints {session?}` — the labels currently captured.
-fn tool_list_checkpoints(
-    args: &Value,
-    sessions: &mut HashMap<String, Workspace>,
-) -> Result<String, String> {
-    let session = resolve_session(args, sessions)?;
-    let program = "(report \"checkpoints\" (list-checkpoints))".to_string();
-    let report = run_in_session(sessions, &session, &program)?;
-    let labels = report_value(&report, "checkpoints").unwrap_or_else(|| "nil".to_string());
-    Ok(format!("checkpoints: {labels}"))
-}
-
 /// `save_buffer {session?|path?, to?}` — write the session buffer's text to
 /// disk. `path` addresses WHICH session, like on every other tool; the
 /// destination is `to` (save-as), defaulting to the session's visited file —
@@ -1536,6 +1523,7 @@ fn tool_session_status(sessions: &HashMap<String, Workspace>) -> Result<String, 
                 "narrowed": ws.is_narrowed(),
                 "stale": ws.is_stale(),
                 "unsaved": ws.visited_path().is_some() && ws.is_modified(),
+                "checkpoints": ws.checkpoint_labels(),
             })
         })
         .collect();
@@ -1976,10 +1964,13 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
         "session_status" => (
             Session,
             A::read(),
-            "list warm sessions with stale/unsaved flags",
+            "list warm sessions with stale/unsaved flags + checkpoint labels",
         ),
-        "checkpoint" => (Session, A::append(), "capture a labelled restore point"),
-        "list_checkpoints" => (Session, A::read(), "list this session's checkpoint labels"),
+        "checkpoint" => (
+            Session,
+            A::append(),
+            "capture a labelled restore point (advanced; undo_last is the default net)",
+        ),
         "restore_checkpoint" => (
             Session,
             A::destructive(),
@@ -2333,7 +2324,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "checkpoint",
-            "description": "Capture a restore point of the current buffer. Cheap (structural sharing for files).",
+            "description": "Capture a named restore point of the current buffer (cheap — structural sharing for files). ADVANCED: every mutating tool call already captures an automatic restore point, so undo_last is the usual safety net; reach for explicit checkpoints only to mark a spot you'll want to return to by name. Captured labels show up per session in session_status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2358,7 +2349,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "restore_checkpoint",
-            "description": "Rewind the buffer to a previously captured checkpoint by label.",
+            "description": "Rewind the buffer to a previously captured checkpoint by label (the labels are listed per session by session_status).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2367,15 +2358,6 @@ fn build_tool_schemas() -> Vec<Value> {
                     "path": path,
                 },
                 "required": ["label"],
-            },
-        }),
-        json!({
-            "name": "list_checkpoints",
-            "description": "List the labels of checkpoints captured in this session.",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "session": session, "path": path },
-                "required": [],
             },
         }),
         json!({

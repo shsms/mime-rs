@@ -611,6 +611,17 @@ impl Workspace {
         s.buffer.version() != s.synced_version
     }
 
+    /// Labels of the user checkpoints captured in this session, in creation
+    /// order (excludes the implicit undo ring). Surfaced by `session_status`.
+    pub fn checkpoint_labels(&self) -> Vec<String> {
+        self.session
+            .borrow()
+            .checkpoints
+            .iter()
+            .map(|c| c.label.clone())
+            .collect()
+    }
+
     /// Auto-revert (Emacs `auto-revert-mode`): if the visited file drifted on
     /// disk and the buffer has NO unsaved edits, silently re-read it so the next
     /// read/edit sees the current file instead of stale-or-corrupt bytes. Returns

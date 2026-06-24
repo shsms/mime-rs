@@ -115,7 +115,7 @@ Overview of the merge-conflict hunks in the buffer: number, position + line, bra
 
 ## checkpoint
 
-Capture a restore point of the current buffer. Cheap (structural sharing for files).
+Capture a named restore point of the current buffer (cheap — structural sharing for files). ADVANCED: every mutating tool call already captures an automatic restore point, so undo_last is the usual safety net; reach for explicit checkpoints only to mark a spot you'll want to return to by name. Captured labels show up per session in session_status.
 
 - `label` — Optional label; auto-generated (auto-N) when omitted.
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
@@ -130,16 +130,9 @@ Rewind the buffer to its state before the most recent mutating call — the auto
 
 ## restore_checkpoint
 
-Rewind the buffer to a previously captured checkpoint by label.
+Rewind the buffer to a previously captured checkpoint by label (the labels are listed per session by session_status).
 
 - `label` (required) — Label of the checkpoint to restore.
-- `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
-- `session` — Warm session id; defaults to "default" when omitted.
-
-## list_checkpoints
-
-List the labels of checkpoints captured in this session.
-
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `session` — Warm session id; defaults to "default" when omitted.
 
