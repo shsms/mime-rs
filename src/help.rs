@@ -122,7 +122,8 @@ close_session drops one (force: true discards unsaved edits).
 
 Saving: edits live in the warm buffer until saved. Pass save:true on an
 edit tool, or call save_buffer ({path} = save the visited file; to:"…" =
-save-as). Saves are atomic and stale-guarded: if the file changed on disk
+save-as a COPY — it does not rebind the session, so a later plain save
+still targets the original file). Saves are atomic and stale-guarded: if the file changed on disk
 since open, the save refuses and the edit stays warm — re-check, then
 save_buffer elsewhere or (revert-buffer) to discard. A clean-but-drifted
 buffer auto-reverts before reads, programs, and rehearsals.

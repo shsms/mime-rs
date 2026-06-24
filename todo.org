@@ -219,7 +219,12 @@ edit would share one vocabulary. A =read_region {path, start_line,
 end_line}= alias for "lines 120–140 of X" already exists; the gap is
 purely the multi-file fan-out.
 
-** TODO save_buffer {to:} rebinds the visited file — a footgun for path-keyed sessions [#B] :dogfooding:
+** DONE save_buffer {to:} rebinds the visited file — a footgun for path-keyed sessions [#B] :dogfooding:
+DONE (2026-06-24, branch ~mcp-surface-review~): implemented exactly the fix
+below — ~to:~ to a different file is a pure copy-out (~Workspace::write_copy_to~,
+no rebind, visited file + baseline untouched); same-path ~to:~ stays an in-place
+save. See the surface-review item that subsumed this.
+
 
 Hit during the 2026-06-11 switchyard session. Recovery sequence after a
 bad save: ~save_buffer {path: X, to: TMP}~ to park the good buffer, then
@@ -512,10 +517,15 @@ Accept a message /edit/ instead: e.g. =edits: [{pattern, replacement}]= applied
 to the existing message, or directives like delete-trailer / append-line. Should
 compose with any sign-off / trailer validation.
 
-** TODO MCP command-surface review — prune the middle, grow power via params :mcp:
+** DONE MCP command-surface review — prune the middle, grow power via params :mcp:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-06-24 Mi]
 - State "TODO"       from              [2026-06-24 Mi]
 :END:
+
+Outcome (2026-06-24, branch ~mcp-surface-review~): all five items below done;
+surface 29 → 27 tools, no new ones. Cross-file ~grep~ (the "too little") stays
+its own TODO.
 
 Verdict (analysis 2026-06-24): the 29-tool surface is coherent at the macro
 level — two domains (a buffer you edit; a repo you rewrite) bridged by a shared
@@ -528,20 +538,30 @@ PARAMETERS, not new tools; trim the marginal verbs rather than let the count
 creep past ~30. Already tracked elsewhere: the cross-file ~grep~ gap (the main
 "too little") and the ~save_buffer {to:}~ addressing footgun.
 
-*** TODO Trim or demote the manual checkpoint trio [#C]
+*** DONE Trim or demote the manual checkpoint trio [#C]
 ~checkpoint~ / ~list_checkpoints~ / ~restore_checkpoint~ are three tools for a
 deliberate-restore-point workflow agents rarely use; automatic ~undo_last~
 (every mutation, ring of 8) covers most "oops". Either fold them into one
 ~checkpoint {action: save|list|restore}~, or keep them but explicitly position
 them as advanced with ~undo_last~ as the default net. Net: ~−2 tools of context.
 
-*** TODO Reconsider ~search~ as a standalone tool [#C]
+DONE: dropped ~list_checkpoints~; its labels now ride in ~session_status~
+(new ~Workspace::checkpoint_labels~). ~checkpoint~/~restore_checkpoint~ kept but
+repositioned as advanced (descriptions point at ~undo_last~ + ~session_status~).
+Not merged into one ~{action}~ tool — that would force one annotation across
+save (append) + restore (destructive), mis-gating like the run_program case.
+
+*** DONE Reconsider ~search~ as a standalone tool [#C]
 It is a single ~re-search-forward~ that MOVES POINT as a side effect — a subtle
 stateful gotcha beside read-only ~occur~, and otherwise ~run_program~ territory.
 Either drop it (lean on ~occur~ for orientation + ~run_program~ to navigate) or
 fold a "move point to first match" option into ~occur~.
 
-*** TODO Reconcile the dual buffer addressing (~session~ id vs ~path~) [#B]
+DONE: dropped the tool. Orientation = ~occur~ (read-only); moving point for a
+follow-up edit = ~run_program~ (goto-char / re-search-forward). The lisp search
+functions are unaffected.
+
+*** DONE Reconcile the dual buffer addressing (~session~ id vs ~path~) [#B]
 Every editing tool takes BOTH a warm ~session~ id and an auto-opening ~path~;
 that overlap is the root of the ~save_buffer {to:}~ footgun and makes
 ~open_file~ partly redundant with implicit-open. Decide one coherent model
@@ -549,19 +569,33 @@ that overlap is the root of the ~save_buffer {to:}~ footgun and makes
 never doubles as the selector) and align every tool + doc to it. Subsumes the
 standalone ~save_buffer {to:}~ item.
 
-*** TODO Clarify ~rehearse~ vs ~run_program~ (no save) [#C]
+DONE: the model (~path~/~session~ select the session; ~to~ is the only
+destination) was already consistent across tools — the one wart was the
+footgun, now fixed: ~save_buffer {to: other}~ writes a copy via
+~Workspace::write_copy_to~ and does NOT rebind the session. Resolves the
+standalone footgun item below.
+
+*** DONE Clarify ~rehearse~ vs ~run_program~ (no save) [#C]
 Both "don't touch disk", but ~rehearse~ also rolls the BUFFER back while
 ~run_program~ persists buffer edits (just not to the file) — easy to conflate.
 A naming or doc fix (the ~instructions~ preamble only half-covers it) so the
 buffer-persist vs full-rollback line is unmistakable.
 
-*** TODO Discoverability: structural + conflict-resolution verbs hidden in ~run_program~ [#C]
+DONE: the ~instructions~ preamble now spells out the three persistence levels —
+rehearse rolls the buffer back / run_program + edit tools persist to the warm
+buffer (not disk) / save writes to disk.
+
+*** DONE Discoverability: structural + conflict-resolution verbs hidden in ~run_program~ [#C]
 Structural editing (treesit nodes/queries) is surfaced only as ~outline~; the
 conflict RESOLUTION verbs (~conflict-keep~ etc.) are ~run_program~ functions,
 not tools (the ~conflicts~ tool only reports). ~help {treesit|conflicts}~
 bridges both, but it is a discovery step. Decide whether that is the intended
 "small surface, deep engine" tradeoff (then document it as such) or worth one
 more surfaced affordance.
+
+DONE: chose to keep the small surface and make the tradeoff explicit — the
+~instructions~ now say the deep vocabulary (regex / treesit / conflict-keep …)
+lives inside ~run_program~ by design, reached via help {topic|tool}.
 
 * Structural editing
 
