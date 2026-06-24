@@ -311,6 +311,21 @@ pub fn continue_op(repo: &Repository) -> Result<Outcome, Error> {
     drive(repo, st)
 }
 
+/// Skip the stopped step: discard its (conflicted) merge, then continue the
+/// plan as if that commit had been dropped.
+pub fn skip(repo: &Repository) -> Result<Outcome, Error> {
+    let mut st = load_state(repo)?;
+    if st.next >= st.steps.len() {
+        return Err(estr("nothing to skip"));
+    }
+    // Discard the in-progress merge residue, back to the last good tip.
+    repo.reset(&repo.find_object(st.current, None)?, ResetType::Hard, None)?;
+    let _ = repo.cleanup_state();
+    st.next += 1;
+    save_state(repo, &st)?;
+    drive(repo, st)
+}
+
 /// Abort: restore HEAD/refs/worktree to the pre-op snapshot, drop the state.
 pub fn abort(repo: &Repository) -> Result<(), Error> {
     let st = load_state(repo)?;
@@ -618,6 +633,33 @@ mod tests {
         assert!(matches!(out, Outcome::Done { .. }));
         assert_eq!(read(&repo, "a"), "resolved\n");
         assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn skip_omits_the_conflicting_step() {
+        let dir = tmp("skip");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "10\n")], "ours a");
+        let f2 = commit(&repo, &[f1], &[("a", "10\n"), ("b", "1\n")], "add b");
+        let m1 = commit(&repo, &[base], &[("a", "20\n")], "their a");
+        on_branch(&repo, "topic", f2);
+
+        // f1 conflicts on a; f2 (adds b) applies cleanly after skipping f1.
+        let out = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Pick, None), step(f2, Action::Pick, None)],
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, Outcome::Conflict { step: 0, .. }));
+
+        let out = skip(&repo).unwrap();
+        assert!(matches!(out, Outcome::Done { .. }));
+        assert_eq!(read(&repo, "a"), "20\n", "skipped f1, kept their a");
+        assert_eq!(read(&repo, "b"), "1\n", "f2 still applied");
     }
 
     #[test]
