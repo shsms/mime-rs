@@ -17,6 +17,7 @@ pub mod mcp;
 pub mod quire;
 pub mod result;
 pub mod safety;
+pub mod sequencer;
 pub mod store;
 pub mod strings;
 pub mod syntax;
