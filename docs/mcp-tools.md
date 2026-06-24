@@ -99,6 +99,18 @@ Overview of every line matching a pattern in the whole accessible region (compos
 - `scope` — Restrict this call to one part of the buffer without writing a program. {"defun": "name"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.
 - `session` — Warm session id; defaults to "default" when omitted.
 
+## grep
+
+Read-only cross-file search: which files (and lines) mention a pattern — occur across the filesystem. Walks `dir` (default: every allowed root) recursively, skipping dot-entries (.git …) and symlinks, keeping paths that match `glob`. Per file: a header + matching lines (line number + absolute char position, long lines clamped, optional context). The file paths it lists feed replace_text {files: […]} directly. Caps files scanned (5000) and matches rendered. Needs no session — reads files within MIME_ROOTS. Use occur for one already-open buffer; grep to find which files to touch.
+
+- `case_insensitive` — Match case-insensitively (both modes). Default false.
+- `dir` — Directory to search (must resolve inside an allowed root). Omit to search every root.
+- `glob` — Keep only paths matching this glob, relative to the search dir: * within a segment, ** across directories, ? one char (e.g. **/*.rs). Omit to search every file.
+- `limit` — Max matching lines rendered across all files (default 100); a tail line notes truncation.
+- `mode` — exact (literal) or regex (RE2, line-oriented). Defaults to exact.
+- `nlines` — Context lines around each hit (default 0).
+- `pattern` (required) — What to search for.
+
 ## outline
 
 The buffer's structural outline: one 'KIND START END NAME' line per defun (Rust/Python functions, types, impls, mods; Markdown sections), in document order with nested ones included. The natural first move on a code file — survey it without reading it whole; the names feed scope/anchor parameters and treesit-goto-defun.

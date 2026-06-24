@@ -208,6 +208,7 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         "insert_text" => tool_insert_text(&args, sessions),
         "replace_text" => tool_replace_text(&args, sessions),
         "occur" => tool_occur(&args, sessions),
+        "grep" => tool_grep(&args),
         "outline" => tool_outline(&args, sessions),
         "conflicts" => tool_conflicts(&args, sessions),
         "checkpoint" => tool_checkpoint(&args, sessions),
@@ -1368,6 +1369,243 @@ fn tool_occur(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result
     }
 }
 
+/// Translate a shell-style glob to an anchored regex over a path. `*` matches
+/// within a path segment, `**` crosses `/`, `?` is one non-`/` char; everything
+/// else is literal. Matched against the file path RELATIVE to the search dir.
+fn glob_to_regex(glob: &str) -> String {
+    let mut re = String::from("^");
+    let mut chars = glob.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                    if chars.peek() == Some(&'/') {
+                        chars.next();
+                    }
+                    re.push_str(".*"); // ** (optionally **/) crosses directories
+                } else {
+                    re.push_str("[^/]*");
+                }
+            }
+            '?' => re.push_str("[^/]"),
+            '.' | '+' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '\\' => {
+                re.push('\\');
+                re.push(c);
+            }
+            _ => re.push(c),
+        }
+    }
+    re.push('$');
+    re
+}
+
+/// Lines in `text` matching `re`, as (0-based line index, 1-based CHAR offset of
+/// the line start). Line-oriented (the newline is not part of the match).
+fn grep_matches(text: &str, re: &regex::Regex) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut pos = 1usize;
+    for (i, line) in text.split('\n').enumerate() {
+        if re.is_match(line) {
+            out.push((i, pos));
+        }
+        pos += line.chars().count() + 1; // + the newline
+    }
+    out
+}
+
+/// Collect regular files under `dir` (recursively, skipping dot-entries and
+/// symlinks), capped at `max` to bound a pathological tree.
+fn collect_files(
+    dir: &Path,
+    scanned: &mut usize,
+    max: usize,
+    out: &mut Vec<std::path::PathBuf>,
+    capped: &mut bool,
+) {
+    if *scanned >= max {
+        *capped = true;
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        if e.file_name().to_string_lossy().starts_with('.') {
+            continue; // skip .git, dotfiles
+        }
+        match e.file_type() {
+            Ok(t) if t.is_dir() => collect_files(&e.path(), scanned, max, out, capped),
+            Ok(t) if t.is_file() => {
+                if *scanned >= max {
+                    *capped = true;
+                    return;
+                }
+                *scanned += 1;
+                out.push(e.path());
+            }
+            _ => {} // skip symlinks (avoids cycles) and the rest
+        }
+    }
+}
+
+/// `grep {pattern, glob?, dir?, mode?, case_insensitive?, nlines?, limit?}` —
+/// read-only cross-file search: which files (and lines) mention a pattern. Walks
+/// `dir` (default: every MIME_ROOTS root) recursively, skipping dot-entries
+/// (`.git` …) and symlinks, keeping only paths that match `glob` (relative to
+/// the search dir; `**` crosses directories). Line-oriented like occur. The file
+/// paths it prints feed `replace_text {files: …}` directly. No session needed —
+/// it reads files on disk within the sandbox. Caps files scanned and matches.
+fn tool_grep(args: &Value) -> Result<String, String> {
+    const MAX_FILES: usize = 5000;
+    const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+    const MAX_LINE: usize = 200;
+
+    let pattern = str_arg(args, "pattern")?;
+    let mode = args.get("mode").and_then(Value::as_str).unwrap_or("exact");
+    let ci = bool_arg(args, "case_insensitive");
+    let nlines = args
+        .get("nlines")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0) as usize;
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_i64)
+        .unwrap_or(100)
+        .max(1) as usize;
+
+    let body = match (mode, ci) {
+        ("exact", false) => regex::escape(&pattern),
+        ("exact", true) => format!("(?i){}", regex::escape(&pattern)),
+        ("regex", false) => pattern.clone(),
+        ("regex", true) => format!("(?i){pattern}"),
+        (other, _) => return Err(format!("unknown grep mode: {other} (exact|regex)")),
+    };
+    let re = regex::Regex::new(&body).map_err(|e| format!("bad pattern: {e}"))?;
+    let glob_arg = args.get("glob").and_then(Value::as_str);
+    let glob_re = match glob_arg {
+        Some(g) => {
+            Some(regex::Regex::new(&glob_to_regex(g)).map_err(|e| format!("bad glob: {e}"))?)
+        }
+        None => None,
+    };
+    let dirs: Vec<std::path::PathBuf> = match args.get("dir").and_then(Value::as_str) {
+        Some(d) => vec![crate::safety::check_path(Path::new(d))?],
+        None => crate::safety::roots(),
+    };
+
+    let mut scanned = 0usize;
+    let mut capped_files = false;
+    let mut total_hits = 0usize;
+    let mut files_with_hits = 0usize;
+    let mut truncated = false;
+    let mut out = String::new();
+
+    'outer: for base in &dirs {
+        let mut files = Vec::new();
+        collect_files(base, &mut scanned, MAX_FILES, &mut files, &mut capped_files);
+        files.sort();
+        for full in files {
+            let rel = full
+                .strip_prefix(base)
+                .unwrap_or(&full)
+                .to_string_lossy()
+                .to_string();
+            if let Some(g) = &glob_re
+                && !g.is_match(&rel)
+            {
+                continue;
+            }
+            if std::fs::metadata(&full)
+                .map(|m| m.len())
+                .unwrap_or(u64::MAX)
+                > MAX_FILE_BYTES
+            {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&full) else {
+                continue;
+            };
+            let Ok(text) = String::from_utf8(bytes) else {
+                continue; // skip binary / non-UTF-8
+            };
+
+            let hits = grep_matches(&text, &re);
+            if hits.is_empty() {
+                continue;
+            }
+            let lines: Vec<&str> = text.split('\n').collect();
+            let hit_pos: HashMap<usize, usize> = hits.iter().copied().collect();
+            let mut print = std::collections::BTreeSet::new();
+            for &(h, _) in &hits {
+                let lo = h.saturating_sub(nlines);
+                let hi = (h + nlines).min(lines.len().saturating_sub(1));
+                for i in lo..=hi {
+                    print.insert(i);
+                }
+            }
+
+            files_with_hits += 1;
+            out.push_str(&format!(
+                "{rel} ({} match{})\n",
+                hits.len(),
+                if hits.len() == 1 { "" } else { "es" }
+            ));
+            let mut prev: Option<usize> = None;
+            for i in print {
+                if prev.is_some_and(|p| i > p + 1) {
+                    out.push_str("  --\n");
+                }
+                prev = Some(i);
+                let raw = lines.get(i).copied().unwrap_or("");
+                let shown: String = if raw.chars().count() > MAX_LINE {
+                    format!("{}…", raw.chars().take(MAX_LINE).collect::<String>())
+                } else {
+                    raw.to_string()
+                };
+                if let Some(&pos) = hit_pos.get(&i) {
+                    out.push_str(&format!("  L{} @{pos}: {shown}\n", i + 1));
+                    total_hits += 1;
+                    if total_hits >= limit {
+                        truncated = true;
+                        out.push('\n');
+                        break 'outer;
+                    }
+                } else {
+                    out.push_str(&format!("  L{}    {shown}\n", i + 1));
+                }
+            }
+            out.push('\n');
+        }
+    }
+
+    if total_hits == 0 {
+        let g = glob_arg
+            .map(|g| format!(" matching glob {g:?}"))
+            .unwrap_or_default();
+        return Ok(format!(
+            "no matches for {pattern:?}{g} (scanned {scanned} files)"
+        ));
+    }
+    let mut tail = format!(
+        "{total_hits} match{} in {files_with_hits} file{} (scanned {scanned} files",
+        if total_hits == 1 { "" } else { "es" },
+        if files_with_hits == 1 { "" } else { "s" }
+    );
+    if truncated {
+        tail.push_str(&format!(
+            "; stopped at limit {limit} — narrow with glob/dir or raise limit"
+        ));
+    }
+    if capped_files {
+        tail.push_str(&format!("; file scan capped at {MAX_FILES}"));
+    }
+    tail.push_str(").");
+    out.push_str(&tail);
+    Ok(out)
+}
+
 /// `outline {session?|path?}` — the buffer's structural outline: one
 /// `KIND START END NAME` line per defun (Rust/Python functions, types,
 /// impls; Markdown sections), via `treesit-list-defuns`. The natural first
@@ -2075,7 +2313,16 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             "read buffer text between two char positions",
         ),
         "view" => (Inspection, A::read(), "render a viewport around point"),
-        "occur" => (Inspection, A::read(), "list every line matching a pattern"),
+        "occur" => (
+            Inspection,
+            A::read(),
+            "list every line matching a pattern (one buffer)",
+        ),
+        "grep" => (
+            Inspection,
+            A::read(),
+            "search a pattern across files — which files/lines mention X",
+        ),
         "help" => (
             Inspection,
             A::read(),
@@ -2319,6 +2566,27 @@ fn build_tool_schemas() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "grep",
+            "description": "Read-only cross-file search: which files (and lines) mention a pattern — occur across the filesystem. Walks `dir` (default: every allowed root) recursively, skipping dot-entries (.git …) and symlinks, keeping paths that match `glob`. Per file: a header + matching lines (line number + absolute char position, long lines clamped, optional context). The file paths it lists feed replace_text {files: […]} directly. Caps files scanned (5000) and matches rendered. Needs no session — reads files within MIME_ROOTS. Use occur for one already-open buffer; grep to find which files to touch.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "What to search for." },
+                    "glob": { "type": "string", "description": "Keep only paths matching this glob, relative to the search dir: * within a segment, ** across directories, ? one char (e.g. **/*.rs). Omit to search every file." },
+                    "dir": { "type": "string", "description": "Directory to search (must resolve inside an allowed root). Omit to search every root." },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["exact", "regex"],
+                        "description": "exact (literal) or regex (RE2, line-oriented). Defaults to exact.",
+                    },
+                    "case_insensitive": { "type": "boolean", "description": "Match case-insensitively (both modes). Default false." },
+                    "nlines": { "type": "integer", "description": "Context lines around each hit (default 0)." },
+                    "limit": { "type": "integer", "description": "Max matching lines rendered across all files (default 100); a tail line notes truncation." },
+                },
+                "required": ["pattern"],
+            },
+        }),
+        json!({
             "name": "outline",
             "description": "The buffer's structural outline: one 'KIND START END NAME' line per defun (Rust/Python functions, types, impls, mods; Markdown sections), in document order with nested ones included. The natural first move on a code file — survey it without reading it whole; the names feed scope/anchor parameters and treesit-goto-defun.",
             "inputSchema": {
@@ -2507,6 +2775,26 @@ mod git_tool_tests {
         // unparseable input → parse error (-32700) against a null id.
         let parse = call("{not json", &mut s).unwrap();
         assert_eq!(parse["error"]["code"], -32700);
+    }
+
+    #[test]
+    fn glob_to_regex_respects_segments_and_recursion() {
+        let m = |g: &str, p: &str| regex::Regex::new(&glob_to_regex(g)).unwrap().is_match(p);
+        assert!(m("*.rs", "lib.rs"));
+        assert!(!m("*.rs", "src/lib.rs"), "* stays within one path segment");
+        assert!(m("**/*.rs", "src/a/lib.rs"), "** crosses directories");
+        assert!(m("**/*.rs", "lib.rs"));
+        assert!(!m("**/*.rs", "lib.txt"));
+        assert!(m("src/?.rs", "src/a.rs"));
+        assert!(!m("src/?.rs", "src/ab.rs"), "? is exactly one char");
+    }
+
+    #[test]
+    fn grep_matches_reports_line_and_char_offsets() {
+        let re = regex::Regex::new("needle").unwrap();
+        // "αβ" is 2 chars (4 bytes) — offsets must be in CHARS, not bytes.
+        let text = "αβ\nneedle here\nno\nneedle again\n";
+        assert_eq!(grep_matches(text, &re), vec![(1, 4), (3, 19)]);
     }
 
     #[test]
