@@ -301,7 +301,7 @@ git so the agent's git mental model transfers.
 Rewriting history + checkout is more powerful than text editing (a bad reset
 destroys uncommitted work). Gate it like ~register_orchestration~
 (engine.rs:314): a new ~register_git~ group, registered only on explicit
-opt-in (env, e.g. ~MIME_GIT_ROOTS~, or a flag), default OFF, repos confined to
+opt-in (env, e.g. ~MIME_ENABLE_GIT~, or a flag), default OFF, repos confined to
 MIME_ROOTS via ~check_path~. When off, the ~git_*~ tools are not registered at
 all (same registration-time gating as the sandboxed/trusted split) — the
 default sandbox stays byte-for-byte unchanged, and git is an explicit,
@@ -335,7 +335,7 @@ worktree authority.
   engine.rs:620, called on the run path mcp.rs:435), modified buffers are
   save-guarded. No proactive reload hook needed, matching the paged-reader
   decision; the sequencer stays a free function over a ~git2::Repository~.
-- [X] ~git_*~ MCP tools gated by an opt-in env (~MIME_GIT_ROOTS~, default OFF):
+- [X] ~git_*~ MCP tools gated by an opt-in env (~MIME_ENABLE_GIT~, default OFF):
   ~git_rebase~ / ~git_cherry_pick~ / ~git_revert~ / ~git_continue~ / ~git_skip~
   / ~git_abort~ / ~git_status~ / ~git_log~ / ~git_show~. Schemas appended only
   when enabled (so ~tools/list~ + ~validate_args~ omit them when off); dispatch
@@ -348,7 +348,7 @@ DONE — the sequencer is feature-complete and tested (13 sequencer + 2 MCP unit
 tests; manual end-to-end). Optional follow-ups, not blocking:
 - ~git_show~ shows changed-file status only; full unified diff could be added.
 - ~describe-mcp~ documents the default catalogue; regenerate with
-  ~MIME_GIT_ROOTS=1~ if the git tools should appear in docs/mcp-tools.md.
+  ~MIME_ENABLE_GIT=1~ if the git tools should appear in docs/mcp-tools.md.
 - Migrate to pure-Rust ~gix~ once its conflict-marker merge is production-grade
   (the ~cmd_*~/typed API is the small surface to swap).
 

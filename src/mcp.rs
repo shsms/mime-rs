@@ -218,7 +218,7 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
                 dispatch_git(git, &args)
             } else {
                 Err(
-                    "git tools are disabled — set MIME_GIT_ROOTS to enable them \
+                    "git tools are disabled — set MIME_ENABLE_GIT to enable them \
                      (history rewriting + checkout, no network/hooks/exec)"
                         .to_string(),
                 )
@@ -1714,17 +1714,20 @@ fn tools_list_result() -> Value {
     json!({ "tools": tool_schemas() })
 }
 
-// ---- git sequencer tools (gated by MIME_GIT_ROOTS) -------------------------
+// ---- git sequencer tools (gated by MIME_ENABLE_GIT) -------------------------
 //
 // These rewrite history and check files out, so they stay OFF by default and
-// are exposed only when MIME_GIT_ROOTS is set. They never reach the network and
-// run no hooks/filters/exec (the library does the work in-process). The repo
-// path is `safety::check_path`-confined like open_file/save_buffer; all git2
-// use lives in `crate::sequencer`.
+// are exposed only when MIME_ENABLE_GIT is set. They never reach the network and
+// run no hooks/filters/exec (the library does the work in-process). MIME_ENABLE_GIT
+// is a pure on/off switch (its value is unused); confinement is the SAME as every
+// other FS tool — the repo path is `safety::check_path`-bound to MIME_ROOTS — so
+// there is no second, git-specific root list to keep in sync. All git2 use lives
+// in `crate::sequencer`.
 
-/// Whether the git sequencer tools are exposed (opt-in via `MIME_GIT_ROOTS`).
+/// Whether the git sequencer tools are exposed (opt-in via `MIME_ENABLE_GIT`;
+/// presence only — confinement stays with MIME_ROOTS via `repo_path`).
 fn git_enabled() -> bool {
-    std::env::var_os("MIME_GIT_ROOTS").is_some()
+    std::env::var_os("MIME_ENABLE_GIT").is_some()
 }
 
 /// Resolve + confine the `repo` argument to the allowed roots.
