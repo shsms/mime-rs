@@ -597,6 +597,24 @@ DONE: chose to keep the small surface and make the tradeoff explicit — the
 ~instructions~ now say the deep vocabulary (regex / treesit / conflict-keep …)
 lives inside ~run_program~ by design, reached via help {topic|tool}.
 
+** TODO save_buffer {to:} copy-out can clobber another live session's visited file [#C] :mcp:
+From the mcp-surface-review code review (2026-06-24). ~Workspace::write_copy_to~
+writes a different path with no stale guard and no cross-session awareness, so
+~save_buffer {path: A, to: B}~ where B is the visited file of ANOTHER warm
+session with unsaved edits silently overwrites B — and B's own stale guard never
+fires (the change happened out from under it). Pre-existing in spirit (the old
+~save_to~ also skipped the guard for a non-visited path), but the explicit
+copy branch is now the documented route. Low severity (localhost, single-user,
+cp-like intent), but worth a guard: before the copy, check whether ~to~ is
+canonically some other live session's visited path and refuse / warn.
+
+** TODO checkpoint_labels clones every label on each session_status call [#C] :mcp:
+From the mcp-surface-review code review (2026-06-24). ~session_status~ calls
+~Workspace::checkpoint_labels~ for every warm session, cloning each label
+~String~ into a fresh ~Vec~. Trivial on an infrequent status call, but needless
+allocation for a long-lived session with many checkpoints — return a borrow /
+iterator, or skip when empty.
+
 * Structural editing
 
 ** TODO Incremental re-parse (~InputEdit~s) [#C]
