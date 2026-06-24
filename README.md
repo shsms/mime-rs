@@ -110,21 +110,24 @@ linear-time, no backreferences in patterns. The full table lives in
 
 ## Using it from an agent (MCP)
 
+mime is a standard MCP server — `mime --mcp` over **stdio** or `mime --http` for
+**Streamable HTTP** — so any MCP client drives it the same way: Claude Code,
+Cursor, Cline, Continue, VS Code, the Gemini/Codex CLIs, or your own harness.
+It's self-describing: `initialize` returns how-to-drive `instructions` and a tool
+index, and every tool carries MCP `annotations` (read-only vs destructive), so a
+client onboards its model straight from the protocol — no per-client setup file.
+[docs/clients.md](docs/clients.md) has copy-paste registration for each client
+(and the HTTP endpoint); for Claude Code there's a shortcut:
+
 ```sh
-make claude   # cargo install + register `mime --mcp` with Claude Code (MIME_ROOTS)
+make claude   # cargo install + register `mime --mcp` (MIME_ROOTS) with Claude Code
 ```
 
-That registers a sandboxed MCP server with Claude Code; **any** MCP client works
-the same way (`mime --mcp` over stdio, or `mime --http` for Streamable HTTP) —
-see [docs/clients.md](docs/clients.md) for Cursor, Cline, Continue, VS Code, and
-others. The server is self-describing:
-`initialize` returns how-to-drive `instructions` and a tool index, and every
-tool carries MCP `annotations` (read-only vs destructive), so a client onboards
-its model from the protocol. Each tool takes a `path` and auto-opens the file
-into a warm session keyed by its canonical path; mutating tools take `save: true`
-for an atomic, stale-guarded write-back. The catalogue is generated from the live
-schemas into [docs/mcp-tools.md](docs/mcp-tools.md) (`make docs`), so the docs
-can't drift from the code. The edits that matter:
+Each tool takes a `path` and auto-opens the file into a warm session keyed by its
+canonical path; mutating tools take `save: true` for an atomic, stale-guarded
+write-back. The catalogue is generated from the live schemas into
+[docs/mcp-tools.md](docs/mcp-tools.md) (`make docs`), so the docs can't drift from
+the code. The edits that matter:
 
 ```json
 replace_text {path, pattern, replacement, expect_unique: true, save: true}
