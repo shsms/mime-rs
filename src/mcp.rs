@@ -213,6 +213,17 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         "save_buffer" => tool_save_buffer(&args, sessions),
         "session_status" => tool_session_status(sessions),
         "help" => tool_help(&args),
+        git if git.starts_with("git_") => {
+            if git_enabled() {
+                dispatch_git(git, &args)
+            } else {
+                Err(
+                    "git tools are disabled — set MIME_GIT_ROOTS to enable them \
+                     (history rewriting + checkout, no network/hooks/exec)"
+                        .to_string(),
+                )
+            }
+        }
         other => Err(format!("unknown tool: {other}")),
     };
 
@@ -1703,10 +1714,176 @@ fn tools_list_result() -> Value {
     json!({ "tools": tool_schemas() })
 }
 
+// ---- git sequencer tools (gated by MIME_GIT_ROOTS) -------------------------
+//
+// These rewrite history and check files out, so they stay OFF by default and
+// are exposed only when MIME_GIT_ROOTS is set. They never reach the network and
+// run no hooks/filters/exec (the library does the work in-process). The repo
+// path is `safety::check_path`-confined like open_file/save_buffer; all git2
+// use lives in `crate::sequencer`.
+
+/// Whether the git sequencer tools are exposed (opt-in via `MIME_GIT_ROOTS`).
+fn git_enabled() -> bool {
+    std::env::var_os("MIME_GIT_ROOTS").is_some()
+}
+
+/// Resolve + confine the `repo` argument to the allowed roots.
+fn repo_path(args: &Value) -> Result<std::path::PathBuf, String> {
+    crate::safety::check_path(Path::new(&str_arg(args, "repo")?))
+}
+
+/// The `git_rebase` plan array → (commit, action, message) tuples.
+fn plan_arg(args: &Value) -> Option<Vec<(String, String, Option<String>)>> {
+    args.get("plan").and_then(Value::as_array).map(|arr| {
+        arr.iter()
+            .map(|s| {
+                (
+                    s.get("commit")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    s.get("action")
+                        .and_then(Value::as_str)
+                        .unwrap_or("pick")
+                        .to_string(),
+                    s.get("message").and_then(Value::as_str).map(str::to_string),
+                )
+            })
+            .collect()
+    })
+}
+
+/// A required list-of-strings argument (e.g. `commits`).
+fn str_list_arg(args: &Value, key: &str) -> Result<Vec<String>, String> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("missing or non-array argument \"{key}\""))?
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("\"{key}\" must be a list of strings"))
+        })
+        .collect()
+}
+
+fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
+    use crate::sequencer as seq;
+    let repo = repo_path(args)?;
+    match name {
+        "git_rebase" => seq::cmd_rebase(&repo, &str_arg(args, "onto")?, plan_arg(args)),
+        "git_cherry_pick" => seq::cmd_cherry_pick(&repo, &str_list_arg(args, "commits")?),
+        "git_revert" => seq::cmd_revert(&repo, &str_list_arg(args, "commits")?),
+        "git_continue" => seq::cmd_continue(&repo),
+        "git_skip" => seq::cmd_skip(&repo),
+        "git_abort" => seq::cmd_abort(&repo),
+        "git_status" => seq::cmd_status(&repo),
+        "git_log" => seq::cmd_log(&repo, args.get("range").and_then(Value::as_str)),
+        "git_show" => seq::cmd_show(&repo, &str_arg(args, "commit")?),
+        other => Err(format!("unknown tool: {other}")),
+    }
+}
+
+/// Schemas for the `git_*` tools, appended to the catalogue only when enabled.
+fn git_tool_schemas() -> Vec<Value> {
+    let repo = json!({
+        "type": "string",
+        "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS)."
+    });
+    let commits = json!({
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Commits to apply, in order — each an oid, ref, or revspec (e.g. HEAD~2)."
+    });
+    vec![
+        json!({
+            "name": "git_rebase",
+            "description": "Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`. Each step picks/rewords/squashes/fixups/drops a commit; reorder by listing in the new order. Stops on a conflict for the conflict tools + git_continue. No network, hooks, or exec.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": repo,
+                    "onto": { "type": "string", "description": "The new base — oid/ref/revspec the commits are replayed onto." },
+                    "plan": {
+                        "type": "array",
+                        "description": "Explicit steps (omit to pick all of onto..HEAD in order). List order is the new commit order.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "commit": { "type": "string", "description": "oid/ref/revspec of the commit." },
+                                "action": { "type": "string", "enum": ["pick", "reword", "squash", "fixup", "drop"] },
+                                "message": { "type": "string", "description": "New message (reword) or melded message (squash); ignored otherwise." }
+                            },
+                            "required": ["commit", "action"]
+                        }
+                    }
+                },
+                "required": ["repo", "onto"],
+            },
+        }),
+        json!({
+            "name": "git_cherry_pick",
+            "description": "Apply `commits` (in order) on top of the current branch tip. Stops on conflict for the conflict tools + git_continue.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "repo": repo, "commits": commits },
+                "required": ["repo", "commits"],
+            },
+        }),
+        json!({
+            "name": "git_revert",
+            "description": "Apply the inverse of `commits` (in order) on top of the current branch tip. Stops on conflict for the conflict tools + git_continue.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "repo": repo, "commits": commits },
+                "required": ["repo", "commits"],
+            },
+        }),
+        json!({
+            "name": "git_continue",
+            "description": "After resolving the stopped step's conflicts in the worktree (and saving), commit the resolution and continue the operation. Errors if unresolved markers remain.",
+            "inputSchema": { "type": "object", "properties": { "repo": repo }, "required": ["repo"] },
+        }),
+        json!({
+            "name": "git_skip",
+            "description": "Drop the stopped step and continue the operation as if that commit had been omitted.",
+            "inputSchema": { "type": "object", "properties": { "repo": repo }, "required": ["repo"] },
+        }),
+        json!({
+            "name": "git_abort",
+            "description": "Abort the in-progress operation, restoring HEAD/branch/worktree to the pre-operation state.",
+            "inputSchema": { "type": "object", "properties": { "repo": repo }, "required": ["repo"] },
+        }),
+        json!({
+            "name": "git_status",
+            "description": "Report the in-progress operation: which step, of how many, the current tip, and any unresolved conflict files (or that nothing is in progress).",
+            "inputSchema": { "type": "object", "properties": { "repo": repo }, "required": ["repo"] },
+        }),
+        json!({
+            "name": "git_log",
+            "description": "One line per commit (oid + summary), for `range` (e.g. main..HEAD) or from HEAD; capped at 50. Use to build a rebase plan.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "repo": repo, "range": { "type": "string", "description": "A revision range like main..HEAD; omit for HEAD's history." } },
+                "required": ["repo"],
+            },
+        }),
+        json!({
+            "name": "git_show",
+            "description": "A commit's metadata, message, and the files it changed vs its first parent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "repo": repo, "commit": { "type": "string", "description": "oid/ref/revspec of the commit." } },
+                "required": ["repo", "commit"],
+            },
+        }),
+    ]
+}
+
 /// The MCP tool catalogue, built once and shared. `validate_args` reads it on
-/// every dispatch, so the ~20-entry Vec is held behind a `LazyLock` rather than
-/// rebuilt per call; `tools/list`, `describe-mcp`, and argument validation all
-/// borrow this single source.
+/// every dispatch, so the Vec is held behind a `LazyLock` rather than rebuilt
+/// per call; `tools/list`, `describe-mcp`, and argument validation all borrow
+/// this single source.
 pub(crate) fn tool_schemas() -> &'static [Value] {
     static SCHEMAS: LazyLock<Vec<Value>> = LazyLock::new(build_tool_schemas);
     &SCHEMAS
@@ -1731,7 +1908,7 @@ fn build_tool_schemas() -> Vec<Value> {
         "description": "Restrict this call to one part of the buffer without writing a program. {\"defun\": \"name\"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.",
         "properties": { "defun": { "type": "string" } },
     });
-    vec![
+    let mut schemas = vec![
         json!({
             "name": "open_file",
             "description": "Open a file from disk into a warm session (replacing any existing session of that name). The buffer stays resident so later tools need no file re-reads. The path must resolve inside an allowed root (MIME_ROOTS, default cwd).",
@@ -2019,5 +2196,61 @@ fn build_tool_schemas() -> Vec<Value> {
                 "required": [],
             },
         }),
-    ]
+    ];
+    if git_enabled() {
+        schemas.extend(git_tool_schemas());
+    }
+    schemas
+}
+
+#[cfg(test)]
+mod git_tool_tests {
+    use super::*;
+
+    #[test]
+    fn git_schemas_cover_the_expected_tools() {
+        let schemas = git_tool_schemas();
+        let names: Vec<&str> = schemas
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for expected in [
+            "git_rebase",
+            "git_cherry_pick",
+            "git_revert",
+            "git_continue",
+            "git_skip",
+            "git_abort",
+            "git_status",
+            "git_log",
+            "git_show",
+        ] {
+            assert!(names.contains(&expected), "missing schema for {expected}");
+        }
+        // Every git schema is well-formed (name + description + object input).
+        for t in &schemas {
+            assert!(t["name"].as_str().unwrap().starts_with("git_"));
+            assert!(!t["description"].as_str().unwrap().is_empty());
+            assert_eq!(t["inputSchema"]["type"], "object");
+        }
+    }
+
+    #[test]
+    fn git_tools_are_off_unless_opted_in() {
+        // Disabled by default → the catalogue omits git tools, so validation has
+        // no schema for them and the dispatcher reports them disabled.
+        if !git_enabled() {
+            let reply = tools_call_result(
+                &json!({"name": "git_status", "arguments": {"repo": "."}}),
+                &mut HashMap::new(),
+            );
+            assert_eq!(reply["isError"], true);
+            assert!(
+                reply["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("disabled")
+            );
+        }
+    }
 }

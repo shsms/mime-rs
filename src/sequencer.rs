@@ -20,7 +20,8 @@
 //! at the tool boundary (see todo.org for the security checklist).
 
 use git2::{
-    CherrypickOptions, Index, Oid, Repository, ResetType, RevertOptions, build::CheckoutBuilder,
+    CherrypickOptions, Delta, Index, Oid, Repository, ResetType, RevertOptions, Sort,
+    build::CheckoutBuilder,
 };
 use serde_json::json;
 use std::path::Path;
@@ -157,12 +158,15 @@ fn save_state(repo: &Repository, st: &State) -> Result<(), Error> {
 }
 
 fn load_state(repo: &Repository) -> Result<State, Error> {
-    let data = std::fs::read(state_path(repo))
-        .map_err(|_| estr("no sequencer operation in progress"))?;
-    let v: serde_json::Value =
-        serde_json::from_slice(&data).map_err(|e| estr(&format!("corrupt sequencer state: {e}")))?;
+    let data =
+        std::fs::read(state_path(repo)).map_err(|_| estr("no sequencer operation in progress"))?;
+    let v: serde_json::Value = serde_json::from_slice(&data)
+        .map_err(|e| estr(&format!("corrupt sequencer state: {e}")))?;
     let oid = |k: &str| -> Result<Oid, Error> {
-        Oid::from_str(v[k].as_str().ok_or_else(|| estr("corrupt sequencer state"))?)
+        Oid::from_str(
+            v[k].as_str()
+                .ok_or_else(|| estr("corrupt sequencer state"))?,
+        )
     };
     let steps = v["steps"]
         .as_array()
@@ -170,9 +174,7 @@ fn load_state(repo: &Repository) -> Result<State, Error> {
         .iter()
         .map(|s| {
             Ok(Step {
-                commit: Oid::from_str(
-                    s["commit"].as_str().ok_or_else(|| estr("corrupt step"))?,
-                )?,
+                commit: Oid::from_str(s["commit"].as_str().ok_or_else(|| estr("corrupt step"))?)?,
                 action: Action::parse(s["action"].as_str().unwrap_or(""))
                     .ok_or_else(|| estr("corrupt step action"))?,
                 message: s["message"].as_str().map(str::to_string),
@@ -368,18 +370,40 @@ fn land_step(repo: &Repository, st: &State, step: &Step, tree: &git2::Tree) -> R
         // A revert always appends on `current` with a generated message; the
         // forward-action vocabulary (reword/squash/fixup) does not apply.
         let summary = pick.summary().unwrap_or("commit");
-        let msg = format!("Revert \"{summary}\"\n\nThis reverts commit {}.\n", pick.id());
-        let new = repo.commit(None, &pick.committer(), &pick.committer(), &msg, tree, &[&current])?;
+        let msg = format!(
+            "Revert \"{summary}\"\n\nThis reverts commit {}.\n",
+            pick.id()
+        );
+        let new = repo.commit(
+            None,
+            &pick.committer(),
+            &pick.committer(),
+            &msg,
+            tree,
+            &[&current],
+        )?;
         repo.set_head_detached(new)?;
         return Ok(new);
     }
     let new = match step.action {
-        Action::Pick => {
-            repo.commit(None, &pick.author(), &pick.committer(), &pick_msg(), tree, &[&current])?
-        }
+        Action::Pick => repo.commit(
+            None,
+            &pick.author(),
+            &pick.committer(),
+            &pick_msg(),
+            tree,
+            &[&current],
+        )?,
         Action::Reword => {
             let msg = step.message.clone().unwrap_or_else(pick_msg);
-            repo.commit(None, &pick.author(), &pick.committer(), &msg, tree, &[&current])?
+            repo.commit(
+                None,
+                &pick.author(),
+                &pick.committer(),
+                &msg,
+                tree,
+                &[&current],
+            )?
         }
         Action::Squash | Action::Fixup => {
             if st.current == st.onto {
@@ -393,7 +417,14 @@ fn land_step(repo: &Repository, st: &State, step: &Step, tree: &git2::Tree) -> R
                     format!("{}\n\n{}", cur_msg.trim_end(), pick_msg().trim_end())
                 }),
             };
-            repo.commit(None, &current.author(), &current.committer(), &msg, tree, &[&parent])?
+            repo.commit(
+                None,
+                &current.author(),
+                &current.committer(),
+                &msg,
+                tree,
+                &[&parent],
+            )?
         }
         Action::Drop => unreachable!("drop is handled before land_step"),
     };
@@ -457,6 +488,227 @@ fn finish(repo: &Repository, st: &State) -> Result<(), Error> {
     Ok(())
 }
 
+// ---- read-only inspection -------------------------------------------------
+
+/// Resolve a revspec (oid, ref, `HEAD~3`, …) to a commit oid.
+pub fn resolve(repo: &Repository, spec: &str) -> Result<Oid, Error> {
+    Ok(repo.revparse_single(spec)?.peel_to_commit()?.id())
+}
+
+/// The commits reachable from HEAD but not from `onto`, oldest-first — the
+/// default rebase plan (`pick` each) for `onto..HEAD`.
+pub fn commits_since(repo: &Repository, onto: Oid) -> Result<Vec<Oid>, Error> {
+    let mut walk = repo.revwalk()?;
+    walk.push_head()?;
+    walk.hide(onto)?;
+    walk.set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE)?;
+    walk.collect()
+}
+
+fn short(oid: Oid) -> String {
+    let s = oid.to_string();
+    s[..s.len().min(10)].to_string()
+}
+
+/// A one-line-per-commit log of `range` (default: from HEAD), capped at `limit`.
+pub fn log(repo: &Repository, range: Option<&str>, limit: usize) -> Result<String, Error> {
+    let mut walk = repo.revwalk()?;
+    match range {
+        Some(r) => walk.push_range(r)?,
+        None => walk.push_head()?,
+    }
+    let mut out = String::new();
+    for (n, oid) in walk.enumerate() {
+        if n >= limit {
+            out.push_str(&format!("… (truncated at {limit}; pass a tighter range)\n"));
+            break;
+        }
+        let c = repo.find_commit(oid?)?;
+        out.push_str(&format!(
+            "{} {}\n",
+            short(c.id()),
+            c.summary().unwrap_or("")
+        ));
+    }
+    if out.is_empty() {
+        out.push_str("(no commits)\n");
+    }
+    Ok(out)
+}
+
+/// A commit's metadata, message, and the files it changed vs its first parent.
+pub fn show(repo: &Repository, oid: Oid) -> Result<String, Error> {
+    let c = repo.find_commit(oid)?;
+    let a = c.author();
+    let body = c.message().unwrap_or("").trim_end().replace('\n', "\n    ");
+    let mut out = format!(
+        "commit {}\nAuthor: {} <{}>\n\n    {body}\n\nChanged files:\n",
+        c.id(),
+        a.name().unwrap_or(""),
+        a.email().unwrap_or(""),
+    );
+    let new_tree = c.tree()?;
+    let old_tree = if c.parent_count() > 0 {
+        Some(c.parent(0)?.tree()?)
+    } else {
+        None
+    };
+    let diff = repo.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)?;
+    for d in diff.deltas() {
+        let mark = match d.status() {
+            Delta::Added => "A",
+            Delta::Deleted => "D",
+            Delta::Modified => "M",
+            Delta::Renamed => "R",
+            Delta::Copied => "C",
+            _ => "?",
+        };
+        let p = d
+            .new_file()
+            .path()
+            .or_else(|| d.old_file().path())
+            .and_then(|p| p.to_str())
+            .unwrap_or("?");
+        out.push_str(&format!("  {mark} {p}\n"));
+    }
+    Ok(out)
+}
+
+// ---- text rendering for the tool layer ------------------------------------
+
+/// The agent-facing summary of an [`Outcome`].
+pub fn outcome_text(out: &Outcome) -> String {
+    match out {
+        Outcome::Done { head } => format!("done — new tip {}", short(*head)),
+        Outcome::Conflict { step, files } => format!(
+            "stopped on a conflict at step {} — resolve {} file(s) with the conflict tools \
+             (conflicts / conflict-keep / …), then git_continue (or git_skip / git_abort):\n  {}",
+            step + 1,
+            files.len(),
+            files.join("\n  "),
+        ),
+    }
+}
+
+/// The agent-facing summary of [`status`].
+pub fn status_text(st: Option<Status>) -> String {
+    match st {
+        None => "no sequencer operation in progress".to_string(),
+        Some(s) => {
+            let conflicts = if s.conflicts.is_empty() {
+                String::new()
+            } else {
+                format!("\n  unresolved: {}", s.conflicts.join(", "))
+            };
+            format!(
+                "operation in progress: step {}/{}, tip {}{conflicts}",
+                s.next + 1,
+                s.total,
+                short(s.current),
+            )
+        }
+    }
+}
+
+// ---- path-facing command wrappers (the MCP tool layer calls these) --------
+//
+// These open the repo, resolve revspecs, and stringify errors so the MCP layer
+// never touches git2. The caller must have `safety::check_path`-confined the
+// repo path first (MIME_ROOTS).
+
+fn gerr(e: Error) -> String {
+    e.message().to_string()
+}
+
+fn resolve_s(repo: &Repository, spec: &str) -> Result<Oid, String> {
+    resolve(repo, spec).map_err(|e| format!("bad revision \"{spec}\": {}", e.message()))
+}
+
+fn open(repo_path: &std::path::Path) -> Result<Repository, String> {
+    Repository::open(repo_path).map_err(|e| format!("cannot open git repo: {}", e.message()))
+}
+
+/// `git_rebase`: replay `onto..HEAD` (or an explicit `plan` of
+/// `(commit, action, message)`) onto `onto`.
+pub fn cmd_rebase(
+    repo_path: &std::path::Path,
+    onto: &str,
+    plan: Option<Vec<(String, String, Option<String>)>>,
+) -> Result<String, String> {
+    let repo = open(repo_path)?;
+    let onto_oid = resolve_s(&repo, onto)?;
+    let steps = match plan {
+        Some(items) => items
+            .iter()
+            .map(|(commit, action, message)| {
+                Ok(Step {
+                    commit: resolve_s(&repo, commit)?,
+                    action: Action::parse(action)
+                        .ok_or_else(|| format!("unknown action \"{action}\""))?,
+                    message: message.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        None => commits_since(&repo, onto_oid)
+            .map_err(gerr)?
+            .into_iter()
+            .map(pick_step)
+            .collect(),
+    };
+    let out = start(
+        &repo,
+        Plan {
+            onto: onto_oid,
+            steps,
+        },
+    )
+    .map_err(gerr)?;
+    Ok(outcome_text(&out))
+}
+
+fn resolve_all(repo: &Repository, specs: &[String]) -> Result<Vec<Oid>, String> {
+    specs.iter().map(|s| resolve_s(repo, s)).collect()
+}
+
+pub fn cmd_cherry_pick(repo_path: &std::path::Path, commits: &[String]) -> Result<String, String> {
+    let repo = open(repo_path)?;
+    let oids = resolve_all(&repo, commits)?;
+    Ok(outcome_text(&cherry_pick(&repo, oids).map_err(gerr)?))
+}
+
+pub fn cmd_revert(repo_path: &std::path::Path, commits: &[String]) -> Result<String, String> {
+    let repo = open(repo_path)?;
+    let oids = resolve_all(&repo, commits)?;
+    Ok(outcome_text(&revert(&repo, oids).map_err(gerr)?))
+}
+
+pub fn cmd_continue(repo_path: &std::path::Path) -> Result<String, String> {
+    Ok(outcome_text(&continue_op(&open(repo_path)?).map_err(gerr)?))
+}
+
+pub fn cmd_skip(repo_path: &std::path::Path) -> Result<String, String> {
+    Ok(outcome_text(&skip(&open(repo_path)?).map_err(gerr)?))
+}
+
+pub fn cmd_abort(repo_path: &std::path::Path) -> Result<String, String> {
+    abort(&open(repo_path)?).map_err(gerr)?;
+    Ok("aborted — restored to the pre-operation state".to_string())
+}
+
+pub fn cmd_status(repo_path: &std::path::Path) -> Result<String, String> {
+    Ok(status_text(status(&open(repo_path)?).map_err(gerr)?))
+}
+
+pub fn cmd_log(repo_path: &std::path::Path, range: Option<&str>) -> Result<String, String> {
+    log(&open(repo_path)?, range, 50).map_err(gerr)
+}
+
+pub fn cmd_show(repo_path: &std::path::Path, commit: &str) -> Result<String, String> {
+    let repo = open(repo_path)?;
+    let oid = resolve_s(&repo, commit)?;
+    show(&repo, oid).map_err(gerr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,14 +730,18 @@ mod tests {
         }
         let tree = repo.find_tree(tb.write().unwrap()).unwrap();
         let sig = Signature::now("test", "test@example.invalid").unwrap();
-        let pc: Vec<_> = parents.iter().map(|o| repo.find_commit(*o).unwrap()).collect();
+        let pc: Vec<_> = parents
+            .iter()
+            .map(|o| repo.find_commit(*o).unwrap())
+            .collect();
         let pr: Vec<&git2::Commit> = pc.iter().collect();
         repo.commit(None, &sig, &sig, msg, &tree, &pr).unwrap()
     }
 
     /// Point `name` (and HEAD + worktree) at `tip`.
     fn on_branch(repo: &Repository, name: &str, tip: Oid) {
-        repo.branch(name, &repo.find_commit(tip).unwrap(), true).unwrap();
+        repo.branch(name, &repo.find_commit(tip).unwrap(), true)
+            .unwrap();
         repo.set_head(&format!("refs/heads/{name}")).unwrap();
         repo.reset(&repo.find_object(tip, None).unwrap(), ResetType::Hard, None)
             .unwrap();
@@ -579,7 +835,12 @@ mod tests {
         let repo = Repository::init(&dir).unwrap();
         let base = commit(&repo, &[], &[("a", "1\n")], "base");
         let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
-        let f2 = commit(&repo, &[f1], &[("a", "1\n"), ("b", "1\n"), ("c", "1\n")], "add c");
+        let f2 = commit(
+            &repo,
+            &[f1],
+            &[("a", "1\n"), ("b", "1\n"), ("c", "1\n")],
+            "add c",
+        );
         let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
         on_branch(&repo, "topic", f2);
 
@@ -623,7 +884,7 @@ mod tests {
             }
         );
         // The worktree carries parseable markers.
-        let mut b = Buffer::from_string("a", &read(&repo, "a"));
+        let mut b = Buffer::from_string("a", read(&repo, "a"));
         assert_eq!(crate::conflict::scan(&mut b).len(), 1);
         assert!(status(&repo).unwrap().is_some());
 
@@ -694,7 +955,12 @@ mod tests {
         let repo = Repository::init(&dir).unwrap();
         let base = commit(&repo, &[], &[("a", "1\n")], "base");
         let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
-        let f2 = commit(&repo, &[f1], &[("a", "1\n"), ("b", "1\n"), ("c", "1\n")], "add c");
+        let f2 = commit(
+            &repo,
+            &[f1],
+            &[("a", "1\n"), ("b", "1\n"), ("c", "1\n")],
+            "add c",
+        );
         let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
         on_branch(&repo, "topic", f2);
 
@@ -713,7 +979,10 @@ mod tests {
         let tip = repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(tip.parent(0).unwrap().id(), m1, "squashed onto m1");
         let msg = tip.message().unwrap();
-        assert!(msg.contains("add b") && msg.contains("add c"), "melded message: {msg}");
+        assert!(
+            msg.contains("add b") && msg.contains("add c"),
+            "melded message: {msg}"
+        );
     }
 
     #[test]
@@ -722,7 +991,12 @@ mod tests {
         let repo = Repository::init(&dir).unwrap();
         let base = commit(&repo, &[], &[("a", "1\n")], "base");
         let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "keep me");
-        let f2 = commit(&repo, &[f1], &[("a", "1\n"), ("b", "1\n"), ("c", "1\n")], "discard me");
+        let f2 = commit(
+            &repo,
+            &[f1],
+            &[("a", "1\n"), ("b", "1\n"), ("c", "1\n")],
+            "discard me",
+        );
         on_branch(&repo, "topic", f2);
 
         start(
@@ -769,6 +1043,32 @@ mod tests {
         let tip = repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(tip.parent(0).unwrap().id(), c1, "revert commit on top");
         assert!(tip.message().unwrap().contains("Revert \"bump a\""));
+    }
+
+    #[test]
+    fn cmd_layer_drives_a_rebase_by_revspec_and_reports() {
+        let dir = tmp("cmd");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+
+        // Default plan (onto..HEAD) via the path-facing wrapper, onto by oid string.
+        let out = cmd_rebase(&dir, &m1.to_string(), None).unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        assert_eq!(
+            cmd_status(&dir).unwrap(),
+            "no sequencer operation in progress"
+        );
+
+        let log = cmd_log(&dir, None).unwrap();
+        assert!(log.contains("add b") && log.contains("change a"), "{log}");
+        let show = cmd_show(&dir, "HEAD").unwrap();
+        assert!(
+            show.contains("Changed files") && show.contains(" b"),
+            "{show}"
+        );
     }
 
     #[test]
