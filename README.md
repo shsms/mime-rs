@@ -115,8 +115,9 @@ make claude   # cargo install + register `mime --mcp` with Claude Code (MIME_ROO
 ```
 
 That registers a sandboxed MCP server with Claude Code; **any** MCP client works
-the same way (`mime --mcp` over stdio) — see [docs/clients.md](docs/clients.md)
-for Cursor, Cline, Continue, VS Code, and others. The server is self-describing:
+the same way (`mime --mcp` over stdio, or `mime --http` for Streamable HTTP) —
+see [docs/clients.md](docs/clients.md) for Cursor, Cline, Continue, VS Code, and
+others. The server is self-describing:
 `initialize` returns how-to-drive `instructions` and a tool index, and every
 tool carries MCP `annotations` (read-only vs destructive), so a client onboards
 its model from the protocol. Each tool takes a `path` and auto-opens the file
@@ -152,8 +153,8 @@ stamps a `refs/mime-backup/<branch>` ref so the pre-op state is recoverable.
 ## How it works
 
 ```
-            cli.rs        mcp.rs / daemon.rs        ← three front ends
-          (trusted)          (sandboxed)
+          cli.rs     mcp.rs / http.rs / daemon.rs    ← four front ends
+        (trusted)            (sandboxed)
                 \              /
                  engine.rs                          ← sessions, capability tiers,
               (warm sessions,                          time-travel (checkpoints/undo)
@@ -183,8 +184,9 @@ stamps a `refs/mime-backup/<branch>` ref so the pre-op state is recoverable.
   revert state machine, persisted to `.git/mime-sequencer.json`).
 - **`safety.rs`** is the single filesystem chokepoint: `$MIME_ROOTS` enforcement,
   atomic writes, and the audit log.
-- **`cli.rs`**, **`mcp.rs`**, and **`daemon.rs`** are the three front ends —
-  one-shot/REPL, stdio MCP, and a long-lived unix-socket daemon.
+- **`cli.rs`**, **`mcp.rs`**, **`http.rs`**, and **`daemon.rs`** are the four
+  front ends — one-shot/REPL, stdio MCP, MCP over Streamable HTTP, and a
+  long-lived unix-socket daemon. The two MCP transports share one dispatch core.
 
 ## Building & testing
 

@@ -85,6 +85,32 @@ mcpServers:
 at the stdio command `mime --mcp` with `MIME_ROOTS` in the environment. That's
 all the server needs.
 
+## Over HTTP
+
+For a hosted or multi-client setup, run the server over Streamable HTTP instead
+of stdio:
+
+```sh
+MIME_ROOTS=/path/to/project mime --http            # binds 127.0.0.1:7711
+MIME_ROOTS=/path/to/project mime --http 127.0.0.1:9000   # or a chosen address
+```
+
+Then point an HTTP-capable client at the endpoint `http://127.0.0.1:7711/mcp`:
+
+```json
+{
+  "mcpServers": {
+    "mime": { "type": "streamable-http", "url": "http://127.0.0.1:7711/mcp" }
+  }
+}
+```
+
+It speaks JSON over `POST /mcp` (no SSE — mime never server-initiates). The
+server binds localhost and rejects a non-local browser `Origin`; each client is
+isolated by the `Mcp-Session-Id` it's issued on `initialize`. Verify it the same
+way: `npx @modelcontextprotocol/inspector --cli http://127.0.0.1:7711/mcp
+--method tools/list`.
+
 ## Verifying a connection
 
 The official [MCP Inspector](https://github.com/modelcontextprotocol/inspector)

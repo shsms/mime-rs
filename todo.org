@@ -193,8 +193,10 @@ the read-only set; gate the destructive set).
   tools — deferred (lower value than the above).
 - [ ] MCP Inspector pass (~npx @modelcontextprotocol/inspector mime --mcp~) +
   try one non-Claude client — manual, needs node/that client.
-- [ ] Streamable HTTP transport (daemon.rs is a head start) — for
-  hosted/multi-client harnesses; stdio already covers every CLI.
+- [X] Streamable HTTP transport (~mime --http~, src/http.rs on tiny_http):
+  JSON-only, localhost-bound + Origin-checked, per-client Mcp-Session-Id
+  isolation, reusing ~handle_line~. Validated via curl AND the MCP Inspector
+  over HTTP. Documented in docs/clients.md.
 - [ ] Publish to crates.io — outward/irreversible; the user runs it.
 - [ ] Thin the out-of-band client skill now that ~instructions~ carries the
   driving knowledge in-protocol.
