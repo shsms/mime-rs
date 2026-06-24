@@ -148,28 +148,215 @@ the replacement (or take lines, not raw text).
 - State "TODO"       from              [2026-06-18 Do 09:27]
 :END:
 
-Agent-driven interactive rebase / cherry-pick belongs here, not as a
-separate MCP server: the hard, agent-hostile 80% is conflict resolution
-during replay, which mime already owns (~conflicts~, ~conflict-resolve-trivial~,
-~conflict-keep~, …). A clean rebase needs no editing tool; a conflicted one
-needs exactly this surface.
+Agent-driven rebase / cherry-pick belongs here, not as a separate MCP
+server: the agent-hostile 80% is conflict resolution during replay, which
+mime already owns (~conflicts~, ~conflict-resolve-trivial~, ~conflict-keep~,
+~conflict-replace~, ~conflict-context~ — conflict.rs + builtins.rs
+1742–1965). A clean rebase needs no editing tool; a conflicted one needs
+exactly this surface.
 
-Shape: a driver that orchestrates the git op non-interactively and, at each
-conflict stop, routes the hunks through the existing conflict tools. Two
-separable pieces — (1) history manipulation (build/edit the rebase todo:
-reorder / squash / drop / reword; run the cherry-pick) is git plumbing that
-wraps ~git rebase~/~cherry-pick~; (2) conflict resolution during replay is
-already built.
+*** Approach (decided 2026-06-24): in-process git sequencer on a Rust git library — do NOT shell out to ~git~
 
-Why mime specifically:
-- The overlap is real and already implemented — conflict resolution is the
-  bulk of the agent pain.
-- ~rehearse~ the plan -> apply -> clean ~abort~, with the transaction/undo
-  model, is the missing safety net: ~git rebase -i~ is undrivable by agents
-  today (opens ~$EDITOR~, expects a human) and easy to botch with no recovery.
-- One authority over the working tree: if mime DRIVES the rebase it knows when
-  to revert/reload its warm buffers as HEAD moves; an external server racing
-  mime over the same files would leave every buffer stale each step.
+Three approaches were weighed:
+
+1. Shell out to ~git rebase -i~ with editor shims (~GIT_SEQUENCE_EDITOR~ /
+   ~GIT_EDITOR~ → a ~mime~ sub-process that hosts the todo/message file and
+   blocks until the agent resumes). REJECTED. (a) The MCP server is
+   stdio-only and holds sessions in-process (~HashMap<String, Workspace>~,
+   mcp.rs:76); a separately-spawned shim CANNOT see the agent's warm
+   sessions, so the rendezvous degrades to an on-disk scratch file + sentinel
+   handshake. (b) Shelling out re-opens every side-channel that makes ~git~
+   unsafe for a sandboxed agent — hooks, ~--exec~, gitattributes
+   clean/smudge filters, ~core.fsmonitor~, ~ext::~/ssh transports — i.e.
+   arbitrary code execution + network. (c) Breaks the "no process spawn"
+   invariant (safety.rs:1-10).
+
+2. MCP server spawns the ~git~ binary directly. REJECTED for (b)+(c) above:
+   ~git rebase --exec~ and hooks run arbitrary code, so a sandboxed agent
+   able to invoke ~git~ has a full sandbox escape.
+
+3. *In-process git "sequencer" on a Rust git library (CHOSEN).* Drive
+   rebase / cherry-pick / revert as a sequence of pick → 3-way-merge →
+   commit steps that mime owns end to end. This dissolves the ~$EDITOR~
+   problem: history manipulation (reorder / squash / reword / drop) is DATA
+   the agent passes or edits, never an editor invocation. The only hard
+   primitive is a 3-way merge that writes conflict markers into the worktree
+   — which routes straight into the existing conflict tools.
+
+Why a library, not the ~git~ binary:
+- No process spawn → mime's "no shell, no process spawn, no network"
+  invariant (safety.rs:1-10) is PRESERVED. Git becomes in-process Rust calls,
+  like the existing file ops.
+- No shell-out side-channels. ~git~ is dangerous in a sandbox not for its
+  data ops but for hooks / ~--exec~ / clean+smudge filters / fsmonitor /
+  pager / editor / ~ext::~ transports. A library has none of these unless we
+  wire them — "git minus code-execution" is the DEFAULT, not something we
+  fight the binary to suppress.
+- Network blocked by OMISSION, not by filtering flags. fetch / push / clone /
+  remote are a SEPARATE API surface; the sequencer never calls or exposes
+  them. Defense in depth: reject any op needing a remote; never register
+  remote/transport tools. (This is the clean form of "block push/pull/remote"
+  — clean because it's a different code path, not a flag on one omnipotent
+  binary.)
+
+Security checklist — block the non-network arbitrary-code channels too (they
+are subtler than the network ones):
+- Hooks: never run ~.git/hooks~. (libgit2 does not run hooks itself; if
+  hand-rolled, never invoke them. Bonus: deterministic, no surprise side
+  effects.)
+- ~--exec~ / arbitrary step commands: do not implement.
+- gitattributes process filters (clean/smudge): never register process-filter
+  callbacks; built-in ident/crlf are fine.
+- ~core.fsmonitor~ / ~core.sshCommand~ / ~core.pager~ / ~core.editor~ /
+  aliases / ~http.*~ / ~url.*.insteadOf~: moot once remote/exec/editor paths
+  are unexposed, but audit that the chosen lib honors no repo-local config
+  key that shells out.
+- Confine to repos under MIME_ROOTS: ~safety::check_path~ the repo path,
+  refuse repos outside the allowlist (mirrors open_file, mcp.rs:551).
+
+Library: ~git2~ (libgit2 bindings) — DECIDED 2026-06-24. It has complete,
+mature merge / cherry-pick / checkout-with-conflict-style TODAY, so the
+DISCRIMINATING capability (3-way merge → diff3 markers in the worktree) is
+proven, not in-flight — exactly the risk gix carried. Pure-Rust ~gix~ was
+considered and DEFERRED: ~gix-merge~ (its conflict-marker merge) is the newer,
+less-proven piece; revisit a migration once it is production-grade (the
+sequencer's library surface is small, so a later swap is contained).
+- C dependency: build libgit2 from source via the ~git2~ ~vendored~ feature
+  (no system libgit2 needed; adds a ~cc~ toolchain + build time — fine, the
+  VM can install build tools).
+- KEY API NUANCE: do NOT use libgit2's high-level ~Repository::rebase~ — it
+  replays the commits between upstream and branch as plain picks and does NOT
+  express reorder / squash / reword / drop. HAND-ROLL the sequencer over the
+  low-level primitives: ~cherrypick_commit~ / ~merge_commits~ → in-memory
+  ~Index~; ~checkout_index~ with ~CheckoutBuilder::conflict_style_diff3~ to
+  write markers to the worktree; ~index.write_tree~ + ~Repository::commit~ to
+  land each step; ref update to move the branch; ~reset(.., Hard)~ to the
+  pre-op snapshot for ~git_abort~. (Verify exact signatures against the
+  installed ~git2~ version — they drift; knowledge cutoff 2026-01.)
+- Hooks: libgit2 does not run ~.git/hooks~ — nothing to suppress, but never
+  add hook execution. Do not register custom (process) filters; built-in
+  crlf/ident are harmless.
+- Smoke-test (DONE 2026-06-24, sequencer.rs): ~cherrypick_commit~ of two
+  conflicting commits + ~checkout_index~ diff3 → conflict.rs's scanner parses
+  the markers, base section and all (it understands ours/theirs/base + flags
+  strays, builtins.rs:1773-1778). git2 ~vendored-libgit2~ builds with just
+  ~cc~ (no cmake) in the VM.
+
+*** The sequencer
+
+mime implements git's "sequencer" — replay a list of pick/commit steps with
+conflict stops — unified across rebase, cherry-pick, and revert (git unifies
+these too: .git/sequencer + CHERRY_PICK_HEAD / REBASE_HEAD).
+
+State lives in ~.git~ (re-entrant + crash-safe, mirrors git), NOT only in the
+warm session: each tool call re-opens the repo and reads the in-progress
+operation from our own ~.git/mime-sequencer~ state file (the plan is
+hand-rolled over git2's cherrypick primitives — see Approach — so libgit2's
+own rebase state is unused). So ~rebase~ → ~continue~ → ~continue~ survives a
+server restart and never desyncs.
+
+Step loop, per planned commit:
+1. 3-way merge (cherry-pick) the commit onto current HEAD;
+2. clean → create the commit (planned message for reword/squash), advance,
+   recurse;
+3. conflicted → write markers to the worktree, RELOAD any warm buffer whose
+   file changed (mime is the worktree authority — it knows exactly which
+   files moved; reuse ~Quire::rebase_to~, quire.rs:852 / revert), then STOP,
+   returning a conflict state.
+
+*** Agent-facing MCP tools (new ~git_*~ group)
+
+History ops (start an operation; each may return a conflict stop):
+- ~git_rebase~ {repo, upstream | onto, plan?} — plan = list of {commit,
+  action: pick|reword|squash|fixup|drop, message?}; list order = new order.
+  Omit plan → pick-all in order. No ~$EDITOR~, no todo buffer; the plan is
+  data. (Optional sugar: expose the plan as an editable buffer for users who
+  prefer to hand-edit it — not required.)
+- ~git_cherry_pick~ {repo, commits, onto?}
+- ~git_revert~ {repo, commits}
+
+Sequencer control (polymorphic over the in-progress op, like git's
+sequencer — not per-op):
+- ~git_continue~ {repo} — after the agent resolves conflicts with the
+  existing conflict tools and saves, commit the resolved tree and advance;
+  returns next state (another conflict stop, or done). Pre-check: refuse if
+  ~conflict-count~ > 0 — a free safety net.
+- ~git_skip~ {repo} — drop the current step, advance.
+- ~git_abort~ {repo} — restore HEAD/refs/worktree to the pre-op snapshot.
+- ~git_status~ {repo} — {operation, current_step, done/remaining steps,
+  conflicted_files, head}. The poll/inspect call.
+
+Read/inspect (safe; for building a plan):
+- ~git_log~ {repo, range?} — commits (hash, subject, author).
+- ~git_show~ {repo, commit} — metadata + diff.
+
+Conflict resolution adds NO new surface — the agent uses the existing
+~conflicts~ / ~conflict-context~ / ~conflict-keep~ / ~conflict-replace~ /
+~conflict-resolve-trivial~ tools on the conflicted worktree files, saves,
+then calls ~git_continue~. Naming: ~git_*~ prefix groups them; verbs mirror
+git so the agent's git mental model transfers.
+
+*** Tier / gating
+
+Rewriting history + checkout is more powerful than text editing (a bad reset
+destroys uncommitted work). Gate it like ~register_orchestration~
+(engine.rs:314): a new ~register_git~ group, registered only on explicit
+opt-in (env, e.g. ~MIME_GIT_ROOTS~, or a flag), default OFF, repos confined to
+MIME_ROOTS via ~check_path~. When off, the ~git_*~ tools are not registered at
+all (same registration-time gating as the sandboxed/trusted split) — the
+default sandbox stays byte-for-byte unchanged, and git is an explicit,
+bounded, auditable capability, NOT a tier escalation.
+
+*** Interim (works today, zero mime changes)
+
+The agent can already drive ~git rebase~ via Bash and open the conflicted
+files in mime to resolve them — that is the stop-gap. The sequencer is the
+productized, deterministic, ~$EDITOR~-free version that makes mime the single
+worktree authority.
+
+*** Progress (branch ~rebase-sequencer~)
+
+- [X] git2 ~vendored-libgit2~ added (builds with ~cc~ alone, no cmake).
+- [X] Smoke test: cherrypick conflict → diff3 worktree markers → conflict.rs
+  parses them (~src/sequencer.rs~).
+- [X] Sequencer core in ~sequencer.rs~ (~Plan~ / ~Step~ / ~Action~, the
+  ~start~ / ~continue_op~ / ~abort~ / ~status~ surface). Step loop:
+  ~Repository::cherrypick~ onto a detached, moving HEAD with a diff3 checkout →
+  clean: commit & advance / conflicted: stop with markers in the worktree.
+  State persisted to ~.git/mime-sequencer.json~ (re-entrant); ~abort~ =
+  ~reset --hard~ to the pre-op snapshot; branch ref only moves at ~finish~.
+  Pick / reword / drop + conflict→continue + abort covered by unit tests.
+- [X] Squash / fixup (~land_step~): re-parent on ~current~'s parent + meld the
+  message (squash concatenates, fixup keeps the first); a leading squash/fixup
+  is rejected. Cherry-pick (~onto~ = HEAD) and revert (inverse, ~Mode::Revert~)
+  share the loop. ~git_skip~ drops the stopped step.
+- [X] Worktree authority: handled by mime's EXISTING auto-revert — clean
+  drifted buffers re-read on next session use (~auto_revert_if_clean~,
+  engine.rs:620, called on the run path mcp.rs:435), modified buffers are
+  save-guarded. No proactive reload hook needed, matching the paged-reader
+  decision; the sequencer stays a free function over a ~git2::Repository~.
+- [X] ~git_*~ MCP tools gated by an opt-in env (~MIME_GIT_ROOTS~, default OFF):
+  ~git_rebase~ / ~git_cherry_pick~ / ~git_revert~ / ~git_continue~ / ~git_skip~
+  / ~git_abort~ / ~git_status~ / ~git_log~ / ~git_show~. Schemas appended only
+  when enabled (so ~tools/list~ + ~validate_args~ omit them when off); dispatch
+  rejects ~git_*~ when off; repo path ~check_path~-confined. git2 stays entirely
+  in ~sequencer.rs~ via path-facing ~cmd_*~ wrappers. Verified end-to-end
+  through the real MCP JSON-RPC server (clean rebase, conflict→continue,
+  gating on/off).
+
+DONE — the sequencer is feature-complete and tested (13 sequencer + 2 MCP unit
+tests; manual end-to-end). Optional follow-ups, not blocking:
+- ~git_show~ shows changed-file status only; full unified diff could be added.
+- ~describe-mcp~ documents the default catalogue; regenerate with
+  ~MIME_GIT_ROOTS=1~ if the git tools should appear in docs/mcp-tools.md.
+- Migrate to pure-Rust ~gix~ once its conflict-marker merge is production-grade
+  (the ~cmd_*~/typed API is the small surface to swap).
+
+/Exit: ~git_rebase~ with a squash+reword plan over a 3-commit range, one
+conflicted step resolved via the existing conflict tools + ~git_continue~,
+yields the same tree as ~git~; ~git_abort~ mid-conflict restores the pre-op
+state exactly; no network/exec/hook code path is reachable from any ~git_*~
+tool./
 
 * Structural editing
 
