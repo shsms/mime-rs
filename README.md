@@ -41,6 +41,12 @@ Built for two users at once:
   (full orchestration, like `emacs --batch`); the MCP/daemon tier is
   sandboxed — filesystem confined to `$MIME_ROOTS`, every run audited, no
   shell, no network.
+- **Git history editing, in-process.** An opt-in `git_*` tool group drives
+  rebase / cherry-pick / revert as an agent-friendly sequencer (`git2` /
+  vendored libgit2): plan steps are data, conflicts surface through the same
+  merge-conflict vocabulary (resolve, then `git_continue`), and `git_rebase`
+  can `rehearse` a plan first. No `git` subprocess, no network, no hooks or
+  exec — gated behind `MIME_ENABLE_GIT`.
 - **Honest results.** Token-frugal diffs (clamped when huge), per-call
   reports, `stale`/`unsaved` flags only when true, and a save-time syntax
   check for code buffers.
@@ -83,18 +89,25 @@ an edit to one function; warm sessions are bounded and never evicted with
 unsaved work. The full catalogue is generated from the live schemas into
 [docs/mcp-tools.md](docs/mcp-tools.md) (`make docs`), so it can't drift.
 
+With `MIME_ENABLE_GIT` set, a gated `git_*` group joins them — `git_rebase`
+(with `rehearse`), `git_cherry_pick`, `git_revert`, `git_continue`, `git_skip`,
+`git_abort`, `git_status`, `git_log`, `git_show` — for agent-driven history
+editing. A conflicted step stops with diff3 markers in the worktree; resolve
+with the merge-conflict tools above, then `git_continue` (or `git_abort`).
+
 ## Build & layout
 
 `cargo build` (a C toolchain is needed for the tree-sitter grammars);
-`make test` runs the CI gate — fmt, `clippy -D warnings`, 260+ tests
+`make test` runs the CI gate — fmt, `clippy -D warnings`, 280+ tests
 including differential suites that pin the file-backed store to an in-memory
 oracle. Pending work: [`todo.org`](todo.org).
 
 The map: `store.rs` (the buffer trait) · `buffer.rs` / `quire.rs` (the two
 stores) · `builtins.rs` + `strings.rs` + `conflict.rs` + `syntax.rs` (the
-vocabulary) · `engine.rs` (sessions, tiers, time travel) · `safety.rs`
-(roots, atomic saves, audit) · `cli.rs` / `daemon.rs` / `mcp.rs` (the three
-front ends).
+vocabulary) · `engine.rs` (sessions, tiers, time travel) · `sequencer.rs`
+(the git rebase/cherry-pick/revert state machine) · `safety.rs` (roots,
+atomic saves, audit) · `cli.rs` / `daemon.rs` / `mcp.rs` (the three front
+ends).
 
 ## Dogfooding
 
