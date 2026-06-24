@@ -677,6 +677,21 @@ impl Workspace {
         self.session.borrow_mut().synced_version = v;
         Ok(bytes)
     }
+
+    /// Write the buffer's text to `path` atomically WITHOUT rebinding the
+    /// session to it — a save-as copy. The session stays bound to its visited
+    /// file, so a later plain save still targets the original (unlike
+    /// [`save_to`](Self::save_to), which rebases onto `path`). Returns the byte
+    /// count.
+    pub fn write_copy_to(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        let s = self.session.borrow();
+        let mut written = 0usize;
+        crate::safety::write_atomic_with(path, |w| {
+            written = s.buffer.write_to(w)?;
+            Ok(())
+        })?;
+        Ok(written)
+    }
 }
 
 /// Re-read the buffer's visited file from disk, discarding the warm buffer's
@@ -984,6 +999,40 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&tmp).unwrap(), want2);
         assert_eq!(ws.text(), want2);
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn write_copy_to_does_not_rebind_the_session() {
+        // save-as to a different path writes a copy but leaves the session bound
+        // to its original file, so a later plain save still targets the original.
+        let pid = std::process::id();
+        let orig = std::env::temp_dir().join(format!("mime-copy-orig-{pid}.txt"));
+        let other = std::env::temp_dir().join(format!("mime-copy-other-{pid}.txt"));
+        std::fs::write(&orig, "alpha\n").unwrap();
+        let mut ws = Workspace::new(Box::new(Quire::open(&orig).unwrap()));
+        ws.run(r#"(goto-char (point-max)) (insert "beta\n")"#)
+            .unwrap();
+        let want = ws.text();
+
+        let n = ws.write_copy_to(&other).unwrap();
+        assert_eq!(n, want.len());
+        assert_eq!(
+            std::fs::read_to_string(&other).unwrap(),
+            want,
+            "copy written"
+        );
+        assert_eq!(
+            ws.visited_path().as_deref(),
+            Some(orig.as_path()),
+            "session stays bound to the original file"
+        );
+
+        // A later in-place save lands on the ORIGINAL, not the copy target.
+        ws.save_to(&orig).unwrap();
+        assert_eq!(std::fs::read_to_string(&orig).unwrap(), want);
+
+        std::fs::remove_file(&orig).ok();
+        std::fs::remove_file(&other).ok();
     }
 
     #[test]

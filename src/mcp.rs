@@ -1474,7 +1474,9 @@ fn tool_undo_last(
 /// disk. `path` addresses WHICH session, like on every other tool; the
 /// destination is `to` (save-as), defaulting to the session's visited file —
 /// so a plain `save_buffer {path}` is "save this file" with the stale guard
-/// and parse warning applied.
+/// and parse warning applied. A `to` pointing at a DIFFERENT file writes a copy
+/// and leaves the session bound to its original file (so a later plain save
+/// still targets the original) — it does not adopt the new path.
 fn tool_save_buffer(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
@@ -1487,15 +1489,29 @@ fn tool_save_buffer(
             if !sessions.contains_key(&session) {
                 return Err(no_such_session(sessions, &session));
             }
-            // save_to writes atomically (temp + rename) and re-bases the
-            // buffer onto the new file, so an in-place save reclaims the
-            // pre-save mmap backing.
-            let bytes = sessions
-                .get_mut(&session)
-                .expect("checked above")
-                .save_to(&checked)
-                .map_err(|e| format!("cannot write {to}: {e}"))?;
-            Ok(format!("wrote {bytes} bytes to {to}"))
+            let ws = sessions.get_mut(&session).expect("checked above");
+            // save-as to the SAME file as the visited path is an in-place save
+            // (save_to: stale guard + mmap reclaim, rebase is a no-op). To a
+            // DIFFERENT path it's a copy-out that must NOT rebind the session —
+            // otherwise a later plain `save_buffer {path}` would silently retarget
+            // the copy instead of the original file (the footgun this avoids).
+            if ws.visited_path().as_deref() == Some(checked.as_path()) {
+                let bytes = ws
+                    .save_to(&checked)
+                    .map_err(|e| format!("cannot write {to}: {e}"))?;
+                Ok(format!("wrote {bytes} bytes to {to}"))
+            } else {
+                let bytes = ws
+                    .write_copy_to(&checked)
+                    .map_err(|e| format!("cannot write {to}: {e}"))?;
+                match ws.visited_path() {
+                    Some(bound) => Ok(format!(
+                        "wrote {bytes} bytes to {to} (session still bound to {})",
+                        bound.display()
+                    )),
+                    None => Ok(format!("wrote {bytes} bytes to {to}")),
+                }
+            }
         }
     }
 }
@@ -2362,11 +2378,11 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "save_buffer",
-            "description": "Write the session buffer's text to disk. Without `to`, save back to the session's visited file (atomic write, stale-read guard, parse warning — the same save the edit tools' save:true performs); with `to`, save-as to that path. NOTE: `path` addresses WHICH session, exactly like on every other tool — the destination parameter is `to`.",
+            "description": "Write the session buffer's text to disk. Without `to`, save back to the session's visited file (atomic write, stale-read guard, parse warning — the same save the edit tools' save:true performs); with `to` pointing elsewhere, write a COPY there and leave the session bound to its original file (a later plain save still targets the original — no silent retarget). NOTE: `path` addresses WHICH session, exactly like on every other tool — the destination parameter is `to`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "to": { "type": "string", "description": "Optional save-as destination. Omitted: write back to the visited file." },
+                    "to": { "type": "string", "description": "Optional save-as destination — writes a copy there without rebinding the session. Omitted: write back to the visited file." },
                     "session": session,
                     "path": path,
                 },
