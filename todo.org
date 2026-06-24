@@ -483,6 +483,86 @@ yields the same tree as ~git~; ~git_abort~ mid-conflict restores the pre-op
 state exactly; no network/exec/hook code path is reachable from any ~git_*~
 tool./
 
+** TODO git_rebase: add an `edit`/`break` step action                   :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-06-24 Mi 18:59]
+:END:
+
+The rebase plan supports only pick/reword/squash/fixup/drop. Add an =edit= (or
+=break=) action that pauses the rebase with the target commit checked out, lets
+the agent run the normal editing tools (=replace_text= / =run_program=) and the
+existing conflict tools against the worktree, then resumes via =git_continue=.
+
+Without it, an agent that needs to amend a commit's tree mid-rebase has to
+abandon the in-process sequencer and drive =git rebase -i= + manual continue via
+the shell — defeating the point of owning the rebase in-process. Pairs naturally
+with the conflict surface already present.
+
+** TODO git_rebase: let `reword`/`squash` take a message edit, not the whole message :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-06-24 Mi 18:59]
+:END:
+
+=reword= / =squash= currently require the entire replacement message as one
+string. For a small change (strip a trailing trailer line, fix one paragraph)
+the agent must reproduce the whole multi-line message verbatim — verbose and
+error-prone.
+
+Accept a message /edit/ instead: e.g. =edits: [{pattern, replacement}]= applied
+to the existing message, or directives like delete-trailer / append-line. Should
+compose with any sign-off / trailer validation.
+
+** TODO MCP command-surface review — prune the middle, grow power via params :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-06-24 Mi]
+:END:
+
+Verdict (analysis 2026-06-24): the 29-tool surface is coherent at the macro
+level — two domains (a buffer you edit; a repo you rewrite) bridged by a shared
+conflict surface (~conflicts~ + the ~conflict-*~ lisp verbs serve both a merge
+file and a rebase stop; the planned rebase ~edit~/~break~ action deepens the
+bridge). The new ~instructions~ index + annotations offset the raw count. The
+fat is in Sessions/Editing; the confusion is a few specific seams. Guiding
+principle — already shown by the two ~git_rebase~ items above: GROW POWER VIA
+PARAMETERS, not new tools; trim the marginal verbs rather than let the count
+creep past ~30. Already tracked elsewhere: the cross-file ~grep~ gap (the main
+"too little") and the ~save_buffer {to:}~ addressing footgun.
+
+*** TODO Trim or demote the manual checkpoint trio [#C]
+~checkpoint~ / ~list_checkpoints~ / ~restore_checkpoint~ are three tools for a
+deliberate-restore-point workflow agents rarely use; automatic ~undo_last~
+(every mutation, ring of 8) covers most "oops". Either fold them into one
+~checkpoint {action: save|list|restore}~, or keep them but explicitly position
+them as advanced with ~undo_last~ as the default net. Net: ~−2 tools of context.
+
+*** TODO Reconsider ~search~ as a standalone tool [#C]
+It is a single ~re-search-forward~ that MOVES POINT as a side effect — a subtle
+stateful gotcha beside read-only ~occur~, and otherwise ~run_program~ territory.
+Either drop it (lean on ~occur~ for orientation + ~run_program~ to navigate) or
+fold a "move point to first match" option into ~occur~.
+
+*** TODO Reconcile the dual buffer addressing (~session~ id vs ~path~) [#B]
+Every editing tool takes BOTH a warm ~session~ id and an auto-opening ~path~;
+that overlap is the root of the ~save_buffer {to:}~ footgun and makes
+~open_file~ partly redundant with implicit-open. Decide one coherent model
+(e.g. ~path~ is sugar resolving to a canonical session; a destination like ~to~
+never doubles as the selector) and align every tool + doc to it. Subsumes the
+standalone ~save_buffer {to:}~ item.
+
+*** TODO Clarify ~rehearse~ vs ~run_program~ (no save) [#C]
+Both "don't touch disk", but ~rehearse~ also rolls the BUFFER back while
+~run_program~ persists buffer edits (just not to the file) — easy to conflate.
+A naming or doc fix (the ~instructions~ preamble only half-covers it) so the
+buffer-persist vs full-rollback line is unmistakable.
+
+*** TODO Discoverability: structural + conflict-resolution verbs hidden in ~run_program~ [#C]
+Structural editing (treesit nodes/queries) is surfaced only as ~outline~; the
+conflict RESOLUTION verbs (~conflict-keep~ etc.) are ~run_program~ functions,
+not tools (the ~conflicts~ tool only reports). ~help {treesit|conflicts}~
+bridges both, but it is a discovery step. Decide whether that is the intended
+"small surface, deep engine" tradeoff (then document it as such) or worth one
+more surfaced affordance.
+
 * Structural editing
 
 ** TODO Incremental re-parse (~InputEdit~s) [#C]
