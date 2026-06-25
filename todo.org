@@ -73,8 +73,7 @@ matter MOST for less capable models — defaults that make wrong edits
 an error instead of a silent outcome, one-call recovery, and
 discoverability over memorized conventions. The 2026-06 review batch
 (uniform path addressing, undo_last, expect_unique, close_session,
-outline + scope/anchor, help + describe-mcp, diff clamping, search
-direction/echo/case-folding, viewport echo) has landed, as has the
+outline + scope/anchor, help + describe-mcp, diff clamping, viewport echo) has landed, as has the
 follow-up round (multi-file ~files:~ batches, clean-LRU session cap,
 decorated defun spans, ~make docs~ generation); what follows is the
 remainder.
@@ -128,8 +127,8 @@ Projections (all derived):
 
 *** Tool annotations (MCP hints; derived from the registry)
 
-Classify every tool. ~readOnlyHint~: view, read_region, search, occur, outline,
-session_status, list_checkpoints, conflicts, help, rehearse, git_log, git_show,
+Classify every tool. ~readOnlyHint~: view, read_region, occur, outline,
+session_status, conflicts, help, rehearse, git_log, git_show,
 git_status. ~destructiveHint~: save_buffer, restore_checkpoint, undo_last, and
 all mutating git_* (rebase/cherry_pick/revert/continue/skip/abort). The plain
 editors (insert_text/replace_text/run_program/open_*/checkpoint/close_session)

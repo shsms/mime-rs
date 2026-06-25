@@ -144,14 +144,12 @@ fn full_session_round_trip_over_stdio() {
         "run_program",
         "rehearse",
         "read_region",
-        "search",
         "replace_text",
         "occur",
         "conflicts",
         "checkpoint",
         "restore_checkpoint",
         "undo_last",
-        "list_checkpoints",
         "save_buffer",
         "session_status",
         "outline",
@@ -210,9 +208,9 @@ fn full_session_round_trip_over_stdio() {
     let mutated: Value = serde_json::from_str(&mutated).unwrap();
     assert_eq!(mutated["len_after"], 9);
 
-    // list_checkpoints shows our label.
-    let cps = s.call_ok(8, "list_checkpoints", json!({}));
-    assert!(cps.contains("before"), "list_checkpoints said: {cps}");
+    // session_status shows our checkpoint label.
+    let cps = s.call_ok(8, "session_status", json!({}));
+    assert!(cps.contains("before"), "session_status said: {cps}");
 
     // Restore.
     let restored = s.call_ok(9, "restore_checkpoint", json!({ "label": "before" }));
@@ -515,15 +513,23 @@ fn occur_overviews_matches_without_moving_point() {
     assert!(out.contains("4 matches on 3 lines"), "got: {out}");
     assert!(out.contains("    2 @12 ×2: beta beta"), "got: {out}");
 
-    // Point did not move: an exact search still finds "alpha" ahead of point.
-    let found = s.call_ok(3, "search", json!({ "pattern": "alpha" }));
-    assert!(found.contains("point is now 6"), "got: {found}");
+    // Point did not move: occur is read-only, so the cursor stays at point-min.
+    let view = s.call_ok(3, "view", json!({}));
+    assert!(view.contains("line 1 col 0"), "got: {view}");
 
     // Regex mode and the limit tail both pass through to the builtin.
     let out = s.call_ok(4, "occur", json!({ "pattern": "g.mma", "mode": "regex" }));
     assert!(out.contains("1 match on 1 line"), "got: {out}");
     let out = s.call_ok(5, "occur", json!({ "pattern": "beta", "limit": 1 }));
     assert!(out.contains("… and 2 more matching lines"), "got: {out}");
+
+    // case_insensitive is plumbed through the MCP arg (exact + folding branch).
+    let ci = s.call_ok(
+        6,
+        "occur",
+        json!({ "pattern": "BETA", "case_insensitive": true }),
+    );
+    assert!(ci.contains("4 matches on 3 lines"), "got: {ci}");
 }
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -1074,8 +1080,8 @@ fn uniform_path_addressing_on_checkpoint_and_save_tools() {
         "replace_text",
         json!({ "path": p, "pattern": "alpha", "replacement": "beta" }),
     );
-    let cps = s.call_ok(3, "list_checkpoints", json!({ "path": p }));
-    assert!(cps.contains("cp"), "list said: {cps}");
+    let cps = s.call_ok(3, "session_status", json!({}));
+    assert!(cps.contains("cp"), "session_status said: {cps}");
     s.call_ok(4, "restore_checkpoint", json!({ "path": p, "label": "cp" }));
     let txt = s.call_ok(5, "read_region", json!({ "path": p, "start": 1, "end": 6 }));
     assert!(txt.starts_with("alpha"), "restored: {txt}");
@@ -1282,45 +1288,6 @@ fn outline_scope_and_anchor_drive_structural_edits() {
     let m = outline.find("mid").expect("mid");
     let b = outline.find("beta").expect("beta");
     assert!(a < m && m < b, "mid sits between alpha and beta: {outline}");
-}
-
-#[test]
-fn search_reports_direction_line_echo_and_case_folding() {
-    let mut s = Server::spawn();
-    s.call_ok(
-        1,
-        "open_text",
-        json!({ "text": "Alpha one\nbeta two\nALPHA three\n" }),
-    );
-
-    // Forward + case-insensitive exact: finds "Alpha" and echoes the line.
-    let hit = s.call_ok(
-        2,
-        "search",
-        json!({ "pattern": "alpha", "case_insensitive": true }),
-    );
-    assert!(hit.contains("line 1: Alpha one"), "got: {hit}");
-
-    // Backward from the end: the latest case-folded match is on line 3.
-    s.call_ok(3, "run_program", json!({ "program": "(end-of-buffer)" }));
-    let hit = s.call_ok(
-        4,
-        "search",
-        json!({ "pattern": "alpha", "case_insensitive": true, "direction": "backward" }),
-    );
-    assert!(hit.contains("line 3: ALPHA three"), "got: {hit}");
-    assert!(hit.contains("at the match start"), "got: {hit}");
-
-    // occur with case folding sees both spellings.
-    let oc = s.call_ok(
-        5,
-        "occur",
-        json!({ "pattern": "alpha", "case_insensitive": true }),
-    );
-    assert!(
-        oc.contains("Alpha one") && oc.contains("ALPHA three"),
-        "got: {oc}"
-    );
 }
 
 #[test]

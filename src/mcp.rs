@@ -408,7 +408,7 @@ fn make_workspace(store: Box<dyn TextStore>, read_only: bool) -> Workspace {
 
 /// Run a program against an existing session and return the resulting
 /// `RunReport`; an engine error becomes `Err(message)`. The internal tools that
-/// build on this (read_region, view, search, …) only read, so they always
+/// build on this (read_region, view, …) only read, so they always
 /// `run`; see [`run_or_rehearse`] for the user-facing rehearse path.
 fn run_in_session(
     sessions: &mut HashMap<String, Workspace>,
