@@ -253,6 +253,22 @@ where
     Ok(count)
 }
 
+/// Apply a whole-buffer set of `(start, end, replacement)` splices bottom-up so
+/// earlier spans stay valid as later ones shrink/grow, then return the remaining
+/// conflict count. The multi-hunk counterpart of [`conflict_splice`], shared by
+/// the buffer-wide resolvers (`conflict-keep-all`, `conflict-resolve-trivial`).
+fn conflict_splice_all(
+    b: &mut dyn crate::store::TextStore,
+    plan: Vec<(usize, usize, String)>,
+) -> i64 {
+    for (start, end, text) in plan.into_iter().rev() {
+        b.delete_region(start, end);
+        b.goto_char(start);
+        b.insert(&text);
+    }
+    crate::conflict::scan(b).len() as i64
+}
+
 pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     // ---- navigation ----
     {
@@ -1921,6 +1937,41 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         );
     }
     {
+        // (conflict-keep-all SIDE) — resolve EVERY remaining hunk by keeping
+        // SIDE ("ours" | "theirs" | "both" | "all" | "base"): one call instead
+        // of looping conflict-keep by hand (which renumbers as it goes). Side
+        // text is resolved for all hunks FIRST, so an unavailable side errors
+        // before any edit (all-or-nothing); the edits then run bottom-up so
+        // earlier spans stay valid. Returns the remaining count (0 on success).
+        let s = session.clone();
+        ctx.defun(
+            "conflict-keep-all",
+            move |side: String| -> Result<i64, Error> {
+                let mut sess = s.borrow_mut();
+                let (remaining, warnings) = {
+                    let b = sess.buffer.as_mut();
+                    let hunks = crate::conflict::scan(b);
+                    let mut warnings = Vec::new();
+                    let mut plan = Vec::with_capacity(hunks.len());
+                    for h in &hunks {
+                        let (text, warning) =
+                            crate::conflict::side_text_with_warning(&*b, h, &side)
+                                .map_err(|e| err(&e))?;
+                        if let Some(w) = warning {
+                            warnings.push(w);
+                        }
+                        plan.push((h.start, h.end, text));
+                    }
+                    (conflict_splice_all(b, plan), warnings)
+                };
+                for w in warnings {
+                    sess.log.push(w);
+                }
+                Ok(remaining)
+            },
+        );
+    }
+    {
         // (conflict-replace TEXT &optional N) — resolve hunk N (or the hunk at
         // point) by splicing TEXT verbatim in place of the whole hunk — the
         // hand-crafted resolution. Returns the remaining conflict count.
@@ -1942,7 +1993,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             let mut sess = s.borrow_mut();
             let b = sess.buffer.as_mut();
             let hunks = crate::conflict::scan(b);
-            for h in hunks.iter().rev() {
+            let mut plan = Vec::new();
+            for h in &hunks {
                 let ours = b.substring(h.ours.0, h.ours.1);
                 let theirs = b.substring(h.theirs.0, h.theirs.1);
                 let base = h.base.map(|(s, e)| b.substring(s, e));
@@ -1956,12 +2008,10 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                     None
                 };
                 if let Some(text) = keep {
-                    b.delete_region(h.start, h.end);
-                    b.goto_char(h.start);
-                    b.insert(&text);
+                    plan.push((h.start, h.end, text));
                 }
             }
-            crate::conflict::scan(b).len() as i64
+            conflict_splice_all(b, plan)
         });
     }
 
@@ -4237,6 +4287,71 @@ mod tests {
         assert!(
             txt.starts_with("\"x\\nt\\no2\\n<<<<<<< A\\nreal\\n"),
             "got: {txt}"
+        );
+    }
+
+    #[test]
+    fn conflict_keep_all_resolves_every_remaining_hunk_at_once() {
+        let mut ws = trusted(
+            "<<<<<<< A\no1\n=======\nt1\n>>>>>>> B\n\
+             mid\n\
+             <<<<<<< A\no2\n=======\nt2\n>>>>>>> B\n",
+        );
+        // One call takes ours on BOTH hunks (applied bottom-up internally, so
+        // no manual renumbering); returns the remaining count.
+        let r = ws
+            .run(r#"(report "left" (conflict-keep-all "ours")) (report "txt" (buffer-string))"#)
+            .unwrap();
+        assert_eq!(report(&r, "left"), "0");
+        assert_eq!(report(&r, "txt"), "\"o1\\nmid\\no2\\n\"");
+    }
+
+    #[test]
+    fn conflict_keep_all_is_all_or_nothing_on_an_unavailable_side() {
+        // "base" needs a diff3 hunk; the FIRST hunk here has none. All side-texts
+        // are resolved before any splice, so the call errors before touching the
+        // buffer. The diff3 hunk is placed SECOND on purpose: an impl that
+        // spliced as it scanned bottom-up (no planning phase) would resolve it
+        // before hitting the error and leave the buffer half-resolved — this
+        // ordering, plus the byte-for-byte check, catches that.
+        let mut ws = trusted(
+            "<<<<<<< A\no1\n=======\nt1\n>>>>>>> B\n\
+             <<<<<<< A\no2\n||||||| base\nb2\n=======\nt2\n>>>>>>> B\n",
+        );
+        let before = ws.run(r#"(report "txt" (buffer-string))"#).unwrap();
+        assert!(ws.run(r#"(conflict-keep-all "base")"#).is_err());
+        // Buffer untouched — both hunks still present, byte-for-byte.
+        let after = ws
+            .run(r#"(report "n" (conflict-count)) (report "txt" (buffer-string))"#)
+            .unwrap();
+        assert_eq!(report(&after, "n"), "2");
+        assert_eq!(report(&after, "txt"), report(&before, "txt"));
+    }
+
+    #[test]
+    fn conflict_keep_all_collects_fused_keep_warnings() {
+        // Two hunks whose "both" join each leaves a brace open. conflict-keep-all
+        // resolves every hunk AND drains a fused-keep warning per hunk to the log
+        // — exercising its own warning-collection path (collect during planning,
+        // push after the buffer borrow ends), which conflict-keep does not share.
+        let mut ws = trusted(
+            "fn a() {\n<<<<<<< HEAD\n  if x {\n    p()\n=======\n  if y {\n    q()\n\
+             >>>>>>> branch\n  }\n}\n\
+             fn b() {\n<<<<<<< HEAD\n  if x {\n    p()\n=======\n  if y {\n    q()\n\
+             >>>>>>> branch\n  }\n}\n",
+        );
+        let r = ws
+            .run(r#"(report "left" (conflict-keep-all "both"))"#)
+            .unwrap();
+        assert_eq!(report(&r, "left"), "0", "every hunk resolved");
+        assert_eq!(
+            r.log
+                .iter()
+                .filter(|m| m.contains("leave a bracket open"))
+                .count(),
+            2,
+            "one fused-keep warning per hunk; log = {:?}",
+            r.log
         );
     }
 
