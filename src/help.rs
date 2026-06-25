@@ -8,6 +8,10 @@
 /// topic" help text.
 pub const TOPICS: &[(&str, &str)] = &[
     (
+        "lisp",
+        "the callable Lisp surface, grouped by task (search, structure, delete, narrow, transact)",
+    ),
+    (
         "regex",
         "the regex dialect: RE2 patterns, Emacs anchors, replacement syntax",
     ),
@@ -20,6 +24,10 @@ pub const TOPICS: &[(&str, &str)] = &[
         "merge-conflict workflow: overview, keep/replace, trivial sweep",
     ),
     (
+        "git",
+        "in-process rebase/cherry-pick/revert: plan, stop, resolve, continue",
+    ),
+    (
         "sessions",
         "warm sessions, path addressing, saving, staleness, undo",
     ),
@@ -29,14 +37,46 @@ pub const TOPICS: &[(&str, &str)] = &[
 /// The reference text for `name`, or `None` for an unknown topic.
 pub fn topic(name: &str) -> Option<&'static str> {
     match name {
+        "lisp" => Some(LISP),
         "regex" => Some(REGEX),
         "treesit" => Some(TREESIT),
         "conflicts" => Some(CONFLICTS),
+        "git" => Some(GIT),
         "sessions" => Some(SESSIONS),
         "recipes" => Some(RECIPES),
         _ => None,
     }
 }
+
+// Mirrors the grouped index in docs/vocabulary.md — keep the two in sync.
+const LISP: &str = r#"— the callable Lisp surface —
+Programs are Emacs-Lisp (tulisp): let/lambda/dolist/while/condition-case plus
+these editor builtins. For syntax + examples: help {regex} (patterns/replace),
+help {treesit} (structure), help {recipes} (worked programs).
+
+Motion/inspect: point point-min point-max goto-char goto-line forward-line
+  beginning-of-line end-of-line line-number-at-pos current-column looking-at
+  char-after buffer-substring buffer-string
+Search/replace: re-search-forward re-search-backward search-forward
+  search-backward replace-match match-string replace-regexp replace-string
+  count-matches regexp-quote
+Edit/delete: insert delete-region delete-char flush-lines keep-lines
+  kill-region kill-whole-line yank sort-lines delete-trailing-whitespace
+Narrowing: narrow-to-region widen save-restriction save-excursion
+Structure (tree-sitter): treesit-goto-defun treesit-defun-at treesit-node-at
+  treesit-node-start treesit-node-end treesit-node-text treesit-narrow-to-defun
+  treesit-list-defuns treesit-has-error treesit-query; node edits
+  treesit-replace-node treesit-kill-node treesit-wrap-node treesit-insert-sibling
+Conflicts: conflict-keep conflict-keep-all conflict-replace conflict-resolve-trivial
+  conflict-diff conflict-text conflict-context  (full workflow: help {conflicts})
+Atomicity/observe: with-transaction checkpoint report message window
+Strings: replace-regexp-in-string split-string string-trim string-replace
+  string-join number-to-string string-prefix-p
+
+Gotchas: only the FINAL form's value is returned — wrap earlier results in
+(report "label" …). @N/point are absolute (goto-char); line numbers are
+narrowing-relative (goto-line). A defun node EXCLUDES its leading attribute /
+decorator / doc-comment — extend the region upward to delete the whole item."#;
 
 const REGEX: &str = r#"— regex dialect —
 PATTERNS are RE2 (the Rust regex crate): linear-time, safe on huge files;
@@ -101,6 +141,7 @@ tool renders the overview (hunk numbers, positions, labels, side sizes;
 diff3/zdiff3 handled; heed its `!` line about unparseable markers).
 Then, via run_program, hunk by hunk:
   (report "left" (conflict-resolve-trivial)) ; sweep the safe hunks first
+  (report "left" (conflict-keep-all "ours"|"theirs"|"both")) ; one side, ALL hunks
   (conflict-context N)   ; one hunk rendered WITH surrounding code
   (conflict-diff N)      ; just what differs between the sides
   (conflict-text SIDE N) ; read one side
@@ -108,9 +149,28 @@ Then, via run_program, hunk by hunk:
   (report "left" (conflict-replace "merged text\n" N))
 "base"/"all" work on diff3 hunks only. Mutating calls return the REMAINING
 count — wrap them in (report …) or it is invisible. Hunk numbers are
-1-based and refresh after every edit: resolve top-down or re-list. Omit N
+1-based and refresh after every edit: resolve highest-N first or re-list
+(conflict-keep-all sweeps one side over all hunks for you). Omit N
 to address the hunk at point. Nested conflicts surface innermost-first.
 Run (treesit-has-error) after resolving code, then save."#;
+
+const GIT: &str = r#"— git history workflow —
+In-process rebase/cherry-pick/revert: no network, no hooks, no exec; the
+worktree is the warm buffer set. Plan with git_log (oid + summary over a
+range like main..HEAD) and git_show (a commit's diff + metadata).
+  git_rebase {onto, plan?}  plan = [{commit, action, message?}], action =
+    pick|reword|squash|fixup|drop; list order is the new commit order. Omit
+    plan to replay all of onto..HEAD. rehearse:true previews the result
+    (and whether it is a pure reorder/fold) without applying.
+  git_cherry_pick {commits} / git_revert {commits}  on top of the tip.
+Each STOPS on the first conflict. Then, per stop:
+  git_status     which step of how many + the unresolved files
+  resolve each file with the conflicts vocabulary (help conflicts), SAVE
+  git_continue   commit the resolution + resume (errors while marker lines
+                 remain; force:true overrides)
+  git_skip       drop the stopped commit and resume
+  git_abort      restore HEAD/branch/worktree to the pre-op state
+Resolve via the keep/replace vocabulary, never by hand-splicing markers."#;
 
 const SESSIONS: &str = r#"— sessions, saving, staleness, undo —
 Every tool takes `path` (auto-opens the file into a warm session keyed by
@@ -159,6 +219,33 @@ Edit only lines 100–200:
   (goto-line 100) (narrow-to-region (point) (progn (goto-line 201) (point)))
   … edits … (widen)
 Move a block: (kill-region A B) … (goto-char DEST) (yank)
+Delete a whole defun incl. its leading #[attr]/decorator/// (the defun node
+EXCLUDES those — walk up first):
+  (when (treesit-goto-defun "name")
+    (let ((end (treesit-node-end (treesit-defun-at))))
+      (goto-char (treesit-node-start (treesit-defun-at))) (beginning-of-line)
+      ;; (not (bobp)) is essential: at the top of the buffer (forward-line -1)
+      ;; can't advance, so without it a comment/attr on line 1 spins forever.
+      (while (and (not (bobp))
+                  (save-excursion (forward-line -1) (looking-at "[ \t]*(#\\[|//|///)")))
+        (forward-line -1))
+      (delete-region (point) end)))   ; save:true — fmt tidies any leftover blank
+Replace or wrap a whole defun (structural):
+  (treesit-replace-node (treesit-defun-at) "fn name() { todo!() }")
+  (treesit-wrap-node (treesit-defun-at) "mod tests {\n" "\n}")
+Visit every top-level defun by name:
+  (dolist (name (treesit-list-defuns)) (treesit-goto-defun name) …)
+Whole-word rename (patterns are RE2 everywhere — incl. looking-at /
+re-search-forward; literal replace_text would also hit substrings):
+  (goto-char (point-min)) (report "n" (replace-regexp "\\bfoo\\b" "bar"))
+Resolve merge conflicts (overview: the conflicts tool; vocab: help {conflicts}).
+Sweep the safe hunks, then take one side for ALL the rest in a single call:
+  (report "left" (conflict-resolve-trivial))      ; identical/whitespace hunks
+  (report "left" (conflict-keep-all "ours"))      ; or "theirs" | "both"
+Mixed per-hunk: (conflict-keep "ours"|"theirs"|"both" N) or a hand-merge
+(conflict-replace "merged\n" N); inspect first with (conflict-diff N). N
+renumbers after every resolve, so resolve the HIGHEST N first. Then check
+(treesit-has-error) and save.
 Preview anything non-trivial first: rehearse {program}, inspect the diff,
 then run_program the same program (with save:true when done)."#;
 

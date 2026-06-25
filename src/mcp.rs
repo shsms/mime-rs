@@ -2356,7 +2356,7 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
         "conflicts" => (
             Conflicts,
             A::read(),
-            "overview of the merge-conflict hunks in the buffer",
+            "merge-conflict hunk overview + the keep/replace resolve vocabulary (run_program)",
         ),
 
         "git_rebase" => (
@@ -2404,7 +2404,7 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
         "help" => (
             Inspection,
             A::read(),
-            "reference briefs: regex/treesit/conflicts/sessions/recipes",
+            "reference briefs: lisp/regex/treesit/conflicts/git/sessions/recipes",
         ),
 
         _ => (Inspection, A::append(), ""),
@@ -2437,7 +2437,7 @@ fn instructions() -> String {
     let mut s = String::from(
         "mime-rs is a transactional text-editing engine — reach for it for rule-shaped, \
          bulk, regex, structural (tree-sitter), cross-file, or very large edits, and for \
-         in-process git rebase/cherry-pick/revert; a single unique-string change may be \
+         in-process git rebase/cherry-pick/revert and merge-conflict resolution; a single unique-string change may be \
          simpler in your own editor. Opening is implicit: pass `path` to any tool and the \
          file becomes a warm session (or `session` for an in-memory buffer); buffers stay \
          warm and NOTHING is written until you save (`save: true` on an edit, or save_buffer). \
@@ -2467,8 +2467,8 @@ fn instructions() -> String {
     s.push_str(
         "\nThe deep vocabulary — regex, treesit structural editing, and conflict \
          resolution (conflict-keep / conflict-replace / …) — lives inside run_program \
-         by design: a small tool surface over a deep engine. Call \
-         help {regex|treesit|conflicts|sessions|recipes} (or help {tool: \"name\"}) for it.",
+         by design: a small tool surface over a deep engine. BEFORE writing a run_program, skim \
+         help {lisp} (the verb index) or help {recipes} (worked patterns); help {regex|treesit|conflicts|git|sessions} cover specifics (or help {tool: \"name\"}).",
     );
     s
 }
@@ -2531,7 +2531,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "run_program",
-            "description": "Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and return a structured RunReport (unified diff, point, length before/after, any (report ...)/(message ...) output, and `value`: the final form's result rendered the way tulisp prints it — present only when non-nil, so a read-only inspector like (conflict-diff N) is readable without wrapping it in (message ...)). This is the core, general-purpose editing tool; the buffer and any defined functions persist for the next call. On failure the error content is a JSON object {ok:false, error, dirty, reports, log} carrying the diagnostics the program emitted before dying; dirty=true means its pre-error edits persist (a run does not roll back on error — use rehearse, or with-transaction inside the program, for atomicity).",
+            "description": "Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and return a structured RunReport (unified diff, point, length before/after, any (report ...)/(message ...) output, and `value`: the final form's result rendered the way tulisp prints it — present only when non-nil, so a read-only inspector like (conflict-diff N) is readable without wrapping it in (message ...)). Only the FINAL form's value comes back, so wrap any earlier result you need (e.g. a replace-regexp match count) in (report …) or it stays invisible. This is the core, general-purpose editing tool; the buffer and any defined functions persist for the next call. The callable Lisp surface is indexed in help {lisp} (help {regex|treesit|recipes} for syntax and worked examples). On failure the error content is a JSON object {ok:false, error, dirty, reports, log} carrying the diagnostics the program emitted before dying; dirty=true means its pre-error edits persist (a run does not roll back on error — use rehearse, or with-transaction inside the program, for atomicity).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2683,7 +2683,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "conflicts",
-            "description": "Overview of the merge-conflict hunks in the buffer: number, position + line, branch labels, side sizes; warns about marker lines it could not parse (malformed/nested). Read-only. Resolve via run_program: (conflict-keep SIDE &optional N) with ours|theirs|both, or base|all on diff3 hunks only; (conflict-replace TEXT &optional N) for a hand-crafted merge; (conflict-resolve-trivial) to sweep the safe ones; (conflict-diff &optional N) to see what differs; (conflict-text SIDE &optional N) to read one side. Mutating calls return the remaining count — wrap them in (report \"left\" …) to see it in run_program's JSON. N is 1-based and refreshes after each edit; nil N = the hunk at point. @positions are absolute, L labels narrowing-relative; a narrowing that cuts through a hunk hides it entirely — widen before resolving.",
+            "description": "Overview of the merge-conflict hunks in the buffer: number, position + line, branch labels, side sizes; warns about marker lines it could not parse (malformed/nested). Read-only, but the resolution entry point — don't hand-edit markers with replace_text/insert_text; resolve via run_program: (conflict-keep SIDE &optional N) with ours|theirs|both, or base|all on diff3 hunks only; (conflict-keep-all SIDE) to take one side over every remaining hunk at once; (conflict-replace TEXT &optional N) for a hand-crafted merge; (conflict-resolve-trivial) to sweep the safe ones; (conflict-diff &optional N) to see what differs; (conflict-text SIDE &optional N) to read one side. Mutating calls return the remaining count — wrap them in (report \"left\" …) to see it in run_program's JSON. N is 1-based and refreshes after each edit; nil N = the hunk at point. @positions are absolute, L labels narrowing-relative; a narrowing that cuts through a hunk hides it entirely — widen before resolving.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2759,11 +2759,11 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "help",
-            "description": "Reference briefs served on demand: the regex dialect (RE2 patterns, Emacs anchors/replacements), the treesit structural-editing vocabulary, the merge-conflict workflow, session/saving/undo semantics, and ready-to-adapt edit recipes. Call it with no argument to list the topics; pass `tool` for one tool's full reference (description + annotations). Reach for it BEFORE guessing at syntax or vocabulary.",
+            "description": "Reference briefs served on demand: the callable Lisp-surface index, the regex dialect (RE2 patterns, Emacs anchors/replacements), the treesit structural-editing vocabulary, the merge-conflict workflow, the in-process git rebase/cherry-pick/revert workflow, session/saving/undo semantics, and ready-to-adapt edit recipes. Call it with no argument to list the topics; pass `tool` for one tool's full reference (description + annotations). Reach for it BEFORE guessing at syntax or vocabulary.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "topic": { "type": "string", "enum": ["regex", "treesit", "conflicts", "sessions", "recipes"], "description": "Which brief to fetch; omit to list them." },
+                    "topic": { "type": "string", "enum": ["lisp", "regex", "treesit", "conflicts", "git", "sessions", "recipes"], "description": "Which brief to fetch; omit to list them." },
                     "tool": { "type": "string", "description": "A tool name — return that tool's full description + annotations from the registry." },
                 },
                 "required": [],
