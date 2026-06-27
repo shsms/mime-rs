@@ -273,6 +273,63 @@ impl PagedFile {
         filled
     }
 
+    /// Detect the BOM and DOS/Unix line ending by scanning to the first `\n`
+    /// (DOS iff it is preceded by `\r`). Uncapped: a file whose first line is
+    /// huge is still classified correctly, and a newline-free file simply reads
+    /// through (Unix). Reads in modest chunks, so for real text (first `\n`
+    /// early) only the leading bytes are touched. CR-only (classic-Mac) files
+    /// have no `\n`, so they are Unix and kept byte-exact.
+    fn detect_coding(&self) -> crate::coding::FileCoding {
+        use crate::coding::{Eol, FileCoding};
+        const CHUNK: usize = 8 * 1024;
+        let mut head = [0u8; 3];
+        let n0 = self.read_into(&mut head, 0);
+        let had_bom = head[..n0].starts_with(&crate::coding::BOM);
+        let mut prev = 0u8;
+        let mut off = 0usize;
+        let mut buf = vec![0u8; CHUNK];
+        while off < self.len {
+            let n = self.read_into(&mut buf[..CHUNK.min(self.len - off)], off);
+            if n == 0 {
+                break;
+            }
+            for &b in &buf[..n] {
+                if b == b'\n' {
+                    let eol = if prev == b'\r' { Eol::Dos } else { Eol::Unix };
+                    return FileCoding::new(had_bom, eol);
+                }
+                prev = b;
+            }
+            off += n;
+        }
+        FileCoding::new(had_bom, Eol::Unix) // no `\n` anywhere
+    }
+
+    /// LOGICAL char/line counts for the normalized view: a leading BOM and the
+    /// `\r` of each `\r\n` count as neither char nor (for the `\r`) line. One
+    /// streaming pass; bounded RAM (the view never materializes the file).
+    fn count_view(&self, had_bom: bool, dos: bool) -> (usize, usize) {
+        let (mut chars, mut lines) = (0usize, 0usize);
+        let mut prev_cr = false;
+        let mut off = 0usize;
+        let mut buf = vec![0u8; PAGE];
+        while off < self.len {
+            let n = self.read_into(&mut buf[..PAGE.min(self.len - off)], off);
+            if n == 0 {
+                break;
+            }
+            for (k, &b) in buf[..n].iter().enumerate() {
+                let is_bom = had_bom && off + k < 3;
+                let absorbed_lf = dos && b == b'\n' && prev_cr;
+                chars += usize::from((b & 0xC0) != 0x80 && !is_bom && !absorbed_lf);
+                lines += usize::from(b == b'\n');
+                prev_cr = dos && b == b'\r';
+            }
+            off += n;
+        }
+        (chars, lines)
+    }
+
     /// The page at index `pno`, reading + caching it on a miss. The page is the
     /// expected extent (`PAGE`, or shorter for the last page); a `read_at` that
     /// comes up short (truncation) leaves the tail zero-filled.
@@ -477,6 +534,24 @@ fn count_chars_lines(bytes: &[u8]) -> (usize, usize) {
         lines += usize::from(b == b'\n');
     }
     (chars, lines)
+}
+
+/// A root that is one whole-file Original piece `[start, start+len)` with the
+/// given logical char/line counts — or the empty node when `len == 0`. Used at
+/// open and rebase; `start` is 3 for a BOM file (the BOM bytes precede the piece)
+/// and 0 otherwise.
+fn single_original_root(start: usize, len: usize, chars: usize, lines: usize) -> Arc<Node> {
+    if len == 0 {
+        Node::empty()
+    } else {
+        Arc::new(Node::leaf(vec![Piece {
+            source: Source::Original,
+            start,
+            len,
+            chars,
+            lines,
+        }]))
+    }
 }
 
 /// Advance `i` forward to the next UTF-8 char boundary at or after it, so a
@@ -736,6 +811,15 @@ pub struct Quire {
     /// Content version (see `TextStore::version`): re-stamped on every text
     /// mutation; a snapshot keeps it — same version, same text.
     version: u64,
+    /// The TARGET coding for the next save (Emacs `buffer-file-coding-system`):
+    /// what `write_to` encodes to, what `set_coding` changes, what session_status
+    /// shows. Defaults to `view_coding` at open.
+    coding: crate::coding::FileCoding,
+    /// The format the paged Original's RAW bytes are actually in (the coding
+    /// detected at open) — the basis for the normalized view (`strips_crlf`) and
+    /// for a byte-exact save when it still equals `coding`. Immutable after open;
+    /// `set_coding` never touches it. `default()` for in-memory/plain.
+    view_coding: crate::coding::FileCoding,
 }
 
 impl Quire {
@@ -754,7 +838,7 @@ impl Quire {
         let paged = PagedFile::open(file, len, stamp.clone());
         // One fused pass: UTF-8 validation AND the char/line index (the two
         // used to be separate whole-file scans — the dominant open cost).
-        let Some(counts) = paged.validate_and_count() else {
+        let Some(raw_counts) = paged.validate_and_count() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Quire::open: file is not valid UTF-8",
@@ -764,8 +848,26 @@ impl Quire {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        let mut quire = Quire::with_original_counted(name, Original::Paged(paged), Some(counts));
+        // A non-plain file keeps its raw BOM/CRLF bytes on the paged backing (no
+        // materialization, so large-file support is preserved); the char/byte
+        // scan primitives present a normalized LF view (`strips_crlf`) and the BOM
+        // is excluded from the piece below, so the tree's piece summaries must be
+        // the LOGICAL counts, not the raw ones.
+        let coding = paged.detect_coding();
+        let counts = if coding.is_plain() {
+            raw_counts
+        } else {
+            paged.count_view(coding.had_bom, coding.eol == crate::coding::Eol::Dos)
+        };
+        // The BOM bytes are NOT part of any piece: the Original starts 3 bytes in,
+        // and `write_to` re-emits the BOM. This keeps the signature robust against
+        // inserts/deletes at the buffer start (it can't be relocated or pruned).
+        let start = if coding.had_bom { 3 } else { 0 };
+        let mut quire =
+            Quire::with_original_counted(name, Original::Paged(paged), Some(counts), start);
         quire.stamp = Some(stamp);
+        quire.coding = coding;
+        quire.view_coding = coding;
         Ok(quire)
     }
 
@@ -776,7 +878,7 @@ impl Quire {
     }
 
     fn with_original(name: String, original: Original) -> Quire {
-        Quire::with_original_counted(name, original, None)
+        Quire::with_original_counted(name, original, None, 0)
     }
 
     /// [`with_original`] with the char/line counts already in hand (the fused
@@ -785,26 +887,16 @@ impl Quire {
         name: String,
         original: Original,
         counts: Option<(usize, usize)>,
+        start: usize,
     ) -> Quire {
-        // One piece spanning the whole original. Counting its chars/lines is the
-        // one up-front scan and the real cost of opening a multi-GB file. It is
-        // parallelized over the available cores above `PARALLEL_INDEX_THRESHOLD`
-        // (see `count_chars_lines_parallel`); the tree itself is still the single
-        // whole-file piece — only the counting is fanned out. (Making it
-        // incremental/background remains a later option — TODO.)
-        let bytes_len = original.len();
-        let root = if bytes_len == 0 {
-            Node::empty()
-        } else {
-            let (chars, lines) = counts.unwrap_or_else(|| original.count_chars_lines());
-            Arc::new(Node::leaf(vec![Piece {
-                source: Source::Original,
-                start: 0,
-                len: bytes_len,
-                chars,
-                lines,
-            }]))
-        };
+        // One piece spanning the original from `start` (3 past a BOM, else 0) to
+        // the end. Counting its chars/lines is the one up-front scan and the real
+        // cost of opening a multi-GB file. It is parallelized over the available
+        // cores above `PARALLEL_INDEX_THRESHOLD` (see `count_chars_lines_parallel`);
+        // the tree itself is still the single whole-file piece — only the counting
+        // is fanned out. (Making it incremental/background remains a later option.)
+        let (chars, lines) = counts.unwrap_or_else(|| original.count_chars_lines());
+        let root = single_original_root(start, original.len() - start, chars, lines);
         Quire {
             name,
             original: Rc::new(original),
@@ -818,6 +910,8 @@ impl Quire {
             stamp: None,
             text_cache: RefCell::new(None),
             version: crate::store::next_version(),
+            coding: crate::coding::FileCoding::default(),
+            view_coding: crate::coding::FileCoding::default(),
         }
     }
 
@@ -840,6 +934,8 @@ impl Quire {
             stamp: self.stamp.clone(),
             text_cache: RefCell::new(None),
             version: self.version,
+            coding: self.coding,
+            view_coding: self.view_coding,
         }
     }
 
@@ -853,23 +949,22 @@ impl Quire {
         let stamp = crate::safety::FileStamp::capture(path)?;
         let file = std::fs::File::open(path)?;
         let bytes_len = file.metadata()?.len() as usize;
-        debug_assert_eq!(
-            bytes_len,
-            self.total_bytes(),
-            "rebase: saved file size must equal the current content"
+        // Only a fully-plain save (target AND original coding plain) writes the
+        // pieces' raw bytes verbatim, so its size equals the content. Any BOM/EOL
+        // encoding — restoring the view OR converting to a new coding — makes the
+        // saved file a different size; the new Original is then in the TARGET
+        // coding, and the view strips it back to the same logical text, so the
+        // char/line summary is reused with the saved file's byte length.
+        debug_assert!(
+            !(self.coding.is_plain() && self.view_coding.is_plain())
+                || bytes_len == self.total_bytes(),
+            "rebase: a fully-plain saved file's size must equal the content"
         );
         let summary = self.root.summary();
-        let root = if bytes_len == 0 {
-            Node::empty()
-        } else {
-            Arc::new(Node::leaf(vec![Piece {
-                source: Source::Original,
-                start: 0,
-                len: bytes_len,
-                chars: summary.chars,
-                lines: summary.lines,
-            }]))
-        };
+        // The saved file is now in the TARGET coding; its BOM (if any) precedes
+        // the Original piece, which therefore starts at byte 3.
+        let bom_off = if self.coding.had_bom { 3 } else { 0 };
+        let root = single_original_root(bom_off, bytes_len - bom_off, summary.chars, summary.lines);
         self.original = Rc::new(Original::Paged(PagedFile::open(
             file,
             bytes_len,
@@ -878,6 +973,7 @@ impl Quire {
         self.add = Arc::new(Vec::new());
         self.root = root;
         self.stamp = Some(stamp);
+        self.view_coding = self.coding; // the saved file is in the target coding now
         self.invalidate();
         Ok(())
     }
@@ -905,16 +1001,103 @@ impl Quire {
         }
     }
 
+    /// Like [`for_bytes`](Self::for_bytes), but yields the NORMALIZED VIEW bytes:
+    /// for a non-plain Original it elides a leading BOM and the `\r` of each
+    /// `\r\n` (keeping the `\n`). The read paths (`full_text`, `collect_range`)
+    /// use this; `write_to` uses raw `for_bytes` so untouched regions save
+    /// byte-exact. `start`/`len` are RAW byte offsets into the source.
+    fn for_view_bytes(
+        &self,
+        source: Source,
+        start: usize,
+        len: usize,
+        mut f: impl FnMut(&[u8]) -> bool,
+    ) {
+        if !self.strips_crlf(source) {
+            self.for_bytes(source, start, len, f);
+            return;
+        }
+        let mut out: Vec<u8> = Vec::new();
+        let mut pending_cr = false; // a `\r` held at a chunk boundary
+        let mut stop = false;
+        self.for_bytes(source, start, len, |chunk| {
+            out.clear();
+            if pending_cr {
+                pending_cr = false;
+                if chunk.first() != Some(&b'\n') {
+                    out.push(b'\r'); // the held `\r` was a lone CR
+                }
+            }
+            for (j, &b) in chunk.iter().enumerate() {
+                if b == b'\r' {
+                    match chunk.get(j + 1) {
+                        Some(&b'\n') => continue,   // drop the `\r` of `\r\n`
+                        Some(_) => out.push(b'\r'), // lone CR
+                        None => {
+                            pending_cr = true; // decide at the next chunk
+                            continue;
+                        }
+                    }
+                } else {
+                    out.push(b);
+                }
+            }
+            if !out.is_empty() {
+                stop = !f(&out);
+            }
+            !stop
+        });
+        if pending_cr && !stop {
+            f(b"\r");
+        }
+    }
+
+    /// `true` when reads of `source` strip CRLF → LF for the normalized view. The
+    /// BOM is NOT handled here: its bytes are excluded from every piece's range at
+    /// open (the Original starts after them) and re-emitted on save, so it survives
+    /// edits at the buffer start. Only the paged Original of a DOS file is stripped;
+    /// the add buffer (inserted text) is always plain LF. `write_to` bypasses this
+    /// and emits raw Original bytes, so untouched regions save byte-exact.
+    fn strips_crlf(&self, source: Source) -> bool {
+        source == Source::Original && self.view_coding.eol == crate::coding::Eol::Dos
+    }
+
     /// Walk the chars of `piece` in order, one chunked byte pass, calling
     /// `f(byte_offset_of_char_start, char_index, newlines_before_char)`; `f`
     /// returns `false` to stop. Char starts are the non-continuation bytes, so no
     /// UTF-8 decode is needed — chunk splits inside a multi-byte char are
     /// invisible to the counts. The unifying primitive for every within-piece
     /// char→byte seek (locate, summary_before, the insert/delete leaf cuts).
+    ///
+    /// Under a normalized DOS view (see [`strips_crlf`](Self::strips_crlf)) the
+    /// byte offsets stay RAW (file offsets) while char indices are LOGICAL: a
+    /// `\r\n` is one newline char whose byte-start is the `\r` (the `\n` is
+    /// absorbed, so a split at a char boundary never lands between them).
     fn for_each_char_mark(&self, piece: &Piece, mut f: impl FnMut(usize, usize, usize) -> bool) {
         let mut bp = 0usize; // byte offset within the piece
         let mut ci = 0usize; // chars seen so far
         let mut nl = 0usize; // newlines seen so far
+        let mut prev_cr = false; // previous byte was a `\r` (carried across chunks)
+        if self.strips_crlf(piece.source) {
+            self.for_bytes(piece.source, piece.start, piece.len, |chunk| {
+                for &b in chunk {
+                    let absorbed_lf = b == b'\n' && prev_cr;
+                    if (b & 0xC0) != 0x80 && !absorbed_lf {
+                        if !f(bp, ci, nl) {
+                            return false;
+                        }
+                        ci += 1;
+                    }
+                    if b == b'\n' {
+                        nl += 1;
+                    }
+                    prev_cr = b == b'\r';
+                    bp += 1;
+                }
+                true
+            });
+            return;
+        }
         self.for_bytes(piece.source, piece.start, piece.len, |chunk| {
             for &b in chunk {
                 if (b & 0xC0) != 0x80 {
@@ -953,9 +1136,23 @@ impl Quire {
 
     /// Char and newline counts of `[start, start+len)` in `source`, summed over
     /// chunks (chars = non-continuation bytes, lines = `\n` bytes — both additive
-    /// across chunk splits).
+    /// across chunk splits). Under a normalized DOS view, counts are LOGICAL: a
+    /// `\r\n` is one char + one line.
     fn count_range(&self, source: Source, start: usize, len: usize) -> (usize, usize) {
         let (mut chars, mut lines) = (0usize, 0usize);
+        if self.strips_crlf(source) {
+            let mut prev_cr = false;
+            self.for_bytes(source, start, len, |chunk| {
+                for &b in chunk {
+                    let absorbed_lf = b == b'\n' && prev_cr;
+                    chars += usize::from((b & 0xC0) != 0x80 && !absorbed_lf);
+                    lines += usize::from(b == b'\n');
+                    prev_cr = b == b'\r';
+                }
+                true
+            });
+            return (chars, lines);
+        }
         self.for_bytes(source, start, len, |chunk| {
             let (c, l) = count_chars_lines(chunk);
             chars += c;
@@ -982,6 +1179,17 @@ impl Quire {
             }
             true
         });
+        // Under a DOS view this byte starts a newline char iff it is the `\r` of
+        // a `\r\n` (then the logical char is `\n`); a `\r` not followed by `\n`
+        // is a real lone-CR char. (Splits never separate `\r\n`, so a `\r` at the
+        // piece's end is a lone CR.)
+        if self.strips_crlf(piece.source) && buf[0] == b'\r' {
+            return Some(if i >= 2 && buf[1] == b'\n' {
+                '\n'
+            } else {
+                '\r'
+            });
+        }
         let clen = match buf[0] {
             b if b < 0x80 => 1,
             b if b < 0xE0 => 2,
@@ -1175,7 +1383,7 @@ impl Quire {
         if self.text_cache.borrow().is_none() {
             let mut bytes = Vec::with_capacity(self.total_bytes());
             self.for_each_piece(|piece| {
-                self.for_bytes(piece.source, piece.start, piece.len, |chunk| {
+                self.for_view_bytes(piece.source, piece.start, piece.len, |chunk| {
                     bytes.extend_from_slice(chunk);
                     true
                 });
@@ -1214,7 +1422,7 @@ impl Quire {
                 let to = (hi - pos).min(piece.chars); // chars to take (exclusive)
                 let bstart = self.scan_prefix(piece, from).0;
                 let bend = self.scan_prefix(piece, to).0;
-                self.for_bytes(piece.source, piece.start + bstart, bend - bstart, |chunk| {
+                self.for_view_bytes(piece.source, piece.start + bstart, bend - bstart, |chunk| {
                     keep_going = f(chunk);
                     keep_going
                 });
@@ -2147,26 +2355,76 @@ impl TextStore for Quire {
         Quire::rebase_to(self, path)
     }
     fn write_to(&self, w: &mut dyn std::io::Write) -> std::io::Result<usize> {
-        // Stream each piece's bytes in document order — equals `full_text()` byte
-        // for byte, but never materializes the whole document.
-        let mut written = 0usize;
+        // The target coding still matches the file the Original came from: save
+        // byte-exact. The BOM (excluded from the pieces) is re-emitted first;
+        // Original pieces then emit RAW (their on-disk CRLF preserved, so
+        // untouched regions — even mixed line endings — round-trip exactly), and
+        // inserted text (the LF add buffer) is encoded to the target EOL.
+        if self.coding == self.view_coding {
+            let dos = self.coding.eol == crate::coding::Eol::Dos;
+            let mut written = 0usize;
+            let mut err = None;
+            if self.coding.had_bom {
+                w.write_all(&crate::coding::BOM)?;
+                written += crate::coding::BOM.len();
+            }
+            self.for_each_piece(|p| {
+                let encode = dos && p.source == Source::Add;
+                let mut ok = true;
+                self.for_bytes(p.source, p.start, p.len, |chunk| {
+                    let res = if encode {
+                        crate::coding::write_lf_as_crlf(w, chunk).map(|n| written += n)
+                    } else {
+                        w.write_all(chunk).map(|()| written += chunk.len())
+                    };
+                    match res {
+                        Ok(()) => true,
+                        Err(e) => {
+                            err = Some(e);
+                            ok = false;
+                            false
+                        }
+                    }
+                });
+                ok
+            });
+            return err.map_or(Ok(written), Err);
+        }
+        // The target coding was changed (e.g. "re-save as UTF-8" / convert to
+        // CRLF): re-encode the whole NORMALIZED view to the new coding. Streams
+        // the logical LF/no-BOM bytes through the CodingWriter — still no
+        // whole-document materialization — at the cost of byte-exactness (the
+        // user asked to change the format).
+        let mut cw = crate::coding::CodingWriter::new(w, self.coding);
         let mut err = None;
         self.for_each_piece(|p| {
             let mut ok = true;
-            self.for_bytes(p.source, p.start, p.len, |chunk| match w.write_all(chunk) {
-                Ok(()) => {
-                    written += chunk.len();
-                    true
-                }
-                Err(e) => {
+            self.for_view_bytes(p.source, p.start, p.len, |chunk| {
+                if let Err(e) = std::io::Write::write_all(&mut cw, chunk) {
                     err = Some(e);
                     ok = false;
-                    false
+                    return false;
                 }
+                true
             });
             ok
         });
-        err.map_or(Ok(written), Err)
+        if let Some(e) = err {
+            return Err(e);
+        }
+        cw.finish()
+    }
+    fn coding(&self) -> crate::coding::FileCoding {
+        self.coding
+    }
+    fn set_coding(&mut self, coding: crate::coding::FileCoding) {
+        if self.coding != coding {
+            self.coding = coding;
+            // A coding change alters the on-disk bytes the next save writes, so
+            // it must count as a modification — otherwise the conversion reads as
+            // unsaved:false and an auto-revert could silently discard it.
+            self.version = crate::store::next_version();
+        }
     }
 }
 
@@ -3470,6 +3728,60 @@ mod tests {
         for seed in SNAP_SEEDS {
             run_diff_snap(seed, 4000, SNAP_INITIAL, Quire::open(&path).unwrap());
         }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn differential_crlf_view_paged() {
+        // The proof the stripped-paged view is behaviourally identical to an LF
+        // buffer: open CRLF (and BOM+CRLF) files and run the full random-op stress
+        // against a Buffer holding the decoded LF text. Every text/position/read/
+        // search/insert/delete/snapshot step must stay in lockstep.
+        let crlf = SNAP_INITIAL.replace('\n', "\r\n");
+        let bom_crlf = {
+            let mut v = crate::coding::BOM.to_vec();
+            v.extend_from_slice(crlf.as_bytes());
+            v
+        };
+        for (label, bytes) in [("crlf", crlf.into_bytes()), ("bom-crlf", bom_crlf)] {
+            let path = std::env::temp_dir().join(format!(
+                "mime-crlf-{}-{}.txt",
+                label,
+                std::process::id()
+            ));
+            std::fs::write(&path, &bytes).unwrap();
+            for seed in SNAP_SEEDS {
+                run_diff_snap(seed, 4000, SNAP_INITIAL, Quire::open(&path).unwrap());
+            }
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    #[test]
+    fn crlf_straddling_a_page_boundary() {
+        // The pending-`\r` carry in the view primitives must work when a `\r\n`
+        // splits across a 64 KiB page read (the `\r` ends page 0, the `\n` starts
+        // page 1) — text, char_at across the seam, and a save round-trip.
+        let mut bytes = vec![b'x'; PAGE - 1]; // `\r` lands at offset PAGE-1
+        bytes.extend_from_slice(b"\r\ntail\r\n");
+        let path = std::env::temp_dir().join(format!("mime-pageb-{}.txt", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let q = Quire::open(&path).unwrap();
+        let mut want = String::from_utf8(vec![b'x'; PAGE - 1]).unwrap();
+        want.push_str("\ntail\n");
+        assert_eq!(TextStore::text(&q), want, "view across the page seam");
+        assert_eq!(TextStore::char_len(&q), want.chars().count());
+        // The newline char sits right at the seam: char (PAGE-1)+1 is '\n'.
+        assert_eq!(TextStore::char_after(&q, PAGE), Some('\n'));
+        assert_eq!(TextStore::char_after(&q, PAGE + 1), Some('t'));
+
+        let mut buf: Vec<u8> = Vec::new();
+        TextStore::write_to(&q, &mut buf).unwrap();
+        assert_eq!(
+            buf, bytes,
+            "save restores the exact CRLF bytes across the seam"
+        );
         std::fs::remove_file(&path).ok();
     }
 }

@@ -9,6 +9,7 @@
 pub mod buffer;
 pub mod builtins;
 pub mod cli;
+pub mod coding;
 pub mod conflict;
 pub mod daemon;
 pub mod engine;

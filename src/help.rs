@@ -203,6 +203,17 @@ save refuses and the edit stays warm — re-check, then save_buffer elsewhere or
 writes a different file). A clean-but-drifted buffer auto-reverts before reads,
 programs, and rehearsals.
 
+Coding: a file's BOM and DOS (`\r\n`) line endings are detected on open and the
+buffer is a normalized VIEW (no BOM character, LF lines — so `\n` patterns and
+char positions behave) over the raw paged file, so even huge CRLF files are NOT
+materialized. Save keeps untouched regions byte-exact (mixed endings preserved)
+and encodes inserted text to the file's EOL. A lone `\r` (classic-Mac CR) is NOT
+a line ending — such a file is plain utf-8-unix, its `\r`s kept byte-for-byte.
+session_status shows a `coding` (e.g. utf-8-with-signature-dos) when it isn't the
+plain utf-8-unix default. `(set-buffer-file-coding-system "utf-8-unix")` strips a
+BOM and forces LF on the next save (re-encoding the whole file — the "re-save as
+UTF-8" idiom); "utf-8-dos" / "…-with-signature" force those.
+
 Safety ladder: rehearse = dry-run with full report, nothing persists;
 (with-transaction …) = all-or-nothing inside a program; checkpoint /
 restore_checkpoint = named restore points; undo_last = automatic rewind

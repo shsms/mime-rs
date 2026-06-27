@@ -594,6 +594,11 @@ impl Workspace {
         self.session.borrow().buffer.narrowing().is_some()
     }
 
+    /// The current buffer's file coding (BOM/EOL) — restored on save.
+    pub fn coding(&self) -> crate::coding::FileCoding {
+        self.session.borrow().buffer.coding()
+    }
+
     /// Whether the visited file changed on disk since open/rebase (the
     /// stale-read guard's view); `false` for an unvisited buffer. A current
     /// stat catches drift now; the store's sticky `drifted` flag keeps reporting
@@ -964,6 +969,128 @@ mod tests {
             "restriction moved to fn two: {:?}",
             r.reports
         );
+    }
+
+    #[test]
+    fn bom_survives_insert_and_delete_at_the_start() {
+        // The BOM must stay at offset 0 regardless of edits at the buffer start:
+        // inserting before the first char keeps the BOM first (not relocated),
+        // and deleting the first char keeps the signature (not dropped).
+        let tmp = std::env::temp_dir().join(format!("mime-bom-edge-{}.txt", std::process::id()));
+
+        // Insert at point-min.
+        std::fs::write(&tmp, b"\xEF\xBB\xBFone\r\ntwo\r\n").unwrap();
+        let mut ws = Workspace::new(Box::new(Quire::open(&tmp).unwrap()));
+        ws.run(r#"(goto-char (point-min)) (insert "X")"#).unwrap();
+        ws.save_to(&tmp).unwrap();
+        assert_eq!(
+            std::fs::read(&tmp).unwrap(),
+            b"\xEF\xBB\xBFXone\r\ntwo\r\n",
+            "BOM stays at offset 0; inserted text follows it"
+        );
+        assert_eq!(ws.text(), "Xone\ntwo\n", "no corruption after save+rebase");
+
+        // Delete the first char.
+        std::fs::write(&tmp, b"\xEF\xBB\xBFone\r\ntwo\r\n").unwrap();
+        let mut ws = Workspace::new(Box::new(Quire::open(&tmp).unwrap()));
+        ws.run(r#"(goto-char (point-min)) (delete-char 1)"#)
+            .unwrap();
+        ws.save_to(&tmp).unwrap();
+        assert_eq!(
+            std::fs::read(&tmp).unwrap(),
+            b"\xEF\xBB\xBFne\r\ntwo\r\n",
+            "BOM kept after deleting the first char"
+        );
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn crlf_bom_save_is_byte_exact_with_encoded_inserts() {
+        // A BOM+CRLF file opens as a clean LF buffer; saving restores the BOM,
+        // keeps untouched lines CRLF byte-exact, and encodes inserted text to
+        // CRLF. Editing again after the rebase stays consistent.
+        let tmp = std::env::temp_dir().join(format!("mime-crlf-save-{}.txt", std::process::id()));
+        std::fs::write(&tmp, b"\xEF\xBB\xBFone\r\ntwo\r\nthree\r\n").unwrap();
+        let mut ws = Workspace::new(Box::new(Quire::open(&tmp).unwrap()));
+        assert_eq!(ws.text(), "one\ntwo\nthree\n");
+
+        ws.run(r#"(goto-char (point-min)) (search-forward "two\n" nil t) (insert "NEW\n")"#)
+            .unwrap();
+        ws.save_to(&tmp).unwrap();
+        assert_eq!(
+            std::fs::read(&tmp).unwrap(),
+            b"\xEF\xBB\xBFone\r\ntwo\r\nNEW\r\nthree\r\n",
+            "BOM kept, untouched lines byte-exact CRLF, inserted line encoded"
+        );
+        assert_eq!(
+            ws.text(),
+            "one\ntwo\nNEW\nthree\n",
+            "buffer stays LF after rebase"
+        );
+
+        ws.run(r#"(goto-char (point-max)) (insert "end\n")"#)
+            .unwrap();
+        ws.save_to(&tmp).unwrap();
+        assert_eq!(
+            std::fs::read(&tmp).unwrap(),
+            b"\xEF\xBB\xBFone\r\ntwo\r\nNEW\r\nthree\r\nend\r\n"
+        );
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn mixed_line_endings_are_preserved_outside_edits() {
+        // First terminator is CRLF (→ utf-8-dos), but the middle line is a bare
+        // LF. Saving must keep that bare LF byte-exact (the view's win over a
+        // normalizing save), only the edited region following the target EOL.
+        let tmp = std::env::temp_dir().join(format!("mime-mixed-{}.txt", std::process::id()));
+        std::fs::write(&tmp, b"a\r\nb\nc\r\n").unwrap();
+        let mut ws = Workspace::new(Box::new(Quire::open(&tmp).unwrap()));
+        assert_eq!(ws.coding().name(), "utf-8-dos");
+        assert_eq!(ws.text(), "a\nb\nc\n");
+        ws.run(r#"(goto-char (point-min)) (insert "X")"#).unwrap();
+        ws.save_to(&tmp).unwrap();
+        assert_eq!(
+            std::fs::read(&tmp).unwrap(),
+            b"Xa\r\nb\nc\r\n",
+            "the bare-LF line stays bare LF; CRLF lines stay CRLF"
+        );
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn cr_only_file_is_unix_and_kept_byte_exact() {
+        // Classic-Mac CR endings are NOT a coding: a CR-only file is plain unix,
+        // its `\r` kept literal in the buffer, and it round-trips byte-for-byte
+        // (never mangled to `\r\r`).
+        let tmp = std::env::temp_dir().join(format!("mime-cr-{}.txt", std::process::id()));
+        std::fs::write(&tmp, b"a\rb\rc").unwrap();
+        let mut ws = Workspace::new(Box::new(Quire::open(&tmp).unwrap()));
+        assert!(ws.coding().is_plain());
+        assert_eq!(ws.text(), "a\rb\rc");
+        ws.run(r#"(goto-char (point-max)) (insert "\rd")"#).unwrap();
+        ws.save_to(&tmp).unwrap();
+        assert_eq!(
+            std::fs::read(&tmp).unwrap(),
+            b"a\rb\rc\rd",
+            "byte-exact, no \\r\\r"
+        );
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn converting_coding_re_encodes_the_whole_file() {
+        // `(set-buffer-file-coding-system "utf-8-unix")` is the "re-save as
+        // UTF-8" idiom: the next save strips the BOM and forces LF everywhere.
+        let tmp = std::env::temp_dir().join(format!("mime-conv-{}.txt", std::process::id()));
+        std::fs::write(&tmp, b"\xEF\xBB\xBFone\r\ntwo\r\n").unwrap();
+        let mut ws = Workspace::new(Box::new(Quire::open(&tmp).unwrap()));
+        ws.run(r#"(set-buffer-file-coding-system "utf-8-unix")"#)
+            .unwrap();
+        ws.save_to(&tmp).unwrap();
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"one\ntwo\n");
+        assert!(ws.coding().is_plain());
+        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]

@@ -102,7 +102,18 @@ pub trait TextStore {
     /// Stream the buffer's bytes into `w` and return the byte count written. The
     /// streaming atomic save uses this so a multi-GB `Quire` is written piece by
     /// piece, never materialized into one allocation; `Buffer` writes its string.
+    /// File-backed stores re-apply their [`coding`](Self::coding) (BOM/EOL) here.
     fn write_to(&self, w: &mut dyn std::io::Write) -> std::io::Result<usize>;
+
+    /// The visited file's BOM/EOL convention, restored by `write_to` on save.
+    /// `default()` (utf-8-unix) for stores with no file, like the in-memory
+    /// `Buffer` — they need no round-trip.
+    fn coding(&self) -> crate::coding::FileCoding {
+        crate::coding::FileCoding::default()
+    }
+    /// Change the coding (Emacs `set-buffer-file-coding-system`); a no-op for
+    /// stores that don't round-trip a file.
+    fn set_coding(&mut self, _coding: crate::coding::FileCoding) {}
 }
 
 /// The latest-starting match of `re` inside `window` (byte offsets), plus its

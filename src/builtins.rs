@@ -1449,6 +1449,50 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         });
     }
 
+    // ---- buffer-file-coding-system: read/change the visited file's BOM+EOL
+    // round-trip. `(set-buffer-file-coding-system "utf-8-unix")` strips a BOM and
+    // forces LF on the next save (the "re-save as UTF-8" idiom); "utf-8-dos" /
+    // "utf-8-with-signature" force those. Bare "unix"/"dos" change only the line
+    // ending. The reader returns the current name, or nil for a fileless buffer. ----
+    {
+        let s = session.clone();
+        ctx.defun(
+            "set-buffer-file-coding-system",
+            move |name: String| -> Result<String, Error> {
+                let mut sess = s.borrow_mut();
+                // A coding only round-trips through a visited file; an in-memory
+                // buffer (open_text) has none, so reject rather than report a
+                // success the next save wouldn't honor.
+                if sess.buffer.file_stamp().is_none() {
+                    return Err(err(
+                        "buffer has no file coding system (only file-backed buffers round-trip BOM/EOL)",
+                    ));
+                }
+                let next = crate::coding::FileCoding::parse(&name, sess.buffer.coding())
+                    .ok_or_else(|| err(&format!("unknown coding system: {name}")))?;
+                sess.buffer.set_coding(next);
+                Ok(next.name().to_string())
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // nil for a buffer with no visited file (like Emacs, and symmetric with
+        // the setter, which rejects fileless buffers).
+        ctx.defun(
+            "buffer-file-coding-system",
+            move || -> Result<TulispObject, Error> {
+                let sess = s.borrow();
+                Ok(match sess.buffer.file_stamp() {
+                    Some(_) => {
+                        TulispValue::from(sess.buffer.coding().name().to_string()).into_ref(None)
+                    }
+                    None => TulispObject::nil(),
+                })
+            },
+        );
+    }
+
     // (float-time) — seconds since the epoch as a float (Emacs `float-time`),
     // for coarse in-script profiling.
     {

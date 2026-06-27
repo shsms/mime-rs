@@ -1854,7 +1854,8 @@ fn tool_session_status(sessions: &HashMap<String, Workspace>) -> Result<String, 
         .into_iter()
         .map(|id| {
             let ws = &sessions[id];
-            json!({
+            let coding = ws.coding();
+            let mut entry = json!({
                 "id": id,
                 "buffer": ws.buffer_name(),
                 "file": ws.visited_path().map(|p| p.display().to_string()),
@@ -1862,7 +1863,13 @@ fn tool_session_status(sessions: &HashMap<String, Workspace>) -> Result<String, 
                 "stale": ws.is_stale(),
                 "unsaved": ws.visited_path().is_some() && ws.is_modified(),
                 "checkpoints": ws.checkpoint_labels(),
-            })
+            });
+            // Only when it's not the plain utf-8-unix default, to keep the
+            // common case quiet — like Emacs only flagging non-LF in the modeline.
+            if !coding.is_plain() {
+                entry["coding"] = Value::String(coding.name().to_string());
+            }
+            entry
         })
         .collect();
     let roots: Vec<String> = crate::safety::roots()
