@@ -104,8 +104,9 @@ mime rehearse prog.tl --file ./in.txt
 The vocabulary is Emacs Lisp (via [tulisp](https://crates.io/crates/tulisp)):
 `goto-char`, `re-search-forward`, `replace-match`, narrowing, markers, the
 kill-ring, `occur`, merge-conflict resolution, the `treesit-*` family, and the
-`replace-regexp` streaming bulk pass. Regex is RE2 syntax under Emacs names —
-linear-time, no backreferences in patterns. The full table lives in
+`replace-regexp` streaming bulk pass. Regex is Emacs syntax (`\(...\)`, `\|`,
+`\{n,m\}`) on the RE2 engine — linear-time, no backreferences in patterns. The
+full table lives in
 [docs/vocabulary.md](docs/vocabulary.md).
 
 ## Using it from an agent (MCP)

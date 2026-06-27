@@ -1334,7 +1334,7 @@ fn tool_occur(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result
         ("exact", false) => format!("(regexp-quote \"{}\")", lisp_escape(&pattern)),
         ("exact", true) => format!(
             "\"{}\"",
-            lisp_escape(&format!("(?i){}", regex::escape(&pattern)))
+            lisp_escape(&format!("(?i){}", crate::regex_dialect::quote(&pattern)))
         ),
         ("regex", ci) => {
             let re = if ci {
@@ -1517,10 +1517,12 @@ fn tool_grep(args: &Value) -> Result<String, String> {
         .max(1) as usize;
 
     let body = match (mode, ci) {
+        // grep compiles RE2 directly (no Lisp surface), so exact mode uses RE2
+        // escaping; regex mode translates the user's Emacs-dialect pattern.
         ("exact", false) => regex::escape(&pattern),
         ("exact", true) => format!("(?i){}", regex::escape(&pattern)),
-        ("regex", false) => pattern.clone(),
-        ("regex", true) => format!("(?i){pattern}"),
+        ("regex", false) => crate::regex_dialect::translate(&pattern)?,
+        ("regex", true) => format!("(?i){}", crate::regex_dialect::translate(&pattern)?),
         (other, _) => return Err(format!("unknown grep mode: {other} (exact|regex)")),
     };
     let re = regex::Regex::new(&body).map_err(|e| format!("bad pattern: {e}"))?;
@@ -2636,7 +2638,7 @@ fn build_tool_schemas() -> Vec<Value> {
                     "mode": {
                         "type": "string",
                         "enum": ["exact", "regex"],
-                        "description": "exact (literal) or regex (RE2). Defaults to exact.",
+                        "description": "exact (literal) or regex (Emacs dialect). Defaults to exact.",
                     },
                     "case_insensitive": { "type": "boolean", "description": "Match case-insensitively (both modes). Default false." },
                     "nlines": { "type": "integer", "description": "Context lines around each hit (default 0)." },
@@ -2660,7 +2662,7 @@ fn build_tool_schemas() -> Vec<Value> {
                     "mode": {
                         "type": "string",
                         "enum": ["exact", "regex"],
-                        "description": "exact (literal) or regex (RE2, line-oriented). Defaults to exact.",
+                        "description": "exact (literal) or regex (Emacs dialect, line-oriented). Defaults to exact.",
                     },
                     "case_insensitive": { "type": "boolean", "description": "Match case-insensitively (both modes). Default false." },
                     "nlines": { "type": "integer", "description": "Context lines around each hit (default 0)." },
@@ -2759,7 +2761,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "help",
-            "description": "Reference briefs served on demand: the callable Lisp-surface index, the regex dialect (RE2 patterns, Emacs anchors/replacements), the treesit structural-editing vocabulary, the merge-conflict workflow, the in-process git rebase/cherry-pick/revert workflow, session/saving/undo semantics, and ready-to-adapt edit recipes. Call it with no argument to list the topics; pass `tool` for one tool's full reference (description + annotations). Reach for it BEFORE guessing at syntax or vocabulary.",
+            "description": "Reference briefs served on demand: the callable Lisp-surface index, the regex dialect (Emacs syntax on the RE2 engine), the treesit structural-editing vocabulary, the merge-conflict workflow, the in-process git rebase/cherry-pick/revert workflow, session/saving/undo semantics, and ready-to-adapt edit recipes. Call it with no argument to list the topics; pass `tool` for one tool's full reference (description + annotations). Reach for it BEFORE guessing at syntax or vocabulary.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

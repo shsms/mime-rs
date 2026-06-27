@@ -4,8 +4,8 @@
 ;;
 ;; Renames the symbol `oldName` to `newName`. The `\b` word boundaries are what
 ;; make this a *symbol* rename rather than a blind substring replace: `oldName`
-;; matches, but `oldNameSuffix`, `prefixOldName`, and `oldName_2` do NOT (RE2
-;; treats `_` and alphanumerics as word constituents, so `\b` sits only at true
+;; matches, but `oldNameSuffix`, `prefixOldName`, and `oldName_2` do NOT (the
+;; engine treats `_` and alphanumerics as word constituents, so `\b` sits only at true
 ;; identifier edges). `replace-regexp` returns the count, which we report.
 ;;
 ;; NOTE on escaping: inside a tulisp string each backslash is written doubled,

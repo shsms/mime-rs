@@ -13,7 +13,7 @@ pub const TOPICS: &[(&str, &str)] = &[
     ),
     (
         "regex",
-        "the regex dialect: RE2 patterns, Emacs anchors, replacement syntax",
+        "the regex dialect: Emacs syntax on the RE2 engine, replacement syntax",
     ),
     (
         "treesit",
@@ -79,13 +79,24 @@ narrowing-relative (goto-line). A defun node EXCLUDES its leading attribute /
 decorator / doc-comment — extend the region upward to delete the whole item."#;
 
 const REGEX: &str = r#"— regex dialect —
-PATTERNS are RE2 (the Rust regex crate): linear-time, safe on huge files;
-no backreferences, no lookaround. Compiled multi-line, so `^` / `$` anchor
-LINE boundaries (Emacs semantics) and the accessible region's edges count
-as real boundaries (`^` matches at point-min). `\A` / `\z` are the absolute
-ends. Inline flags work: `(?i)` case-insensitive, `(?s)` dot-matches-newline.
-With an explicit search BOUND, `$` / `\b` treat the cut as a boundary where
-real Emacs would consult the text beyond it — the one documented divergence.
+PATTERNS are Emacs regexp syntax, translated onto the RE2 engine (Rust regex
+crate) — you write the dialect you'd type in Emacs and keep RE2's linear-time
+safety on huge files. Groups are `\(...\)`, shy groups `\(?:...\)`,
+alternation `\|`, intervals `\{n,m\}`; a bare `(` `|` `{` is a LITERAL.
+Classes `\w \W \b \B \< \>` work; `\`` / `\'` (the buffer ends) and `\A` /
+`\z` are the absolute ends. Compiled multi-line, so `^` / `$` anchor LINE
+boundaries (Emacs semantics) and the region's edges count as real boundaries
+(`^` matches at point-min). Inline flags `(?i)` (case-insensitive) and `(?s)`
+(dot-matches-newline) are the one RE2 form kept verbatim. For a class, use
+`[[:space:]]` / `[[:alpha:]]` etc.
+
+NOT supported — these ERROR rather than silently mismatch (RE2 doesn't
+backtrack): backreferences in a PATTERN (`\1`), lookaround, `\=` (point),
+`\_<` / `\_>` (symbol boundaries — use `\b`), and `\s` / `\S` (Emacs syntax
+classes — use a `[[:...:]]` class). Inside `[...]` a backslash is a literal
+member (Emacs has no class escapes). With an explicit search BOUND, `$` / `\b`
+treat the cut as a boundary where real Emacs would consult text beyond it —
+the one documented divergence.
 
 REPLACEMENTS (replace-match / replace-regexp) use Emacs syntax: `\&` = the
 whole match, `\1`..`\9` = capture groups — written "\\&", "\\1" inside a
@@ -235,7 +246,7 @@ Replace or wrap a whole defun (structural):
   (treesit-wrap-node (treesit-defun-at) "mod tests {\n" "\n}")
 Visit every top-level defun by name:
   (dolist (name (treesit-list-defuns)) (treesit-goto-defun name) …)
-Whole-word rename (patterns are RE2 everywhere — incl. looking-at /
+Whole-word rename (Emacs-dialect patterns everywhere — incl. looking-at /
 re-search-forward; literal replace_text would also hit substrings):
   (goto-char (point-min)) (report "n" (replace-regexp "\\bfoo\\b" "bar"))
 Resolve merge conflicts (overview: the conflicts tool; vocab: help {conflicts}).

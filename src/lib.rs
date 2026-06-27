@@ -16,6 +16,7 @@ pub mod help;
 pub mod http;
 pub mod mcp;
 pub mod quire;
+pub mod regex_dialect;
 pub mod result;
 pub mod safety;
 pub mod sequencer;

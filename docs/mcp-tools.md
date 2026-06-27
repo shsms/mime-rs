@@ -92,7 +92,7 @@ Overview of every line matching a pattern in the whole accessible region (compos
 
 - `case_insensitive` — Match case-insensitively (both modes). Default false.
 - `limit` — Max matching lines rendered (default 100); the rest are summarized in a tail line.
-- `mode` — exact (literal) or regex (RE2). Defaults to exact.
+- `mode` — exact (literal) or regex (Emacs dialect). Defaults to exact.
 - `nlines` — Context lines around each hit (default 0).
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `pattern` (required) — What to list matches for.
@@ -107,7 +107,7 @@ Read-only cross-file search: which files (and lines) mention a pattern — occur
 - `dir` — Directory to search (must resolve inside an allowed root). Omit to search every root.
 - `glob` — Keep only paths matching this glob, relative to the search dir: * within a segment, ** across directories, ? one char (e.g. **/*.rs). Omit to search every file.
 - `limit` — Max matching lines rendered across all files (default 100); a tail line notes truncation.
-- `mode` — exact (literal) or regex (RE2, line-oriented). Defaults to exact.
+- `mode` — exact (literal) or regex (Emacs dialect, line-oriented). Defaults to exact.
 - `nlines` — Context lines around each hit (default 0).
 - `pattern` (required) — What to search for.
 
@@ -166,7 +166,7 @@ Drop a warm session: releases its buffer and the open file handle a file-backed 
 
 ## help
 
-Reference briefs served on demand: the callable Lisp-surface index, the regex dialect (RE2 patterns, Emacs anchors/replacements), the treesit structural-editing vocabulary, the merge-conflict workflow, the in-process git rebase/cherry-pick/revert workflow, session/saving/undo semantics, and ready-to-adapt edit recipes. Call it with no argument to list the topics; pass `tool` for one tool's full reference (description + annotations). Reach for it BEFORE guessing at syntax or vocabulary.
+Reference briefs served on demand: the callable Lisp-surface index, the regex dialect (Emacs syntax on the RE2 engine), the treesit structural-editing vocabulary, the merge-conflict workflow, the in-process git rebase/cherry-pick/revert workflow, session/saving/undo semantics, and ready-to-adapt edit recipes. Call it with no argument to list the topics; pass `tool` for one tool's full reference (description + annotations). Reach for it BEFORE guessing at syntax or vocabulary.
 
 - `tool` — A tool name — return that tool's full description + annotations from the registry.
 - `topic` — Which brief to fetch; omit to list them.

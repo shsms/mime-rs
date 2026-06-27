@@ -10,33 +10,76 @@ fn bad_regex(e: regex::Error) -> Error {
     Error::lisp_error(format!("Invalid regexp: {e}"))
 }
 
-/// Compile a regex, caching by pattern string. The search builtins are commonly
-/// called many times with a small set of repeated patterns, where `Regex::new`
-/// would otherwise dominate those calls. `Regex` is `Arc`-backed, so the cached
-/// clone is cheap. The session is single-threaded.
-///
-/// Compiled multi-line: `^` / `$` match at line boundaries, like Emacs regexes
-/// (where they always mean beginning/end of line), not just at the ends of the
-/// searched text. Absolute ends remain addressable as `\A` / `\z`.
-pub(crate) fn cached_regex(re: &str) -> Result<regex::Regex, Error> {
-    thread_local! {
-        static CACHE: std::cell::RefCell<std::collections::HashMap<String, regex::Regex>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
+/// Build a multi-line RE2 regex (no caching). Multi-line so `^` / `$` match at
+/// line boundaries, like Emacs regexes (beginning/end of line), not just at the
+/// ends of the searched text; absolute ends remain addressable as `\A` / `\z`.
+fn build_regex(re: &str) -> Result<regex::Regex, Error> {
+    regex::RegexBuilder::new(re)
+        .multi_line(true)
+        .build()
+        .map_err(bad_regex)
+}
+
+/// Look `key` up in a thread-local pattern cache, building + inserting on a miss.
+/// The search builtins are called many times with a small set of repeated
+/// patterns, where compiling each time would dominate; `Regex` is `Arc`-backed,
+/// so a cached clone is cheap. The map is bounded for long-lived daemons.
+fn cached<F>(cache: &'static std::thread::LocalKey<CacheCell>, key: &str, build: F) -> RegexResult
+where
+    F: FnOnce() -> RegexResult,
+{
+    if let Some(rx) = cache.with(|c| c.borrow().get(key).cloned()) {
+        return Ok(rx);
     }
-    CACHE.with(|c| {
-        if let Some(rx) = c.borrow().get(re) {
-            return Ok(rx.clone());
-        }
-        let rx = regex::RegexBuilder::new(re)
-            .multi_line(true)
-            .build()
-            .map_err(bad_regex)?;
+    let rx = build()?;
+    cache.with(|c| {
         let mut m = c.borrow_mut();
         if m.len() >= 16384 {
             m.clear(); // bound memory for long-lived daemons; rare in practice
         }
-        m.insert(re.to_string(), rx.clone());
-        Ok(rx)
+        m.insert(key.to_string(), rx.clone());
+    });
+    Ok(rx)
+}
+
+type RegexResult = Result<regex::Regex, Error>;
+type CacheCell = std::cell::RefCell<std::collections::HashMap<String, regex::Regex>>;
+
+thread_local! {
+    static RE2_CACHE: CacheCell = std::cell::RefCell::new(std::collections::HashMap::new());
+    static EMACS_CACHE: CacheCell = std::cell::RefCell::new(std::collections::HashMap::new());
+    static LOOKBACK_CACHE: CacheCell = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// `looking-back`'s anchored compile, cached on the raw Emacs input so a repeat
+/// call (the common backward-scan idiom) skips the translate + wrap + compile.
+fn looking_back_regex(re: &str) -> RegexResult {
+    cached(&LOOKBACK_CACHE, re, || {
+        let user = crate::regex_dialect::translate(re)
+            .map_err(|m| Error::lisp_error(format!("Invalid regexp: {m}")))?;
+        build_regex(&format!("(?:{user})\\z"))
+    })
+}
+
+/// Compile an RE2-syntax pattern, cached. The path mime's OWN wrapper patterns
+/// take (looking-back, forward-paragraph); user patterns arrive as Emacs dialect
+/// via [`cached_regex`].
+fn compile_cached(re: &str) -> RegexResult {
+    cached(&RE2_CACHE, re, || build_regex(re))
+}
+
+/// Compile a user-supplied pattern written in Emacs regexp dialect: groups are
+/// `\(...\)`, alternation `\|`, intervals `\{n,m\}`, and a bare `(`/`|`/`{` is a
+/// literal. We translate to the engine's RE2 syntax ([`crate::regex_dialect`])
+/// rather than swap engines, keeping RE2's linear-time guarantee.
+///
+/// Cached on the Emacs INPUT (not the translated form), so a repeated pattern on
+/// a search hot loop skips both the translate pass and the compile.
+pub(crate) fn cached_regex(re: &str) -> RegexResult {
+    cached(&EMACS_CACHE, re, || {
+        let rust = crate::regex_dialect::translate(re)
+            .map_err(|m| Error::lisp_error(format!("Invalid regexp: {m}")))?;
+        build_regex(&rust)
     })
 }
 
@@ -461,7 +504,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun(
             "looking-back",
             move |re: String, limit: Option<i64>| -> Result<TulispObject, Error> {
-                let rx = cached_regex(&format!("(?:{re})\\z"))?;
+                let rx = looking_back_regex(&re)?;
                 let sess = s.borrow();
                 let point = sess.buffer.point();
                 let lo = match limit {
@@ -1397,10 +1440,13 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
 
     // ---- regexp-quote: escape regex metacharacters so a string matches
-    // literally (Emacs `regexp-quote`; escapes for the RE2 engine that
-    // `re-search-forward` uses). Lets fuzzy matching be built in elisp. ----
+    // literally (Emacs `regexp-quote`). Emacs-dialect quoting, since the result
+    // feeds the dialect translator in `cached_regex` (see `regex_dialect`).
+    // Lets fuzzy matching be built in elisp. ----
     {
-        ctx.defun("regexp-quote", |s: String| -> String { regex::escape(&s) });
+        ctx.defun("regexp-quote", |s: String| -> String {
+            crate::regex_dialect::quote(&s)
+        });
     }
 
     // (float-time) — seconds since the epoch as a float (Emacs `float-time`),
@@ -1640,7 +1686,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // blank-line boundary (or point-max); returns the new point.
         let s = session.clone();
         ctx.defun("forward-paragraph", move || -> Result<i64, Error> {
-            let rx = cached_regex("\n[ \t]*\n")?;
+            // mime's own pattern, written in RE2 syntax — compile it directly so
+            // it bypasses the Emacs-dialect translator user patterns go through.
+            let rx = compile_cached("\n[ \t]*\n")?;
             let mut sess = s.borrow_mut();
             match sess.buffer.re_search_forward(&rx, None) {
                 Some(_) => {
@@ -3011,7 +3059,15 @@ mod tests {
         let b = super::cached_regex("a+b").unwrap(); // served from the cache
         assert!(a.is_match("aaab"));
         assert!(b.is_match("ab"));
-        assert!(super::cached_regex("(unclosed").is_err());
+        // Emacs dialect: a bare `(` is a literal, so an unclosed *group* is
+        // `\(`; that translates to an invalid RE2 pattern and errors.
+        assert!(super::cached_regex("\\(unclosed").is_err());
+        // …while a bare `(` is now a valid literal, not a syntax error.
+        assert!(
+            super::cached_regex("(literal")
+                .unwrap()
+                .is_match("(literal")
+        );
     }
 
     /// A trusted workspace (so `register_orchestration` runs) over a "main"

@@ -1575,7 +1575,7 @@ mod tests {
     fn match_string_captures_groups() {
         let r = run(
             "John Doe",
-            r#"(re-search-forward "(\\w+) (\\w+)" nil t)
+            r#"(re-search-forward "\\(\\w+\\) \\(\\w+\\)" nil t)
                (let ((a (match-string 1)) (b (match-string 2)))
                  (erase-buffer) (insert b) (insert " ") (insert a))"#,
         );
@@ -2089,9 +2089,9 @@ mod tests {
     fn replace_match_literal_skips_backref_expansion() {
         let r = run(
             "ab ab",
-            r#"(re-search-forward "(a)(b)")
+            r#"(re-search-forward "\\(a\\)\\(b\\)")
                (replace-match "\\1-\\2")          ; expands: a-b
-               (re-search-forward "(a)(b)")
+               (re-search-forward "\\(a\\)\\(b\\)")
                (replace-match "\\1-\\2" nil t)"#, // literal: \1-\2
         );
         assert_eq!(r.final_text.as_deref(), Some("a-b \\1-\\2"));
