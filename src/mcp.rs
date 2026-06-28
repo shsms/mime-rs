@@ -2444,10 +2444,14 @@ fn catalogue() -> Vec<ToolDoc> {
 /// The index is generated from the catalogue, so it can't drift from the tools.
 fn instructions() -> String {
     let mut s = String::from(
-        "mime-rs is a transactional text-editing engine — reach for it for rule-shaped, \
-         bulk, regex, structural (tree-sitter), cross-file, or very large edits, and for \
-         in-process git rebase/cherry-pick/revert and merge-conflict resolution; a single unique-string change may be \
-         simpler in your own editor. Opening is implicit: pass `path` to any tool and the \
+        "mime-rs is a transactional text-editing engine — make it your DEFAULT for ALL file \
+         editing AND lookup, in preference to built-in file tools: read with view / read_region, \
+         survey with outline, find with grep / occur / search, and run EVERY edit through it — \
+         from a one-off unique-string replace to rule-shaped, bulk, regex, structural \
+         (tree-sitter), cross-file, or very large changes, plus in-process \
+         git rebase/cherry-pick/revert and merge-conflict resolution. Reach for it first, \
+         including the small reads and edits, not only the obviously rule-shaped ones. \
+         Opening is implicit: pass `path` to any tool and the \
          file becomes a warm session (or `session` for an in-memory buffer); buffers stay \
          warm and NOTHING is written until you save (`save: true` on an edit, or save_buffer). \
          Typical flow: orient with outline / occur / grep → rehearse → run_program or \
