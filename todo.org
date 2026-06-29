@@ -505,8 +505,9 @@ yields the same tree as ~git~; ~git_abort~ mid-conflict restores the pre-op
 state exactly; no network/exec/hook code path is reachable from any ~git_*~
 tool./
 
-** TODO git_rebase: add an `edit`/`break` step action                   :git:
+** DONE git_rebase: add an `edit`/`break` step action                   :git:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-06-29 Mo 12:09]
 - State "TODO"       from              [2026-06-24 Mi 18:59]
 :END:
 
@@ -520,8 +521,17 @@ abandon the in-process sequencer and drive =git rebase -i= + manual continue via
 the shell — defeating the point of owning the rebase in-process. Pairs naturally
 with the conflict surface already present.
 
-** TODO git_rebase: let `reword`/`squash` take a message edit, not the whole message :git:
+DONE (branch =sequencer-tree-edits=): implemented =edit=. The step applies its
+commit then PAUSES with it checked out; =git_continue= folds the worktree changes
+into it (an amend), =git_skip= discards the pending edits and resumes, =git_abort=
+bails. A conflicted edit step resolves through the existing conflict tools first,
+then pauses. Standalone =break= (a no-commit pause) was intentionally OMITTED: an
+agent can inspect via =git_status= / =git_show=, and it would force =Step.commit=
+to become optional for marginal value.
+
+** DONE git_rebase: let `reword`/`squash` take a message edit, not the whole message :git:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-06-29 Mo 12:09]
 - State "TODO"       from              [2026-06-24 Mi 18:59]
 :END:
 
@@ -534,7 +544,15 @@ Accept a message /edit/ instead: e.g. =edits: [{pattern, replacement}]= applied
 to the existing message, or directives like delete-trailer / append-line. Should
 compose with any sign-off / trailer validation.
 
+DONE (branch =sequencer-tree-edits=): a reword/squash/fixup/edit step can carry
+=message_edits= — an ordered list applied to the action's default message, each
+either ={find, replace?}= (replace the first literal occurrence; omit replace to
+delete; errors if =find= is absent) or ={append}= (add a trailing line). Preserves
+the rest of the message, so the =Signed-off-by= a full reword would drop survives.
+Reword/edit finds are pre-validated in =begin= before any mutation.
+
 ** TODO git_rebase: split a commit + move changes between commits :git:dogfooding:
+
 The plan reorders / squashes / drops WHOLE commits, and the planned =edit=
 action (above) amends one commit's tree in place — but nothing REPARTITIONS
 what is already committed:
@@ -554,6 +572,14 @@ Shape: extend the plan with a =split= action ({commit, into: [{message, paths
 the path / hunk selection the engine already has (treesit nodes, occur / grep
 hunks). Offer a =rehearse= of the resulting history — the tree-diff of each new
 commit — so a mis-partition is caught before it is written, not after.
+
+DONE so far (branch =sequencer-tree-edits=): PATH-based =split=. The =split= action
+takes =into = [{message, paths}]=; it partitions a commit's changes by file path
+into N commits (one part may omit =paths= as the catch-all), pre-validated in
+=begin= against the commit's own diff so a bad partition fails before mutation, and
+=rehearse=-able. Trees are built in-memory, never touching the worktree.
+Remaining: HUNK-level split (partial-hunk application, =git add -p=-grade) and the
+=move= directive (relocate changes between existing adjacent commits).
 
 ** TODO Inspect the need for a git-blame-shaped "which commit owns this?" read :git:dogfooding:
 The edit / squash / fixup / split work all assume the agent ALREADY knows
