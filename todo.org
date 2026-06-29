@@ -605,6 +605,29 @@ files (it re-walks history)? (4) is this even needed once =edit= lands, or do
 agents naturally drive it via git_log + git_show? Measure on real sessions
 before building.
 
+** TODO Sequencer internals cleanup (post-review tidy) :git:
+Non-blocking code-quality items from the 2026-06-29 pre-PR review of the
+edit / message_edits / split work — no correctness impact:
+- The =if step.action == Action::Split { land_split } else { land_step }=
+  dispatch is duplicated verbatim in =drive= and =continue_op=; fold into one
+  =land()= helper so a future special-landing action (or a land_* signature
+  change) is edited once, not in two places that can drift.
+- =changed_paths= extracts diff paths via =diff.foreach= (four closure args)
+  while =show= already does the same =new_file()/old_file()= pick over the
+  simpler =diff.deltas()= iterator — share one helper.
+- =split_assignment= does =touched.iter().any(...)= per assigned path (O(n*m))
+  though =touched= is sorted+deduped and =assigned= is already a HashSet; use a
+  =HashSet= (or =binary_search=) for symmetric O(1) membership.
+- =split_commits= re-runs =changed_paths= + =split_assignment= that =begin=
+  already validated, and calls =repo.find_commit(current)= twice per part
+  (prev_tree + parent) — fetch the commit once and reuse.
+- =message_edits= / =split_into= are parsed in three hand-rolled forms with
+  divergent keys: =plan_arg= reads {find, replace, append} / {message, paths,
+  into}; =save_state= writes {find, with} / {…, rest}; =load_state= reads them
+  back. The persisted-vs-input key mismatch (=replace= vs =with=, absent-paths
+  vs =rest=) is easy to break silently — unify, ideally via serde derives on
+  the structs.
+
 ** DONE MCP command-surface review — prune the middle, grow power via params :mcp:
 :LOGBOOK:
 - State "DONE"       from "TODO"       [2026-06-24 Mi]
