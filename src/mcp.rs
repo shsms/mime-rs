@@ -2011,7 +2011,8 @@ fn repo_path(args: &Value) -> Result<std::path::PathBuf, String> {
     crate::safety::check_path(Path::new(&str_arg(args, "repo")?))
 }
 
-/// The `git_rebase` plan array → (commit, action, message, message_edits) tuples.
+/// The `git_rebase` plan array → (commit, action, message, message_edits, split
+/// parts) tuples. A split part with no `paths` key is the catch-all.
 fn plan_arg(args: &Value) -> Option<Vec<crate::sequencer::PlanItem>> {
     args.get("plan").and_then(Value::as_array).map(|arr| {
         arr.iter()
@@ -2032,6 +2033,37 @@ fn plan_arg(args: &Value) -> Option<Vec<crate::sequencer::PlanItem>> {
                             .collect()
                     })
                     .unwrap_or_default();
+                let into = s
+                    .get("into")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .map(|p| {
+                                let paths_key = p.get("paths");
+                                crate::sequencer::SplitPart {
+                                    message: p
+                                        .get("message")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    paths: paths_key
+                                        .and_then(Value::as_array)
+                                        .map(|ps| {
+                                            ps.iter()
+                                                .filter_map(|x| x.as_str().map(str::to_string))
+                                                .collect()
+                                        })
+                                        .unwrap_or_default(),
+                                    // Only an ABSENT `paths` key is the catch-all; a present
+                                    // but non-array `paths` stays a non-catch-all with empty
+                                    // paths, which split_assignment then rejects (no silent
+                                    // promotion to the catch-all).
+                                    rest: paths_key.is_none(),
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 (
                     s.get("commit")
                         .and_then(Value::as_str)
@@ -2043,6 +2075,7 @@ fn plan_arg(args: &Value) -> Option<Vec<crate::sequencer::PlanItem>> {
                         .to_string(),
                     s.get("message").and_then(Value::as_str).map(str::to_string),
                     edits,
+                    into,
                 )
             })
             .collect()
@@ -2110,7 +2143,7 @@ fn git_tool_schemas() -> Vec<Value> {
     vec![
         json!({
             "name": "git_rebase",
-            "description": "Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`. Each step picks/rewords/squashes/fixups/edits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. Stops on a conflict for the conflict tools + git_continue. No network, hooks, or exec.",
+            "description": "Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`. Each step picks/rewords/squashes/fixups/edits/splits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. A `split` step partitions one commit's changes, by file path, into the commits listed in `into`. Stops on a conflict for the conflict tools + git_continue. No network, hooks, or exec.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2123,7 +2156,7 @@ fn git_tool_schemas() -> Vec<Value> {
                             "type": "object",
                             "properties": {
                                 "commit": { "type": "string", "description": "oid/ref/revspec of the commit." },
-                                "action": { "type": "string", "enum": ["pick", "reword", "squash", "fixup", "edit", "drop"] },
+                                "action": { "type": "string", "enum": ["pick", "reword", "squash", "fixup", "edit", "split", "drop"] },
                                 "message": { "type": "string", "description": "New message (reword/edit) or melded message (squash); ignored otherwise." },
                                 "message_edits": {
                                     "type": "array",
@@ -2135,6 +2168,18 @@ fn git_tool_schemas() -> Vec<Value> {
                                             "replace": { "type": "string", "description": "Replacement for `find` (omit = delete)." },
                                             "append": { "type": "string", "description": "Text to append as a trailing line." }
                                         }
+                                    }
+                                },
+                                "into": {
+                                    "type": "array",
+                                    "description": "For a `split` step: the output commits, in order. Each is {message, paths}; one part may omit `paths` to be the catch-all that collects every changed path no other part claims. Every path the commit changes must be covered exactly once.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "message": { "type": "string", "description": "Commit message for this output commit." },
+                                            "paths": { "type": "array", "items": { "type": "string" }, "description": "Paths whose changes go into this commit. Omit in exactly one part to make it the catch-all." }
+                                        },
+                                        "required": ["message"]
                                     }
                                 }
                             },
@@ -2900,6 +2945,29 @@ mod git_tool_tests {
         // unparseable input → parse error (-32700) against a null id.
         let parse = call("{not json", &mut s).unwrap();
         assert_eq!(parse["error"]["code"], -32700);
+    }
+
+    #[test]
+    fn plan_arg_treats_only_an_absent_paths_key_as_the_split_catch_all() {
+        let plan = plan_arg(&json!({
+            "plan": [{
+                "commit": "abc",
+                "action": "split",
+                "into": [
+                    {"message": "m1", "paths": ["x"]},
+                    {"message": "m2", "paths": "not-an-array"},
+                    {"message": "m3"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let parts = &plan[0].4;
+        assert!(!parts[0].rest && parts[0].paths == ["x"], "explicit paths");
+        assert!(
+            !parts[1].rest && parts[1].paths.is_empty(),
+            "malformed paths is NOT silently promoted to the catch-all"
+        );
+        assert!(parts[2].rest, "an absent paths key IS the catch-all");
     }
 
     #[test]

@@ -73,6 +73,7 @@ pub enum Action {
     Reword,
     Squash,
     Fixup,
+    Split,
     Drop,
 }
 
@@ -84,6 +85,7 @@ impl Action {
             Action::Reword => "reword",
             Action::Squash => "squash",
             Action::Fixup => "fixup",
+            Action::Split => "split",
             Action::Drop => "drop",
         }
     }
@@ -94,20 +96,23 @@ impl Action {
             "reword" => Action::Reword,
             "squash" => Action::Squash,
             "fixup" => Action::Fixup,
+            "split" => Action::Split,
             "drop" => Action::Drop,
             _ => return None,
         })
     }
 }
 
-/// One planned step: a commit to replay, how, and an optional message change
-/// (a full `message` and/or ordered `message_edits`, for reword/squash/fixup/edit).
+/// One planned step: a commit to replay, how, an optional message change (a full
+/// `message` and/or ordered `message_edits`, for reword/squash/fixup/edit), and
+/// for a `split` the output parts (`split_into`).
 #[derive(Clone, Debug)]
 pub struct Step {
     pub commit: Oid,
     pub action: Action,
     pub message: Option<String>,
     pub message_edits: Vec<MsgEdit>,
+    pub split_into: Vec<SplitPart>,
 }
 
 /// A rebase plan: replay `steps` (in order) onto `onto`.
@@ -135,9 +140,25 @@ pub struct MsgEditSpec {
     pub append: Option<String>,
 }
 
+/// One output commit of a `split`: a message and the paths whose changes go into
+/// it. At most one part per split may set `rest` (omit `paths` in the MCP form) to
+/// collect every changed path not claimed by another part.
+#[derive(Clone, Debug)]
+pub struct SplitPart {
+    pub message: String,
+    pub paths: Vec<String>,
+    pub rest: bool,
+}
+
 /// A raw plan step as the MCP layer extracts it: (commit, action, message,
-/// message_edits). `cmd_rebase` resolves/validates each into a `Step`.
-pub type PlanItem = (String, String, Option<String>, Vec<MsgEditSpec>);
+/// message_edits, split parts). `cmd_rebase` resolves/validates each into a `Step`.
+pub type PlanItem = (
+    String,
+    String,
+    Option<String>,
+    Vec<MsgEditSpec>,
+    Vec<SplitPart>,
+);
 
 impl MsgEdit {
     pub fn from_spec(spec: &MsgEditSpec) -> Result<MsgEdit, String> {
@@ -284,7 +305,12 @@ fn save_state(repo: &Repository, st: &State) -> Result<(), Error> {
                     MsgEdit::Append { text } => json!({"append": text}),
                 })
                 .collect();
-            json!({"commit": s.commit.to_string(), "action": s.action.as_str(), "message": s.message, "message_edits": edits})
+            let split: Vec<_> = s
+                .split_into
+                .iter()
+                .map(|p| json!({"message": p.message, "paths": p.paths, "rest": p.rest}))
+                .collect();
+            json!({"commit": s.commit.to_string(), "action": s.action.as_str(), "message": s.message, "message_edits": edits, "split_into": split})
         })
         .collect();
     let v = json!({
@@ -337,6 +363,25 @@ fn load_state(repo: &Repository) -> Result<State, Error> {
                                         with: e["with"].as_str().unwrap_or("").to_string(),
                                     }
                                 }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                split_into: s["split_into"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|p| SplitPart {
+                                message: p["message"].as_str().unwrap_or("").to_string(),
+                                paths: p["paths"]
+                                    .as_array()
+                                    .map(|ps| {
+                                        ps.iter()
+                                            .filter_map(|x| x.as_str().map(str::to_string))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                                rest: p["rest"].as_bool().unwrap_or(false),
                             })
                             .collect()
                     })
@@ -426,6 +471,7 @@ fn pick_step(commit: Oid) -> Step {
         action: Action::Pick,
         message: None,
         message_edits: Vec::new(),
+        split_into: Vec::new(),
     }
 }
 
@@ -469,6 +515,20 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
                     .to_string(),
             };
             apply_msg_edits(base, &s.message_edits)?;
+        }
+        // Best-effort early check: validate the split against the commit's OWN
+        // parent→commit diff — the authoritative path set for the common case, so a
+        // bad partition usually fails before any mutation. NOT a guarantee: if
+        // `onto` or an earlier step already contains some of the change, the
+        // replayed net-diff differs and split_commits re-validates against it,
+        // surfacing any mismatch mid-op (recoverable via git_abort).
+        if s.action == Action::Split {
+            let c = repo.find_commit(s.commit)?;
+            if c.parent_count() == 0 {
+                return Err(estr("split: cannot split a root commit"));
+            }
+            let touched = changed_paths(repo, &c.parent(0)?.tree()?, &c.tree()?)?;
+            split_assignment(&touched, &s.split_into)?;
         }
     }
     if state_path(repo).exists() {
@@ -572,10 +632,20 @@ fn rehearse(repo: &Repository, plan: &Plan, mode: Mode) -> Result<Preview, Error
             });
         }
         let tree = repo.find_tree(index.write_tree_to(repo)?)?;
-        let new = make_commit(repo, mode, plan.onto, current, step, &tree)?;
-        let summary = repo.find_commit(new)?.summary().unwrap_or("").to_string();
-        commits.push((new, summary));
-        current = new;
+        if step.action == Action::Split {
+            // Preview the split's output commits (real objects, left dangling).
+            let pick = repo.find_commit(step.commit)?;
+            for c in split_commits(repo, &pick, current, &tree, &step.split_into)? {
+                let summary = repo.find_commit(c)?.summary().unwrap_or("").to_string();
+                commits.push((c, summary));
+                current = c;
+            }
+        } else {
+            let new = make_commit(repo, mode, plan.onto, current, step, &tree)?;
+            let summary = repo.find_commit(new)?.summary().unwrap_or("").to_string();
+            commits.push((new, summary));
+            current = new;
+        }
     }
     Ok(Preview {
         commits,
@@ -669,7 +739,11 @@ pub fn continue_op(repo: &Repository, force: bool) -> Result<Outcome, Error> {
     }
     let tree = repo.find_tree(index.write_tree()?)?;
     index.write()?;
-    let new = land_step(repo, &st, &step, &tree)?;
+    let new = if step.action == Action::Split {
+        land_split(repo, &st, &step, &tree)?
+    } else {
+        land_step(repo, &st, &step, &tree)?
+    };
     repo.cleanup_state()?;
     st.current = new;
     st.next += 1;
@@ -831,6 +905,7 @@ fn make_commit(
             )
         }
         Action::Drop => unreachable!("drop is handled before make_commit"),
+        Action::Split => unreachable!("split builds its commits via land_split"),
     }
 }
 
@@ -842,6 +917,164 @@ fn land_step(repo: &Repository, st: &State, step: &Step, tree: &git2::Tree) -> R
     let new = make_commit(repo, st.mode, st.onto, st.current, step, tree)?;
     repo.set_head_detached(new)?;
     Ok(new)
+}
+
+/// Paths that differ between the `base` and `target` trees (a commit's net change).
+fn changed_paths(
+    repo: &Repository,
+    base: &git2::Tree,
+    target: &git2::Tree,
+) -> Result<Vec<String>, Error> {
+    let diff = repo.diff_tree_to_tree(Some(base), Some(target), None)?;
+    let mut paths = Vec::new();
+    diff.foreach(
+        &mut |delta, _| {
+            if let Some(p) = delta.new_file().path().or_else(|| delta.old_file().path()) {
+                paths.push(p.to_string_lossy().into_owned());
+            }
+            true
+        },
+        None,
+        None,
+        None,
+    )?;
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// Validate a split's parts against the `touched` paths and return the catch-all
+/// part's paths (every touched path no explicit part claimed). Errors on an empty
+/// plan, an unchanged or doubly-claimed path, an empty part, more than one
+/// catch-all, or (with no catch-all) any unassigned changed path.
+fn split_assignment(touched: &[String], parts: &[SplitPart]) -> Result<Vec<String>, Error> {
+    if parts.is_empty() {
+        return Err(estr("split: `into` must list at least one part"));
+    }
+    let mut assigned: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut rest = 0usize;
+    for part in parts {
+        if part.message.trim().is_empty() {
+            return Err(estr("split: every part needs a non-empty message"));
+        }
+        if part.rest {
+            rest += 1;
+            continue;
+        }
+        if part.paths.is_empty() {
+            return Err(estr(
+                "split: a non-catch-all part needs at least one path (give one part no paths to be the catch-all)",
+            ));
+        }
+        for p in &part.paths {
+            if !touched.iter().any(|t| t == p) {
+                return Err(estr(&format!("split: the commit does not change {p}")));
+            }
+            if !assigned.insert(p.as_str()) {
+                return Err(estr(&format!(
+                    "split: {p} is assigned to more than one part"
+                )));
+            }
+        }
+    }
+    if rest > 1 {
+        return Err(estr(
+            "split: at most one part may be the catch-all (the one with no paths)",
+        ));
+    }
+    let leftover: Vec<String> = touched
+        .iter()
+        .filter(|t| !assigned.contains(t.as_str()))
+        .cloned()
+        .collect();
+    if rest == 0 && !leftover.is_empty() {
+        return Err(estr(&format!(
+            "split: these changed paths are unassigned (add them to a part, or give one part no paths as the catch-all): {}",
+            leftover.join(", ")
+        )));
+    }
+    if rest == 1 && leftover.is_empty() {
+        return Err(estr("split: the catch-all part has no remaining changes"));
+    }
+    Ok(leftover)
+}
+
+/// Build a split's output commits: replay each part's paths (taken from `target`)
+/// onto a chain rooted at `base`, in order. Returns the new oids; the last one's
+/// tree equals `target`. Pure tree construction — touches no worktree.
+fn split_commits(
+    repo: &Repository,
+    pick: &git2::Commit,
+    base: Oid,
+    target: &git2::Tree,
+    parts: &[SplitPart],
+) -> Result<Vec<Oid>, Error> {
+    let base_tree = repo.find_commit(base)?.tree()?;
+    let touched = changed_paths(repo, &base_tree, target)?;
+    let leftover = split_assignment(&touched, parts)?;
+
+    let mut current = base;
+    let mut made = Vec::new();
+    for part in parts {
+        let paths: &[String] = if part.rest { &leftover } else { &part.paths };
+        let prev_tree = repo.find_commit(current)?.tree()?;
+        let mut index = git2::Index::new()?;
+        index.read_tree(&prev_tree)?;
+        for p in paths {
+            let path = Path::new(p);
+            match target.get_path(path) {
+                Ok(entry) => {
+                    // Stat fields are irrelevant to write_tree_to; zero them.
+                    let ie = git2::IndexEntry {
+                        ctime: git2::IndexTime::new(0, 0),
+                        mtime: git2::IndexTime::new(0, 0),
+                        dev: 0,
+                        ino: 0,
+                        mode: entry.filemode() as u32,
+                        uid: 0,
+                        gid: 0,
+                        file_size: 0,
+                        id: entry.id(),
+                        flags: 0,
+                        flags_extended: 0,
+                        path: p.clone().into_bytes(),
+                    };
+                    index.add(&ie)?;
+                }
+                // Absent in the applied tree → the commit deleted this path.
+                Err(_) => {
+                    index.remove_path(path)?;
+                }
+            }
+        }
+        let tree = repo.find_tree(index.write_tree_to(repo)?)?;
+        let parent = repo.find_commit(current)?;
+        let new = repo.commit(
+            None,
+            &pick.author(),
+            &pick.committer(),
+            &part.message,
+            &tree,
+            &[&parent],
+        )?;
+        made.push(new);
+        current = new;
+    }
+    Ok(made)
+}
+
+/// Land a `split` step: produce its output commits and move HEAD to the last.
+fn land_split(
+    repo: &Repository,
+    st: &State,
+    step: &Step,
+    target: &git2::Tree,
+) -> Result<Oid, Error> {
+    let pick = repo.find_commit(step.commit)?;
+    let made = split_commits(repo, &pick, st.current, target, &step.split_into)?;
+    let last = *made.last().expect("split produced at least one commit");
+    repo.set_head_detached(last)?;
+    Ok(last)
 }
 
 /// Replay steps from `st.next` until the plan completes or a step conflicts.
@@ -879,7 +1112,11 @@ fn drive(repo: &Repository, mut st: State) -> Result<Outcome, Error> {
         }
 
         let tree = repo.find_tree(index.write_tree()?)?;
-        let new = land_step(repo, &st, &step, &tree)?;
+        let new = if step.action == Action::Split {
+            land_split(repo, &st, &step, &tree)?
+        } else {
+            land_step(repo, &st, &step, &tree)?
+        };
         repo.cleanup_state()?;
         st.current = new;
         st.next += 1;
@@ -1148,7 +1385,7 @@ pub fn cmd_rebase(
     let steps = match plan {
         Some(items) => items
             .iter()
-            .map(|(commit, action, message, edits)| {
+            .map(|(commit, action, message, edits, into)| {
                 let message_edits = edits
                     .iter()
                     .map(MsgEdit::from_spec)
@@ -1159,6 +1396,7 @@ pub fn cmd_rebase(
                         .ok_or_else(|| format!("unknown action \"{action}\""))?,
                     message: message.clone(),
                     message_edits,
+                    split_into: into.clone(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?,
@@ -1287,6 +1525,7 @@ mod tests {
             action,
             message: message.map(str::to_string),
             message_edits: Vec::new(),
+            split_into: Vec::new(),
         }
     }
 
@@ -2055,6 +2294,7 @@ mod tests {
                 find: "Subject line".to_string(),
                 with: "New subject".to_string(),
             }],
+            split_into: Vec::new(),
         };
         start(
             &repo,
@@ -2088,6 +2328,7 @@ mod tests {
             message_edits: vec![MsgEdit::Append {
                 text: "Acked-by: Z <z@e.invalid>".to_string(),
             }],
+            split_into: Vec::new(),
         };
         start(
             &repo,
@@ -2119,6 +2360,7 @@ mod tests {
                 find: "not present".to_string(),
                 with: "x".to_string(),
             }],
+            split_into: Vec::new(),
         };
         assert!(
             start(
@@ -2158,6 +2400,7 @@ mod tests {
                 find: "new".to_string(),
                 with: "NEW".to_string(),
             }],
+            split_into: Vec::new(),
         };
         start(
             &repo,
@@ -2190,6 +2433,7 @@ mod tests {
             message_edits: vec![MsgEdit::Append {
                 text: "Note".to_string(),
             }],
+            split_into: Vec::new(),
         };
         assert!(
             start(
@@ -2235,6 +2479,7 @@ mod tests {
                     with: "baz gadget".to_string(),
                 },
             ],
+            split_into: Vec::new(),
         };
         start(
             &repo,
@@ -2278,6 +2523,7 @@ mod tests {
                     with: "X".to_string(),
                 },
             ],
+            split_into: Vec::new(),
         };
         assert!(
             start(
@@ -2319,5 +2565,200 @@ mod tests {
             MsgEdit::from_spec(&ok),
             Ok(MsgEdit::Replace { .. })
         ));
+    }
+
+    fn split_part(message: &str, paths: &[&str], rest: bool) -> SplitPart {
+        SplitPart {
+            message: message.to_string(),
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+            rest,
+        }
+    }
+
+    fn split_step(commit: Oid, parts: Vec<SplitPart>) -> Step {
+        Step {
+            commit,
+            action: Action::Split,
+            message: None,
+            message_edits: Vec::new(),
+            split_into: parts,
+        }
+    }
+
+    #[test]
+    fn split_partitions_a_commit_by_path() {
+        let dir = tmp("split");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(
+            &repo,
+            &[base],
+            &[("a", "1\n"), ("b", "1\n"), ("c", "1\n")],
+            "add b and c",
+        );
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+
+        let out = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![split_step(
+                    f1,
+                    vec![
+                        split_part("add b", &["b"], false),
+                        split_part("add c", &["c"], false),
+                    ],
+                )],
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, Outcome::Done { .. }));
+
+        // Final state = the whole original change, rebased onto m1.
+        assert_eq!(read(&repo, "a"), "2\n");
+        assert_eq!(read(&repo, "b"), "1\n");
+        assert_eq!(read(&repo, "c"), "1\n");
+
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        let first = tip.parent(0).unwrap();
+        assert_eq!(tip.message().unwrap(), "add c");
+        assert_eq!(first.message().unwrap(), "add b");
+        assert_eq!(first.parent(0).unwrap().id(), m1, "chain rooted on m1");
+        // The first commit has b but not yet c; the second adds c.
+        assert!(first.tree().unwrap().get_path(Path::new("b")).is_ok());
+        assert!(first.tree().unwrap().get_path(Path::new("c")).is_err());
+        assert!(tip.tree().unwrap().get_path(Path::new("c")).is_ok());
+        assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn split_catch_all_collects_the_rest() {
+        let dir = tmp("split-rest");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(
+            &repo,
+            &[base],
+            &[("a", "1\n"), ("b", "1\n"), ("c", "1\n")],
+            "add b and c",
+        );
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+
+        start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![split_step(
+                    f1,
+                    vec![
+                        split_part("just b", &["b"], false),
+                        split_part("the rest", &[], true),
+                    ],
+                )],
+            },
+        )
+        .unwrap();
+
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        let first = tip.parent(0).unwrap();
+        assert_eq!(first.message().unwrap(), "just b");
+        assert_eq!(tip.message().unwrap(), "the rest");
+        assert!(first.tree().unwrap().get_path(Path::new("c")).is_err());
+        assert!(tip.tree().unwrap().get_path(Path::new("c")).is_ok());
+    }
+
+    #[test]
+    fn split_rejects_an_unassigned_path_before_mutating() {
+        let dir = tmp("split-bad");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(
+            &repo,
+            &[base],
+            &[("a", "1\n"), ("b", "1\n"), ("c", "1\n")],
+            "add b and c",
+        );
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+        let before = repo.head().unwrap().peel_to_commit().unwrap().id();
+
+        // Only b is assigned and there is no catch-all → c is unassigned.
+        let err = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![split_step(f1, vec![split_part("just b", &["b"], false)])],
+            },
+        );
+        assert!(err.is_err());
+        assert!(!state_path(&repo).exists(), "no op left dangling");
+        assert_eq!(
+            repo.head().unwrap().peel_to_commit().unwrap().id(),
+            before,
+            "no mutation on a pre-validated split error"
+        );
+    }
+
+    #[test]
+    fn split_rejects_a_path_the_commit_does_not_change() {
+        let dir = tmp("split-untouched");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+
+        let err = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![split_step(
+                    f1,
+                    vec![
+                        split_part("nope", &["a"], false),
+                        split_part("rest", &[], true),
+                    ],
+                )],
+            },
+        );
+        assert!(err.is_err(), "the commit does not change a");
+    }
+
+    #[test]
+    fn split_rehearse_previews_the_parts_without_mutating() {
+        let dir = tmp("split-rehearse");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(
+            &repo,
+            &[base],
+            &[("a", "1\n"), ("b", "1\n"), ("c", "1\n")],
+            "add b and c",
+        );
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+
+        let preview = rehearse(
+            &repo,
+            &Plan {
+                onto: m1,
+                steps: vec![split_step(
+                    f1,
+                    vec![
+                        split_part("add b", &["b"], false),
+                        split_part("add c", &["c"], false),
+                    ],
+                )],
+            },
+            Mode::Pick,
+        )
+        .unwrap();
+        let msgs: Vec<&str> = preview.commits.iter().map(|(_, m)| m.as_str()).collect();
+        assert_eq!(msgs, vec!["add b", "add c"], "both parts previewed");
+        assert!(preview.conflict.is_none());
+        assert!(!repo.head_detached().unwrap(), "no mutation");
+        assert!(!state_path(&repo).exists());
     }
 }
