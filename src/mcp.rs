@@ -1320,6 +1320,22 @@ fn tool_replace_files(
     ))
 }
 
+/// When exact (literal) mode was reached BY DEFAULT and the pattern contains an
+/// Emacs regex operator (`\(` `\)` `\|` `\{` `\}` — which have no use in a
+/// literal search), return a one-line nudge to pass `mode:"regex"`. Silent when
+/// `mode` was given explicitly, so an intentional literal search isn't nagged.
+fn exact_regex_hint(args: &Value, pattern: &str) -> &'static str {
+    let defaulted = args.get("mode").is_none();
+    let looks_regex = ["\\(", "\\)", "\\|", "\\{", "\\}"]
+        .iter()
+        .any(|t| pattern.contains(t));
+    if defaulted && looks_regex {
+        "\n(exact mode searched the pattern literally — pass mode:\"regex\" to use \\|, \\(…\\), \\{…\\} as regex operators)"
+    } else {
+        ""
+    }
+}
+
 /// `occur {session?, pattern, mode?, nlines?, limit?}` — every line in the
 /// accessible region matching the pattern, rendered with line numbers + char
 /// positions (and `nlines` of context), via the `occur` builtin. Read-only
@@ -1365,7 +1381,8 @@ fn tool_occur(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result
                 no_defun_error(sessions, &session, &name)
             ))
         }
-        other => other,
+        Ok(out) => Ok(format!("{out}{}", exact_regex_hint(args, &pattern))),
+        Err(e) => Err(e),
     }
 }
 
@@ -1665,7 +1682,8 @@ fn tool_grep(args: &Value) -> Result<String, String> {
             .map(|g| format!(" matching glob {g:?}"))
             .unwrap_or_default();
         return Ok(format!(
-            "no matches for {pattern:?}{g} (visited {visited} files)"
+            "no matches for {pattern:?}{g} (visited {visited} files){}",
+            exact_regex_hint(args, &pattern)
         ));
     }
     let mut tail = format!(
@@ -1683,6 +1701,7 @@ fn tool_grep(args: &Value) -> Result<String, String> {
     }
     tail.push_str(").");
     out.push_str(&tail);
+    out.push_str(exact_regex_hint(args, &pattern));
     Ok(out)
 }
 
@@ -2980,6 +2999,24 @@ mod git_tool_tests {
         assert!(!m("**/*.rs", "lib.txt"));
         assert!(m("src/?.rs", "src/a.rs"));
         assert!(!m("src/?.rs", "src/ab.rs"), "? is exactly one char");
+    }
+
+    #[test]
+    fn exact_mode_hints_only_when_a_regex_operator_is_searched_literally() {
+        let fires = |args: Value, pat: &str| !exact_regex_hint(&args, pat).is_empty();
+        // Defaulted exact mode + an Emacs operator => nudge.
+        assert!(fires(json!({}), "a\\|b"), "alternation");
+        assert!(fires(json!({}), "\\(x\\)"), "groups");
+        assert!(fires(json!({}), "a\\{2,3\\}"), "intervals");
+        // Plain literal, or a bare metachar with literal uses => silent.
+        assert!(!fires(json!({}), "plain text"));
+        assert!(
+            !fires(json!({}), "version 1.2.3"),
+            "bare dot is commonly literal"
+        );
+        // Mode given explicitly => never nag (intentional choice either way).
+        assert!(!fires(json!({"mode": "regex"}), "a\\|b"));
+        assert!(!fires(json!({"mode": "exact"}), "a\\|b"));
     }
 
     #[test]
