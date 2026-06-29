@@ -2539,7 +2539,7 @@ fn instructions() -> String {
     let mut s = String::from(
         "mime-rs is a transactional text-editing engine — make it your DEFAULT for ALL file \
          editing AND lookup, in preference to built-in file tools: read with view / read_region, \
-         survey with outline, find with grep / occur / search, and run EVERY edit through it — \
+         survey with outline, find with grep / occur, and run EVERY edit through it — \
          from a one-off unique-string replace to rule-shaped, bulk, regex, structural \
          (tree-sitter), cross-file, or very large changes, plus in-process \
          git rebase/cherry-pick/revert and merge-conflict resolution. Reach for it first, \
