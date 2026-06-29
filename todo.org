@@ -204,7 +204,11 @@ the read-only set; gate the destructive set).
 reads ~instructions~, and an agent drives a rule-shaped edit AND a rebase using
 only what the protocol surfaces — no external skill file./
 
-** TODO Cross-file search: a grep tool (or occur over files/glob) [#B] :dogfooding:
+** DONE Cross-file search: a grep tool (or occur over files/glob) [#B] :dogfooding:
+DONE (2026-06, commits ~a3379ef~ + ~85ddf0e~ hardening): a read-only ~grep
+{pattern, files | glob, mode, nlines}~ tool landed with occur's output shape,
+per-file headers and a hit cap, sandbox-confined to ~$MIME_ROOTS~; its file
+list feeds ~replace_text {files: …}~ as planned.
 
 The biggest reason the agent still shells out to =grep -rn= / =sed -n=
 mid-edit: =occur= is per-buffer, so "which files mention X" and "show
@@ -249,10 +253,24 @@ ambiguity-as-error is arguably the right default. Measure the token
 / ergonomics cost on real sessions before flipping (a default flip
 breaks "replace the first TODO" one-shots).
 
-** TODO Pattern translation misses: escaped metachars and alternation :dogfooding:
+** DONE Pattern translation misses: escaped metachars and alternation :dogfooding:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-06-29 Mo 11:07]
 - State "TODO"       from              [2026-06-11 Do 23:45]
 :END:
+
+DONE (2026-06, commit ~4d16fd8~): ~src/regex_dialect.rs~ is an Emacs→RE2
+syntax translator at the ~cached_regex~ compile chokepoint — it maps ~\|~
+alternation, ~\(...\)~ groups, ~\{n,m\}~, ~\(?:...\)~ shy groups and the
+~\`~ / ~\'~ anchors, treats bare ~( | {~ as literals, and errors clearly on
+constructs RE2 can't express (backreferences, ~\=~, ~\_<~ / ~\_>~, ~\s~ / ~\S~
+classes). ~regexp-quote~ / occur's literal-quoting now emit Emacs-style
+escaping so quoted text isn't re-read as group syntax. The original "no
+match" on ~\|~ alternation + escaped metachars is fixed; the supported
+dialect is documented in help{regex}.
+
+Original report follows.
+
 From an agent session (2026-06-11) driving git-conflict resolution
 and TOML/Rust edits via MCP: ~replace_text~ patterns
 with RE2-style escapes (~\[features\]~) and ~occur~ with ~|~
@@ -516,6 +534,27 @@ Accept a message /edit/ instead: e.g. =edits: [{pattern, replacement}]= applied
 to the existing message, or directives like delete-trailer / append-line. Should
 compose with any sign-off / trailer validation.
 
+** TODO git_rebase: split a commit + move changes between commits :git:dogfooding:
+The plan reorders / squashes / drops WHOLE commits, and the planned =edit=
+action (above) amends one commit's tree in place — but nothing REPARTITIONS
+what is already committed:
+- split one commit into two or more along path or hunk boundaries (e.g. code
+  in one commit, docs/notes in another);
+- move a file or hunk OUT of one commit and INTO an adjacent one.
+(Reordering whole commits is already covered by plan order.)
+
+Without these, an agent asked to "put these changes in a different commit"
+must abandon the in-process sequencer and hand-drive =git reset --soft= +
+selective =git add= + recommit — error-prone (easy to mis-stage and silently
+change the resulting tree) and exactly the transactional, rehearsable job mime
+is built for.
+
+Shape: extend the plan with a =split= action ({commit, into: [{message, paths
+| hunks}, …]}) and/or a =move= directive ({from, to, paths | hunks}), reusing
+the path / hunk selection the engine already has (treesit nodes, occur / grep
+hunks). Offer a =rehearse= of the resulting history — the tree-diff of each new
+commit — so a mis-partition is caught before it is written, not after.
+
 ** DONE MCP command-surface review — prune the middle, grow power via params :mcp:
 :LOGBOOK:
 - State "DONE"       from "TODO"       [2026-06-24 Mi]
@@ -640,17 +679,37 @@ inputs. Overarching caveat: LLMs use named, richly-described tools better than
 generic dispatchers + introspection, so CURATE, don't genericize — this is
 evolution, not a rewrite (mime is already ~80% there).
 
-*** TODO git: merge the read verbs + fold skip into continue (9 → 6) :mcp:
-Merge ~git_log~/~git_show~/~git_status~ into one ~git_history {query:
-log|show|status}~ (all read-only → one honest annotation). Fold ~git_skip~ into
-~git_continue {skip?: true}~ (one intent "advance the op"; the param says how).
-Keep rebase/cherry_pick/revert distinct (different intents/params; merging guts
-the descriptions LLMs lean on) and ~git_abort~ separate (the one destructive
-transition, annotated apart from continue). Net: git ~a quarter of the surface,
-no coherence loss, annotations stay honest. Do NOT split into a separate
-~mime-git~ server — the shared conflict surface (a rebase conflict resolves
-through the merge-conflict tools) is the reason it's coherent. One of two
-concretely-shippable pieces on the current code.
+*** TODO git: load the git-tool schemas on demand, not always-on :mcp:
+The real cost of "git is ~a third of the surface" is the ALWAYS-LOADED schema
+weight, not the tool count itself — so cut what's always loaded, don't overload
+the tools. The rebase/cherry-pick/conflict flow is rarely touched in a typical
+editing session, yet its 9 schemas sit in every client's context from the first
+turn. Load them on demand instead: keep the editing tools always-on, and surface
+the ~git_*~ schemas only when a repo operation is in play (a deferred/lazy tool
+set the client fetches by name — the pattern this very harness uses for its own
+deferred tools). Cuts the always-loaded surface with ZERO loss of per-call
+clarity: every git tool stays one-intent, flat-schema, git-named.
+
+REJECTED alternative (considered 2026-06-29): merging the read verbs into
+~git_history {query: log|show|status}~ and folding ~git_skip~ into ~git_continue
+{skip?: true}~. Against, on agent-ergonomics grounds:
+- The "one honest annotation" win is illusory for the read merge — ~git_log~ /
+  ~git_show~ / ~git_status~ are ALREADY all read-only; three honest annotations,
+  not a mix. Merging buys nothing there.
+- It trades flat, single-purpose schemas for a DEPENDENT-parameter one (~range~
+  only for log, ~commit~ required only for show) that JSON Schema can't express
+  cleanly → prose + runtime validation → more wrong-call round-trips, worst for
+  the weak models this surface targets.
+- ~git_log/show/status~ are names the model already learned from git; a
+  ~git_history {query}~ meta-name + enum is strictly more to get right.
+- Folding skip into continue re-merges OPPOSITE consequence-classes under one
+  boolean (continue commits the resolution = append; skip hard-resets, discarding
+  the merge residue = destructive) — exactly the read+write / reversible+destructive
+  mix that killed the polymorphic-checkpoint idea (principle 3 above). One
+  annotation can't honestly gate both.
+Net: the merge optimizes tool COUNT (a proxy) at the expense of per-call CLARITY
+(the real driver of agent accuracy). Deferred loading gets the context saving
+without that cost.
 
 *** TODO editor: surface structural editing as intents + make the engine introspectable :mcp:
 Curate the 80% case as one named tool — ~edit_defun {name, action:
@@ -663,6 +722,44 @@ discovers what's possible by asking, not prose-reading — discoverability with 
 extra always-loaded tool. Keep ~run_program~ central (the "few commands over an
 eval engine" shape is the right design; the fix is visibility, not dethroning
 it). The other concretely-shippable piece.
+
+Assessment (2026-06-29): right instinct, but as written the proposal
+over-scopes and under-specifies. Build the core, with these changes:
+- DROP ~wrap~ from the action set. ~replace~ / ~delete~ / ~insert-before~ /
+  ~insert-after~ each map cleanly to {one text, one position}; ~wrap~ does NOT.
+  The existing primitive is ~(treesit-wrap-node NODE BEFORE AFTER)~
+  (builtins.rs:2404) — it encloses a node by inserting on BOTH sides (expr →
+  ~Some(~ … ~)~), so it needs TWO strings, not the proposal's single ~text~.
+  Decorators / Rust ~#[...]~ are just the degenerate before-only case — i.e.
+  plain ~insert-before~ — so the common defun-level want is already covered;
+  true wrapping is mostly a sub-defun/expr op, fine to leave in ~run_program~.
+- NAME DISAMBIGUATION is the make-or-break and the proposal is silent on it.
+  Real code repeats names (two ~impl~ blocks each with ~new~, free fn vs
+  method, trait impls, nested fns). An ambiguous ~name~ must be an ERROR that
+  lists candidates (kind + enclosing scope), like ~replace_text~'s
+  ~expect_unique~ — never a silent first-match. Probably needs a path-ish
+  selector (~Foo::new~, or kind+name).
+- "80% case" OVERSELLS it. The most common edit is SUB-defun ("change these
+  three lines in ~foo~"), which stays ~replace_text~. ~edit_defun~ owns
+  WHOLE-UNIT ops — a meaningful minority. Honest framing: "removes hand-written
+  treesit lisp for whole-unit edits."
+- Where it genuinely beats the alternatives: ~replace~/~delete~ of a named node
+  needs no reproduction of the old body (literal ~replace_text~ does). Note the
+  file's own "grow power via params" principle would argue for params on
+  ~insert_text~/~replace_text~ (the latter already has ~scope: {defun}~) instead
+  of a new tool — but a single named ~edit_defun~ wins HERE because it
+  CONSOLIDATES one intent ("operate on a code unit by name") rather than
+  scattering it across three tools' optional params; that's the opposite of the
+  git-merge case, where a param overloaded one tool. Consistent, not special.
+- DEPENDENCY: correctness rides on per-language defun spans, and Python
+  ~decorated_definition~ spans are currently wrong (decorators excluded — see
+  "More languages" above). Fix that first, or scope ~edit_defun~ to languages
+  with correct spans.
+- PRIORITY: the ~help {list: "operations"}~ companion is the higher-leverage
+  half — structured discoverability of the whole ~run_program~ vocabulary (fed
+  by the tulisp obarray-introspection wishlist item) is the SYSTEMIC cure for
+  "power hidden behind run_program"; ~edit_defun~ is one curated shortcut. Do
+  the help-list first.
 
 *** TODO unify read/preview tools via params — weigh, likely keep separate :mcp:
 Power-via-params candidates a from-scratch design would weigh, but which the
