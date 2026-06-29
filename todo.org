@@ -555,6 +555,30 @@ the path / hunk selection the engine already has (treesit nodes, occur / grep
 hunks). Offer a =rehearse= of the resulting history — the tree-diff of each new
 commit — so a mis-partition is caught before it is written, not after.
 
+** TODO Inspect the need for a git-blame-shaped "which commit owns this?" read :git:dogfooding:
+The edit / squash / fixup / split work all assume the agent ALREADY knows
+which commit to target. But the common real task is the reverse: the agent has
+an uncommitted change (a hunk in the worktree, or lines it just edited) and
+needs to find the commit it logically belongs to — to fold it in via an =edit=
+amend, a =fixup=, or a =move= into the right commit. Without a blame-shaped
+read it falls back to shelling out to =git blame= / =git log -L=.
+
+Investigate (NOT yet committed to building): a read-only =git_blame {repo, path,
+lines?}=-style tool reporting, per line (or per worktree-hunk), the last commit
+that touched it — oid + summary, ideally scoped to the current op's range so the
+answer is "which of MY commits owns this", not "any commit in history". Output
+should compose into the other git tools: the reported oid feeds =git_rebase=
+plan {commit, action: fixup|edit} or a =move= directive directly, so
+find-the-commit → fold-in is one vocabulary.
+
+Open questions to settle first: (1) is per-line blame the right granularity, or
+blame-the-hunk (map a worktree diff hunk → the commit that last touched those
+lines)? (2) confine to onto..HEAD by default? (3) does git2 expose
+=Repository::blame_file= with the options we need, and is it fast enough on big
+files (it re-walks history)? (4) is this even needed once =edit= lands, or do
+agents naturally drive it via git_log + git_show? Measure on real sessions
+before building.
+
 ** DONE MCP command-surface review — prune the middle, grow power via params :mcp:
 :LOGBOOK:
 - State "DONE"       from "TODO"       [2026-06-24 Mi]
