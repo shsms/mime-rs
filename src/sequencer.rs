@@ -69,6 +69,7 @@ fn is_dirty(repo: &Repository) -> Result<bool, Error> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     Pick,
+    Edit,
     Reword,
     Squash,
     Fixup,
@@ -79,6 +80,7 @@ impl Action {
     fn as_str(self) -> &'static str {
         match self {
             Action::Pick => "pick",
+            Action::Edit => "edit",
             Action::Reword => "reword",
             Action::Squash => "squash",
             Action::Fixup => "fixup",
@@ -88,6 +90,7 @@ impl Action {
     pub fn parse(s: &str) -> Option<Action> {
         Some(match s {
             "pick" => Action::Pick,
+            "edit" => Action::Edit,
             "reword" => Action::Reword,
             "squash" => Action::Squash,
             "fixup" => Action::Fixup,
@@ -97,7 +100,7 @@ impl Action {
     }
 }
 
-/// One planned step: a commit to replay, how, and (for reword) a new message.
+/// One planned step: a commit to replay, how, and (for reword/edit) a new message.
 #[derive(Clone, Debug)]
 pub struct Step {
     pub commit: Oid,
@@ -139,8 +142,19 @@ impl Mode {
 /// new tip), or it stopped on a conflict the agent must resolve.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    Done { head: Oid },
-    Conflict { step: usize, files: Vec<String> },
+    Done {
+        head: Oid,
+    },
+    Conflict {
+        step: usize,
+        files: Vec<String>,
+    },
+    /// An `edit` step applied and committed; the operation is paused with that
+    /// commit checked out for the agent to amend, then `git_continue`.
+    Paused {
+        step: usize,
+        head: Oid,
+    },
 }
 
 /// A snapshot of an in-progress operation, for `git_status`.
@@ -150,6 +164,8 @@ pub struct Status {
     pub total: usize,
     pub current: Oid,
     pub conflicts: Vec<String>,
+    /// Paused at an `edit` step, waiting for the agent to amend + continue.
+    pub editing: bool,
 }
 
 /// A dry-run of a plan: the commits it WOULD produce (oldest→newest, with
@@ -172,6 +188,8 @@ struct State {
     next: usize,
     steps: Vec<Step>,
     mode: Mode,
+    /// True while paused at a landed `edit` step, awaiting the amend on continue.
+    editing: bool,
 }
 
 fn state_path(repo: &Repository) -> std::path::PathBuf {
@@ -194,6 +212,7 @@ fn save_state(repo: &Repository, st: &State) -> Result<(), Error> {
         "next": st.next,
         "steps": steps,
         "mode": st.mode.as_str(),
+        "editing": st.editing,
     });
     std::fs::write(state_path(repo), serde_json::to_vec_pretty(&v).unwrap())
         .map_err(|e| estr(&format!("cannot write sequencer state: {e}")))
@@ -231,6 +250,7 @@ fn load_state(repo: &Repository) -> Result<State, Error> {
         next: v["next"].as_u64().unwrap_or(0) as usize,
         steps,
         mode: Mode::parse(v["mode"].as_str().unwrap_or("pick")),
+        editing: v["editing"].as_bool().unwrap_or(false),
     })
 }
 
@@ -375,6 +395,7 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
         next: 0,
         steps: plan.steps,
         mode,
+        editing: false,
     };
     save_state(repo, &st)?;
     drive(repo, st)
@@ -428,8 +449,42 @@ fn rehearse(repo: &Repository, plan: &Plan, mode: Mode) -> Result<Preview, Error
 /// resolved paths, commit the stopped step, then continue the plan. `force`
 /// skips the conflict-marker guard (for a resolution that legitimately contains
 /// marker-like lines, e.g. a diff fixture).
+/// Resume from an `edit` pause: fold the agent's worktree changes into the
+/// paused commit (an amend), then drive the remaining steps.
+fn amend_step(repo: &Repository, mut st: State) -> Result<Outcome, Error> {
+    let current = repo.find_commit(st.current)?;
+    let parent = current.parent(0)?;
+    // Sync the index to the worktree: update_all stages modifications and
+    // deletions of tracked files; add_all stages new files (honouring .gitignore).
+    let mut index = repo.index()?;
+    index.update_all(["*"], None)?;
+    index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)?;
+    index.write()?;
+    let tree = repo.find_tree(index.write_tree()?)?;
+    // Amend in place: same author/committer/message, the worktree's tree, the
+    // same parent. An unedited worktree reproduces the identical commit (no-op).
+    let amended = repo.commit(
+        None,
+        &current.author(),
+        &current.committer(),
+        current.message().unwrap_or(""),
+        &tree,
+        &[&parent],
+    )?;
+    repo.set_head_detached(amended)?;
+    st.current = amended;
+    st.editing = false;
+    save_state(repo, &st)?;
+    drive(repo, st)
+}
+
 pub fn continue_op(repo: &Repository, force: bool) -> Result<Outcome, Error> {
     let mut st = load_state(repo)?;
+    if st.editing {
+        // Resuming from an `edit` pause: the commit is already landed; amend it
+        // with the agent's worktree changes, then continue.
+        return amend_step(repo, st);
+    }
     let step = st
         .steps
         .get(st.next)
@@ -479,6 +534,16 @@ pub fn continue_op(repo: &Repository, force: bool) -> Result<Outcome, Error> {
     repo.cleanup_state()?;
     st.current = new;
     st.next += 1;
+    if step.action == Action::Edit {
+        // A conflicted `edit` step: now that it's resolved and landed, pause for
+        // the agent to amend it (same as a clean edit step in drive).
+        st.editing = true;
+        save_state(repo, &st)?;
+        return Ok(Outcome::Paused {
+            step: st.next - 1,
+            head: st.current,
+        });
+    }
     save_state(repo, &st)?;
     drive(repo, st)
 }
@@ -487,6 +552,15 @@ pub fn continue_op(repo: &Repository, force: bool) -> Result<Outcome, Error> {
 /// plan as if that commit had been dropped.
 pub fn skip(repo: &Repository) -> Result<Outcome, Error> {
     let mut st = load_state(repo)?;
+    if st.editing {
+        // Skipping an edit pause = abandon the pending worktree edits and resume,
+        // leaving the landed commit unchanged.
+        hard_reset(repo, st.current)?;
+        let _ = repo.cleanup_state();
+        st.editing = false;
+        save_state(repo, &st)?;
+        return drive(repo, st);
+    }
     if st.next >= st.steps.len() {
         return Err(estr("nothing to skip"));
     }
@@ -532,6 +606,7 @@ pub fn status(repo: &Repository) -> Result<Option<Status>, Error> {
         total: st.steps.len(),
         current: st.current,
         conflicts,
+        editing: st.editing,
     }))
 }
 
@@ -580,7 +655,9 @@ fn make_commit(
             tree,
             &[&current],
         ),
-        Action::Reword => {
+        // `edit` lands like a pick (optionally reworded); the amend happens on
+        // continue, once the agent has changed the worktree.
+        Action::Reword | Action::Edit => {
             let msg = step.message.clone().unwrap_or_else(pick_msg);
             repo.commit(
                 None,
@@ -665,9 +742,20 @@ fn drive(repo: &Repository, mut st: State) -> Result<Outcome, Error> {
         repo.cleanup_state()?;
         st.current = new;
         st.next += 1;
+        if step.action == Action::Edit {
+            st.editing = true;
+        }
         // Persist after each landed step: a crash mid-run otherwise leaves HEAD
         // ahead of a stale next=0/current=onto state that would re-apply commits.
         save_state(repo, &st)?;
+        if st.editing {
+            // Pause with the just-landed commit checked out; the agent edits the
+            // worktree, then git_continue amends it (git_skip leaves it as-is).
+            return Ok(Outcome::Paused {
+                step: st.next - 1,
+                head: st.current,
+            });
+        }
     }
     finish(repo, &st)?;
     Ok(Outcome::Done { head: st.current })
@@ -802,6 +890,13 @@ pub fn outcome_text(out: &Outcome) -> String {
             files.len(),
             files.join("\n  "),
         ),
+        Outcome::Paused { step, head } => format!(
+            "paused at step {} for editing — commit {} is checked out. Edit the \
+             worktree with the normal tools, then git_continue to fold the changes \
+             into it (git_skip to leave it unchanged, git_abort to bail).",
+            step + 1,
+            short(*head),
+        ),
     }
 }
 
@@ -815,8 +910,13 @@ pub fn status_text(st: Option<Status>) -> String {
             } else {
                 format!("\n  unresolved: {}", s.conflicts.join(", "))
             };
+            let editing = if s.editing {
+                " (paused for editing — amend the worktree, then git_continue)"
+            } else {
+                ""
+            };
             format!(
-                "operation in progress: step {}/{}, tip {}{conflicts}",
+                "operation in progress: step {}/{}, tip {}{editing}{conflicts}",
                 s.next + 1,
                 s.total,
                 short(s.current),
@@ -1672,6 +1772,117 @@ mod tests {
         assert_eq!(preview.conflict, Some((0, vec!["a".to_string()])));
         assert!(preview.commits.is_empty());
         assert!(!repo.head_detached().unwrap(), "no mutation");
+        assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn edit_pauses_then_amends_the_worktree() {
+        let dir = tmp("edit");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+
+        let out = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Edit, None)],
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(out, Outcome::Paused { step: 0, .. }),
+            "paused at the edit step"
+        );
+        assert_eq!(
+            read(&repo, "b"),
+            "1\n",
+            "the commit is applied at the pause"
+        );
+
+        // The agent edits the worktree, then continues.
+        std::fs::write(repo.workdir().unwrap().join("b"), b"EDITED\n").unwrap();
+        std::fs::write(repo.workdir().unwrap().join("c"), b"new\n").unwrap();
+        let out = continue_op(&repo, false).unwrap();
+        assert!(matches!(out, Outcome::Done { .. }));
+
+        assert_eq!(read(&repo, "b"), "EDITED\n", "edit folded into the commit");
+        assert_eq!(read(&repo, "c"), "new\n", "new file folded in");
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(tip.message().unwrap(), "add b", "message preserved");
+        assert_eq!(tip.parent(0).unwrap().id(), m1, "still rebased onto m1");
+        assert!(!state_path(&repo).exists(), "state cleared on finish");
+    }
+
+    #[test]
+    fn edit_skip_leaves_the_commit_unchanged() {
+        let dir = tmp("edit-skip");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+
+        let out = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Edit, None)],
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, Outcome::Paused { .. }));
+
+        // A stray edit, then skip — the edit must be discarded, the commit kept.
+        std::fs::write(repo.workdir().unwrap().join("b"), b"STRAY\n").unwrap();
+        let out = skip(&repo).unwrap();
+        assert!(matches!(out, Outcome::Done { .. }));
+        assert_eq!(read(&repo, "b"), "1\n", "stray edit discarded");
+        assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn edit_step_that_conflicts_pauses_after_resolution() {
+        let dir = tmp("edit-conflict");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "f1\n")], "ours");
+        let m1 = commit(&repo, &[base], &[("a", "m1\n")], "theirs");
+        on_branch(&repo, "topic", f1);
+
+        let out = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Edit, None)],
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(out, Outcome::Conflict { step: 0, .. }),
+            "edit step conflicts on apply"
+        );
+
+        // Resolve the conflict, continue → lands the commit, then PAUSES for the edit.
+        std::fs::write(repo.workdir().unwrap().join("a"), b"resolved\n").unwrap();
+        let out = continue_op(&repo, false).unwrap();
+        assert!(
+            matches!(out, Outcome::Paused { .. }),
+            "paused after resolving the conflict"
+        );
+        assert_eq!(read(&repo, "a"), "resolved\n");
+
+        // Now amend the resolved commit and finish.
+        std::fs::write(repo.workdir().unwrap().join("a"), b"final\n").unwrap();
+        let out = continue_op(&repo, false).unwrap();
+        assert!(matches!(out, Outcome::Done { .. }));
+        assert_eq!(
+            read(&repo, "a"),
+            "final\n",
+            "amend applied on the resolution"
+        );
         assert!(!state_path(&repo).exists());
     }
 }

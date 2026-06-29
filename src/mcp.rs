@@ -2093,7 +2093,7 @@ fn git_tool_schemas() -> Vec<Value> {
     vec![
         json!({
             "name": "git_rebase",
-            "description": "Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`. Each step picks/rewords/squashes/fixups/drops a commit; reorder by listing in the new order. Stops on a conflict for the conflict tools + git_continue. No network, hooks, or exec.",
+            "description": "Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`. Each step picks/rewords/squashes/fixups/edits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. Stops on a conflict for the conflict tools + git_continue. No network, hooks, or exec.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2106,8 +2106,8 @@ fn git_tool_schemas() -> Vec<Value> {
                             "type": "object",
                             "properties": {
                                 "commit": { "type": "string", "description": "oid/ref/revspec of the commit." },
-                                "action": { "type": "string", "enum": ["pick", "reword", "squash", "fixup", "drop"] },
-                                "message": { "type": "string", "description": "New message (reword) or melded message (squash); ignored otherwise." }
+                                "action": { "type": "string", "enum": ["pick", "reword", "squash", "fixup", "edit", "drop"] },
+                                "message": { "type": "string", "description": "New message (reword/edit) or melded message (squash); ignored otherwise." }
                             },
                             "required": ["commit", "action"]
                         }
@@ -2137,7 +2137,7 @@ fn git_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "git_continue",
-            "description": "After resolving the stopped step's conflicts in the worktree (and saving), commit the resolution and continue the operation. Errors if a resolved file still contains conflict-marker lines; pass force: true to override (e.g. the resolution legitimately contains marker-like text).",
+            "description": "After resolving the stopped step's conflicts in the worktree (and saving), commit the resolution and continue the operation. At an `edit` pause, instead amends the paused commit to match the worktree, then continues. Errors if a resolved file still contains conflict-marker lines; pass force: true to override (e.g. the resolution legitimately contains marker-like text).",
             "inputSchema": {
                 "type": "object",
                 "properties": { "repo": repo, "force": { "type": "boolean", "description": "Commit even if a resolved file still has conflict-marker lines. Default false." } },
@@ -2146,7 +2146,7 @@ fn git_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "git_skip",
-            "description": "Drop the stopped step and continue the operation as if that commit had been omitted.",
+            "description": "Drop the stopped step and continue the operation as if that commit had been omitted. At an `edit` pause, instead resumes leaving the landed commit unchanged.",
             "inputSchema": { "type": "object", "properties": { "repo": repo }, "required": ["repo"] },
         }),
         json!({

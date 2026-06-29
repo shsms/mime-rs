@@ -170,16 +170,20 @@ In-process rebase/cherry-pick/revert: no network, no hooks, no exec; the
 worktree is the warm buffer set. Plan with git_log (oid + summary over a
 range like main..HEAD) and git_show (a commit's diff + metadata).
   git_rebase {onto, plan?}  plan = [{commit, action, message?}], action =
-    pick|reword|squash|fixup|drop; list order is the new commit order. Omit
+    pick|reword|squash|fixup|edit|drop; list order is the new commit order. Omit
     plan to replay all of onto..HEAD. rehearse:true previews the result
-    (and whether it is a pure reorder/fold) without applying.
+    (and whether it is a pure reorder/fold) without applying. An `edit` step
+    applies the commit then PAUSES with it checked out: edit the worktree, then
+    git_continue folds the changes into that commit.
   git_cherry_pick {commits} / git_revert {commits}  on top of the tip.
 Each STOPS on the first conflict. Then, per stop:
   git_status     which step of how many + the unresolved files
   resolve each file with the conflicts vocabulary (help conflicts), SAVE
   git_continue   commit the resolution + resume (errors while marker lines
-                 remain; force:true overrides)
-  git_skip       drop the stopped commit and resume
+                 remain; force:true overrides); at an edit pause, amends the
+                 paused commit to match the worktree, then resumes
+  git_skip       drop the stopped commit and resume; at an edit pause, resume
+                 leaving the landed commit unchanged
   git_abort      restore HEAD/branch/worktree to the pre-op state
 Resolve via the keep/replace vocabulary, never by hand-splicing markers."#;
 

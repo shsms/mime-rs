@@ -178,7 +178,7 @@ Report engine status: per live session the current buffer, its visited file, and
 
 ## git_rebase
 
-Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`. Each step picks/rewords/squashes/fixups/drops a commit; reorder by listing in the new order. Stops on a conflict for the conflict tools + git_continue. No network, hooks, or exec.
+Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`. Each step picks/rewords/squashes/fixups/edits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. Stops on a conflict for the conflict tools + git_continue. No network, hooks, or exec.
 
 - `onto` (required) — The new base — oid/ref/revspec the commits are replayed onto.
 - `plan` — Explicit steps (omit to pick all of onto..HEAD in order). List order is the new commit order.
@@ -201,14 +201,14 @@ Apply the inverse of `commits` (in order) on top of the current branch tip. Stop
 
 ## git_continue
 
-After resolving the stopped step's conflicts in the worktree (and saving), commit the resolution and continue the operation. Errors if a resolved file still contains conflict-marker lines; pass force: true to override (e.g. the resolution legitimately contains marker-like text).
+After resolving the stopped step's conflicts in the worktree (and saving), commit the resolution and continue the operation. At an `edit` pause, instead amends the paused commit to match the worktree, then continues. Errors if a resolved file still contains conflict-marker lines; pass force: true to override (e.g. the resolution legitimately contains marker-like text).
 
 - `force` — Commit even if a resolved file still has conflict-marker lines. Default false.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 
 ## git_skip
 
-Drop the stopped step and continue the operation as if that commit had been omitted.
+Drop the stopped step and continue the operation as if that commit had been omitted. At an `edit` pause, instead resumes leaving the landed commit unchanged.
 
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 
