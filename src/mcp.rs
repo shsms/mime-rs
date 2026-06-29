@@ -2011,11 +2011,27 @@ fn repo_path(args: &Value) -> Result<std::path::PathBuf, String> {
     crate::safety::check_path(Path::new(&str_arg(args, "repo")?))
 }
 
-/// The `git_rebase` plan array → (commit, action, message) tuples.
-fn plan_arg(args: &Value) -> Option<Vec<(String, String, Option<String>)>> {
+/// The `git_rebase` plan array → (commit, action, message, message_edits) tuples.
+fn plan_arg(args: &Value) -> Option<Vec<crate::sequencer::PlanItem>> {
     args.get("plan").and_then(Value::as_array).map(|arr| {
         arr.iter()
             .map(|s| {
+                let edits = s
+                    .get("message_edits")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .map(|e| crate::sequencer::MsgEditSpec {
+                                find: e.get("find").and_then(Value::as_str).map(str::to_string),
+                                replace: e
+                                    .get("replace")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                                append: e.get("append").and_then(Value::as_str).map(str::to_string),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 (
                     s.get("commit")
                         .and_then(Value::as_str)
@@ -2026,6 +2042,7 @@ fn plan_arg(args: &Value) -> Option<Vec<(String, String, Option<String>)>> {
                         .unwrap_or("pick")
                         .to_string(),
                     s.get("message").and_then(Value::as_str).map(str::to_string),
+                    edits,
                 )
             })
             .collect()
@@ -2107,7 +2124,19 @@ fn git_tool_schemas() -> Vec<Value> {
                             "properties": {
                                 "commit": { "type": "string", "description": "oid/ref/revspec of the commit." },
                                 "action": { "type": "string", "enum": ["pick", "reword", "squash", "fixup", "edit", "drop"] },
-                                "message": { "type": "string", "description": "New message (reword/edit) or melded message (squash); ignored otherwise." }
+                                "message": { "type": "string", "description": "New message (reword/edit) or melded message (squash); ignored otherwise." },
+                                "message_edits": {
+                                    "type": "array",
+                                    "description": "Edits applied in order to the message (reword/squash/fixup/edit), keeping the rest (e.g. the sign-off) intact — use instead of retyping the whole message. Each item is {find, replace?} (replace the first occurrence of literal `find`; omit replace to delete; errors if `find` is absent) or {append} (append as a trailing line).",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "find": { "type": "string", "description": "Literal text to find in the existing message." },
+                                            "replace": { "type": "string", "description": "Replacement for `find` (omit = delete)." },
+                                            "append": { "type": "string", "description": "Text to append as a trailing line." }
+                                        }
+                                    }
+                                }
                             },
                             "required": ["commit", "action"]
                         }

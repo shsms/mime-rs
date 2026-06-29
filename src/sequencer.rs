@@ -100,12 +100,14 @@ impl Action {
     }
 }
 
-/// One planned step: a commit to replay, how, and (for reword/edit) a new message.
+/// One planned step: a commit to replay, how, and an optional message change
+/// (a full `message` and/or ordered `message_edits`, for reword/squash/fixup/edit).
 #[derive(Clone, Debug)]
 pub struct Step {
     pub commit: Oid,
     pub action: Action,
     pub message: Option<String>,
+    pub message_edits: Vec<MsgEdit>,
 }
 
 /// A rebase plan: replay `steps` (in order) onto `onto`.
@@ -113,6 +115,79 @@ pub struct Step {
 pub struct Plan {
     pub onto: Oid,
     pub steps: Vec<Step>,
+}
+
+/// One edit applied (in order) to a step's commit message — the alternative to
+/// retyping the whole message, so the rest (e.g. the sign-off) is preserved.
+#[derive(Clone, Debug)]
+pub enum MsgEdit {
+    /// Replace the first occurrence of `find` with `with` (with = "" deletes).
+    Replace { find: String, with: String },
+    /// Append `text` as a trailing line.
+    Append { text: String },
+}
+
+/// The raw form the MCP layer extracts from a step's `message_edits`;
+/// `MsgEdit::from_spec` validates it into a `MsgEdit`.
+pub struct MsgEditSpec {
+    pub find: Option<String>,
+    pub replace: Option<String>,
+    pub append: Option<String>,
+}
+
+/// A raw plan step as the MCP layer extracts it: (commit, action, message,
+/// message_edits). `cmd_rebase` resolves/validates each into a `Step`.
+pub type PlanItem = (String, String, Option<String>, Vec<MsgEditSpec>);
+
+impl MsgEdit {
+    pub fn from_spec(spec: &MsgEditSpec) -> Result<MsgEdit, String> {
+        match (&spec.find, &spec.append) {
+            (Some(find), None) => {
+                if find.is_empty() {
+                    return Err("message_edits: `find` must be non-empty".to_string());
+                }
+                Ok(MsgEdit::Replace {
+                    find: find.clone(),
+                    with: spec.replace.clone().unwrap_or_default(),
+                })
+            }
+            (None, Some(text)) => Ok(MsgEdit::Append { text: text.clone() }),
+            (Some(_), Some(_)) => {
+                Err("message_edits: an item has both `find` and `append` — use one".to_string())
+            }
+            (None, None) => Err(
+                "message_edits: an item needs `find` (with optional `replace`) or `append`"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+/// Apply `edits` to `msg` in order. A `find` that is absent is an error (a
+/// typo'd anchor fails loudly rather than silently doing nothing).
+fn apply_msg_edits(mut msg: String, edits: &[MsgEdit]) -> Result<String, Error> {
+    for e in edits {
+        match e {
+            MsgEdit::Replace { find, with } => match msg.find(find.as_str()) {
+                Some(pos) => msg.replace_range(pos..pos + find.len(), with),
+                None => {
+                    return Err(estr(&format!(
+                        "message edit: text not found in the commit message: {find:?}"
+                    )));
+                }
+            },
+            MsgEdit::Append { text } => {
+                if !msg.is_empty() && !msg.ends_with('\n') {
+                    msg.push('\n');
+                }
+                msg.push_str(text);
+                if !text.ends_with('\n') {
+                    msg.push('\n');
+                }
+            }
+        }
+    }
+    Ok(msg)
 }
 
 /// How a step's diff is applied: forward (rebase/cherry-pick) or inverted
@@ -201,7 +276,15 @@ fn save_state(repo: &Repository, st: &State) -> Result<(), Error> {
         .steps
         .iter()
         .map(|s| {
-            json!({"commit": s.commit.to_string(), "action": s.action.as_str(), "message": s.message})
+            let edits: Vec<_> = s
+                .message_edits
+                .iter()
+                .map(|e| match e {
+                    MsgEdit::Replace { find, with } => json!({"find": find, "with": with}),
+                    MsgEdit::Append { text } => json!({"append": text}),
+                })
+                .collect();
+            json!({"commit": s.commit.to_string(), "action": s.action.as_str(), "message": s.message, "message_edits": edits})
         })
         .collect();
     let v = json!({
@@ -239,6 +322,25 @@ fn load_state(repo: &Repository) -> Result<State, Error> {
                 action: Action::parse(s["action"].as_str().unwrap_or(""))
                     .ok_or_else(|| estr("corrupt step action"))?,
                 message: s["message"].as_str().map(str::to_string),
+                message_edits: s["message_edits"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|e| {
+                                if let Some(t) = e["append"].as_str() {
+                                    MsgEdit::Append {
+                                        text: t.to_string(),
+                                    }
+                                } else {
+                                    MsgEdit::Replace {
+                                        find: e["find"].as_str().unwrap_or("").to_string(),
+                                        with: e["with"].as_str().unwrap_or("").to_string(),
+                                    }
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
@@ -323,6 +425,7 @@ fn pick_step(commit: Oid) -> Step {
         commit,
         action: Action::Pick,
         message: None,
+        message_edits: Vec::new(),
     }
 }
 
@@ -331,6 +434,42 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
         && matches!(first.action, Action::Squash | Action::Fixup)
     {
         return Err(estr("the first applied step cannot be squash/fixup"));
+    }
+    // Pre-validate message_edits before mutating. They only make sense for actions
+    // that build a message from a base; reject them on any other action so a
+    // silently-dropped edit can't masquerade as applied. For reword/edit the base
+    // is known up front (the provided message, else the commit's own), so a typo'd
+    // `find` fails BEFORE we mutate rather than stranding a half-applied op.
+    // (squash/fixup meld a dynamic base, so their finds are only checked at land.)
+    for s in &plan.steps {
+        if !s.message_edits.is_empty()
+            && !matches!(
+                s.action,
+                Action::Reword | Action::Edit | Action::Squash | Action::Fixup
+            )
+        {
+            return Err(estr(&format!(
+                "message_edits apply only to reword/squash/fixup/edit, not {}",
+                s.action.as_str()
+            )));
+        }
+        if matches!(s.action, Action::Reword | Action::Edit) {
+            // Dry-run the edits against the same base make_commit will use (the
+            // provided message if any, else the commit's own), reusing the exact
+            // land-time logic so a bad edit fails BEFORE we mutate. Checking each
+            // `find` independently against the static base would disagree with the
+            // sequential apply: it would miss a later edit whose anchor an earlier
+            // edit deletes, and falsely reject one whose anchor an earlier creates.
+            let base = match &s.message {
+                Some(m) => m.clone(),
+                None => repo
+                    .find_commit(s.commit)?
+                    .message()
+                    .unwrap_or("")
+                    .to_string(),
+            };
+            apply_msg_edits(base, &s.message_edits)?;
+        }
     }
     if state_path(repo).exists() {
         return Err(estr(
@@ -659,6 +798,7 @@ fn make_commit(
         // continue, once the agent has changed the worktree.
         Action::Reword | Action::Edit => {
             let msg = step.message.clone().unwrap_or_else(pick_msg);
+            let msg = apply_msg_edits(msg, &step.message_edits)?;
             repo.commit(
                 None,
                 &pick.author(),
@@ -680,6 +820,7 @@ fn make_commit(
                     format!("{}\n\n{}", cur_msg.trim_end(), pick_msg().trim_end())
                 }),
             };
+            let msg = apply_msg_edits(msg, &step.message_edits)?;
             repo.commit(
                 None,
                 &current.author(),
@@ -999,7 +1140,7 @@ fn backup_note(repo: &Repository) -> String {
 pub fn cmd_rebase(
     repo_path: &std::path::Path,
     onto: &str,
-    plan: Option<Vec<(String, String, Option<String>)>>,
+    plan: Option<Vec<PlanItem>>,
     rehearse_only: bool,
 ) -> Result<String, String> {
     let repo = open(repo_path)?;
@@ -1007,12 +1148,17 @@ pub fn cmd_rebase(
     let steps = match plan {
         Some(items) => items
             .iter()
-            .map(|(commit, action, message)| {
+            .map(|(commit, action, message, edits)| {
+                let message_edits = edits
+                    .iter()
+                    .map(MsgEdit::from_spec)
+                    .collect::<Result<Vec<_>, String>>()?;
                 Ok(Step {
                     commit: resolve_s(&repo, commit)?,
                     action: Action::parse(action)
                         .ok_or_else(|| format!("unknown action \"{action}\""))?,
                     message: message.clone(),
+                    message_edits,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?,
@@ -1140,6 +1286,7 @@ mod tests {
             commit,
             action,
             message: message.map(str::to_string),
+            message_edits: Vec::new(),
         }
     }
 
@@ -1884,5 +2031,293 @@ mod tests {
             "amend applied on the resolution"
         );
         assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn reword_with_message_edits_preserves_the_rest() {
+        let dir = tmp("msgedit");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(
+            &repo,
+            &[base],
+            &[("a", "1\n"), ("b", "1\n")],
+            "Subject line\n\nBody paragraph.\n\nSigned-off-by: T <t@e.invalid>\n",
+        );
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+
+        let s = Step {
+            commit: f1,
+            action: Action::Reword,
+            message: None,
+            message_edits: vec![MsgEdit::Replace {
+                find: "Subject line".to_string(),
+                with: "New subject".to_string(),
+            }],
+        };
+        start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![s],
+            },
+        )
+        .unwrap();
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(
+            tip.message().unwrap(),
+            "New subject\n\nBody paragraph.\n\nSigned-off-by: T <t@e.invalid>\n",
+            "only the subject changed; body + sign-off preserved"
+        );
+    }
+
+    #[test]
+    fn message_edit_append_adds_a_trailing_line() {
+        let dir = tmp("msgappend");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "Add b\n");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+
+        let s = Step {
+            commit: f1,
+            action: Action::Reword,
+            message: None,
+            message_edits: vec![MsgEdit::Append {
+                text: "Acked-by: Z <z@e.invalid>".to_string(),
+            }],
+        };
+        start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![s],
+            },
+        )
+        .unwrap();
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(tip.message().unwrap(), "Add b\nAcked-by: Z <z@e.invalid>\n");
+    }
+
+    #[test]
+    fn message_edit_missing_find_fails_before_mutating() {
+        let dir = tmp("msgmiss");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "Add b\n");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+        let before = repo.head().unwrap().peel_to_commit().unwrap().id();
+
+        let s = Step {
+            commit: f1,
+            action: Action::Reword,
+            message: None,
+            message_edits: vec![MsgEdit::Replace {
+                find: "not present".to_string(),
+                with: "x".to_string(),
+            }],
+        };
+        assert!(
+            start(
+                &repo,
+                Plan {
+                    onto: m1,
+                    steps: vec![s]
+                }
+            )
+            .is_err()
+        );
+        assert!(!state_path(&repo).exists(), "no op left dangling");
+        assert!(!repo.head_detached().unwrap(), "branch untouched");
+        assert_eq!(
+            repo.head().unwrap().peel_to_commit().unwrap().id(),
+            before,
+            "no mutation on a pre-validated message-edit error"
+        );
+    }
+
+    #[test]
+    fn reword_message_edits_target_the_provided_message() {
+        let dir = tmp("msg-provided");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "orig\n");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+
+        // message_edits apply to the PROVIDED message, not the commit's original;
+        // pre-validation must use the same base or it falsely rejects this plan.
+        let s = Step {
+            commit: f1,
+            action: Action::Reword,
+            message: Some("brand new subject".to_string()),
+            message_edits: vec![MsgEdit::Replace {
+                find: "new".to_string(),
+                with: "NEW".to_string(),
+            }],
+        };
+        start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![s],
+            },
+        )
+        .unwrap();
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(tip.message().unwrap(), "brand NEW subject");
+    }
+
+    #[test]
+    fn message_edits_rejected_on_a_pick_step() {
+        let dir = tmp("msg-on-pick");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+        let before = repo.head().unwrap().peel_to_commit().unwrap().id();
+
+        // pick doesn't build a message from a base, so message_edits would be
+        // silently dropped — reject them before mutating instead.
+        let s = Step {
+            commit: f1,
+            action: Action::Pick,
+            message: None,
+            message_edits: vec![MsgEdit::Append {
+                text: "Note".to_string(),
+            }],
+        };
+        assert!(
+            start(
+                &repo,
+                Plan {
+                    onto: m1,
+                    steps: vec![s]
+                }
+            )
+            .is_err()
+        );
+        assert!(!state_path(&repo).exists(), "no op left dangling");
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), before);
+    }
+
+    #[test]
+    fn chained_message_edits_validate_as_a_sequence() {
+        let dir = tmp("msg-chain");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+
+        // Create-then-match: edit 2's anchor is produced by edit 1 — must SUCCEED
+        // (validating each find against the static base would falsely reject it).
+        let f_ok = commit(
+            &repo,
+            &[base],
+            &[("a", "1\n"), ("b", "1\n")],
+            "Fix the bar widget",
+        );
+        on_branch(&repo, "topic", f_ok);
+        let s = Step {
+            commit: f_ok,
+            action: Action::Reword,
+            message: None,
+            message_edits: vec![
+                MsgEdit::Replace {
+                    find: "bar".to_string(),
+                    with: "baz".to_string(),
+                },
+                MsgEdit::Replace {
+                    find: "baz widget".to_string(),
+                    with: "baz gadget".to_string(),
+                },
+            ],
+        };
+        start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![s],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            repo.head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .message()
+                .unwrap(),
+            "Fix the baz gadget"
+        );
+
+        // Remove-then-match: edit 1 deletes edit 2's anchor — must fail BEFORE
+        // mutating (the old per-find check passed this, then died mid-land).
+        let f_bad = commit(
+            &repo,
+            &[base],
+            &[("a", "1\n"), ("c", "1\n")],
+            "Remove the old flag and the old code",
+        );
+        on_branch(&repo, "topic2", f_bad);
+        let before = repo.head().unwrap().peel_to_commit().unwrap().id();
+        let s2 = Step {
+            commit: f_bad,
+            action: Action::Reword,
+            message: None,
+            message_edits: vec![
+                MsgEdit::Replace {
+                    find: "the old flag and ".to_string(),
+                    with: String::new(),
+                },
+                MsgEdit::Replace {
+                    find: "old flag".to_string(),
+                    with: "X".to_string(),
+                },
+            ],
+        };
+        assert!(
+            start(
+                &repo,
+                Plan {
+                    onto: m1,
+                    steps: vec![s2]
+                }
+            )
+            .is_err()
+        );
+        assert!(!state_path(&repo).exists(), "fails before mutation");
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), before);
+    }
+
+    #[test]
+    fn msg_edit_spec_requires_exactly_find_or_append() {
+        let both = MsgEditSpec {
+            find: Some("x".into()),
+            replace: None,
+            append: Some("y".into()),
+        };
+        let neither = MsgEditSpec {
+            find: None,
+            replace: Some("y".into()),
+            append: None,
+        };
+        assert!(MsgEdit::from_spec(&both).is_err(), "both find + append");
+        assert!(
+            MsgEdit::from_spec(&neither).is_err(),
+            "neither find nor append"
+        );
+        let ok = MsgEditSpec {
+            find: Some("x".into()),
+            replace: Some("y".into()),
+            append: None,
+        };
+        assert!(matches!(
+            MsgEdit::from_spec(&ok),
+            Ok(MsgEdit::Replace { .. })
+        ));
     }
 }

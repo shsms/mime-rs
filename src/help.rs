@@ -169,12 +169,15 @@ const GIT: &str = r#"— git history workflow —
 In-process rebase/cherry-pick/revert: no network, no hooks, no exec; the
 worktree is the warm buffer set. Plan with git_log (oid + summary over a
 range like main..HEAD) and git_show (a commit's diff + metadata).
-  git_rebase {onto, plan?}  plan = [{commit, action, message?}], action =
-    pick|reword|squash|fixup|edit|drop; list order is the new commit order. Omit
-    plan to replay all of onto..HEAD. rehearse:true previews the result
-    (and whether it is a pure reorder/fold) without applying. An `edit` step
-    applies the commit then PAUSES with it checked out: edit the worktree, then
-    git_continue folds the changes into that commit.
+  git_rebase {onto, plan?}  plan = [{commit, action, message?, message_edits?}],
+    action = pick|reword|squash|fixup|edit|drop; list order is the new commit
+    order. Omit plan to replay all of onto..HEAD. rehearse:true previews the
+    result (and whether it is a pure reorder/fold) without applying. An `edit`
+    step applies the commit then PAUSES with it checked out: edit the worktree,
+    then git_continue folds the changes into that commit. message_edits
+    ([{find, replace?}] to replace/delete literal text, [{append}] to add a
+    trailing line) tweak a reword/squash/fixup/edit message without retyping it,
+    so the sign-off and the rest survive.
   git_cherry_pick {commits} / git_revert {commits}  on top of the tip.
 Each STOPS on the first conflict. Then, per stop:
   git_status     which step of how many + the unresolved files
