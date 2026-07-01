@@ -15,7 +15,7 @@ exclude = ["*.org"]
 # Git sequencer (rebase / cherry-pick / revert) — see todo.org. `vendored-libgit2`
 # builds libgit2 from source via `cc` so there is no system-libgit2 dependency;
 # we never expose remote/transport ops, so the network surface is unused.
-git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 # Streamable HTTP transport for the MCP server (`mime --http`) — a sync, minimal
 # HTTP/1.1 server (no async runtime). The agent never reaches the network; this
 # is a localhost front end, like the daemon's unix socket.
