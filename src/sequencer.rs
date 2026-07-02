@@ -28,8 +28,8 @@
 
 use crate::buffer::Buffer;
 use git2::{
-    BlameOptions, CherrypickOptions, Delta, Index, Oid, Repository, ResetType, RevertOptions, Sort,
-    build::CheckoutBuilder,
+    BlameOptions, CherrypickOptions, Delta, DiffFormat, Index, Oid, Repository, ResetType,
+    RevertOptions, Sort, build::CheckoutBuilder,
 };
 use serde_json::json;
 use std::path::Path;
@@ -1252,6 +1252,17 @@ pub fn show(repo: &Repository, oid: Oid) -> Result<String, Error> {
             .unwrap_or("?");
         out.push_str(&format!("  {mark} {p}\n"));
     }
+    // Full unified diff after the file summary: reconstruct the patch, prefixing
+    // each content line with its +/-/space origin (hunk/file headers carry their
+    // own text). Binary content that isn't UTF-8 renders as its header only.
+    out.push_str("\nDiff:\n");
+    diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+        if matches!(line.origin(), '+' | '-' | ' ') {
+            out.push(line.origin());
+        }
+        out.push_str(std::str::from_utf8(line.content()).unwrap_or(""));
+        true
+    })?;
     Ok(out)
 }
 
@@ -1910,6 +1921,11 @@ mod tests {
         assert!(
             show.contains("Changed files") && show.contains(" b"),
             "{show}"
+        );
+        // The full unified diff follows the file summary: b's added line shows.
+        assert!(
+            show.contains("Diff:") && show.contains("+1"),
+            "show carries the unified diff: {show}"
         );
     }
 

@@ -2361,7 +2361,7 @@ fn git_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "git_show",
-            "description": "A commit's metadata, message, and the files it changed vs its first parent.",
+            "description": "A commit's metadata, message, the files it changed vs its first parent, and the full unified diff.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "repo": repo, "commit": { "type": "string", "description": "oid/ref/revspec of the commit." } },
@@ -2599,7 +2599,7 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
         "git_show" => (
             Git,
             A::read(),
-            "a commit's metadata, message, and changed files",
+            "a commit's metadata, message, changed files, and full diff",
         ),
         "git_blame" => (
             Git,

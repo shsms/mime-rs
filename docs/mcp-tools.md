@@ -233,7 +233,7 @@ One line per commit (oid + summary), for `range` (e.g. main..HEAD) or from HEAD;
 
 ## git_show
 
-A commit's metadata, message, and the files it changed vs its first parent.
+A commit's metadata, message, the files it changed vs its first parent, and the full unified diff.
 
 - `commit` (required) — oid/ref/revspec of the commit.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
