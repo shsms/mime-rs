@@ -101,7 +101,7 @@ Overview of every line matching a pattern in the whole accessible region (compos
 
 ## grep
 
-Read-only cross-file search: which files (and lines) mention a pattern — occur across the filesystem. Walks `dir` (default: every allowed root) recursively, skipping dot-entries (.git …) and symlinks, keeping paths that match `glob`. Per file: a header + matching lines (line number + absolute char position, long lines clamped, optional context). The file paths it lists feed replace_text {files: […]} directly. Caps files scanned (5000) and matches rendered. Needs no session — reads files within MIME_ROOTS. Use occur for one already-open buffer; grep to find which files to touch.
+Read-only cross-file search: which files (and lines) mention a pattern — occur across the filesystem. Walks `dir` (default: every allowed root) recursively, skipping dot-entries (.git …), symlinks, and git-ignored-and-untracked paths (target/ …; tracked files are always searched), keeping paths that match `glob`. Per file: a header + matching lines (line number + absolute char position, long lines clamped, optional context). The file paths it lists feed replace_text {files: […]} directly. Caps files scanned (5000) and matches rendered. Needs no session — reads files within MIME_ROOTS. Use occur for one already-open buffer; grep to find which files to touch.
 
 - `case_insensitive` — Match case-insensitively (both modes). Default false.
 - `dir` — Directory to search (must resolve inside an allowed root). Omit to search every root.

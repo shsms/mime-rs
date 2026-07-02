@@ -1459,17 +1459,72 @@ fn clamp_line(line: &str, focus: usize, max: usize) -> String {
 /// clean method instead of an 8-argument function.
 struct Walk<'a> {
     glob_re: Option<&'a regex::Regex>,
+    /// The repo containing the search dir, if any, used to skip git-ignored
+    /// paths (`target/`, build output …) so a large ignored subtree can't
+    /// starve the visit cap. `None` when the dir isn't in a repo, or when the
+    /// dir is ITSELF ignored (the caller asked for it explicitly — honour that).
+    repo: Option<&'a git2::Repository>,
+    /// The repo's tracked paths, so ignored-BUT-tracked content (a committed
+    /// `vendor/`, a force-added `*.log`) is still searched — only ignored AND
+    /// untracked entries are pruned. `None` degrades to pure ignore-rule
+    /// pruning (ripgrep-style) when the index can't be read.
+    tracked: Option<&'a Tracked>,
     max: usize,
     visited: usize,
     capped: bool,
     out: Vec<std::path::PathBuf>,
 }
 
+/// A repo's index paths (relative to the workdir, `/`-separated) kept sorted,
+/// so the walk can ask "is this file tracked?" and "does this directory hold
+/// any tracked file?" in O(log n) — the second answer is what keeps an ignored
+/// directory with committed contents (e.g. a checked-in `vendor/`) from being
+/// pruned as if it were pure build output.
+struct Tracked {
+    workdir: std::path::PathBuf,
+    paths: Vec<String>,
+}
+
+impl Tracked {
+    /// Snapshot the repo's index once (cheap — a memory-mapped read, no walk).
+    /// `None` if the repo is bare or its index can't be read.
+    fn from_repo(repo: &git2::Repository) -> Option<Self> {
+        let workdir = repo.workdir()?.to_path_buf();
+        let index = repo.index().ok()?;
+        let mut paths: Vec<String> = index
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+            .collect();
+        paths.sort();
+        Some(Tracked { workdir, paths })
+    }
+
+    /// Is `abs` a tracked file (when `is_dir` is false), or a directory holding
+    /// at least one tracked file (when `is_dir` is true)? Paths outside the
+    /// workdir are never tracked.
+    fn covers(&self, abs: &Path, is_dir: bool) -> bool {
+        let Ok(rel) = abs.strip_prefix(&self.workdir) else {
+            return false;
+        };
+        let rel = rel.to_string_lossy();
+        if is_dir {
+            // The first index path >= "rel/" starts with "rel/" iff a tracked
+            // file lives under this directory (paths are sorted).
+            let prefix = format!("{rel}/");
+            let i = self.paths.partition_point(|p| p.as_str() < prefix.as_str());
+            self.paths.get(i).is_some_and(|p| p.starts_with(&prefix))
+        } else {
+            self.paths.binary_search(&rel.into_owned()).is_ok()
+        }
+    }
+}
+
 impl Walk<'_> {
     /// Collect regular files under `dir` whose path relative to `base` matches
-    /// `glob_re` (if any), skipping dot-entries and symlinks. Bounded by `max`
-    /// files VISITED (a wide tree can't run away) and a depth cap (a deep chain
-    /// can't overflow the stack); sets `capped` when a bound trips.
+    /// `glob_re` (if any), skipping dot-entries, symlinks, and git-ignored
+    /// paths (see `repo`/`tracked`). Bounded by `max` files VISITED (a wide tree
+    /// can't run away) and a depth cap (a deep chain can't overflow the stack);
+    /// sets `capped` when a bound trips.
     fn collect(&mut self, dir: &Path, base: &Path, depth: usize) {
         const MAX_DEPTH: usize = 64;
         if depth > MAX_DEPTH {
@@ -1483,15 +1538,29 @@ impl Walk<'_> {
             if e.file_name().to_string_lossy().starts_with('.') {
                 continue; // skip .git, dotfiles
             }
+            let path = e.path();
+            let ft = e.file_type();
+            let is_dir = matches!(&ft, Ok(t) if t.is_dir());
+            // Prune git-ignored entries (dirs AND files) BEFORE they count
+            // toward the visit cap, so a huge ignored subtree like `target/`
+            // can't exhaust the budget before a top-level file is reached — but
+            // keep anything tracked, so committed-yet-ignored content (a
+            // checked-in `vendor/`, a force-added file) still turns up.
+            if let Some(repo) = self.repo
+                && repo.is_path_ignored(&path).unwrap_or(false)
+                && !self.tracked.is_some_and(|t| t.covers(&path, is_dir))
+            {
+                continue;
+            }
             if self.visited >= self.max {
                 self.capped = true;
                 return;
             }
-            match e.file_type() {
-                Ok(t) if t.is_dir() => self.collect(&e.path(), base, depth + 1),
+            match ft {
+                Ok(t) if t.is_dir() => self.collect(&path, base, depth + 1),
                 Ok(t) if t.is_file() => {
                     self.visited += 1; // bounds the WALK, glob-matching or not
-                    let full = e.path();
+                    let full = path;
                     let keep = self.glob_re.is_none_or(|g| {
                         g.is_match(&full.strip_prefix(base).unwrap_or(&full).to_string_lossy())
                     });
@@ -1508,8 +1577,10 @@ impl Walk<'_> {
 /// `grep {pattern, glob?, dir?, mode?, case_insensitive?, nlines?, limit?}` —
 /// read-only cross-file search: which files (and lines) mention a pattern. Walks
 /// `dir` (default: every MIME_ROOTS root) recursively, skipping dot-entries
-/// (`.git` …) and symlinks, keeping only paths that match `glob` (relative to
-/// the search dir; `**` crosses directories). Line-oriented like occur. Prints
+/// (`.git` …), symlinks, and git-ignored-and-untracked paths (`target/` …;
+/// tracked files are always searched), keeping only paths that match `glob`
+/// (relative to the search dir; `**` crosses directories). Line-oriented like
+/// occur. Prints
 /// CANONICAL absolute paths that feed `replace_text {files: …}` directly. No
 /// session needed — reads files within the sandbox (each routed through the
 /// path chokepoint). Caps files visited and matches rendered.
@@ -1568,8 +1639,18 @@ fn tool_grep(args: &Value) -> Result<String, String> {
     let mut out = String::new();
 
     'outer: for base in &dirs {
+        // Discover the repo (if any) enclosing `base` so the walk can skip
+        // git-ignored paths. If `base` is ITSELF ignored, the caller descended
+        // into an ignored location deliberately (e.g. dir: <repo>/target) —
+        // don't filter, or the search would find nothing there.
+        let repo = git2::Repository::discover(base)
+            .ok()
+            .filter(|r| !r.is_path_ignored(base).unwrap_or(false));
+        let tracked = repo.as_ref().and_then(Tracked::from_repo);
         let mut walk = Walk {
             glob_re: glob_re.as_ref(),
+            repo: repo.as_ref(),
+            tracked: tracked.as_ref(),
             max: MAX_FILES,
             visited,
             capped,
@@ -1681,8 +1762,15 @@ fn tool_grep(args: &Value) -> Result<String, String> {
         let g = glob_arg
             .map(|g| format!(" matching glob {g:?}"))
             .unwrap_or_default();
+        // A capped walk that finds nothing is NOT the same as "term absent" —
+        // say so, or the empty result reads as a false negative.
+        let cap = if capped {
+            format!("; walk capped at {MAX_FILES} files / depth — narrow with dir")
+        } else {
+            String::new()
+        };
         return Ok(format!(
-            "no matches for {pattern:?}{g} (visited {visited} files){}",
+            "no matches for {pattern:?}{g} (visited {visited} files{cap}){}",
             exact_regex_hint(args, &pattern)
         ));
     }
@@ -2756,7 +2844,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "grep",
-            "description": "Read-only cross-file search: which files (and lines) mention a pattern — occur across the filesystem. Walks `dir` (default: every allowed root) recursively, skipping dot-entries (.git …) and symlinks, keeping paths that match `glob`. Per file: a header + matching lines (line number + absolute char position, long lines clamped, optional context). The file paths it lists feed replace_text {files: […]} directly. Caps files scanned (5000) and matches rendered. Needs no session — reads files within MIME_ROOTS. Use occur for one already-open buffer; grep to find which files to touch.",
+            "description": "Read-only cross-file search: which files (and lines) mention a pattern — occur across the filesystem. Walks `dir` (default: every allowed root) recursively, skipping dot-entries (.git …), symlinks, and git-ignored-and-untracked paths (target/ …; tracked files are always searched), keeping paths that match `glob`. Per file: a header + matching lines (line number + absolute char position, long lines clamped, optional context). The file paths it lists feed replace_text {files: […]} directly. Caps files scanned (5000) and matches rendered. Needs no session — reads files within MIME_ROOTS. Use occur for one already-open buffer; grep to find which files to touch.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3043,6 +3131,73 @@ mod git_tool_tests {
             clamp_line("short", 0, 200) == "short",
             "short lines pass through"
         );
+    }
+
+    #[test]
+    fn walk_skips_ignored_untracked_but_keeps_tracked() {
+        // A large git-ignored subtree (like `target/`) must be pruned — walking
+        // it would burn the visit cap before top-level files are reached, so a
+        // real match reads back as "no matches" (the bug this guards). But an
+        // ignored path that is TRACKED (a committed `vendor/`, a force-added
+        // file) must still be searched, or grep hides committed content.
+        let root = std::env::temp_dir().join(format!("mime-walk-ignore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("ignored")).unwrap();
+        let repo = git2::Repository::init(&root).unwrap();
+        std::fs::write(root.join(".gitignore"), "/ignored\n").unwrap();
+        std::fs::write(root.join("kept.txt"), "needle\n").unwrap();
+        std::fs::write(root.join("ignored").join("hit.txt"), "needle\n").unwrap();
+        std::fs::write(root.join("ignored").join("tracked.txt"), "needle\n").unwrap();
+        // Force-add the tracked file under the ignored dir (plumbing add bypasses
+        // the ignore check, like `git add -f`).
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("ignored/tracked.txt")).unwrap();
+        index.write().unwrap();
+
+        let rels = |repo: Option<&git2::Repository>| {
+            let tracked = repo.and_then(Tracked::from_repo);
+            let mut w = Walk {
+                glob_re: None,
+                repo,
+                tracked: tracked.as_ref(),
+                max: 5000,
+                visited: 0,
+                capped: false,
+                out: Vec::new(),
+            };
+            w.collect(&root, &root, 0);
+            let mut got: Vec<String> = w
+                .out
+                .iter()
+                .map(|p| {
+                    p.strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            got.sort();
+            got
+        };
+
+        // With the repo: the untracked ignored file (`hit.txt`) is pruned, but
+        // the tracked one under the same ignored dir survives — as does the
+        // plain top-level file. (`.gitignore`/`.git` are dotfiles, skipped.)
+        assert_eq!(
+            rels(Some(&repo)),
+            vec!["ignored/tracked.txt".to_string(), "kept.txt".to_string()]
+        );
+        // Without ignore filtering every file is walked.
+        assert_eq!(
+            rels(None),
+            vec![
+                "ignored/hit.txt".to_string(),
+                "ignored/tracked.txt".to_string(),
+                "kept.txt".to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
