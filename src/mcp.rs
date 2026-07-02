@@ -2326,7 +2326,13 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
         "git_status" => seq::cmd_status(&repo),
         "git_log" => seq::cmd_log(&repo, args.get("range").and_then(Value::as_str)),
         "git_show" => seq::cmd_show(&repo, &str_arg(args, "commit")?),
-        "git_blame" => seq::cmd_blame(&repo, &str_arg(args, "path")?, lines_arg(args)),
+        "git_blame" => seq::cmd_blame(
+            &repo,
+            &str_arg(args, "path")?,
+            lines_arg(args),
+            args.get("since").and_then(Value::as_str),
+            bool_arg(args, "worktree"),
+        ),
         "git_move" => seq::cmd_move(
             &repo,
             &str_arg(args, "from")?,
@@ -2487,7 +2493,7 @@ fn git_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "git_blame",
-            "description": "Which commit last touched each line of `path` (oid + summary), collapsed into contiguous same-commit hunks. Read-only. The find-the-commit half of a fixup/edit: feed a reported oid into a git_rebase plan {commit, action: fixup|edit}. Pass `lines` to blame just a span.",
+            "description": "Which commit last touched each line of `path` (oid + summary), collapsed into contiguous same-commit hunks. Read-only. The find-the-commit half of a fixup/edit: feed a reported oid into a git_rebase plan {commit, action: fixup|edit}. Pass `lines` to blame just a span; `since` to scope to your own commits; `worktree` to map each UNCOMMITTED change to the commit that owns the lines it touches (absorb-target discovery — feed that oid into git_fixup).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2498,6 +2504,8 @@ fn git_tool_schemas() -> Vec<Value> {
                         "items": { "type": "integer" },
                         "description": "Optional [start, end] 1-based inclusive line range; omit to blame the whole file.",
                     },
+                    "since": { "type": "string", "description": "Scope history to `since..` (oid/ref/revspec, e.g. main): lines older than it collapse to the boundary, so the answer is 'which of MY commits owns this'." },
+                    "worktree": { "type": "boolean", "description": "Instead of blaming committed lines, map each UNCOMMITTED hunk of `path` to the commit that last set the lines it changes — the target for a git_fixup/git_move." }
                 },
                 "required": ["repo", "path"],
             },

@@ -241,11 +241,13 @@ A commit's metadata, message, the files it changed vs its first parent, and the 
 
 ## git_blame
 
-Which commit last touched each line of `path` (oid + summary), collapsed into contiguous same-commit hunks. Read-only. The find-the-commit half of a fixup/edit: feed a reported oid into a git_rebase plan {commit, action: fixup|edit}. Pass `lines` to blame just a span.
+Which commit last touched each line of `path` (oid + summary), collapsed into contiguous same-commit hunks. Read-only. The find-the-commit half of a fixup/edit: feed a reported oid into a git_rebase plan {commit, action: fixup|edit}. Pass `lines` to blame just a span; `since` to scope to your own commits; `worktree` to map each UNCOMMITTED change to the commit that owns the lines it touches (absorb-target discovery — feed that oid into git_fixup).
 
 - `lines` — Optional [start, end] 1-based inclusive line range; omit to blame the whole file.
 - `path` (required) — File to blame — absolute (as grep/occur return) or relative to the repo root.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+- `since` — Scope history to `since..` (oid/ref/revspec, e.g. main): lines older than it collapse to the boundary, so the answer is 'which of MY commits owns this'.
+- `worktree` — Instead of blaming committed lines, map each UNCOMMITTED hunk of `path` to the commit that last set the lines it changes — the target for a git_fixup/git_move.
 
 ## git_move
 

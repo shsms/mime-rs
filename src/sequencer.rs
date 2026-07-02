@@ -1835,11 +1835,18 @@ pub fn blame(
     repo: &Repository,
     rel: &Path,
     range: Option<(usize, usize)>,
+    since: Option<Oid>,
 ) -> Result<String, Error> {
     let mut opts = BlameOptions::new();
     if let Some((lo, hi)) = range {
         opts.min_line(lo.max(1));
         opts.max_line(hi.max(lo.max(1)));
+    }
+    // Scope history to `since..`: lines last touched at or after `since` keep
+    // their commit; older lines collapse to the `since` boundary — so the answer
+    // is "which of MY commits owns this", not any commit in the whole history.
+    if let Some(s) = since {
+        opts.oldest_commit(s);
     }
     let blame = repo.blame_file(rel, Some(&mut opts))?;
     let mut out = String::new();
@@ -1872,6 +1879,81 @@ pub fn blame(
     }
     if out.is_empty() {
         out.push_str("(no blame — file untracked, empty, or outside the range)\n");
+    }
+    Ok(out)
+}
+
+/// "Which commit owns each uncommitted change" for `rel`: diff HEAD→worktree,
+/// then blame the OLD-side lines each hunk touches (the lines as they stand in
+/// HEAD) to name the commit that last set them. The absorb-target discovery —
+/// each reported oid feeds a git_fixup/git_move for that hunk. A pure insertion
+/// borrows the owner of the line it sits after.
+fn blame_worktree(repo: &Repository, rel: &Path, since: Option<Oid>) -> Result<String, Error> {
+    let head_tree = repo.head()?.peel_to_tree()?;
+    let mut dopts = git2::DiffOptions::new();
+    dopts.pathspec(rel.to_string_lossy().as_ref());
+    dopts.context_lines(0);
+    let diff = repo.diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut dopts))?;
+
+    let mut bopts = BlameOptions::new();
+    if let Some(s) = since {
+        bopts.oldest_commit(s);
+    }
+    // The file may be newly added (untracked) → no committed version to blame.
+    let blame = repo.blame_file(rel, Some(&mut bopts)).ok();
+
+    let mut out = String::new();
+    for idx in 0..diff.deltas().len() {
+        let Some(patch) = git2::Patch::from_diff(&diff, idx)? else {
+            continue;
+        };
+        for h in 0..patch.num_hunks() {
+            let (dh, _) = patch.hunk(h)?;
+            let (os, ol, ns, nl) = (
+                dh.old_start(),
+                dh.old_lines(),
+                dh.new_start(),
+                dh.new_lines(),
+            );
+            let span = if nl == 0 {
+                format!("L{ns}")
+            } else {
+                format!("L{ns}-{}", ns + nl - 1)
+            };
+            // Old lines this hunk changes; a pure insertion (ol==0) borrows the
+            // line it follows.
+            let lines: Vec<u32> = if ol == 0 {
+                vec![os.max(1)]
+            } else {
+                (os..os + ol).collect()
+            };
+            let mut owners: Vec<Oid> = Vec::new();
+            if let Some(b) = &blame {
+                for ln in lines {
+                    if let Some(bh) = b.get_line(ln as usize) {
+                        let oid = bh.final_commit_id();
+                        if !owners.contains(&oid) {
+                            owners.push(oid);
+                        }
+                    }
+                }
+            }
+            if owners.is_empty() {
+                out.push_str(&format!("  {span}\t(no prior owner — new lines)\n"));
+            } else {
+                for oid in owners {
+                    let summary = repo
+                        .find_commit(oid)
+                        .ok()
+                        .and_then(|c| c.summary().map(str::to_string))
+                        .unwrap_or_default();
+                    out.push_str(&format!("  {span}\t{}\t{summary}\n", short(oid)));
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push_str("(no uncommitted changes to this path)\n");
     }
     Ok(out)
 }
@@ -2213,8 +2295,11 @@ pub fn cmd_blame(
     repo_path: &std::path::Path,
     path: &str,
     lines: Option<(usize, usize)>,
+    since: Option<&str>,
+    worktree: bool,
 ) -> Result<String, String> {
     let repo = open(repo_path)?;
+    let since = since.map(|s| resolve_s(&repo, s)).transpose()?;
     // Accept an absolute path (what grep/occur hand back) or one already
     // relative to the workdir; blame_file wants it workdir-relative.
     let p = std::path::Path::new(path);
@@ -2228,7 +2313,11 @@ pub fn cmd_blame(
     } else {
         p.to_path_buf()
     };
-    blame(&repo, &rel, lines).map_err(gerr)
+    if worktree {
+        blame_worktree(&repo, &rel, since).map_err(gerr)
+    } else {
+        blame(&repo, &rel, lines, since).map_err(gerr)
+    }
 }
 
 pub fn cmd_move(
@@ -2623,7 +2712,7 @@ mod tests {
         let c2 = commit(&repo, &[c1], &[("f.txt", "one\nTWO\n")], "change two");
         on_branch(&repo, "main", c2);
 
-        let out = cmd_blame(&dir, "f.txt", None).unwrap();
+        let out = cmd_blame(&dir, "f.txt", None, None, false).unwrap();
         let lines: Vec<&str> = out.lines().collect();
         // Line 1 is still c1's; line 2 now belongs to c2. Hunks are one line each.
         assert!(
@@ -2636,7 +2725,7 @@ mod tests {
         );
 
         // A `lines` window blames only that span.
-        let just2 = cmd_blame(&dir, "f.txt", Some((2, 2))).unwrap();
+        let just2 = cmd_blame(&dir, "f.txt", Some((2, 2)), None, false).unwrap();
         assert!(
             just2.contains("change two") && !just2.contains("add one and two"),
             "windowed blame: {just2}"
@@ -2644,8 +2733,52 @@ mod tests {
 
         // An absolute path (what grep/occur hand back) resolves the same way.
         let abs = dir.join("f.txt");
-        let via_abs = cmd_blame(&dir, abs.to_str().unwrap(), None).unwrap();
+        let via_abs = cmd_blame(&dir, abs.to_str().unwrap(), None, None, false).unwrap();
         assert_eq!(via_abs, out, "absolute path blames identically");
+    }
+
+    #[test]
+    fn blame_since_scopes_to_recent_commits() {
+        let dir = tmp("blame-since");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("f", "a\n")], "base");
+        let c1 = commit(&repo, &[base], &[("f", "a\nB\n")], "add B");
+        let c2 = commit(&repo, &[c1], &[("f", "a\nB\nC\n")], "add C");
+        on_branch(&repo, "main", c2);
+
+        // Unscoped: line 1 ("a") is still base's.
+        let full = cmd_blame(&dir, "f", None, None, false).unwrap();
+        assert!(full.contains(&short(base)), "base owns line 1: {full}");
+        // Scoped to c1..: base predates the boundary, so its line collapses to c1
+        // and base's oid no longer appears; c2 still owns its own line.
+        let scoped = cmd_blame(&dir, "f", None, Some(&c1.to_string()), false).unwrap();
+        assert!(
+            !scoped.contains(&short(base)),
+            "base hidden by since: {scoped}"
+        );
+        assert!(
+            scoped.contains(&short(c2)),
+            "c2 still owns its line: {scoped}"
+        );
+    }
+
+    #[test]
+    fn blame_worktree_maps_a_change_to_its_owning_commit() {
+        let dir = tmp("blame-wt");
+        let repo = Repository::init(&dir).unwrap();
+        let _base = commit(&repo, &[], &[("f", "a\nb\nc\n")], "base");
+        let c1 = commit(&repo, &[_base], &[("f", "a\nB\nc\n")], "edit line 2");
+        on_branch(&repo, "main", c1);
+
+        // Re-edit line 2 (which c1 last set) WITHOUT committing.
+        std::fs::write(repo.workdir().unwrap().join("f"), b"a\nB2\nc\n").unwrap();
+        let out = cmd_blame(&dir, "f", None, None, true).unwrap();
+        // The uncommitted hunk at new line 2 is owned by c1.
+        assert!(
+            out.contains(&short(c1)) && out.contains("edit line 2"),
+            "worktree hunk maps to c1: {out}"
+        );
+        assert!(out.contains("L2"), "{out}");
     }
 
     #[test]
