@@ -2147,6 +2147,7 @@ fn plan_arg(args: &Value) -> Option<Vec<crate::sequencer::PlanItem>> {
                         a.iter()
                             .map(|p| {
                                 let paths_key = p.get("paths");
+                                let hunks_key = p.get("hunks");
                                 crate::sequencer::SplitPart {
                                     message: p
                                         .get("message")
@@ -2161,11 +2162,31 @@ fn plan_arg(args: &Value) -> Option<Vec<crate::sequencer::PlanItem>> {
                                                 .collect()
                                         })
                                         .unwrap_or_default(),
-                                    // Only an ABSENT `paths` key is the catch-all; a present
-                                    // but non-array `paths` stays a non-catch-all with empty
-                                    // paths, which split_assignment then rejects (no silent
-                                    // promotion to the catch-all).
-                                    rest: paths_key.is_none(),
+                                    hunks: hunks_key
+                                        .and_then(Value::as_array)
+                                        .map(|hs| {
+                                            hs.iter()
+                                                .filter_map(|h| {
+                                                    let path = h
+                                                        .get("path")
+                                                        .and_then(Value::as_str)?
+                                                        .to_string();
+                                                    let lines =
+                                                        h.get("lines").and_then(Value::as_array)?;
+                                                    let lo =
+                                                        lines.first().and_then(Value::as_u64)?
+                                                            as u32;
+                                                    let hi = lines.get(1).and_then(Value::as_u64)?
+                                                        as u32;
+                                                    Some(crate::sequencer::HunkSel { path, lo, hi })
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default(),
+                                    // The catch-all is the part with NEITHER a `paths` nor a
+                                    // `hunks` key; a present-but-non-array key stays a
+                                    // non-catch-all (rejected later, no silent promotion).
+                                    rest: paths_key.is_none() && hunks_key.is_none(),
                                 }
                             })
                             .collect()
@@ -2260,7 +2281,7 @@ fn git_tool_schemas() -> Vec<Value> {
     vec![
         json!({
             "name": "git_rebase",
-            "description": "Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`. Each step picks/rewords/squashes/fixups/edits/splits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. A `split` step partitions one commit's changes, by file path, into the commits listed in `into`. Stops on a conflict for the conflict tools + git_continue. No network, hooks, or exec.",
+            "description": "Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`. Each step picks/rewords/squashes/fixups/edits/splits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. A `split` step partitions one commit's changes — by whole file (`paths`) or by hunk (`hunks`, a post-commit line span) — into the commits listed in `into`. Stops on a conflict for the conflict tools + git_continue. No network, hooks, or exec.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2289,12 +2310,24 @@ fn git_tool_schemas() -> Vec<Value> {
                                 },
                                 "into": {
                                     "type": "array",
-                                    "description": "For a `split` step: the output commits, in order. Each is {message, paths}; one part may omit `paths` to be the catch-all that collects every changed path no other part claims. Every path the commit changes must be covered exactly once.",
+                                    "description": "For a `split` step: the output commits, in order. Each is {message, paths?, hunks?}: `paths` takes whole files, `hunks` takes specific hunks of a file by post-commit line range. One part may omit both to be the catch-all collecting every change no other part claims. Every change the commit makes must be covered exactly once; tracked files can be split across parts by hunk.",
                                     "items": {
                                         "type": "object",
                                         "properties": {
                                             "message": { "type": "string", "description": "Commit message for this output commit." },
-                                            "paths": { "type": "array", "items": { "type": "string" }, "description": "Paths whose changes go into this commit. Omit in exactly one part to make it the catch-all." }
+                                            "paths": { "type": "array", "items": { "type": "string" }, "description": "Whole files whose changes go into this commit." },
+                                            "hunks": {
+                                                "type": "array",
+                                                "description": "Specific hunks of a file: each {path, lines: [start, end]} takes every diff-hunk of `path` whose post-commit line range overlaps [start, end] (1-based inclusive). Lets one part take part of a file and another the rest.",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "path": { "type": "string", "description": "File whose hunks to select." },
+                                                        "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based inclusive line span in the POST-commit file." }
+                                                    },
+                                                    "required": ["path", "lines"]
+                                                }
+                                            }
                                         },
                                         "required": ["message"]
                                     }

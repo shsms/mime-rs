@@ -179,9 +179,10 @@ half for a fixup/edit plan.
     worktree, then git_continue folds the changes into that commit. message_edits
     ([{find, replace?}] to replace/delete literal text, [{append}] to add a
     trailing line) tweak a reword/squash/fixup/edit message without retyping it,
-    so the sign-off and the rest survive. A `split` step partitions one commit by
-    file path into the commits in into = [{message, paths}]; one part may omit
-    paths as the catch-all for everything else.
+    so the sign-off and the rest survive. A `split` step partitions one commit
+    into the commits in into = [{message, paths?, hunks?}] — paths takes whole
+    files, hunks = [{path, lines:[a,b]}] takes hunks by post-commit line span;
+    one part may omit both as the catch-all for everything else.
   git_cherry_pick {commits} / git_revert {commits}  on top of the tip.
 Each STOPS on the first conflict. Then, per stop:
   git_status     which step of how many + the unresolved files

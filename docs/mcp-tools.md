@@ -178,7 +178,7 @@ Report engine status: per live session the current buffer, its visited file, and
 
 ## git_rebase
 
-Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`. Each step picks/rewords/squashes/fixups/edits/splits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. A `split` step partitions one commit's changes, by file path, into the commits listed in `into`. Stops on a conflict for the conflict tools + git_continue. No network, hooks, or exec.
+Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`. Each step picks/rewords/squashes/fixups/edits/splits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. A `split` step partitions one commit's changes — by whole file (`paths`) or by hunk (`hunks`, a post-commit line span) — into the commits listed in `into`. Stops on a conflict for the conflict tools + git_continue. No network, hooks, or exec.
 
 - `onto` (required) — The new base — oid/ref/revspec the commits are replayed onto.
 - `plan` — Explicit steps (omit to pick all of onto..HEAD in order). List order is the new commit order.

@@ -147,7 +147,19 @@ pub struct MsgEditSpec {
 pub struct SplitPart {
     pub message: String,
     pub paths: Vec<String>,
+    pub hunks: Vec<HunkSel>,
     pub rest: bool,
+}
+
+/// A new-side line span selecting whole diff-hunks of `path`: a hunk of that
+/// file joins the part when its post-commit line range overlaps `[lo, hi]`
+/// (1-based inclusive) — the line numbers grep/blame hand back. Lets one part
+/// claim some of a file's changes and another the rest.
+#[derive(Clone, Debug)]
+pub struct HunkSel {
+    pub path: String,
+    pub lo: u32,
+    pub hi: u32,
 }
 
 /// A raw plan step as the MCP layer extracts it: (commit, action, message,
@@ -308,7 +320,14 @@ fn save_state(repo: &Repository, st: &State) -> Result<(), Error> {
             let split: Vec<_> = s
                 .split_into
                 .iter()
-                .map(|p| json!({"message": p.message, "paths": p.paths, "rest": p.rest}))
+                .map(|p| {
+                    let hunks: Vec<_> = p
+                        .hunks
+                        .iter()
+                        .map(|h| json!({"path": h.path, "lo": h.lo, "hi": h.hi}))
+                        .collect();
+                    json!({"message": p.message, "paths": p.paths, "hunks": hunks, "rest": p.rest})
+                })
                 .collect();
             json!({"commit": s.commit.to_string(), "action": s.action.as_str(), "message": s.message, "message_edits": edits, "split_into": split})
         })
@@ -378,6 +397,20 @@ fn load_state(repo: &Repository) -> Result<State, Error> {
                                     .map(|ps| {
                                         ps.iter()
                                             .filter_map(|x| x.as_str().map(str::to_string))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                                hunks: p["hunks"]
+                                    .as_array()
+                                    .map(|hs| {
+                                        hs.iter()
+                                            .filter_map(|h| {
+                                                Some(HunkSel {
+                                                    path: h["path"].as_str()?.to_string(),
+                                                    lo: h["lo"].as_u64()? as u32,
+                                                    hi: h["hi"].as_u64()? as u32,
+                                                })
+                                            })
                                             .collect()
                                     })
                                     .unwrap_or_default(),
@@ -527,8 +560,14 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
             if c.parent_count() == 0 {
                 return Err(estr("split: cannot split a root commit"));
             }
-            let touched = changed_paths(repo, &c.parent(0)?.tree()?, &c.tree()?)?;
-            split_assignment(&touched, &s.split_into)?;
+            let base_tree = c.parent(0)?.tree()?;
+            let target = c.tree()?;
+            if s.split_into.iter().any(|p| !p.hunks.is_empty()) {
+                hunk_assignment(repo, &base_tree, &target, &s.split_into)?;
+            } else {
+                let touched = changed_paths(repo, &base_tree, &target)?;
+                split_assignment(&touched, &s.split_into)?;
+            }
         }
     }
     if state_path(repo).exists() {
@@ -635,7 +674,7 @@ fn rehearse(repo: &Repository, plan: &Plan, mode: Mode) -> Result<Preview, Error
         if step.action == Action::Split {
             // Preview the split's output commits (real objects, left dangling).
             let pick = repo.find_commit(step.commit)?;
-            for c in split_commits(repo, &pick, current, &tree, &step.split_into)? {
+            for c in build_split(repo, &pick, current, &tree, &step.split_into)? {
                 let summary = repo.find_commit(c)?.summary().unwrap_or("").to_string();
                 commits.push((c, summary));
                 current = c;
@@ -1063,6 +1102,273 @@ fn split_commits(
     Ok(made)
 }
 
+/// Build a split's output commits, choosing the path- or hunk-level builder by
+/// whether any part selects hunks. Both are pure tree construction — no worktree.
+fn build_split(
+    repo: &Repository,
+    pick: &git2::Commit,
+    base: Oid,
+    target: &git2::Tree,
+    parts: &[SplitPart],
+) -> Result<Vec<Oid>, Error> {
+    if parts.iter().any(|p| !p.hunks.is_empty()) {
+        split_commits_hunked(repo, pick, base, target, parts)
+    } else {
+        split_commits(repo, pick, base, target, parts)
+    }
+}
+
+/// The resolved ownership of a hunk-aware split: which part takes each file
+/// whole, and which part takes each individual hunk of a hunk-split file. A
+/// path is in exactly one of the two maps.
+struct HunkPlan {
+    /// path → part index, for files claimed whole (a part's `paths`, or a
+    /// no-hunk delta / catch-all file).
+    whole: std::collections::HashMap<String, usize>,
+    /// (path, new_start, new_lines) → part index, for hunk-split files.
+    per_hunk: std::collections::HashMap<(String, u32, u32), usize>,
+}
+
+/// Resolve and validate a hunk-aware split against the commit's own
+/// `base_tree → target` diff. Errors on an empty plan, an empty message, a path
+/// the commit doesn't change, a path claimed twice (or by both path and hunk), a
+/// hunk claimed twice, a selector that overlaps no hunk, more than one catch-all,
+/// an unassigned file/hunk with no catch-all, or a part that ends up empty.
+fn hunk_assignment(
+    repo: &Repository,
+    base_tree: &git2::Tree,
+    target: &git2::Tree,
+    parts: &[SplitPart],
+) -> Result<HunkPlan, Error> {
+    if parts.is_empty() {
+        return Err(estr("split: `into` must list at least one part"));
+    }
+    let mut rest_idx: Option<usize> = None;
+    for (i, p) in parts.iter().enumerate() {
+        if p.message.trim().is_empty() {
+            return Err(estr("split: every part needs a non-empty message"));
+        }
+        if p.paths.is_empty() && p.hunks.is_empty() {
+            if rest_idx.is_some() {
+                return Err(estr(
+                    "split: at most one part may be the catch-all (the one with no paths or hunks)",
+                ));
+            }
+            rest_idx = Some(i);
+        }
+    }
+
+    // The commit's changed files, each with its hunks' new-side spans (empty for
+    // a rename/mode/binary delta that carries no text hunk).
+    let diff = repo.diff_tree_to_tree(Some(base_tree), Some(target), None)?;
+    let mut files: Vec<(String, Vec<(u32, u32)>)> = Vec::new();
+    for idx in 0..diff.deltas().len() {
+        let Some(delta) = diff.get_delta(idx) else {
+            continue;
+        };
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .and_then(|p| p.to_str())
+            .unwrap_or("")
+            .to_string();
+        let mut hunks = Vec::new();
+        if let Some(patch) = git2::Patch::from_diff(&diff, idx)? {
+            for h in 0..patch.num_hunks() {
+                let (dh, _) = patch.hunk(h)?;
+                hunks.push((dh.new_start(), dh.new_lines()));
+            }
+        }
+        files.push((path, hunks));
+    }
+
+    let mut whole: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut per_hunk: std::collections::HashMap<(String, u32, u32), usize> =
+        std::collections::HashMap::new();
+
+    // 1) explicit whole-file claims (`paths`).
+    for (i, part) in parts.iter().enumerate() {
+        for p in &part.paths {
+            if !files.iter().any(|(f, _)| f == p) {
+                return Err(estr(&format!("split: the commit does not change {p}")));
+            }
+            if whole.insert(p.clone(), i).is_some() {
+                return Err(estr(&format!(
+                    "split: {p} is assigned to more than one part"
+                )));
+            }
+        }
+    }
+
+    // 2) explicit hunk claims: a selector takes every hunk whose new-side span
+    // overlaps it.
+    for (i, part) in parts.iter().enumerate() {
+        for sel in &part.hunks {
+            if whole.contains_key(&sel.path) {
+                return Err(estr(&format!(
+                    "split: {} is claimed both by path and by hunk",
+                    sel.path
+                )));
+            }
+            let Some((_, hunks)) = files.iter().find(|(f, _)| f == &sel.path) else {
+                return Err(estr(&format!(
+                    "split: the commit does not change {}",
+                    sel.path
+                )));
+            };
+            if hunks.is_empty() {
+                return Err(estr(&format!(
+                    "split: {} has no text hunks to select (a rename/mode/binary change — assign it by path)",
+                    sel.path
+                )));
+            }
+            let mut matched = false;
+            for &(ns, nl) in hunks {
+                // New-side span [ns, ns+nl-1]; a pure-deletion hunk (nl==0) is a
+                // point at ns.
+                let hi = if nl == 0 { ns } else { ns + nl - 1 };
+                if sel.lo <= hi && ns <= sel.hi {
+                    matched = true;
+                    match per_hunk.insert((sel.path.clone(), ns, nl), i) {
+                        Some(prev) if prev != i => {
+                            return Err(estr(&format!(
+                                "split: a hunk of {} is claimed by more than one part",
+                                sel.path
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !matched {
+                return Err(estr(&format!(
+                    "split: no hunk of {} overlaps lines {}-{}",
+                    sel.path, sel.lo, sel.hi
+                )));
+            }
+        }
+    }
+
+    // 3) sweep everything not explicitly claimed into the catch-all (or error).
+    for (path, hunks) in &files {
+        if whole.contains_key(path) {
+            continue;
+        }
+        if hunks.is_empty() {
+            match rest_idx {
+                Some(r) => {
+                    whole.insert(path.clone(), r);
+                }
+                None => {
+                    return Err(estr(&format!(
+                        "split: {path} is unassigned (add it to a part's paths, or give one part no paths/hunks as the catch-all)"
+                    )));
+                }
+            }
+            continue;
+        }
+        for &(ns, nl) in hunks {
+            if per_hunk.contains_key(&(path.clone(), ns, nl)) {
+                continue;
+            }
+            match rest_idx {
+                Some(r) => {
+                    per_hunk.insert((path.clone(), ns, nl), r);
+                }
+                None => {
+                    return Err(estr(&format!(
+                        "split: a hunk of {path} (line {ns}) is unassigned (add it to a part, or give one part no paths/hunks as the catch-all)"
+                    )));
+                }
+            }
+        }
+    }
+
+    // Every part — catch-all included — must end up owning something.
+    for (i, part) in parts.iter().enumerate() {
+        let owns = whole.values().any(|&v| v == i) || per_hunk.values().any(|&v| v == i);
+        if !owns {
+            return Err(estr(&format!(
+                "split: part \"{}\" ends up with no changes",
+                part.message
+            )));
+        }
+    }
+
+    Ok(HunkPlan { whole, per_hunk })
+}
+
+/// Build a hunk-split's output commits: for each part in turn, apply the
+/// cumulative set of file/hunk changes owned by parts `0..=k` onto the ORIGINAL
+/// base tree, so part `k`'s tree is `base + parts[0..=k]` and the last equals
+/// `target`. Applying a subset of a file's hunks can fail if a skipped hunk
+/// shifted the context a kept one needs — that surfaces as an apply error
+/// (recoverable via git_abort).
+fn split_commits_hunked(
+    repo: &Repository,
+    pick: &git2::Commit,
+    base: Oid,
+    target: &git2::Tree,
+    parts: &[SplitPart],
+) -> Result<Vec<Oid>, Error> {
+    let base_tree = repo.find_commit(base)?.tree()?;
+    let plan = hunk_assignment(repo, &base_tree, target, parts)?;
+    let diff = repo.diff_tree_to_tree(Some(&base_tree), Some(target), None)?;
+
+    let mut current = base;
+    let mut made = Vec::new();
+    for k in 0..parts.len() {
+        let cur_path = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let cur_path_delta = cur_path.clone();
+        let whole = &plan.whole;
+        let per_hunk = &plan.per_hunk;
+        let mut opts = git2::ApplyOptions::new();
+        opts.delta_callback(move |d: Option<git2::DiffDelta>| {
+            let path = d
+                .and_then(|d| d.new_file().path().or_else(|| d.old_file().path()))
+                .and_then(|p| p.to_str())
+                .unwrap_or("")
+                .to_string();
+            *cur_path_delta.borrow_mut() = path.clone();
+            // Whole-file: apply iff a part in 0..=k owns it. Hunk-split file: let
+            // the hunk callback decide, so return true here.
+            whole.get(&path).map(|&owner| owner <= k).unwrap_or(true)
+        });
+        opts.hunk_callback(move |h: Option<git2::DiffHunk>| {
+            let Some(h) = h else { return false };
+            let path = cur_path.borrow().clone();
+            // A whole-file-owned file's hunks aren't in per_hunk; delta_callback
+            // already gated it, so apply them all (None → true).
+            per_hunk
+                .get(&(path, h.new_start(), h.new_lines()))
+                .map(|&owner| owner <= k)
+                .unwrap_or(true)
+        });
+        let mut index = repo.apply_to_tree(&base_tree, &diff, Some(&mut opts))?;
+        let tree = repo.find_tree(index.write_tree_to(repo)?)?;
+        // Safety invariant: the final part must reassemble the original commit
+        // exactly — a mismatch means the partition dropped or duplicated a change.
+        if k == parts.len() - 1 && tree.id() != target.id() {
+            return Err(estr(
+                "split: internal error — the parts do not reassemble the original commit's tree",
+            ));
+        }
+        let parent = repo.find_commit(current)?;
+        let new = repo.commit(
+            None,
+            &pick.author(),
+            &pick.committer(),
+            &parts[k].message,
+            &tree,
+            &[&parent],
+        )?;
+        made.push(new);
+        current = new;
+    }
+    Ok(made)
+}
+
 /// Land a `split` step: produce its output commits and move HEAD to the last.
 fn land_split(
     repo: &Repository,
@@ -1071,7 +1377,7 @@ fn land_split(
     target: &git2::Tree,
 ) -> Result<Oid, Error> {
     let pick = repo.find_commit(step.commit)?;
-    let made = split_commits(repo, &pick, st.current, target, &step.split_into)?;
+    let made = build_split(repo, &pick, st.current, target, &step.split_into)?;
     let last = *made.last().expect("split produced at least one commit");
     repo.set_head_detached(last)?;
     Ok(last)
@@ -2693,7 +2999,22 @@ mod tests {
         SplitPart {
             message: message.to_string(),
             paths: paths.iter().map(|p| p.to_string()).collect(),
+            hunks: Vec::new(),
             rest,
+        }
+    }
+
+    /// A part that claims hunks of one file by new-side line span [lo, hi].
+    fn hunk_part(message: &str, path: &str, lo: u32, hi: u32) -> SplitPart {
+        SplitPart {
+            message: message.to_string(),
+            paths: Vec::new(),
+            hunks: vec![HunkSel {
+                path: path.to_string(),
+                lo,
+                hi,
+            }],
+            rest: false,
         }
     }
 
@@ -2752,6 +3073,89 @@ mod tests {
         assert!(first.tree().unwrap().get_path(Path::new("c")).is_err());
         assert!(tip.tree().unwrap().get_path(Path::new("c")).is_ok());
         assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn split_partitions_a_commit_by_hunk() {
+        let dir = tmp("split-hunk");
+        let repo = Repository::init(&dir).unwrap();
+        // A 12-line file so edits at line 1 and line 12 form two SEPARATE diff
+        // hunks (their 3-line context windows don't touch).
+        let base = commit(
+            &repo,
+            &[],
+            &[("f", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n")],
+            "base",
+        );
+        let c1 = commit(
+            &repo,
+            &[base],
+            &[("f", "X\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nY\n")],
+            "edit top and bottom",
+        );
+        on_branch(&repo, "topic", c1);
+
+        let out = start(
+            &repo,
+            Plan {
+                onto: base,
+                steps: vec![split_step(
+                    c1,
+                    vec![
+                        hunk_part("top", "f", 1, 1),     // the new-line-1 hunk
+                        split_part("bottom", &[], true), // catch-all: the rest
+                    ],
+                )],
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, Outcome::Done { .. }));
+
+        // Reassembled worktree equals the original commit.
+        assert_eq!(read(&repo, "f"), "X\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nY\n");
+
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        let first = tip.parent(0).unwrap();
+        assert_eq!(first.message().unwrap(), "top");
+        assert_eq!(tip.message().unwrap(), "bottom");
+        assert_eq!(first.parent(0).unwrap().id(), base, "chain rooted on base");
+        // The first commit carries ONLY the top hunk; the bottom line is still base's.
+        let e = first.tree().unwrap().get_path(Path::new("f")).unwrap();
+        assert_eq!(
+            repo.find_blob(e.id()).unwrap().content(),
+            b"X\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n"
+        );
+        assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn split_rejects_a_hunk_selector_that_matches_nothing() {
+        let dir = tmp("split-hunk-bad");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("f", "a\nb\nc\n")], "base");
+        let c1 = commit(&repo, &[base], &[("f", "A\nb\nc\n")], "edit line 1");
+        on_branch(&repo, "topic", c1);
+
+        // Line 99 overlaps no hunk — begin() rejects before any mutation.
+        let err = start(
+            &repo,
+            Plan {
+                onto: base,
+                steps: vec![split_step(
+                    c1,
+                    vec![
+                        hunk_part("nope", "f", 99, 99),
+                        split_part("rest", &[], true),
+                    ],
+                )],
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("no hunk of f overlaps"), "{err}");
+        assert!(
+            !state_path(&repo).exists(),
+            "a rejected start leaves no operation state"
+        );
     }
 
     #[test]
