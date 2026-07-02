@@ -1369,6 +1369,257 @@ fn split_commits_hunked(
     Ok(made)
 }
 
+/// The delta's path (new side, falling back to old), for the apply callbacks.
+fn delta_path(d: Option<git2::DiffDelta>) -> String {
+    d.and_then(|d| d.new_file().path().or_else(|| d.old_file().path()))
+        .and_then(|p| p.to_str())
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
+/// Apply the subset of `diff` that the callbacks keep onto `base_tree`, returning
+/// the resulting tree oid. `keep_hunk` decides each hunk of a text file;
+/// `keep_whole` decides a no-hunk delta (rename/mode/binary). A file with NO kept
+/// content is dropped at the DELTA level — so an add/delete that is entirely
+/// excluded doesn't leave an empty file behind (which per-hunk rejection alone
+/// would, since git creates the added file before its hunks run).
+fn apply_subset(
+    repo: &Repository,
+    base_tree: &git2::Tree,
+    diff: &git2::Diff,
+    keep_whole: impl Fn(&str) -> bool,
+    keep_hunk: impl Fn(&str, u32, u32) -> bool,
+) -> Result<Oid, Error> {
+    // Per file: is anything kept? (delta-level gate, computed before applying.)
+    let mut keep_file: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for idx in 0..diff.deltas().len() {
+        let Some(delta) = diff.get_delta(idx) else {
+            continue;
+        };
+        let path = delta_path(Some(delta));
+        let any = match git2::Patch::from_diff(diff, idx)? {
+            Some(p) if p.num_hunks() > 0 => {
+                let mut kept = false;
+                for h in 0..p.num_hunks() {
+                    let (dh, _) = p.hunk(h)?;
+                    if keep_hunk(&path, dh.new_start(), dh.new_lines()) {
+                        kept = true;
+                        break;
+                    }
+                }
+                kept
+            }
+            _ => keep_whole(&path), // no-hunk delta (rename/mode/binary)
+        };
+        keep_file.insert(path, any);
+    }
+
+    let cur = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+    let cur_delta = cur.clone();
+    let mut opts = git2::ApplyOptions::new();
+    opts.delta_callback(move |d: Option<git2::DiffDelta>| {
+        let path = delta_path(d);
+        let keep = *keep_file.get(&path).unwrap_or(&true);
+        *cur_delta.borrow_mut() = path;
+        keep
+    });
+    opts.hunk_callback(move |h: Option<git2::DiffHunk>| {
+        let Some(h) = h else { return false };
+        keep_hunk(&cur.borrow(), h.new_start(), h.new_lines())
+    });
+    let mut index = repo.apply_to_tree(base_tree, diff, Some(&mut opts))?;
+    index.write_tree_to(repo)
+}
+
+/// The change to relocate, resolved against `from`'s own diff: whole files
+/// (`paths`), individual hunks (`hunks`), and the diff's no-hunk files.
+struct MoveSel {
+    whole: std::collections::HashSet<String>,
+    hunks: std::collections::HashSet<(String, u32, u32)>,
+    /// Every path the move touches — for the "changed in both commits" check.
+    paths: std::collections::HashSet<String>,
+}
+
+impl MoveSel {
+    /// Is this hunk (or, via `new_lines`==anything, its file) part of the move?
+    fn takes(&self, path: &str, ns: u32, nl: u32) -> bool {
+        self.whole.contains(path) || self.hunks.contains(&(path.to_string(), ns, nl))
+    }
+}
+
+/// Validate the requested paths/hunks against `from`'s diff and resolve them to a
+/// [`MoveSel`]. Errors on a path/selector the commit doesn't change, a path named
+/// both ways, a selector overlapping no hunk, or a rename/mode/binary hunk-select.
+fn resolve_move_selection(
+    from_diff: &git2::Diff,
+    paths: &[String],
+    hunks: &[HunkSel],
+) -> Result<MoveSel, Error> {
+    let mut files: Vec<(String, Vec<(u32, u32)>)> = Vec::new();
+    for idx in 0..from_diff.deltas().len() {
+        let Some(delta) = from_diff.get_delta(idx) else {
+            continue;
+        };
+        let path = delta_path(Some(delta));
+        let mut hs = Vec::new();
+        if let Some(patch) = git2::Patch::from_diff(from_diff, idx)? {
+            for h in 0..patch.num_hunks() {
+                let (dh, _) = patch.hunk(h)?;
+                hs.push((dh.new_start(), dh.new_lines()));
+            }
+        }
+        files.push((path, hs));
+    }
+
+    let mut whole = std::collections::HashSet::new();
+    for p in paths {
+        if !files.iter().any(|(f, _)| f == p) {
+            return Err(estr(&format!("move: `from` does not change {p}")));
+        }
+        whole.insert(p.clone());
+    }
+    let mut hunk_keys = std::collections::HashSet::new();
+    for sel in hunks {
+        if whole.contains(&sel.path) {
+            return Err(estr(&format!(
+                "move: {} is named both by path and by hunk",
+                sel.path
+            )));
+        }
+        let Some((_, hs)) = files.iter().find(|(f, _)| f == &sel.path) else {
+            return Err(estr(&format!("move: `from` does not change {}", sel.path)));
+        };
+        if hs.is_empty() {
+            return Err(estr(&format!(
+                "move: {} has no text hunks (a rename/mode/binary change — move it by path)",
+                sel.path
+            )));
+        }
+        let mut matched = false;
+        for &(ns, nl) in hs {
+            let hi = if nl == 0 { ns } else { ns + nl - 1 };
+            if sel.lo <= hi && ns <= sel.hi {
+                matched = true;
+                hunk_keys.insert((sel.path.clone(), ns, nl));
+            }
+        }
+        if !matched {
+            return Err(estr(&format!(
+                "move: no hunk of {} overlaps lines {}-{}",
+                sel.path, sel.lo, sel.hi
+            )));
+        }
+    }
+    let mut all = whole.clone();
+    for (p, _, _) in &hunk_keys {
+        all.insert(p.clone());
+    }
+    Ok(MoveSel {
+        whole,
+        hunks: hunk_keys,
+        paths: all,
+    })
+}
+
+/// Relocate `from`'s changes to the adjacent commit `to`, then replay the rest of
+/// the branch. The FINAL tree never changes — only which of the two commits
+/// introduces the moved change — so a move can't alter the branch's end state.
+/// Returns the sequencer outcome (a conflict during tail replay stops for the
+/// conflict tools + git_continue, like any rebase).
+fn move_changes(
+    repo: &Repository,
+    from: Oid,
+    to: Oid,
+    paths: &[String],
+    hunks: &[HunkSel],
+) -> Result<String, Error> {
+    if paths.is_empty() && hunks.is_empty() {
+        return Err(estr("move: name at least one path or hunk to move"));
+    }
+    let fc = repo.find_commit(from)?;
+    let tc = repo.find_commit(to)?;
+    let from_is_child = fc.parent_count() > 0 && fc.parent(0)?.id() == to;
+    let to_is_child = tc.parent_count() > 0 && tc.parent(0)?.id() == from;
+    if !from_is_child && !to_is_child {
+        return Err(estr(
+            "move: `from` and `to` must be adjacent (one the direct parent of the other)",
+        ));
+    }
+    // older is the parent commit, newer its child; `from` is one of them.
+    let (older, newer) = if from_is_child {
+        (tc.clone(), fc.clone())
+    } else {
+        (fc.clone(), tc.clone())
+    };
+    let base_commit = older.parent(0)?; // older is a child (adjacency), so it has a parent
+    let base_tree = base_commit.tree()?;
+    let older_tree = older.tree()?;
+    let newer_tree = newer.tree()?;
+
+    // The move set lives in `from`'s own diff; reject anything `to` also changes.
+    let from_parent_tree = fc.parent(0)?.tree()?;
+    let from_diff = repo.diff_tree_to_tree(Some(&from_parent_tree), Some(&fc.tree()?), None)?;
+    let sel = resolve_move_selection(&from_diff, paths, hunks)?;
+    let to_changed = changed_paths(repo, &tc.parent(0)?.tree()?, &tc.tree()?)?;
+    for p in &sel.paths {
+        if to_changed.iter().any(|c| c == p) {
+            return Err(estr(&format!(
+                "move: {p} is changed by both commits — can't unambiguously move it"
+            )));
+        }
+    }
+
+    // Rebuild `older`: forward move (from=older) drops the move set from its diff;
+    // backward move (from=newer) adds it to older's tree. `newer` keeps the final
+    // tree unchanged, so the branch end state is identical either way.
+    let older_new_tree = if from_is_child {
+        // Backward: older' = older + the moved subset of newer's (=from's) diff.
+        apply_subset(
+            repo,
+            &older_tree,
+            &from_diff,
+            |p| sel.whole.contains(p),
+            |p, ns, nl| sel.takes(p, ns, nl),
+        )?
+    } else {
+        // Forward: older' = base + older's (=from's) diff minus the moved subset.
+        apply_subset(
+            repo,
+            &base_tree,
+            &from_diff,
+            |p| !sel.whole.contains(p),
+            |p, ns, nl| !sel.takes(p, ns, nl),
+        )?
+    };
+
+    let older_prime = repo.commit(
+        None,
+        &older.author(),
+        &older.committer(),
+        older.message().unwrap_or(""),
+        &repo.find_tree(older_new_tree)?,
+        &[&base_commit],
+    )?;
+    let newer_prime = repo.commit(
+        None,
+        &newer.author(),
+        &newer.committer(),
+        newer.message().unwrap_or(""),
+        &newer_tree,
+        &[&repo.find_commit(older_prime)?],
+    )?;
+
+    // Replay the commits after `newer` onto the rebuilt pair via the sequencer,
+    // reusing its conflict handling + backup ref. Empty tail = just move the branch.
+    let tail = commits_since(repo, newer.id())?;
+    let note = backup_note(repo);
+    let plan = Plan {
+        onto: newer_prime,
+        steps: tail.into_iter().map(pick_step).collect(),
+    };
+    Ok(format!("{}{note}", outcome_text(&start(repo, plan)?)))
+}
+
 /// Land a `split` step: produce its output commits and move HEAD to the last.
 fn land_split(
     repo: &Repository,
@@ -1865,6 +2116,19 @@ pub fn cmd_blame(
     blame(&repo, &rel, lines).map_err(gerr)
 }
 
+pub fn cmd_move(
+    repo_path: &std::path::Path,
+    from: &str,
+    to: &str,
+    paths: &[String],
+    hunks: &[HunkSel],
+) -> Result<String, String> {
+    let repo = open(repo_path)?;
+    let from = resolve_s(&repo, from)?;
+    let to = resolve_s(&repo, to)?;
+    move_changes(&repo, from, to, paths, hunks).map_err(gerr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2267,6 +2531,194 @@ mod tests {
         let abs = dir.join("f.txt");
         let via_abs = cmd_blame(&dir, abs.to_str().unwrap(), None).unwrap();
         assert_eq!(via_abs, out, "absolute path blames identically");
+    }
+
+    #[test]
+    fn move_relocates_a_file_forward_and_replays_the_tail() {
+        let dir = tmp("move-fwd");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("x", "0\n")], "base");
+        let f = commit(
+            &repo,
+            &[base],
+            &[("x", "0\n"), ("a", "1\n"), ("b", "1\n")],
+            "F: a and b",
+        );
+        let t = commit(
+            &repo,
+            &[f],
+            &[("x", "0\n"), ("a", "1\n"), ("b", "1\n"), ("c", "1\n")],
+            "T: c",
+        );
+        let tail = commit(
+            &repo,
+            &[t],
+            &[
+                ("x", "0\n"),
+                ("a", "1\n"),
+                ("b", "1\n"),
+                ("c", "1\n"),
+                ("d", "1\n"),
+            ],
+            "tail: d",
+        );
+        on_branch(&repo, "main", tail);
+
+        // Move b's change from F forward into its child T.
+        let out = cmd_move(
+            &dir,
+            &f.to_string(),
+            &t.to_string(),
+            &["b".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert!(out.starts_with("done"), "{out}");
+
+        // Final tree is unchanged: every file still present.
+        for p in ["a", "b", "c", "d"] {
+            assert_eq!(read(&repo, p), "1\n", "{p} survives the move");
+        }
+        // T' now introduces b; F' no longer does; the tail (d) was replayed.
+        let tip = repo.head().unwrap().peel_to_commit().unwrap(); // tail'
+        let t_prime = tip.parent(0).unwrap();
+        let f_prime = t_prime.parent(0).unwrap();
+        assert_eq!(f_prime.message().unwrap(), "F: a and b");
+        assert_eq!(t_prime.message().unwrap(), "T: c");
+        assert_eq!(tip.message().unwrap(), "tail: d");
+        assert!(f_prime.tree().unwrap().get_path(Path::new("a")).is_ok());
+        assert!(
+            f_prime.tree().unwrap().get_path(Path::new("b")).is_err(),
+            "b moved out of F'"
+        );
+        assert!(
+            t_prime.tree().unwrap().get_path(Path::new("b")).is_ok(),
+            "b moved into T'"
+        );
+        assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn move_relocates_a_file_backward() {
+        let dir = tmp("move-back");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("x", "0\n")], "base");
+        let f = commit(&repo, &[base], &[("x", "0\n"), ("a", "1\n")], "F: a");
+        let t = commit(
+            &repo,
+            &[f],
+            &[("x", "0\n"), ("a", "1\n"), ("b", "1\n"), ("d", "1\n")],
+            "T: b and d",
+        );
+        on_branch(&repo, "main", t);
+
+        // Move b's change from T back into its parent F.
+        let out = cmd_move(
+            &dir,
+            &t.to_string(),
+            &f.to_string(),
+            &["b".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert!(out.starts_with("done"), "{out}");
+
+        let tip = repo.head().unwrap().peel_to_commit().unwrap(); // T'
+        let f_prime = tip.parent(0).unwrap();
+        assert!(
+            f_prime.tree().unwrap().get_path(Path::new("b")).is_ok(),
+            "b moved into F'"
+        );
+        // T' still introduces d, no longer b.
+        assert!(tip.tree().unwrap().get_path(Path::new("d")).is_ok());
+        assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn move_relocates_a_single_hunk() {
+        let dir = tmp("move-hunk");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(
+            &repo,
+            &[],
+            &[
+                ("f", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n"),
+                ("g", "0\n"),
+            ],
+            "base",
+        );
+        // F edits f's top and bottom (two hunks); T edits g.
+        let f = commit(
+            &repo,
+            &[base],
+            &[
+                ("f", "X\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nY\n"),
+                ("g", "0\n"),
+            ],
+            "F: edit f",
+        );
+        let t = commit(
+            &repo,
+            &[f],
+            &[
+                ("f", "X\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nY\n"),
+                ("g", "G\n"),
+            ],
+            "T: edit g",
+        );
+        on_branch(&repo, "main", t);
+
+        // Move only f's TOP hunk (new line 1) from F forward into T.
+        let sel = vec![HunkSel {
+            path: "f".into(),
+            lo: 1,
+            hi: 1,
+        }];
+        let out = cmd_move(&dir, &f.to_string(), &t.to_string(), &[], &sel).unwrap();
+        assert!(out.starts_with("done"), "{out}");
+
+        // Final content unchanged.
+        assert_eq!(read(&repo, "f"), "X\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nY\n");
+        let tip = repo.head().unwrap().peel_to_commit().unwrap(); // T'
+        let f_prime = tip.parent(0).unwrap();
+        // F' has only the bottom hunk (line 1 still "1"); T' adds the top hunk.
+        let e = f_prime.tree().unwrap().get_path(Path::new("f")).unwrap();
+        assert_eq!(
+            repo.find_blob(e.id()).unwrap().content(),
+            b"1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nY\n"
+        );
+        assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn move_rejects_a_change_present_in_both_commits() {
+        let dir = tmp("move-both");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "0\n")], "base");
+        let f = commit(&repo, &[base], &[("a", "1\n")], "F: a=1");
+        let t = commit(&repo, &[f], &[("a", "2\n")], "T: a=2");
+        on_branch(&repo, "main", t);
+
+        // `a` is changed by BOTH F and T — the move is ambiguous.
+        let err = cmd_move(
+            &dir,
+            &f.to_string(),
+            &t.to_string(),
+            &["a".to_string()],
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.contains("changed by both commits"), "{err}");
+        // Non-adjacent commits are rejected too.
+        let err2 = cmd_move(
+            &dir,
+            &base.to_string(),
+            &t.to_string(),
+            &["a".to_string()],
+            &[],
+        )
+        .unwrap_err();
+        assert!(err2.contains("must be adjacent"), "{err2}");
     }
 
     #[test]

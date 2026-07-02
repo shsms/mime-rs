@@ -184,6 +184,9 @@ half for a fixup/edit plan.
     files, hunks = [{path, lines:[a,b]}] takes hunks by post-commit line span;
     one part may omit both as the catch-all for everything else.
   git_cherry_pick {commits} / git_revert {commits}  on top of the tip.
+  git_move {from, to, paths?, hunks?}  relocate a change between two ADJACENT
+    commits (the moved change must be in `from`, not `to`), then replay the rest;
+    the branch's final tree is unchanged. hunks = [{path, lines:[a,b]}].
 Each STOPS on the first conflict. Then, per stop:
   git_status     which step of how many + the unresolved files
   resolve each file with the conflicts vocabulary (help conflicts), SAVE

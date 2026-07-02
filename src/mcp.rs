@@ -2219,6 +2219,37 @@ fn lines_arg(args: &Value) -> Option<(usize, usize)> {
     Some((lo, hi))
 }
 
+/// An optional list-of-strings argument — empty when absent or not an array.
+fn opt_str_list(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse a `hunks: [{path, lines: [start, end]}]` argument into hunk selectors;
+/// malformed entries are dropped (empty when absent).
+fn hunk_sels_arg(args: &Value, key: &str) -> Vec<crate::sequencer::HunkSel> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|h| {
+                    let path = h.get("path").and_then(Value::as_str)?.to_string();
+                    let lines = h.get("lines").and_then(Value::as_array)?;
+                    let lo = lines.first().and_then(Value::as_u64)? as u32;
+                    let hi = lines.get(1).and_then(Value::as_u64)? as u32;
+                    Some(crate::sequencer::HunkSel { path, lo, hi })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// A required list-of-strings argument (e.g. `commits`).
 fn str_list_arg(args: &Value, key: &str) -> Result<Vec<String>, String> {
     args.get(key)
@@ -2263,6 +2294,13 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
         "git_log" => seq::cmd_log(&repo, args.get("range").and_then(Value::as_str)),
         "git_show" => seq::cmd_show(&repo, &str_arg(args, "commit")?),
         "git_blame" => seq::cmd_blame(&repo, &str_arg(args, "path")?, lines_arg(args)),
+        "git_move" => seq::cmd_move(
+            &repo,
+            &str_arg(args, "from")?,
+            &str_arg(args, "to")?,
+            &opt_str_list(args, "paths"),
+            &hunk_sels_arg(args, "hunks"),
+        ),
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -2416,6 +2454,32 @@ fn git_tool_schemas() -> Vec<Value> {
                     },
                 },
                 "required": ["repo", "path"],
+            },
+        }),
+        json!({
+            "name": "git_move",
+            "description": "Relocate a change from commit `from` to the adjacent commit `to` (one the direct parent of the other), then replay the rest of the branch. Select what to move with `paths` (whole files) and/or `hunks` ({path, lines:[start,end]} — post-`from` line ranges). The moved change must be made by `from` and NOT by `to` (else it's ambiguous). The branch's final tree never changes — only which commit introduces the change. Stops on a conflict for the conflict tools + git_continue, like a rebase.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": repo,
+                    "from": { "type": "string", "description": "The commit the change currently lives in (oid/ref/revspec)." },
+                    "to": { "type": "string", "description": "The adjacent commit to move the change into (oid/ref/revspec)." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Whole files to move." },
+                    "hunks": {
+                        "type": "array",
+                        "description": "Specific hunks to move: each {path, lines:[start,end]} takes every diff-hunk of `path` whose post-`from` line range overlaps [start,end] (1-based inclusive).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "File whose hunks to move." },
+                                "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based inclusive line span in `from`'s post-commit file." }
+                            },
+                            "required": ["path", "lines"]
+                        }
+                    }
+                },
+                "required": ["repo", "from", "to"],
             },
         }),
     ]
@@ -2638,6 +2702,11 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             Git,
             A::read(),
             "which commit last touched each line of a file",
+        ),
+        "git_move" => (
+            Git,
+            A::destructive(),
+            "move a change between two adjacent commits",
         ),
 
         "read_region" => (
@@ -3305,6 +3374,7 @@ mod git_tool_tests {
             "git_log",
             "git_show",
             "git_blame",
+            "git_move",
         ] {
             assert!(names.contains(&expected), "missing schema for {expected}");
         }

@@ -246,3 +246,13 @@ Which commit last touched each line of `path` (oid + summary), collapsed into co
 - `path` (required) — File to blame — absolute (as grep/occur return) or relative to the repo root.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 
+## git_move
+
+Relocate a change from commit `from` to the adjacent commit `to` (one the direct parent of the other), then replay the rest of the branch. Select what to move with `paths` (whole files) and/or `hunks` ({path, lines:[start,end]} — post-`from` line ranges). The moved change must be made by `from` and NOT by `to` (else it's ambiguous). The branch's final tree never changes — only which commit introduces the change. Stops on a conflict for the conflict tools + git_continue, like a rebase.
+
+- `from` (required) — The commit the change currently lives in (oid/ref/revspec).
+- `hunks` — Specific hunks to move: each {path, lines:[start,end]} takes every diff-hunk of `path` whose post-`from` line range overlaps [start,end] (1-based inclusive).
+- `paths` — Whole files to move.
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+- `to` (required) — The adjacent commit to move the change into (oid/ref/revspec).
+
