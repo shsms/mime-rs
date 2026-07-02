@@ -2219,6 +2219,32 @@ fn lines_arg(args: &Value) -> Option<(usize, usize)> {
     Some((lo, hi))
 }
 
+/// Parse the `autosquash` sparse-plan argument: `[{commit, into, action?}]`
+/// (action defaults to fixup). `None` when absent, so `git_rebase` falls back to
+/// `plan`/full replay.
+fn autosquash_arg(args: &Value) -> Option<Vec<(String, String, String)>> {
+    args.get("autosquash").and_then(Value::as_array).map(|arr| {
+        arr.iter()
+            .map(|d| {
+                (
+                    d.get("commit")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    d.get("into")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    d.get("action")
+                        .and_then(Value::as_str)
+                        .unwrap_or("fixup")
+                        .to_string(),
+                )
+            })
+            .collect()
+    })
+}
+
 /// An optional list-of-strings argument — empty when absent or not an array.
 fn opt_str_list(args: &Value, key: &str) -> Vec<String> {
     args.get(key)
@@ -2283,6 +2309,13 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
             &repo,
             &str_arg(args, "onto")?,
             plan_arg(args),
+            autosquash_arg(args),
+            bool_arg(args, "rehearse"),
+        ),
+        "git_fixup" => seq::cmd_fixup(
+            &repo,
+            &str_arg(args, "target")?,
+            &str_arg(args, "source")?,
             bool_arg(args, "rehearse"),
         ),
         "git_cherry_pick" => seq::cmd_cherry_pick(&repo, &str_list_arg(args, "commits")?),
@@ -2325,6 +2358,19 @@ fn git_tool_schemas() -> Vec<Value> {
                 "properties": {
                     "repo": repo,
                     "onto": { "type": "string", "description": "The new base — oid/ref/revspec the commits are replayed onto." },
+                    "autosquash": {
+                        "type": "array",
+                        "description": "Sparse autosquash: instead of a full `plan`, list only the relocations. Each {commit, into, action?} moves `commit` to sit right after `into` as a fixup (action: fixup|squash, default fixup); every other commit in onto..HEAD is picked unchanged in order. No need to transcribe untouched commits.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "commit": { "type": "string", "description": "The commit to fold (oid/ref/revspec)." },
+                                "into": { "type": "string", "description": "The target it should fold into." },
+                                "action": { "type": "string", "enum": ["fixup", "squash"], "description": "fixup (drop the folded message, default) or squash (keep it)." }
+                            },
+                            "required": ["commit", "into"]
+                        }
+                    },
                     "plan": {
                         "type": "array",
                         "description": "Explicit steps (omit to pick all of onto..HEAD in order). List order is the new commit order.",
@@ -2480,6 +2526,20 @@ fn git_tool_schemas() -> Vec<Value> {
                     }
                 },
                 "required": ["repo", "from", "to"],
+            },
+        }),
+        json!({
+            "name": "git_fixup",
+            "description": "Fold `source`'s changes into `target` (a one-call autosquash for a committed source): `target` keeps its own — already signed-off — message, `source` is relocated under it as a fixup, and the rest of the branch is auto-picked. `source` and `target` must be on one line of history. rehearse:true previews. For a full custom plan use git_rebase; to fold uncommitted work, commit it first (raw `git -s`, to fire the sign-off hook) then git_fixup that commit.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": repo,
+                    "target": { "type": "string", "description": "The commit to fold into — keeps its message (oid/ref/revspec)." },
+                    "source": { "type": "string", "description": "The commit whose changes to fold in (oid/ref/revspec)." },
+                    "rehearse": { "type": "boolean", "description": "Preview the resulting history without applying." }
+                },
+                "required": ["repo", "target", "source"],
             },
         }),
     ]
@@ -2707,6 +2767,11 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             Git,
             A::destructive(),
             "move a change between two adjacent commits",
+        ),
+        "git_fixup" => (
+            Git,
+            A::destructive(),
+            "fold a commit's changes into another (autosquash)",
         ),
 
         "read_region" => (
@@ -3375,6 +3440,7 @@ mod git_tool_tests {
             "git_show",
             "git_blame",
             "git_move",
+            "git_fixup",
         ] {
             assert!(names.contains(&expected), "missing schema for {expected}");
         }

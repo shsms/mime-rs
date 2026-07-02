@@ -180,6 +180,7 @@ Report engine status: per live session the current buffer, its visited file, and
 
 Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`. Each step picks/rewords/squashes/fixups/edits/splits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. A `split` step partitions one commit's changes — by whole file (`paths`) or by hunk (`hunks`, a post-commit line span) — into the commits listed in `into`. Stops on a conflict for the conflict tools + git_continue. No network, hooks, or exec.
 
+- `autosquash` — Sparse autosquash: instead of a full `plan`, list only the relocations. Each {commit, into, action?} moves `commit` to sit right after `into` as a fixup (action: fixup|squash, default fixup); every other commit in onto..HEAD is picked unchanged in order. No need to transcribe untouched commits.
 - `onto` (required) — The new base — oid/ref/revspec the commits are replayed onto.
 - `plan` — Explicit steps (omit to pick all of onto..HEAD in order). List order is the new commit order.
 - `rehearse` — Dry-run: preview the resulting commits and whether the tree is unchanged (a pure reorder/fold), applying nothing. Default false.
@@ -255,4 +256,13 @@ Relocate a change from commit `from` to the adjacent commit `to` (one the direct
 - `paths` — Whole files to move.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 - `to` (required) — The adjacent commit to move the change into (oid/ref/revspec).
+
+## git_fixup
+
+Fold `source`'s changes into `target` (a one-call autosquash for a committed source): `target` keeps its own — already signed-off — message, `source` is relocated under it as a fixup, and the rest of the branch is auto-picked. `source` and `target` must be on one line of history. rehearse:true previews. For a full custom plan use git_rebase; to fold uncommitted work, commit it first (raw `git -s`, to fire the sign-off hook) then git_fixup that commit.
+
+- `rehearse` — Preview the resulting history without applying.
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+- `source` (required) — The commit whose changes to fold in (oid/ref/revspec).
+- `target` (required) — The commit to fold into — keeps its message (oid/ref/revspec).
 

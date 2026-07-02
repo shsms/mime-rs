@@ -1992,37 +1992,149 @@ fn backup_note(repo: &Repository) -> String {
 /// `git_rebase`: replay `onto..HEAD` (or an explicit `plan` of
 /// `(commit, action, message)`) onto `onto`. With `rehearse`, only preview the
 /// result (commit list + whether the tree is unchanged) — no changes applied.
+/// Expand sparse autosquash directives into a full `onto..HEAD` plan: pick every
+/// commit in order, but relocate each named commit to sit right after its target
+/// with the fixup/squash action — git's `--autosquash` as data. Removes the
+/// transcribe-every-untouched-commit chore. A directive whose relocation lands a
+/// fixup/squash first is rejected downstream by the sequencer.
+fn autosquash_steps(
+    repo: &Repository,
+    onto: Oid,
+    directives: &[(Oid, Oid, Action)],
+) -> Result<Vec<Step>, Error> {
+    let mut steps: Vec<Step> = commits_since(repo, onto)?
+        .into_iter()
+        .map(pick_step)
+        .collect();
+    for (commit, into, action) in directives {
+        if commit == into {
+            return Err(estr("autosquash: a commit cannot fold into itself"));
+        }
+        let pos = steps
+            .iter()
+            .position(|s| s.commit == *commit)
+            .ok_or_else(|| {
+                estr(&format!(
+                    "autosquash: {} is not in onto..HEAD",
+                    short(*commit)
+                ))
+            })?;
+        let mut step = steps.remove(pos);
+        step.action = *action;
+        let ipos = steps
+            .iter()
+            .position(|s| s.commit == *into)
+            .ok_or_else(|| {
+                estr(&format!(
+                    "autosquash: target {} is not in onto..HEAD",
+                    short(*into)
+                ))
+            })?;
+        steps.insert(ipos + 1, step);
+    }
+    Ok(steps)
+}
+
+/// The rebase base for folding `source` into `target`: the parent of whichever is
+/// the ancestor. Errors if they aren't on one line of history, or the ancestor is
+/// a root commit.
+fn fixup_onto(repo: &Repository, target: Oid, source: Oid) -> Result<Oid, Error> {
+    if source == target {
+        return Err(estr("fixup: source and target are the same commit"));
+    }
+    let older = if repo.graph_descendant_of(source, target)? {
+        target
+    } else if repo.graph_descendant_of(target, source)? {
+        source
+    } else {
+        return Err(estr(
+            "fixup: source and target aren't on the same line of history",
+        ));
+    };
+    let c = repo.find_commit(older)?;
+    if c.parent_count() == 0 {
+        return Err(estr("fixup: cannot fold into a root commit"));
+    }
+    Ok(c.parent(0)?.id())
+}
+
+/// Fold `source`'s changes into `target` (which keeps its own — already
+/// signed-off — message), auto-picking the rest of the branch. A one-call
+/// autosquash for a committed source: no plan to transcribe.
+pub fn cmd_fixup(
+    repo_path: &std::path::Path,
+    target: &str,
+    source: &str,
+    rehearse_only: bool,
+) -> Result<String, String> {
+    let repo = open(repo_path)?;
+    let target = resolve_s(&repo, target)?;
+    let source = resolve_s(&repo, source)?;
+    let onto = fixup_onto(&repo, target, source).map_err(gerr)?;
+    let steps = autosquash_steps(&repo, onto, &[(source, target, Action::Fixup)]).map_err(gerr)?;
+    let plan = Plan { onto, steps };
+    if rehearse_only {
+        return Ok(preview_text(
+            &repo,
+            &rehearse(&repo, &plan, Mode::Pick).map_err(gerr)?,
+        ));
+    }
+    let note = backup_note(&repo);
+    Ok(format!(
+        "{}{note}",
+        outcome_text(&start(&repo, plan).map_err(gerr)?)
+    ))
+}
+
 pub fn cmd_rebase(
     repo_path: &std::path::Path,
     onto: &str,
     plan: Option<Vec<PlanItem>>,
+    autosquash: Option<Vec<(String, String, String)>>,
     rehearse_only: bool,
 ) -> Result<String, String> {
     let repo = open(repo_path)?;
     let onto_oid = resolve_s(&repo, onto)?;
-    let steps = match plan {
-        Some(items) => items
+    let steps = if let Some(directives) = autosquash {
+        let resolved = directives
             .iter()
-            .map(|(commit, action, message, edits, into)| {
-                let message_edits = edits
-                    .iter()
-                    .map(MsgEdit::from_spec)
-                    .collect::<Result<Vec<_>, String>>()?;
-                Ok(Step {
-                    commit: resolve_s(&repo, commit)?,
-                    action: Action::parse(action)
-                        .ok_or_else(|| format!("unknown action \"{action}\""))?,
-                    message: message.clone(),
-                    message_edits,
-                    split_into: into.clone(),
-                })
+            .map(|(commit, into, action)| {
+                let act = if action.is_empty() { "fixup" } else { action };
+                let action = Action::parse(act)
+                    .filter(|a| matches!(a, Action::Fixup | Action::Squash))
+                    .ok_or_else(|| {
+                        format!("autosquash action must be fixup or squash, got \"{act}\"")
+                    })?;
+                Ok((resolve_s(&repo, commit)?, resolve_s(&repo, into)?, action))
             })
-            .collect::<Result<Vec<_>, String>>()?,
-        None => commits_since(&repo, onto_oid)
-            .map_err(gerr)?
-            .into_iter()
-            .map(pick_step)
-            .collect(),
+            .collect::<Result<Vec<_>, String>>()?;
+        autosquash_steps(&repo, onto_oid, &resolved).map_err(gerr)?
+    } else {
+        match plan {
+            Some(items) => items
+                .iter()
+                .map(|(commit, action, message, edits, into)| {
+                    let message_edits = edits.iter().map(MsgEdit::from_spec).collect::<Result<
+                        Vec<_>,
+                        String,
+                    >>(
+                    )?;
+                    Ok(Step {
+                        commit: resolve_s(&repo, commit)?,
+                        action: Action::parse(action)
+                            .ok_or_else(|| format!("unknown action \"{action}\""))?,
+                        message: message.clone(),
+                        message_edits,
+                        split_into: into.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            None => commits_since(&repo, onto_oid)
+                .map_err(gerr)?
+                .into_iter()
+                .map(pick_step)
+                .collect(),
+        }
     };
     let plan = Plan {
         onto: onto_oid,
@@ -2478,7 +2590,7 @@ mod tests {
         on_branch(&repo, "topic", f1);
 
         // Default plan (onto..HEAD) via the path-facing wrapper, onto by oid string.
-        let out = cmd_rebase(&dir, &m1.to_string(), None, false).unwrap();
+        let out = cmd_rebase(&dir, &m1.to_string(), None, None, false).unwrap();
         assert!(out.starts_with("done"), "{out}");
         assert_eq!(
             cmd_status(&dir).unwrap(),
@@ -2719,6 +2831,78 @@ mod tests {
         )
         .unwrap_err();
         assert!(err2.contains("must be adjacent"), "{err2}");
+    }
+
+    /// A branch base←c1(add a)←c2(add b)←c3(fix a), on `main`.
+    fn fixup_fixture(dir: &std::path::Path) -> (Repository, Oid, Oid, Oid, Oid) {
+        let repo = Repository::init(dir).unwrap();
+        let base = commit(&repo, &[], &[("x", "0\n")], "base");
+        let c1 = commit(&repo, &[base], &[("x", "0\n"), ("a", "1\n")], "add a");
+        let c2 = commit(
+            &repo,
+            &[c1],
+            &[("x", "0\n"), ("a", "1\n"), ("b", "1\n")],
+            "add b",
+        );
+        let c3 = commit(
+            &repo,
+            &[c2],
+            &[("x", "0\n"), ("a", "2\n"), ("b", "1\n")],
+            "fix a",
+        );
+        on_branch(&repo, "main", c3);
+        (repo, base, c1, c2, c3)
+    }
+
+    #[test]
+    fn autosquash_sparse_plan_folds_without_listing_every_commit() {
+        let dir = tmp("autosquash");
+        let (repo, base, c1, _c2, c3) = fixup_fixture(&dir);
+
+        // Only the RELATIONSHIP: fold c3 into c1; c2 is auto-picked untouched.
+        let out = cmd_rebase(
+            &dir,
+            &base.to_string(),
+            None,
+            Some(vec![(c3.to_string(), c1.to_string(), "fixup".to_string())]),
+            false,
+        )
+        .unwrap();
+        assert!(out.starts_with("done"), "{out}");
+
+        // a carries c3's fix, b survives; c3's message is dropped (fixup).
+        assert_eq!(read(&repo, "a"), "2\n");
+        assert_eq!(read(&repo, "b"), "1\n");
+        let tip = repo.head().unwrap().peel_to_commit().unwrap(); // c2'
+        let c1_prime = tip.parent(0).unwrap();
+        assert_eq!(tip.message().unwrap(), "add b");
+        assert_eq!(c1_prime.message().unwrap(), "add a");
+        assert_eq!(c1_prime.parent(0).unwrap().id(), base);
+        let e = c1_prime.tree().unwrap().get_path(Path::new("a")).unwrap();
+        assert_eq!(repo.find_blob(e.id()).unwrap().content(), b"2\n");
+        assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn fixup_folds_a_commit_into_its_target() {
+        let dir = tmp("fixup-fold");
+        let (repo, base, c1, _c2, c3) = fixup_fixture(&dir);
+
+        // One call: fold c3 into c1, inferring the base and picking the rest.
+        let out = cmd_fixup(&dir, &c1.to_string(), &c3.to_string(), false).unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        assert_eq!(read(&repo, "a"), "2\n");
+        assert_eq!(read(&repo, "b"), "1\n");
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        let c1_prime = tip.parent(0).unwrap();
+        assert_eq!(c1_prime.message().unwrap(), "add a");
+        let e = c1_prime.tree().unwrap().get_path(Path::new("a")).unwrap();
+        assert_eq!(repo.find_blob(e.id()).unwrap().content(), b"2\n");
+
+        // A source/target not on one line of history errors cleanly.
+        let side = commit(&repo, &[base], &[("z", "1\n")], "side branch");
+        let err = cmd_fixup(&dir, &side.to_string(), &c3.to_string(), true).unwrap_err();
+        assert!(err.contains("same line of history"), "{err}");
     }
 
     #[test]
