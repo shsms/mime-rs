@@ -28,7 +28,7 @@
 
 use crate::buffer::Buffer;
 use git2::{
-    CherrypickOptions, Delta, Index, Oid, Repository, ResetType, RevertOptions, Sort,
+    BlameOptions, CherrypickOptions, Delta, Index, Oid, Repository, ResetType, RevertOptions, Sort,
     build::CheckoutBuilder,
 };
 use serde_json::json;
@@ -1255,6 +1255,56 @@ pub fn show(repo: &Repository, oid: Oid) -> Result<String, Error> {
     Ok(out)
 }
 
+/// "Which commit last touched each line" for `rel` (relative to the repo
+/// workdir), collapsed into contiguous same-commit hunks: one `L<a>-<b>  <oid>
+/// <summary>` line per hunk. `range` (1-based, inclusive) restricts the blame to
+/// those lines; `None` blames the whole file. The discovery half of the
+/// find-the-commit → fold-in workflow (feeds a git_rebase fixup/edit plan).
+pub fn blame(
+    repo: &Repository,
+    rel: &Path,
+    range: Option<(usize, usize)>,
+) -> Result<String, Error> {
+    let mut opts = BlameOptions::new();
+    if let Some((lo, hi)) = range {
+        opts.min_line(lo.max(1));
+        opts.max_line(hi.max(lo.max(1)));
+    }
+    let blame = repo.blame_file(rel, Some(&mut opts))?;
+    let mut out = String::new();
+    for h in blame.iter() {
+        let n = h.lines_in_hunk();
+        if n == 0 {
+            continue;
+        }
+        let start = h.final_start_line();
+        let end = start + n - 1;
+        // libgit2 still returns whole-file hunks with min/max set; drop the ones
+        // that fall outside the requested window ourselves.
+        if let Some((lo, hi)) = range
+            && (end < lo || start > hi)
+        {
+            continue;
+        }
+        let oid = h.final_commit_id();
+        let summary = repo
+            .find_commit(oid)
+            .ok()
+            .and_then(|c| c.summary().map(str::to_string))
+            .unwrap_or_default();
+        let span = if start == end {
+            format!("L{start}")
+        } else {
+            format!("L{start}-{end}")
+        };
+        out.push_str(&format!("  {span}\t{}\t{summary}\n", short(oid)));
+    }
+    if out.is_empty() {
+        out.push_str("(no blame — file untracked, empty, or outside the range)\n");
+    }
+    Ok(out)
+}
+
 // ---- text rendering for the tool layer ------------------------------------
 
 /// The agent-facing summary of an [`Outcome`].
@@ -1474,6 +1524,28 @@ pub fn cmd_show(repo_path: &std::path::Path, commit: &str) -> Result<String, Str
     let repo = open(repo_path)?;
     let oid = resolve_s(&repo, commit)?;
     show(&repo, oid).map_err(gerr)
+}
+
+pub fn cmd_blame(
+    repo_path: &std::path::Path,
+    path: &str,
+    lines: Option<(usize, usize)>,
+) -> Result<String, String> {
+    let repo = open(repo_path)?;
+    // Accept an absolute path (what grep/occur hand back) or one already
+    // relative to the workdir; blame_file wants it workdir-relative.
+    let p = std::path::Path::new(path);
+    let rel = if p.is_absolute() {
+        let wd = repo
+            .workdir()
+            .ok_or_else(|| "bare repo has no working tree to blame".to_string())?;
+        p.strip_prefix(wd)
+            .map_err(|_| format!("path is outside the repo: {path}"))?
+            .to_path_buf()
+    } else {
+        p.to_path_buf()
+    };
+    blame(&repo, &rel, lines).map_err(gerr)
 }
 
 #[cfg(test)]
@@ -1839,6 +1911,40 @@ mod tests {
             show.contains("Changed files") && show.contains(" b"),
             "{show}"
         );
+    }
+
+    #[test]
+    fn cmd_blame_attributes_each_line_to_its_last_commit() {
+        let dir = tmp("blame");
+        let repo = Repository::init(&dir).unwrap();
+        // c1 introduces both lines; c2 rewrites only line 2.
+        let c1 = commit(&repo, &[], &[("f.txt", "one\ntwo\n")], "add one and two");
+        let c2 = commit(&repo, &[c1], &[("f.txt", "one\nTWO\n")], "change two");
+        on_branch(&repo, "main", c2);
+
+        let out = cmd_blame(&dir, "f.txt", None).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        // Line 1 is still c1's; line 2 now belongs to c2. Hunks are one line each.
+        assert!(
+            lines[0].starts_with("  L1\t") && lines[0].ends_with("add one and two"),
+            "L1 -> c1: {out}"
+        );
+        assert!(
+            lines[1].starts_with("  L2\t") && lines[1].ends_with("change two"),
+            "L2 -> c2: {out}"
+        );
+
+        // A `lines` window blames only that span.
+        let just2 = cmd_blame(&dir, "f.txt", Some((2, 2))).unwrap();
+        assert!(
+            just2.contains("change two") && !just2.contains("add one and two"),
+            "windowed blame: {just2}"
+        );
+
+        // An absolute path (what grep/occur hand back) resolves the same way.
+        let abs = dir.join("f.txt");
+        let via_abs = cmd_blame(&dir, abs.to_str().unwrap(), None).unwrap();
+        assert_eq!(via_abs, out, "absolute path blames identically");
     }
 
     #[test]

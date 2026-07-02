@@ -238,3 +238,11 @@ A commit's metadata, message, and the files it changed vs its first parent.
 - `commit` (required) — oid/ref/revspec of the commit.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 
+## git_blame
+
+Which commit last touched each line of `path` (oid + summary), collapsed into contiguous same-commit hunks. Read-only. The find-the-commit half of a fixup/edit: feed a reported oid into a git_rebase plan {commit, action: fixup|edit}. Pass `lines` to blame just a span.
+
+- `lines` — Optional [start, end] 1-based inclusive line range; omit to blame the whole file.
+- `path` (required) — File to blame — absolute (as grep/occur return) or relative to the repo root.
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+

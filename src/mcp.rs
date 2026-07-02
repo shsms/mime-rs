@@ -2189,6 +2189,15 @@ fn plan_arg(args: &Value) -> Option<Vec<crate::sequencer::PlanItem>> {
     })
 }
 
+/// The optional `lines` blame window: a 2-element `[start, end]` array, 1-based
+/// inclusive. Anything shorter/absent/non-integer → `None` (blame whole file).
+fn lines_arg(args: &Value) -> Option<(usize, usize)> {
+    let a = args.get("lines").and_then(Value::as_array)?;
+    let lo = a.first().and_then(Value::as_u64)? as usize;
+    let hi = a.get(1).and_then(Value::as_u64)? as usize;
+    Some((lo, hi))
+}
+
 /// A required list-of-strings argument (e.g. `commits`).
 fn str_list_arg(args: &Value, key: &str) -> Result<Vec<String>, String> {
     args.get(key)
@@ -2232,6 +2241,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
         "git_status" => seq::cmd_status(&repo),
         "git_log" => seq::cmd_log(&repo, args.get("range").and_then(Value::as_str)),
         "git_show" => seq::cmd_show(&repo, &str_arg(args, "commit")?),
+        "git_blame" => seq::cmd_blame(&repo, &str_arg(args, "path")?, lines_arg(args)),
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -2356,6 +2366,23 @@ fn git_tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": { "repo": repo, "commit": { "type": "string", "description": "oid/ref/revspec of the commit." } },
                 "required": ["repo", "commit"],
+            },
+        }),
+        json!({
+            "name": "git_blame",
+            "description": "Which commit last touched each line of `path` (oid + summary), collapsed into contiguous same-commit hunks. Read-only. The find-the-commit half of a fixup/edit: feed a reported oid into a git_rebase plan {commit, action: fixup|edit}. Pass `lines` to blame just a span.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": repo,
+                    "path": { "type": "string", "description": "File to blame — absolute (as grep/occur return) or relative to the repo root." },
+                    "lines": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "Optional [start, end] 1-based inclusive line range; omit to blame the whole file.",
+                    },
+                },
+                "required": ["repo", "path"],
             },
         }),
     ]
@@ -2573,6 +2600,11 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             Git,
             A::read(),
             "a commit's metadata, message, and changed files",
+        ),
+        "git_blame" => (
+            Git,
+            A::read(),
+            "which commit last touched each line of a file",
         ),
 
         "read_region" => (
@@ -3239,6 +3271,7 @@ mod git_tool_tests {
             "git_status",
             "git_log",
             "git_show",
+            "git_blame",
         ] {
             assert!(names.contains(&expected), "missing schema for {expected}");
         }
