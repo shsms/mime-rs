@@ -313,7 +313,9 @@ fn save_state(repo: &Repository, st: &State) -> Result<(), Error> {
                 .message_edits
                 .iter()
                 .map(|e| match e {
-                    MsgEdit::Replace { find, with } => json!({"find": find, "with": with}),
+                    // Persist with the SAME keys the MCP input uses ({find,
+                    // replace, append}) so the three forms can't drift.
+                    MsgEdit::Replace { find, with } => json!({"find": find, "replace": with}),
                     MsgEdit::Append { text } => json!({"append": text}),
                 })
                 .collect();
@@ -379,7 +381,7 @@ fn load_state(repo: &Repository) -> Result<State, Error> {
                                 } else {
                                     MsgEdit::Replace {
                                         find: e["find"].as_str().unwrap_or("").to_string(),
-                                        with: e["with"].as_str().unwrap_or("").to_string(),
+                                        with: e["replace"].as_str().unwrap_or("").to_string(),
                                     }
                                 }
                             })
@@ -785,11 +787,7 @@ pub fn continue_op(repo: &Repository, force: bool) -> Result<Outcome, Error> {
     }
     let tree = repo.find_tree(index.write_tree()?)?;
     index.write()?;
-    let new = if step.action == Action::Split {
-        land_split(repo, &st, &step, &tree)?
-    } else {
-        land_step(repo, &st, &step, &tree)?
-    };
+    let new = land(repo, &st, &step, &tree)?;
     repo.cleanup_state()?;
     st.current = new;
     st.next += 1;
@@ -965,6 +963,17 @@ fn land_step(repo: &Repository, st: &State, step: &Step, tree: &git2::Tree) -> R
     Ok(new)
 }
 
+/// Land one step's merged `tree`: a `split` fans out into several commits (HEAD
+/// moves to the last), any other action lands a single commit. The one dispatch
+/// point, so a future special-landing action is wired here, not in each driver.
+fn land(repo: &Repository, st: &State, step: &Step, tree: &git2::Tree) -> Result<Oid, Error> {
+    if step.action == Action::Split {
+        land_split(repo, st, step, tree)
+    } else {
+        land_step(repo, st, step, tree)
+    }
+}
+
 /// Paths that differ between the `base` and `target` trees (a commit's net change).
 fn changed_paths(
     repo: &Repository,
@@ -972,18 +981,11 @@ fn changed_paths(
     target: &git2::Tree,
 ) -> Result<Vec<String>, Error> {
     let diff = repo.diff_tree_to_tree(Some(base), Some(target), None)?;
-    let mut paths = Vec::new();
-    diff.foreach(
-        &mut |delta, _| {
-            if let Some(p) = delta.new_file().path().or_else(|| delta.old_file().path()) {
-                paths.push(p.to_string_lossy().into_owned());
-            }
-            true
-        },
-        None,
-        None,
-        None,
-    )?;
+    let mut paths: Vec<String> = diff
+        .deltas()
+        .map(|d| delta_path(Some(d)))
+        .filter(|p| !p.is_empty())
+        .collect();
     paths.sort();
     paths.dedup();
     Ok(paths)
@@ -998,6 +1000,8 @@ fn split_assignment(touched: &[String], parts: &[SplitPart]) -> Result<Vec<Strin
         return Err(estr("split: `into` must list at least one part"));
     }
     let mut assigned: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // O(1) membership for the "does the commit change this path?" check below.
+    let touched_set: std::collections::HashSet<&str> = touched.iter().map(String::as_str).collect();
     let mut rest = 0usize;
     for part in parts {
         if part.message.trim().is_empty() {
@@ -1013,7 +1017,7 @@ fn split_assignment(touched: &[String], parts: &[SplitPart]) -> Result<Vec<Strin
             ));
         }
         for p in &part.paths {
-            if !touched.iter().any(|t| t == p) {
+            if !touched_set.contains(p.as_str()) {
                 return Err(estr(&format!("split: the commit does not change {p}")));
             }
             if !assigned.insert(p.as_str()) {
@@ -1063,7 +1067,8 @@ fn split_commits(
     let mut made = Vec::new();
     for part in parts {
         let paths: &[String] = if part.rest { &leftover } else { &part.paths };
-        let prev_tree = repo.find_commit(current)?.tree()?;
+        let cur = repo.find_commit(current)?;
+        let prev_tree = cur.tree()?;
         let mut index = git2::Index::new()?;
         index.read_tree(&prev_tree)?;
         for p in paths {
@@ -1094,14 +1099,13 @@ fn split_commits(
             }
         }
         let tree = repo.find_tree(index.write_tree_to(repo)?)?;
-        let parent = repo.find_commit(current)?;
         let new = repo.commit(
             None,
             &pick.author(),
             &pick.committer(),
             &part.message,
             &tree,
-            &[&parent],
+            &[&cur],
         )?;
         made.push(new);
         current = new;
@@ -1676,11 +1680,7 @@ fn drive(repo: &Repository, mut st: State) -> Result<Outcome, Error> {
         }
 
         let tree = repo.find_tree(index.write_tree()?)?;
-        let new = if step.action == Action::Split {
-            land_split(repo, &st, &step, &tree)?
-        } else {
-            land_step(repo, &st, &step, &tree)?
-        };
+        let new = land(repo, &st, &step, &tree)?;
         repo.cleanup_state()?;
         st.current = new;
         st.next += 1;
@@ -1808,12 +1808,8 @@ pub fn show(repo: &Repository, oid: Oid) -> Result<String, Error> {
             Delta::Copied => "C",
             _ => "?",
         };
-        let p = d
-            .new_file()
-            .path()
-            .or_else(|| d.old_file().path())
-            .and_then(|p| p.to_str())
-            .unwrap_or("?");
+        let p = delta_path(Some(d));
+        let p = if p.is_empty() { "?" } else { &p };
         out.push_str(&format!("  {mark} {p}\n"));
     }
     // Full unified diff after the file summary: reconstruct the patch, prefixing
@@ -2910,6 +2906,85 @@ mod tests {
         let side = commit(&repo, &[base], &[("z", "1\n")], "side branch");
         let err = cmd_fixup(&dir, &side.to_string(), &c3.to_string(), true).unwrap_err();
         assert!(err.contains("same line of history"), "{err}");
+    }
+
+    #[test]
+    fn state_round_trips_message_edits_and_split_parts() {
+        // Guards the persisted-vs-input key unification: save_state/load_state and
+        // the MCP input must agree, or a resume after a conflict loses edits.
+        let dir = tmp("state-rt");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        on_branch(&repo, "main", base);
+
+        let st = State {
+            branch: "refs/heads/main".to_string(),
+            orig: base,
+            onto: base,
+            current: base,
+            next: 1,
+            steps: vec![
+                Step {
+                    commit: base,
+                    action: Action::Reword,
+                    message: Some("hi".to_string()),
+                    message_edits: vec![
+                        MsgEdit::Replace {
+                            find: "a".into(),
+                            with: "b".into(),
+                        },
+                        MsgEdit::Append {
+                            text: "Sign".into(),
+                        },
+                    ],
+                    split_into: Vec::new(),
+                },
+                Step {
+                    commit: base,
+                    action: Action::Split,
+                    message: None,
+                    message_edits: Vec::new(),
+                    split_into: vec![
+                        SplitPart {
+                            message: "p1".into(),
+                            paths: vec!["a".into()],
+                            hunks: Vec::new(),
+                            rest: false,
+                        },
+                        SplitPart {
+                            message: "p2".into(),
+                            paths: Vec::new(),
+                            hunks: vec![HunkSel {
+                                path: "a".into(),
+                                lo: 1,
+                                hi: 2,
+                            }],
+                            rest: false,
+                        },
+                    ],
+                },
+            ],
+            mode: Mode::Pick,
+            editing: false,
+        };
+        save_state(&repo, &st).unwrap();
+        let back = load_state(&repo).unwrap();
+
+        match &back.steps[0].message_edits[0] {
+            MsgEdit::Replace { find, with } => {
+                assert_eq!(find, "a");
+                assert_eq!(with, "b"); // the `replace` key survived the round trip
+            }
+            other => panic!("expected Replace, got {other:?}"),
+        }
+        assert!(
+            matches!(&back.steps[0].message_edits[1], MsgEdit::Append { text } if text == "Sign")
+        );
+        let parts = &back.steps[1].split_into;
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].paths, vec!["a".to_string()]);
+        assert_eq!(parts[1].hunks[0].path, "a");
+        assert_eq!((parts[1].hunks[0].lo, parts[1].hunks[0].hi), (1, 2));
     }
 
     #[test]
