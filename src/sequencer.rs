@@ -682,6 +682,13 @@ fn rehearse(repo: &Repository, plan: &Plan, mode: Mode) -> Result<Preview, Error
         } else {
             let new = make_commit(repo, mode, plan.onto, current, step, &tree)?;
             let summary = repo.find_commit(new)?.summary().unwrap_or("").to_string();
+            // A squash/fixup re-parents onto the PREVIOUS commit's parent, so the
+            // new commit supersedes it rather than adding one — mirror that in the
+            // preview by replacing the last entry, so the list and "-> N commits"
+            // count match a real apply (which folds).
+            if matches!(step.action, Action::Squash | Action::Fixup) {
+                commits.pop();
+            }
             commits.push((new, summary));
             current = new;
         }
@@ -3200,6 +3207,33 @@ mod tests {
             repo.head().unwrap().peel_to_tree().unwrap().id(),
             preview.final_tree
         );
+    }
+
+    #[test]
+    fn rehearse_folds_a_fixup_in_the_preview() {
+        let dir = tmp("rehearse-fold");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("x", "0\n")], "base");
+        let c1 = commit(&repo, &[base], &[("x", "0\n"), ("a", "1\n")], "add a");
+        let c2 = commit(&repo, &[c1], &[("x", "0\n"), ("a", "2\n")], "tweak a");
+        on_branch(&repo, "topic", c2);
+
+        let plan = Plan {
+            onto: base,
+            steps: vec![step(c1, Action::Pick, None), step(c2, Action::Fixup, None)],
+        };
+        let preview = rehearse(&repo, &plan, Mode::Pick).unwrap();
+        // The fixup folds into the pick: ONE previewed commit, not two, carrying
+        // the target's message (matching a real apply, checked below).
+        assert_eq!(preview.commits.len(), 1, "fixup folded in preview");
+        assert_eq!(preview.commits[0].1, "add a");
+
+        // A real apply of the same plan produces the identical single commit.
+        start(&repo, plan).unwrap();
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(tip.message().unwrap(), "add a");
+        assert_eq!(tip.parent(0).unwrap().id(), base, "one commit above base");
+        assert_eq!(tip.tree_id(), preview.final_tree);
     }
 
     #[test]
