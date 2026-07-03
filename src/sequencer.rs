@@ -381,7 +381,14 @@ fn load_state(repo: &Repository) -> Result<State, Error> {
                                 } else {
                                     MsgEdit::Replace {
                                         find: e["find"].as_str().unwrap_or("").to_string(),
-                                        with: e["replace"].as_str().unwrap_or("").to_string(),
+                                        // `with` is the pre-unification key: fall
+                                        // back so a mid-op upgrade doesn't turn a
+                                        // replacement into a deletion.
+                                        with: e["replace"]
+                                            .as_str()
+                                            .or_else(|| e["with"].as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
                                     }
                                 }
                             })
@@ -1159,13 +1166,20 @@ fn hunk_assignment(
         if p.message.trim().is_empty() {
             return Err(estr("split: every part needs a non-empty message"));
         }
-        if p.paths.is_empty() && p.hunks.is_empty() {
+        // Honour the caller-computed `rest` flag (set only when BOTH keys are
+        // absent), so a present-but-empty `paths`/`hunks` is rejected rather than
+        // silently promoted to the catch-all — matching split_assignment.
+        if p.rest {
             if rest_idx.is_some() {
                 return Err(estr(
                     "split: at most one part may be the catch-all (the one with no paths or hunks)",
                 ));
             }
             rest_idx = Some(i);
+        } else if p.paths.is_empty() && p.hunks.is_empty() {
+            return Err(estr(
+                "split: a non-catch-all part needs at least one path or hunk (give one part no paths/hunks to be the catch-all)",
+            ));
         }
     }
 
@@ -1177,13 +1191,9 @@ fn hunk_assignment(
         let Some(delta) = diff.get_delta(idx) else {
             continue;
         };
-        let path = delta
-            .new_file()
-            .path()
-            .or_else(|| delta.old_file().path())
-            .and_then(|p| p.to_str())
-            .unwrap_or("")
-            .to_string();
+        // Key paths the SAME way apply_subset does (delta_path, lossy) so a
+        // non-UTF-8 path matches on both sides instead of being dropped.
+        let path = delta_path(Some(delta));
         let mut hunks = Vec::new();
         if let Some(patch) = git2::Patch::from_diff(&diff, idx)? {
             for h in 0..patch.num_hunks() {
@@ -1327,50 +1337,36 @@ fn split_commits_hunked(
     let plan = hunk_assignment(repo, &base_tree, target, parts)?;
     let diff = repo.diff_tree_to_tree(Some(&base_tree), Some(target), None)?;
 
+    let whole = &plan.whole;
+    let per_hunk = &plan.per_hunk;
     let mut current = base;
     let mut made = Vec::new();
-    for k in 0..parts.len() {
-        let cur_path = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
-        let cur_path_delta = cur_path.clone();
-        let whole = &plan.whole;
-        let per_hunk = &plan.per_hunk;
-        let mut opts = git2::ApplyOptions::new();
-        opts.delta_callback(move |d: Option<git2::DiffDelta>| {
-            let path = d
-                .and_then(|d| d.new_file().path().or_else(|| d.old_file().path()))
-                .and_then(|p| p.to_str())
-                .unwrap_or("")
-                .to_string();
-            *cur_path_delta.borrow_mut() = path.clone();
-            // Whole-file: apply iff a part in 0..=k owns it. Hunk-split file: let
-            // the hunk callback decide, so return true here.
-            whole.get(&path).map(|&owner| owner <= k).unwrap_or(true)
-        });
-        opts.hunk_callback(move |h: Option<git2::DiffHunk>| {
-            let Some(h) = h else { return false };
-            let path = cur_path.borrow().clone();
-            // A whole-file-owned file's hunks aren't in per_hunk; delta_callback
-            // already gated it, so apply them all (None → true).
-            per_hunk
-                .get(&(path, h.new_start(), h.new_lines()))
-                .map(|&owner| owner <= k)
-                .unwrap_or(true)
-        });
-        let mut index = repo.apply_to_tree(&base_tree, &diff, Some(&mut opts))?;
-        let tree = repo.find_tree(index.write_tree_to(repo)?)?;
-        // Safety invariant: the final part must reassemble the original commit
-        // exactly — a mismatch means the partition dropped or duplicated a change.
-        if k == parts.len() - 1 && tree.id() != target.id() {
-            return Err(estr(
-                "split: internal error — the parts do not reassemble the original commit's tree",
-            ));
-        }
+    for (k, part) in parts.iter().enumerate() {
+        // Apply, cumulatively, every file/hunk owned by parts 0..=k onto the base
+        // tree. apply_subset gates whole-file add/delete at the delta level, so an
+        // added file whose hunks aren't owned yet doesn't linger as an empty file.
+        let tree_oid = apply_subset(
+            repo,
+            &base_tree,
+            &diff,
+            |path| whole.get(path).map(|&o| o <= k).unwrap_or(false),
+            |path, ns, nl| {
+                // A whole-file-owned file's hunks aren't in per_hunk; fall back to
+                // its whole owner so they land with the file.
+                per_hunk
+                    .get(&(path.to_string(), ns, nl))
+                    .or_else(|| whole.get(path))
+                    .map(|&o| o <= k)
+                    .unwrap_or(false)
+            },
+        )?;
+        let tree = repo.find_tree(tree_oid)?;
         let parent = repo.find_commit(current)?;
         let new = repo.commit(
             None,
             &pick.author(),
             &pick.committer(),
-            &parts[k].message,
+            &part.message,
             &tree,
             &[&parent],
         )?;
@@ -1383,8 +1379,7 @@ fn split_commits_hunked(
 /// The delta's path (new side, falling back to old), for the apply callbacks.
 fn delta_path(d: Option<git2::DiffDelta>) -> String {
     d.and_then(|d| d.new_file().path().or_else(|| d.old_file().path()))
-        .and_then(|p| p.to_str())
-        .map(str::to_string)
+        .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
@@ -2087,6 +2082,19 @@ fn autosquash_steps(
     onto: Oid,
     directives: &[(Oid, Oid, Action)],
 ) -> Result<Vec<Step>, Error> {
+    // Chained folds — a target that is itself relocated by another directive —
+    // would strand the earlier fold beside the wrong commit once its target
+    // moves. Reject rather than silently mis-fold; the caller can chain in
+    // separate git_rebase runs. Also reject folding one commit twice.
+    let moved: std::collections::HashSet<Oid> = directives.iter().map(|(c, _, _)| *c).collect();
+    if moved.len() != directives.len() {
+        return Err(estr("autosquash: a commit is folded more than once"));
+    }
+    if directives.iter().any(|(_, into, _)| moved.contains(into)) {
+        return Err(estr(
+            "autosquash: a fold target is itself being folded — fold chained fixups in separate steps",
+        ));
+    }
     let mut steps: Vec<Step> = commits_since(repo, onto)?
         .into_iter()
         .map(pick_step)
@@ -3016,6 +3024,28 @@ mod tests {
         assert_eq!(c1_prime.parent(0).unwrap().id(), base);
         let e = c1_prime.tree().unwrap().get_path(Path::new("a")).unwrap();
         assert_eq!(repo.find_blob(e.id()).unwrap().content(), b"2\n");
+        assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn autosquash_rejects_chained_directives() {
+        let dir = tmp("autosquash-chain");
+        let (repo, base, c1, c2, c3) = fixup_fixture(&dir);
+
+        // Chaining (fold c3 into c2, and c2 into c1) would strand a fold beside
+        // the wrong commit — reject rather than silently mis-fold.
+        let err = cmd_rebase(
+            &dir,
+            &base.to_string(),
+            None,
+            Some(vec![
+                (c3.to_string(), c2.to_string(), "fixup".to_string()),
+                (c2.to_string(), c1.to_string(), "fixup".to_string()),
+            ]),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("itself being folded"), "{err}");
         assert!(!state_path(&repo).exists());
     }
 
@@ -4033,6 +4063,76 @@ mod tests {
         assert!(
             !state_path(&repo).exists(),
             "a rejected start leaves no operation state"
+        );
+    }
+
+    #[test]
+    fn split_by_hunk_does_not_leak_an_empty_added_file() {
+        let dir = tmp("split-hunk-add");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("other", "x\n")], "base");
+        // c1 modifies `other` AND adds a new file (one add-hunk).
+        let c1 = commit(
+            &repo,
+            &[base],
+            &[("other", "X\n"), ("new", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n")],
+            "edit other + add new",
+        );
+        on_branch(&repo, "topic", c1);
+
+        // part0 takes `other`; part1 takes the added file by hunk. `new` must NOT
+        // appear (even empty) in part0 — the delta-level gate drops the add there.
+        let out = start(
+            &repo,
+            Plan {
+                onto: base,
+                steps: vec![split_step(
+                    c1,
+                    vec![
+                        split_part("other only", &["other"], false),
+                        hunk_part("add new", "new", 1, 10),
+                    ],
+                )],
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, Outcome::Done { .. }));
+
+        let tip = repo.head().unwrap().peel_to_commit().unwrap(); // part1
+        let first = tip.parent(0).unwrap(); // part0
+        assert_eq!(first.message().unwrap(), "other only");
+        assert!(
+            first.tree().unwrap().get_path(Path::new("new")).is_err(),
+            "the added file must not leak into the earlier part"
+        );
+        assert!(first.tree().unwrap().get_path(Path::new("other")).is_ok());
+        assert!(tip.tree().unwrap().get_path(Path::new("new")).is_ok());
+    }
+
+    #[test]
+    fn split_by_hunk_rejects_an_empty_non_catch_all_part() {
+        let dir = tmp("split-hunk-empty");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("f", "a\nb\n")], "base");
+        let c1 = commit(&repo, &[base], &[("f", "A\nb\n")], "edit");
+        on_branch(&repo, "topic", c1);
+
+        // A hunk part forces the hunk-aware validator; a second part with neither
+        // paths nor hunks and rest=false must be rejected (not silently promoted).
+        let err = start(
+            &repo,
+            Plan {
+                onto: base,
+                steps: vec![split_step(
+                    c1,
+                    vec![hunk_part("top", "f", 1, 1), split_part("empty", &[], false)],
+                )],
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("needs at least one path or hunk"),
+            "{err}"
         );
     }
 
