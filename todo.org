@@ -281,18 +281,27 @@ literal patterns, losing regex entirely. Reproduce, fix the RE2→emacs
 translation (or document the supported dialect precisely), and add
 round-trip tests for escaped metachars + alternation.
 
-** TODO conflict-replace eats the trailing newline               :dogfooding:
+** DONE conflict-replace eats the trailing newline               :dogfooding:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-03 Fr 11:30]
 - State "TODO"       from              [2026-06-11 Do 23:45]
 :END:
+
 Twice in the same session ~(conflict-replace TEXT N)~ joined the
 replacement onto the line following the conflict block
 (~mod a;mod b;~) because TEXT lacked a trailing newline.
 Replacing a conflict hunk is line-oriented; ensure a final newline on
 the replacement (or take lines, not raw text).
 
-** TODO Rebase / cherry-pick driver                                     :git:
+DONE (2026-07): conflict_splice now newline-terminates a non-empty replacement
+that lacks one (the hunk region ends past the trailing newline, so raw text fused
+onto the next line). Skipped for a removal (empty) or the buffer's final
+newline-less line. Fix is in the shared splice, so every conflict resolver is
+covered; regression test for fuse / no-double / EOF cases.
+
+** DONE Rebase / cherry-pick driver                                     :git:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-02 Do 15:21]
 - State "TODO"       from              [2026-06-18 Do 09:27]
 :END:
 
@@ -302,6 +311,11 @@ mime already owns (~conflicts~, ~conflict-resolve-trivial~, ~conflict-keep~,
 ~conflict-replace~, ~conflict-context~ — conflict.rs + builtins.rs
 1742–1965). A clean rebase needs no editing tool; a conflicted one needs
 exactly this surface.
+
+CLOSED (2026-07): the last non-blocking follow-up — ~git_show~ full unified diff —
+is now implemented, so the driver is complete end to end. Remaining note is the
+~gix~ migration, which stays a FUTURE consideration (blocked on gix's
+conflict-marker merge going production-grade); not tracked as active work.
 
 *** Approach (decided 2026-06-24): in-process git sequencer on a Rust git library — do NOT shell out to ~git~
 
@@ -551,7 +565,10 @@ delete; errors if =find= is absent) or ={append}= (add a trailing line). Preserv
 the rest of the message, so the =Signed-off-by= a full reword would drop survives.
 Reword/edit finds are pre-validated in =begin= before any mutation.
 
-** TODO git_rebase: split a commit + move changes between commits :git:dogfooding:
+** DONE git_rebase: split a commit + move changes between commits :git:dogfooding:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-02 Do 15:47]
+:END:
 
 The plan reorders / squashes / drops WHOLE commits, and the planned =edit=
 action (above) amends one commit's tree in place — but nothing REPARTITIONS
@@ -581,7 +598,21 @@ into N commits (one part may omit =paths= as the catch-all), pre-validated in
 Remaining: HUNK-level split (partial-hunk application, =git add -p=-grade) and the
 =move= directive (relocate changes between existing adjacent commits).
 
-** TODO Inspect the need for a git-blame-shaped "which commit owns this?" read :git:dogfooding:
+DONE (2026-07): both halves shipped.
+- HUNK-level split: a split part now takes ~hunks = [{path, lines:[a,b]}]~ (new-side
+  spans, the numbers grep/blame return) alongside/instead of ~paths~; splits that
+  name hunks route through an ~apply_to_tree~ builder that reassembles the exact
+  original tree in the final part. Path-only splits keep the old blob-copy builder.
+- MOVE: new ~git_move {from, to, paths?, hunks?}~ relocates a change between two
+  ADJACENT commits (must be in ~from~, not ~to~) and replays the tail via the
+  sequencer. Invariant: the branch's final tree is unchanged — only the split point
+  moves. Both validated at begin time, before mutation; tests + docs + help + schema.
+
+** DONE Inspect the need for a git-blame-shaped "which commit owns this?" read :git:dogfooding:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-02 Do 16:14]
+:END:
+
 The edit / squash / fixup / split work all assume the agent ALREADY knows
 which commit to target. But the common real task is the reverse: the agent has
 an uncommitted change (a hunk in the worktree, or lines it just edited) and
@@ -605,7 +636,31 @@ files (it re-walks history)? (4) is this even needed once =edit= lands, or do
 agents naturally drive it via git_log + git_show? Measure on real sessions
 before building.
 
-** TODO Sequencer internals cleanup (post-review tidy) :git:
+DONE (2026-07): shipped a read-only ~git_blame~ MCP tool — ~git_blame {repo, path,
+lines?}~. Per-line "which commit last touched this", collapsed into contiguous
+same-commit hunks (oid + summary); optional ~[start, end]~ line window; accepts an
+absolute path (what grep/occur return) or a workdir-relative one. Built on git2's
+~blame_file~ — the find-the-commit half that feeds a ~git_rebase~ plan {commit,
+action: fixup|edit}. Landed with a sequencer test + doc/help/schema wiring.
+
+Remaining: (1) history-scope — confine the blame to ~onto..HEAD~ by default so the
+answer is "which of MY commits owns this", not any commit in history
+(~BlameOptions~ newest/oldest); (2) blame-the-hunk — map a worktree diff hunk (not
+just a line span) to the commit that last touched those lines, so an uncommitted
+change routes straight into a ~fixup~/~move~.
+
+DONE (2026-07): the two remaining enhancements shipped.
+- ~since~ param scopes blame to ~since..~ (oldest_commit boundary) — "which of MY
+  commits owns this line".
+- ~worktree: true~ maps each UNCOMMITTED hunk to the commit that last set the lines
+  it touches (git-absorb-style target discovery); each oid feeds git_fixup/git_move.
+This closes the find-the-commit -> fold-in vocabulary end to end.
+
+** DONE Sequencer internals cleanup (post-review tidy)                  :git:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-02 Do 16:09]
+:END:
+
 Non-blocking code-quality items from the 2026-06-29 pre-PR review of the
 edit / message_edits / split work — no correctness impact:
 - The =if step.action == Action::Split { land_split } else { land_step }=
@@ -627,6 +682,14 @@ edit / message_edits / split work — no correctness impact:
   back. The persisted-vs-input key mismatch (=replace= vs =with=, absent-paths
   vs =rest=) is easy to break silently — unify, ideally via serde derives on
   the structs.
+
+DONE (2026-07): all five items addressed. land() helper folds the dispatch;
+changed_paths/show share delta_path; split_assignment uses a HashSet;
+split_commits fetches the current commit once. The message-edit persist keys now
+match the MCP input ({find, replace, append}, was {find, with}) — a state
+round-trip test guards the drift the review flagged. Went with matching keys
+rather than a full serde-derive migration: rewriting working, tested persistence
+for a cosmetic gain wasn't worth the risk, and the round-trip test covers it.
 
 ** DONE MCP command-surface review — prune the middle, grow power via params :mcp:
 :LOGBOOK:
@@ -708,7 +771,11 @@ DONE: chose to keep the small surface and make the tradeoff explicit — the
 ~instructions~ now say the deep vocabulary (regex / treesit / conflict-keep …)
 lives inside ~run_program~ by design, reached via help {topic|tool}.
 
-** TODO save_buffer {to:} copy-out can clobber another live session's visited file [#C] :mcp:
+** DONE save_buffer {to:} copy-out can clobber another live session's visited file [#C] :mcp:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-03 Fr 11:31]
+:END:
+
 From the mcp-surface-review code review (2026-06-24). ~Workspace::write_copy_to~
 writes a different path with no stale guard and no cross-session awareness, so
 ~save_buffer {path: A, to: B}~ where B is the visited file of ANOTHER warm
@@ -718,6 +785,12 @@ fires (the change happened out from under it). Pre-existing in spirit (the old
 copy branch is now the documented route. Low severity (localhost, single-user,
 cp-like intent), but worth a guard: before the copy, check whether ~to~ is
 canonically some other live session's visited path and refuse / warn.
+
+DONE (2026-07): save_buffer's copy-out branch now refuses when the target is
+canonically the visited file of a DIFFERENT live session with unsaved edits
+(clobbers_unsaved_session), naming it. A clean session or an unrelated path is
+fine. Unit test covers the dirty-collision, clean, own-session, and no-collision
+cases.
 
 ** TODO checkpoint_labels clones every label on each session_status call [#C] :mcp:
 From the mcp-surface-review code review (2026-06-24). ~session_status~ calls
@@ -861,6 +934,85 @@ Fix: add the missing primitives + the ~recipes~ topic, AND add a drift-guard
 test (like ~meta_covers_every_tool~) asserting every registered builtin appears
 in vocabulary.md — so it cannot silently drift again. (~string-trim-left~ /
 ~string-trim-right~ are already covered as a compound token; not missing.)
+
+** DONE git_rebase: autosquash/absorb — fold a change into the commit that owns it :git:dogfooding:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-02 Do 15:58]
+- State "TODO"       from              [2026-06-30 Di 12:13]
+:END:
+
+From driving mime to rewrite this repo's own history (2026-06): the common
+task "I just made this change — fold it into the commit it belongs to" has no
+one-call path. Each fold took (a) a raw ~git add~ + ~git commit~ to make a temp
+fixup (mime has no stage/commit primitive — correctly, since its git ops run no
+hooks, so commit CREATION should stay on raw ~git -s~ to fire the sign-off
+commit-msg hook), then (b) a ~git_rebase~ with the ENTIRE plan hand-authored:
+every commit oid from the target onward listed in order with the fixup slotted
+in. Step (b) is the friction — transcribing untouched ~pick~ steps just to say
+"fixup A into B"; on a long branch it is tedious and easy to drop or reorder a
+commit. ~rehearse~ (tree-IDENTICAL check) makes it safe, not quick.
+
+Two improvements, smallest first:
+
+1. *Autosquash-style SPARSE plans for ~git_rebase~.* Let the plan express only
+   the RELATIONSHIP and auto-pick the rest of ~onto..HEAD~ in order — e.g.
+   ~plan: [{action: fixup, commit: X, into: Y}]~ moves X to sit under Y as a
+   fixup and picks every other commit unchanged. This is git's
+   ~--autosquash~ semantics as data (no ~fixup!~-subject magic needed). Removes
+   the enumerate-untouched-commits chore with no new tool.
+
+2. *A ~git_fixup~ / absorb tool.* One rehearsable call taking a target commit +
+   a source — a commit, OR the staged/worktree changes directly — that does the
+   temp-commit → move-under-target → fixup dance internally and lands the
+   amended history. A mime-created temp commit is fine here even though mime
+   runs no hooks: ~fixup~ DISCARDS the temp message and PRESERVES the target's
+   existing (already-signed) message, so no sign-off is dropped. Stretch: a
+   ~git absorb~-style AUTO-TARGET that maps each worktree hunk to the commit
+   that last touched those lines — i.e. the find-the-commit half tracked under
+   the blame-shaped read item — so "I edited line X, tuck it into whatever
+   commit introduced X" becomes one call.
+
+Relation to existing items: the blame-shaped "which commit owns this?" read is
+the DISCOVERY half (find the target); this is the ACTION half (fold into it).
+The split/move item is the inverse — repartition what is ALREADY committed.
+Together they are one vocabulary: find-the-commit → fold-in / split-out.
+
+DONE (2026-07): both fold paths shipped.
+- ~git_rebase~ ~autosquash = [{commit, into, action?}]~: sparse plan that relocates
+  only the named commits (fixup/squash under their target) and auto-picks the rest
+  of onto..HEAD — the enumerate-untouched-commits chore is gone.
+- ~git_fixup {target, source}~: one-call fold of a COMMITTED source into target
+  (target keeps its signed message); infers the base, reuses the sequencer.
+Intentionally NOT done: worktree/staged AUTO-absorb (commit-from-worktree). Commit
+creation stays on raw ~git -s~ to fire the sign-off hook, per the driver design; a
+committed source covers the fold. The ~git absorb~ auto-target (hunk -> owning
+commit) still belongs with the blame-the-hunk half of [[git-blame]].
+
+** DONE git_rebase rehearse preview doesn't fold fixup/squash steps :bug:git_rebase:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-02 Do 16:01]
+- State "TODO"       from              [2026-07-01 Mi 13:51]
+:END:
+
+In ~git_rebase~ with ~rehearse: true~, ~fixup~/~squash~ plan steps are not folded
+in the preview: the rehearsal lists one commit line per plan step (each
+~fixup~/~squash~ step shown as a separate commit carrying the melded message) and
+its "-> N commit(s)" summary reports the unfolded step count.
+
+A real (non-rehearse) apply of the identical plan folds correctly — verified on
+an 8-commit branch: a [~reword~, ~fixup~] pair produced 7 commits with a
+byte-identical tree.
+
+The misleading preview makes it look like ~fixup~/~squash~ won't fold, which
+nearly caused abandoning a valid mime fold in favour of a manual
+~git reset --soft~.
+
+Fix: ~rehearse~ should simulate the fold so the previewed commit list and count
+match what apply produces.
+
+DONE (2026-07): rehearse now replaces the superseded entry for a squash/fixup step
+(the fold re-parents onto the previous commit's parent), so the previewed commit
+list and "-> N commits" count match a real apply. Test asserts preview==apply.
 
 * Structural editing
 
