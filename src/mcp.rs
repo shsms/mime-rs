@@ -704,6 +704,28 @@ fn is_unsaved(sessions: &HashMap<String, Workspace>, session: &str) -> bool {
         .is_some_and(|ws| ws.visited_path().is_some() && ws.is_modified())
 }
 
+/// If writing to `target` would land on the visited file of a DIFFERENT live
+/// session that has unsaved edits, return that session's id — a save_buffer
+/// `{to:}` copy-out would overwrite it under that session, which then only
+/// learns of it as a stale conflict on its own next save, so the caller refuses
+/// up front. Paths are compared canonically (`same_file`).
+fn clobbers_unsaved_session<'a>(
+    sessions: &'a HashMap<String, Workspace>,
+    session: &str,
+    target: &std::path::Path,
+) -> Option<&'a str> {
+    sessions
+        .iter()
+        .find(|(id, other)| {
+            id.as_str() != session
+                && other.is_modified()
+                && other
+                    .visited_path()
+                    .is_some_and(|v| crate::engine::same_file(&v, target))
+        })
+        .map(|(id, _)| id.as_str())
+}
+
 /// A reminder appended to an edit tool's message when the edit lives only in the
 /// warm buffer, not on disk — so a forgotten `save` reads as a visible note
 /// instead of a silent loss. Empty when there's nothing to save.
@@ -1914,8 +1936,10 @@ fn tool_save_buffer(
             if !sessions.contains_key(&session) {
                 return Err(no_such_session(sessions, &session));
             }
-            let ws = sessions.get_mut(&session).expect("checked above");
-            let visited = ws.visited_path();
+            let visited = sessions
+                .get(&session)
+                .expect("checked above")
+                .visited_path();
             // Adopt-or-in-place via save_to (which binds + applies the stale
             // guard) when the session is UNBOUND (an in-memory buffer naming its
             // first file) or `to` is the file it already visits — compared
@@ -1927,6 +1951,17 @@ fn tool_save_buffer(
                 None => true,
                 Some(v) => crate::engine::same_file(v, &checked),
             };
+            if !in_place && let Some(other) = clobbers_unsaved_session(sessions, &session, &checked)
+            {
+                // The copy-out must not clobber the visited file of ANOTHER live
+                // session that has unsaved edits: it overwrites the file under
+                // that session, which learns of it only as a stale conflict on
+                // its own next save. Refuse up front instead.
+                return Err(format!(
+                    "cannot copy to {to}: it is the unsaved visited file of live session \"{other}\" — save or close that session first, or copy elsewhere"
+                ));
+            }
+            let ws = sessions.get_mut(&session).expect("checked above");
             if in_place {
                 let bytes = ws
                     .save_to(&checked)
@@ -3185,6 +3220,38 @@ fn build_tool_schemas() -> Vec<Value> {
 #[cfg(test)]
 mod git_tool_tests {
     use super::*;
+
+    #[test]
+    fn clobbers_unsaved_session_flags_only_a_dirty_cross_session_collision() {
+        let pid = std::process::id();
+        let a = std::env::temp_dir().join(format!("mime-clob-a-{pid}.txt"));
+        let b = std::env::temp_dir().join(format!("mime-clob-b-{pid}.txt"));
+        let c = std::env::temp_dir().join(format!("mime-clob-c-{pid}.txt"));
+        std::fs::write(&a, "a\n").unwrap();
+        std::fs::write(&b, "b\n").unwrap();
+
+        let mut sessions: HashMap<String, Workspace> = HashMap::new();
+        // A: clean. B: unsaved edits.
+        sessions.insert(
+            "A".into(),
+            Workspace::new(Box::new(crate::quire::Quire::open(&a).unwrap())),
+        );
+        let mut wb = Workspace::new(Box::new(crate::quire::Quire::open(&b).unwrap()));
+        wb.run(r#"(goto-char (point-max)) (insert "x\n")"#).unwrap();
+        sessions.insert("B".into(), wb);
+
+        // A copy to B's file collides with the DIRTY session B.
+        assert_eq!(clobbers_unsaved_session(&sessions, "A", &b), Some("B"));
+        // A copy to the CLEAN session A's file is not flagged.
+        assert_eq!(clobbers_unsaved_session(&sessions, "B", &a), None);
+        // Your own session never counts as a cross-session clobber.
+        assert_eq!(clobbers_unsaved_session(&sessions, "B", &b), None);
+        // A path no session visits is fine.
+        assert_eq!(clobbers_unsaved_session(&sessions, "A", &c), None);
+
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
 
     #[test]
     fn mcp_handshake_is_spec_conformant() {
