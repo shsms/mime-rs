@@ -285,6 +285,16 @@ where
         let h = crate::conflict::pick(&hunks, n, b.point()).map_err(|e| err(&e))?;
         let (text, warning) = produce(&*b, h)?;
         let (start, end) = (h.start, h.end);
+        // A conflict hunk is line-oriented (`end` sits just past the trailing
+        // newline), so a non-empty replacement must stay newline-terminated or
+        // it fuses onto the line below. Left alone when it's a removal (empty) or
+        // the hunk was the buffer's final, newline-less line (nothing follows).
+        let text = if !text.is_empty() && !text.ends_with('\n') && b.char_before(end) == Some('\n')
+        {
+            format!("{text}\n")
+        } else {
+            text
+        };
         b.delete_region(start, end);
         b.goto_char(start);
         b.insert(&text);
@@ -4246,6 +4256,31 @@ mod tests {
             .unwrap();
         assert_eq!(report(&r, "left"), "0");
         assert_eq!(r.log[0], "pre\npost\n");
+    }
+
+    #[test]
+    fn conflict_replace_keeps_the_replacement_line_oriented() {
+        // A replacement lacking a trailing newline must not fuse onto the line
+        // below (the reported bug); the hunk is line-oriented.
+        let mut ws = trusted("pre\n<<<<<<< A\no\n=======\nt\n>>>>>>> B\npost\n");
+        let r = ws
+            .run(r#"(conflict-replace "merged" 1) (message (buffer-string))"#)
+            .unwrap();
+        assert_eq!(r.log[0], "pre\nmerged\npost\n");
+
+        // A replacement that already ends in a newline isn't doubled.
+        let mut ws = trusted("pre\n<<<<<<< A\no\n=======\nt\n>>>>>>> B\npost\n");
+        let r = ws
+            .run(r#"(conflict-replace "merged\n" 1) (message (buffer-string))"#)
+            .unwrap();
+        assert_eq!(r.log[0], "pre\nmerged\npost\n");
+
+        // A hunk that is the buffer's final, newline-less line keeps no newline.
+        let mut ws = trusted("pre\n<<<<<<< A\no\n=======\nt\n>>>>>>> B");
+        let r = ws
+            .run(r#"(conflict-replace "merged" 1) (message (buffer-string))"#)
+            .unwrap();
+        assert_eq!(r.log[0], "pre\nmerged");
     }
 
     #[test]
