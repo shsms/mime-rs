@@ -1014,8 +1014,9 @@ DONE (2026-07): rehearse now replaces the superseded entry for a squash/fixup st
 (the fold re-parents onto the previous commit's parent), so the previewed commit
 list and "-> N commits" count match a real apply. Test asserts preview==apply.
 
-** TODO git_rebase default pick-all doesn't drop commits already in `onto` (patch-id) — duplicates when rebasing a stacked branch onto a rewritten base :git:dogfooding:
+** DONE git_rebase default pick-all doesn't drop commits already in `onto` (patch-id) — duplicates when rebasing a stacked branch onto a rewritten base :git:dogfooding:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-07 Di 10:24]
 - State "TODO"       from              [2026-07-07 Di 08:31]
 :END:
 
@@ -1024,6 +1025,8 @@ From driving mime to rebase a stacked branch (2026-07-07): branch B sits on base
 Stock ~git rebase~ drops commits already present upstream by patch-id (cherry-pick / already-applied detection — the ~--no-reapply-cherry-picks~ default), so the same "reorder the base, then rebase the stack" sequence yields NO duplicates. mime's default pick-all has no such detection, so the natural stacked-branch workflow silently duplicates; recovering needs an explicit plan with a ~drop~ on each rewritten commit (what I did to fix it).
 
 Fix: on the plan-less rebase, omit commits in ~onto..HEAD~ whose patch-id already exists in ~onto~ (match git's cherry-pick detection), or at minimum WARN and report them so the duplication isn't silent. Consider a ~reapply_cherry_picks~ flag for the rare keep-them case. rehearse already lists the resulting commits — flagging the would-be duplicates there would catch it pre-apply too.
+
+Done [2026-07-07] on branch ~rebase-drop-cherry-picks~: the plan-less pick-all now drops commits already present in ~onto~ by patch-id (matches git's ~--no-reapply-cherry-picks~ default) and REPORTS the skipped commits so it's never silent; a ~reapply_cherry_picks~ flag overrides. An explicit ~plan~/~autosquash~ is unaffected. Cross-checked the drop set against real ~git rebase~.
 
 * Structural editing
 
