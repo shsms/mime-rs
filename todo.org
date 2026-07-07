@@ -1014,6 +1014,17 @@ DONE (2026-07): rehearse now replaces the superseded entry for a squash/fixup st
 (the fold re-parents onto the previous commit's parent), so the previewed commit
 list and "-> N commits" count match a real apply. Test asserts preview==apply.
 
+** TODO git_rebase default pick-all doesn't drop commits already in `onto` (patch-id) — duplicates when rebasing a stacked branch onto a rewritten base :git:dogfooding:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-07 Di 08:31]
+:END:
+
+From driving mime to rebase a stacked branch (2026-07-07): branch B sits on base A; A's top commits were REORDERED (rewritten to new oids, identical patch-ids). Re-rebasing B onto the rewritten A via ~git_rebase {onto: A}~ with the DEFAULT (plan-less) pick-all replayed A's rewritten commits a second time — B ended up with duplicate commits — because the merge-base with the rewritten A had moved BELOW the rewrite, so ~onto..HEAD~ still contained B's old copies of those commits and pick-all replayed every one verbatim.
+
+Stock ~git rebase~ drops commits already present upstream by patch-id (cherry-pick / already-applied detection — the ~--no-reapply-cherry-picks~ default), so the same "reorder the base, then rebase the stack" sequence yields NO duplicates. mime's default pick-all has no such detection, so the natural stacked-branch workflow silently duplicates; recovering needs an explicit plan with a ~drop~ on each rewritten commit (what I did to fix it).
+
+Fix: on the plan-less rebase, omit commits in ~onto..HEAD~ whose patch-id already exists in ~onto~ (match git's cherry-pick detection), or at minimum WARN and report them so the duplication isn't silent. Consider a ~reapply_cherry_picks~ flag for the rare keep-them case. rehearse already lists the resulting commits — flagging the would-be duplicates there would catch it pre-apply too.
+
 * Structural editing
 
 ** TODO Incremental re-parse (~InputEdit~s) [#C]
