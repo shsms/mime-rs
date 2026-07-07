@@ -1745,6 +1745,69 @@ pub fn commits_since(repo: &Repository, onto: Oid) -> Result<Vec<Oid>, Error> {
     walk.collect()
 }
 
+/// The patch-id that identifies `commit` as a cherry-pick candidate, or `None`
+/// when the commit has no single well-defined patch to match on:
+/// - a MERGE (more than one parent) — never an "already-applied" cherry-pick, and
+///   its first-parent diff wouldn't capture what it integrated anyway;
+/// - an EMPTY-diff commit — libgit2 hashes the empty diff to a constant, so every
+///   empty commit would collide on one id and be mistaken for a copy of any other.
+///
+/// A non-merge commit diffs against its first parent (the empty tree for a root
+/// commit); the id is a content hash stable across cherry-pick/reorder — the same
+/// change yields the same id at a different oid, which is how we recognise a
+/// commit as already-applied regardless of where it sits.
+fn commit_patch_id(repo: &Repository, commit: Oid) -> Result<Option<Oid>, Error> {
+    let c = repo.find_commit(commit)?;
+    if c.parent_count() > 1 {
+        return Ok(None);
+    }
+    let parent_tree = if c.parent_count() > 0 {
+        Some(c.parent(0)?.tree()?)
+    } else {
+        None
+    };
+    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&c.tree()?), None)?;
+    if diff.deltas().len() == 0 {
+        return Ok(None);
+    }
+    Ok(Some(diff.patchid(None)?))
+}
+
+/// Split `onto..HEAD` into (kept, dropped): commits whose patch-id already
+/// appears among the upstream-only commits (`HEAD..onto`) are dropped. This
+/// matches `git rebase`'s default cherry-pick detection
+/// (`--no-reapply-cherry-picks`): when a base rewrite (reorder/amend) leaves the
+/// merge-base *below* the rewrite, `onto..HEAD` still contains the pre-rewrite
+/// copies of commits now present — by patch-id — in the new base, and a naive
+/// pick-all would replay them a second time (duplicates). Comparing against only
+/// the onto-only side (not all of `onto`) mirrors git's `onto...HEAD` symmetric
+/// difference, so distinct commits that merely share a base are never dropped.
+fn partition_cherry_picks(repo: &Repository, onto: Oid) -> Result<(Vec<Oid>, Vec<Oid>), Error> {
+    // Patch-ids of the commits reachable from `onto` but not HEAD — git's
+    // "right side" of the onto...HEAD symmetric difference.
+    let mut walk = repo.revwalk()?;
+    walk.push(onto)?;
+    walk.hide_head()?;
+    let mut upstream = std::collections::HashSet::new();
+    for oid in walk {
+        if let Ok(Some(pid)) = commit_patch_id(repo, oid?) {
+            upstream.insert(pid);
+        }
+    }
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for oid in commits_since(repo, onto)? {
+        // Conservative on both None (merge/empty, no patch to match) and Err (a
+        // diff/patchid failure): keep the commit rather than risk dropping one we
+        // can't positively identify as already-applied.
+        match commit_patch_id(repo, oid) {
+            Ok(Some(pid)) if upstream.contains(&pid) => dropped.push(oid),
+            _ => kept.push(oid),
+        }
+    }
+    Ok((kept, dropped))
+}
+
 fn short(oid: Oid) -> String {
     let s = oid.to_string();
     s[..s.len().min(10)].to_string()
@@ -2185,9 +2248,13 @@ pub fn cmd_rebase(
     plan: Option<Vec<PlanItem>>,
     autosquash: Option<Vec<(String, String, String)>>,
     rehearse_only: bool,
+    reapply_cherry_picks: bool,
 ) -> Result<String, String> {
     let repo = open(repo_path)?;
     let onto_oid = resolve_s(&repo, onto)?;
+    // Commits omitted from a plan-less pick-all because they are already present
+    // in `onto` by patch-id (git's default cherry-pick detection).
+    let mut dropped: Vec<Oid> = Vec::new();
     let steps = if let Some(directives) = autosquash {
         let resolved = directives
             .iter()
@@ -2222,28 +2289,57 @@ pub fn cmd_rebase(
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?,
-            None => commits_since(&repo, onto_oid)
-                .map_err(gerr)?
-                .into_iter()
-                .map(pick_step)
-                .collect(),
+            None => {
+                let commits = if reapply_cherry_picks {
+                    commits_since(&repo, onto_oid).map_err(gerr)?
+                } else {
+                    let (kept, drop) = partition_cherry_picks(&repo, onto_oid).map_err(gerr)?;
+                    dropped = drop;
+                    kept
+                };
+                commits.into_iter().map(pick_step).collect()
+            }
         }
     };
     let plan = Plan {
         onto: onto_oid,
         steps,
     };
+    let drop_note = dropped_note(&repo, onto_oid, &dropped);
     if rehearse_only {
-        return Ok(preview_text(
-            &repo,
-            &rehearse(&repo, &plan, Mode::Pick).map_err(gerr)?,
+        return Ok(format!(
+            "{}{drop_note}",
+            preview_text(&repo, &rehearse(&repo, &plan, Mode::Pick).map_err(gerr)?),
         ));
     }
     let note = backup_note(&repo);
     Ok(format!(
-        "{}{note}",
+        "{}{drop_note}{note}",
         outcome_text(&start(&repo, plan).map_err(gerr)?)
     ))
+}
+
+/// A report of the commits a plan-less rebase skipped as already-applied, so the
+/// drop is never silent. Empty when nothing was dropped.
+fn dropped_note(repo: &Repository, onto: Oid, dropped: &[Oid]) -> String {
+    if dropped.is_empty() {
+        return String::new();
+    }
+    let mut s = format!(
+        "\ndropped {} commit(s) already in {} (matched by patch-id; \
+         pass reapply_cherry_picks:true to replay them):",
+        dropped.len(),
+        short(onto),
+    );
+    for oid in dropped {
+        let summary = repo
+            .find_commit(*oid)
+            .ok()
+            .and_then(|c| c.summary().map(str::to_string))
+            .unwrap_or_default();
+        s.push_str(&format!("\n  {} {summary}", short(*oid)));
+    }
+    s
 }
 
 fn resolve_all(repo: &Repository, specs: &[String]) -> Result<Vec<Oid>, String> {
@@ -2690,8 +2786,11 @@ mod tests {
         on_branch(&repo, "topic", f1);
 
         // Default plan (onto..HEAD) via the path-facing wrapper, onto by oid string.
-        let out = cmd_rebase(&dir, &m1.to_string(), None, None, false).unwrap();
+        let out = cmd_rebase(&dir, &m1.to_string(), None, None, false, false).unwrap();
         assert!(out.starts_with("done"), "{out}");
+        // `add b` and `change a` are distinct patches, so cherry-pick detection
+        // drops nothing — a plain rebase onto a diverged base is unaffected.
+        assert!(!out.contains("dropped"), "{out}");
         assert_eq!(
             cmd_status(&dir).unwrap(),
             "no sequencer operation in progress"
@@ -2709,6 +2808,101 @@ mod tests {
             show.contains("Diff:") && show.contains("+1"),
             "show carries the unified diff: {show}"
         );
+    }
+
+    #[test]
+    fn plan_less_rebase_drops_commits_already_in_the_rewritten_base() {
+        // The dogfooding scenario: branch `topic` sits on a base whose top two
+        // commits get REORDERED (rewritten to new oids, identical patch-ids).
+        // Re-rebasing topic onto the rewritten base must drop topic's stale copies
+        // of those commits (already present by patch-id) rather than replay them.
+        let dir = tmp("rebase-cherry-drop");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("base", "0\n")], "base");
+        let a1 = commit(&repo, &[base], &[("base", "0\n"), ("x", "1\n")], "add x");
+        let a2 = commit(
+            &repo,
+            &[a1],
+            &[("base", "0\n"), ("x", "1\n"), ("y", "1\n")],
+            "add y",
+        );
+        let t = commit(
+            &repo,
+            &[a2],
+            &[("base", "0\n"), ("x", "1\n"), ("y", "1\n"), ("z", "1\n")],
+            "add z",
+        );
+        on_branch(&repo, "topic", t);
+
+        // Rewrite the base: add-y then add-x — new oids, same patch-ids. `a1p` is
+        // the rewritten tip we rebase onto; the merge-base with topic is `base`,
+        // BELOW the rewrite, so onto..HEAD still holds the pre-rewrite add-x/add-y.
+        let a2p = commit(&repo, &[base], &[("base", "0\n"), ("y", "1\n")], "add y");
+        let a1p = commit(
+            &repo,
+            &[a2p],
+            &[("base", "0\n"), ("x", "1\n"), ("y", "1\n")],
+            "add x",
+        );
+
+        // rehearse, default: the two already-applied commits are reported dropped.
+        let pre = cmd_rebase(&dir, &a1p.to_string(), None, None, true, false).unwrap();
+        assert!(pre.contains("dropped 2 commit(s)"), "{pre}");
+        assert!(pre.contains("add x") && pre.contains("add y"), "{pre}");
+
+        // rehearse, reapply_cherry_picks: keeps them — no drop note.
+        let keep = cmd_rebase(&dir, &a1p.to_string(), None, None, true, true).unwrap();
+        assert!(!keep.contains("dropped"), "{keep}");
+
+        // apply, default: topic ends as base→add y→add x→add z — no duplicates.
+        let out = cmd_rebase(&dir, &a1p.to_string(), None, None, false, false).unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        assert!(out.contains("dropped 2 commit(s)"), "{out}");
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(tip.summary().unwrap(), "add z");
+        assert_eq!(tip.parent(0).unwrap().id(), a1p);
+        assert_eq!(
+            commits_since(&repo, base).unwrap().len(),
+            3,
+            "no duplicates"
+        );
+    }
+
+    #[test]
+    fn cherry_pick_detection_never_drops_empty_or_merge_commits() {
+        // Empty commits all hash to the constant empty-diff patch-id, and a merge
+        // has no single patch — so neither may be matched as "already applied".
+        // Otherwise one intentional empty commit upstream would drop an unrelated
+        // empty commit (or an `ours` merge) on the branch.
+        let dir = tmp("cherry-empty-merge");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        // Upstream (onto): a real commit then an intentional empty one.
+        let u_real = commit(&repo, &[base], &[("a", "1\n"), ("u", "1\n")], "add u");
+        let u_empty = commit(
+            &repo,
+            &[u_real],
+            &[("a", "1\n"), ("u", "1\n")],
+            "upstream empty",
+        );
+        // Branch: an intentional empty commit, a real commit, and an `ours` merge
+        // (tree equals its first parent, so its first-parent diff is empty).
+        let h_empty = commit(&repo, &[base], &[("a", "1\n")], "keep me (empty)");
+        let t_real = commit(&repo, &[h_empty], &[("a", "1\n"), ("t", "1\n")], "add t");
+        let side = commit(&repo, &[base], &[("a", "1\n"), ("s", "1\n")], "add s");
+        let merge = commit(
+            &repo,
+            &[t_real, side],
+            &[("a", "1\n"), ("t", "1\n")],
+            "merge -s ours side",
+        );
+        on_branch(&repo, "topic", merge);
+
+        let (kept, dropped) = partition_cherry_picks(&repo, u_empty).unwrap();
+        assert!(dropped.is_empty(), "nothing is a cherry-pick: {dropped:?}");
+        assert!(kept.contains(&h_empty), "empty branch commit kept");
+        assert!(kept.contains(&merge), "ours merge kept");
+        assert!(kept.contains(&t_real), "real commit kept");
     }
 
     #[test]
@@ -3010,6 +3204,7 @@ mod tests {
             None,
             Some(vec![(c3.to_string(), c1.to_string(), "fixup".to_string())]),
             false,
+            false,
         )
         .unwrap();
         assert!(out.starts_with("done"), "{out}");
@@ -3042,6 +3237,7 @@ mod tests {
                 (c3.to_string(), c2.to_string(), "fixup".to_string()),
                 (c2.to_string(), c1.to_string(), "fixup".to_string()),
             ]),
+            false,
             false,
         )
         .unwrap_err();

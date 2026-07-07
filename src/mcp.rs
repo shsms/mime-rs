@@ -2346,6 +2346,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
             plan_arg(args),
             autosquash_arg(args),
             bool_arg(args, "rehearse"),
+            bool_arg(args, "reapply_cherry_picks"),
         ),
         "git_fixup" => seq::cmd_fixup(
             &repo,
@@ -2393,7 +2394,7 @@ fn git_tool_schemas() -> Vec<Value> {
     vec![
         json!({
             "name": "git_rebase",
-            "description": "Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`. Each step picks/rewords/squashes/fixups/edits/splits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. A `split` step partitions one commit's changes — by whole file (`paths`) or by hunk (`hunks`, a post-commit line span) — into the commits listed in `into`. Stops on a conflict for the conflict tools + git_continue. No network, hooks, or exec.",
+            "description": "Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`. Each step picks/rewords/squashes/fixups/edits/splits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. A `split` step partitions one commit's changes — by whole file (`paths`) or by hunk (`hunks`, a post-commit line span) — into the commits listed in `into`. The plan-less pick-all drops commits already present in `onto` by patch-id (like `git rebase`, so a stacked branch onto a rewritten base doesn't duplicate them; reported, and overridable with `reapply_cherry_picks`). Stops on a conflict for the conflict tools + git_continue. No network, hooks, or exec.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2461,7 +2462,8 @@ fn git_tool_schemas() -> Vec<Value> {
                             "required": ["commit", "action"]
                         }
                     },
-                    "rehearse": { "type": "boolean", "description": "Dry-run: preview the resulting commits and whether the tree is unchanged (a pure reorder/fold), applying nothing. Default false." }
+                    "rehearse": { "type": "boolean", "description": "Dry-run: preview the resulting commits and whether the tree is unchanged (a pure reorder/fold), applying nothing. Default false." },
+                    "reapply_cherry_picks": { "type": "boolean", "description": "Plan-less pick-all only: keep commits already present in `onto` by patch-id instead of dropping them. Default false — like `git rebase`, a commit whose change already sits in the new base (e.g. after the base was reordered/amended below the merge-base) is skipped so a stacked branch isn't duplicated; the skipped commits are reported. Set true to replay them anyway. Ignored when an explicit `plan` or `autosquash` is given." }
                 },
                 "required": ["repo", "onto"],
             },
