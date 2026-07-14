@@ -241,8 +241,10 @@ Safety ladder: rehearse = dry-run with full report, nothing persists;
 restore_checkpoint = named restore points; undo_last = automatic rewind
 to before the last mutating call (ring of 8, no redo). replace_text's
 expect_unique:true makes a repeated anchor an error instead of a silent
-wrong-site edit. A FAILED run_program does NOT roll back (its error JSON
-says dirty:true when edits persist) — undo_last covers that too."#;
+wrong-site edit. A FAILED run_program rolls its pre-error edits back
+(rolled_back:true in the failure JSON); pass keep_partial:true to keep
+them for inspection — dirty:true then says they persist, and undo_last
+reverts them."#;
 
 const RECIPES: &str = r#"— recipes —
 Cross-file rename (one call, atomic across the set, saved only if every

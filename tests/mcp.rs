@@ -485,17 +485,42 @@ fn failed_run_carries_the_programs_reports_and_log() {
     // A navigate-and-report program left no edits behind.
     assert_eq!(failure["dirty"], false);
 
-    // A program that edits and THEN dies: the failure says the partial edit
-    // persists (a run does not roll back).
+    // A program that edits and THEN dies is transactional by default: the
+    // pre-error edit is rolled back and the failure says so.
     let err = s.call_err(
         3,
         "run_program",
         json!({ "program": r#"(insert "partial ") (error "late boom")"# }),
     );
     let failure: Value = serde_json::from_str(&err).expect("failure content is JSON");
+    assert_eq!(failure["dirty"], false);
+    assert_eq!(failure["rolled_back"], true);
+    assert!(
+        failure["error"].as_str().unwrap().contains("rolled back"),
+        "got: {failure}"
+    );
+    let text = s.call_ok(4, "read_region", json!({ "start": 1, "end": 6 }));
+    assert_eq!(text, "hello", "the pre-error edit was rolled back");
+
+    // keep_partial:true opts out: the edit persists and the error says how
+    // to revert it.
+    let err = s.call_err(
+        5,
+        "run_program",
+        json!({ "program": r#"(goto-char (point-min)) (insert "partial ") (error "late boom")"#, "keep_partial": true }),
+    );
+    let failure: Value = serde_json::from_str(&err).expect("failure content is JSON");
     assert_eq!(failure["dirty"], true);
-    let text = s.call_ok(4, "read_region", json!({ "start": 1, "end": 14 }));
-    assert_eq!(text, "partial hello", "the pre-error edit persisted");
+    assert!(failure.get("rolled_back").is_none());
+    assert!(
+        failure["error"].as_str().unwrap().contains("undo_last"),
+        "got: {failure}"
+    );
+    let text = s.call_ok(6, "read_region", json!({ "start": 1, "end": 14 }));
+    assert_eq!(
+        text, "partial hello",
+        "keep_partial kept the pre-error edit"
+    );
 }
 
 #[test]
@@ -1474,25 +1499,32 @@ fn warm_sessions_are_bounded_with_clean_lru_eviction() {
     );
 }
 
-/// A program's final form value is surfaced as `value` (tulisp-printed), so a
-/// read-only inspector like `(conflict-diff N)` is readable without wrapping it
-/// in `(message …)`; a `nil` value is omitted, like `stale`/`unsaved`.
+/// A program's final form value is surfaced as `value` — a string RAW
+/// (unquoted, unescaped), other types tulisp-printed — so a read-only
+/// inspector like `(conflict-diff N)` is readable without wrapping it in
+/// `(message …)`; a `nil` value is omitted, like `stale`/`unsaved`.
 #[test]
 fn run_program_surfaces_the_final_form_value() {
     let mut s = Server::spawn();
     s.request(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }));
     s.call_ok(2, "open_text", json!({ "text": "hello" }));
 
-    // A non-nil value (a string comes back quoted) rides alongside an empty
-    // read-only `diff`.
+    // A non-nil string value comes back raw (no quotes, escapes undone),
+    // riding alongside an empty read-only `diff`.
     let out: Value = serde_json::from_str(&s.call_ok(
         3,
         "run_program",
-        json!({ "program": r#"(upcase "hi")"# }),
+        json!({ "program": r#"(concat (upcase "hi") "\n2nd")"# }),
     ))
     .unwrap();
-    assert_eq!(out["value"], json!("\"HI\""));
+    assert_eq!(out["value"], json!("HI\n2nd"));
     assert_eq!(out["diff"], json!(""));
+
+    // A non-string value keeps its printed form.
+    let out: Value =
+        serde_json::from_str(&s.call_ok(31, "run_program", json!({ "program": "(+ 40 2)" })))
+            .unwrap();
+    assert_eq!(out["value"], json!("42"));
 
     // A final nil omits the field entirely.
     let out: Value = serde_json::from_str(&s.call_ok(

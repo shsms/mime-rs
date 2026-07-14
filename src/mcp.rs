@@ -627,9 +627,40 @@ fn tool_run_program(
                 .get(&session)
                 .map(|ws| ws.failure_context())
                 .unwrap_or_default();
-            return Err(pretty(&crate::result::failure_json(
-                &e, &reports, &log, dirty,
-            )));
+            let mut json = crate::result::failure_json(&e, &reports, &log, dirty);
+            // Transactional by default: a failed program's pre-error edits
+            // are rolled back to the pre-program state (the push_undo above)
+            // unless the caller opted out with keep_partial — then the
+            // recovery action rides in the error text instead.
+            if dirty && !rehearse {
+                if bool_arg(args, "keep_partial") {
+                    json["error"] = Value::String(format!(
+                        "{e} (the program's pre-error edits persist in the \
+                         warm buffer — undo_last reverts them)"
+                    ));
+                } else if sessions
+                    .get_mut(&session)
+                    .map(|ws| ws.undo_last().is_ok())
+                    .unwrap_or(false)
+                {
+                    json["dirty"] = Value::Bool(false);
+                    json["rolled_back"] = Value::Bool(true);
+                    json["error"] = Value::String(format!(
+                        "{e} (the program's pre-error edits were rolled back — \
+                         pass keep_partial:true to keep them for inspection)"
+                    ));
+                } else {
+                    // The rollback itself failed (nothing on the undo ring to
+                    // rewind to) — never pretend it happened: dirty stays
+                    // true and the error says the edits persist.
+                    json["error"] = Value::String(format!(
+                        "{e} (rollback FAILED — the pre-error edits persist \
+                         in the warm buffer; undo_last or (revert-buffer) \
+                         recovers)"
+                    ));
+                }
+            }
+            return Err(pretty(&json));
         }
     };
     // A rehearsal persists nothing, so it audits as a non-mutating event.
@@ -649,7 +680,7 @@ fn tool_run_program(
     // having to wrap it in `(message …)`; the buffer `diff` field stays empty
     // for a read-only call.
     if value != "nil" {
-        json["value"] = Value::String(value);
+        json["value"] = Value::String(unprint_string_value(&value).unwrap_or(value));
     }
     // A bulk edit's diff can run to megabytes; clamp it for transport unless
     // the caller asked for everything. 200 lines ≈ a large hand-made edit.
@@ -2154,6 +2185,36 @@ fn truncate_for_error(s: &str) -> String {
     }
 }
 
+/// Undo tulisp's string-printing for a final `value` that IS one printed
+/// string: strip the quotes and the printer's escapes, so multi-line text (a
+/// conflict-diff, a rendered window) reads as plain text in the report
+/// instead of a quoted-and-escaped one-liner. `None` for anything else — a
+/// non-string value, an interior unescaped quote (two printed values), or an
+/// escape we don't know — and the caller keeps the printed form.
+fn unprint_string_value(value: &str) -> Option<String> {
+    let inner = value.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            return None; // an unescaped interior quote: not one printed string
+        }
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 // ---- the tool catalogue ----------------------------------------------------
 
 /// `tools/list` result — every tool with a JSON Schema `inputSchema`.
@@ -2908,8 +2969,10 @@ fn instructions() -> String {
          (Emacs-Lisp) when you need regex or structure. Three persistence levels: `rehearse` \
          previews a program then rolls the buffer back (nothing persists); `run_program`/the \
          edit tools persist to the warm buffer for later calls but NOT to disk; `save` (or \
-         save_buffer) writes to disk. Note a FAILED run_program does NOT roll back — its \
-         partial edits persist (undo_last reverts them); rehearse first when unsure. Positions: \
+         save_buffer) writes to disk. A FAILED run_program rolls its pre-error edits back \
+         (keep_partial:true keeps them; undo_last then reverts). A CLEAN buffer whose visited \
+         file changes on disk auto-reverts on next use; one with unsaved edits is left alone \
+         and flagged stale instead. Positions: \
          @N and point are ABSOLUTE (goto-char); line numbers are narrowing-relative \
          (goto-line).\n\nTools:\n",
     );
@@ -2991,12 +3054,13 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "run_program",
-            "description": "Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and return a structured RunReport (unified diff, point, length before/after, any (report ...)/(message ...) output, and `value`: the final form's result rendered the way tulisp prints it — present only when non-nil, so a read-only inspector like (conflict-diff N) is readable without wrapping it in (message ...)). Only the FINAL form's value comes back, so wrap any earlier result you need (e.g. a replace-regexp match count) in (report …) or it stays invisible. This is the core, general-purpose editing tool; the buffer and any defined functions persist for the next call. The callable Lisp surface is indexed in help {lisp} (help {regex|treesit|recipes} for syntax and worked examples). On failure the error content is a JSON object {ok:false, error, dirty, reports, log} carrying the diagnostics the program emitted before dying; dirty=true means its pre-error edits persist (a run does not roll back on error — use rehearse, or with-transaction inside the program, for atomicity).",
+            "description": "Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and return a structured RunReport (unified diff, point, length before/after, any (report ...)/(message ...) output, and `value`: the final form's result — a string comes back raw (unquoted, unescaped), other types render the way tulisp prints them; present only when non-nil, so a read-only inspector like (conflict-diff N) is readable without wrapping it in (message ...)). Only the FINAL form's value comes back, so wrap any earlier result you need (e.g. a replace-regexp match count) in (report …) or it stays invisible. This is the core, general-purpose editing tool; the buffer and any defined functions persist for the next call. The callable Lisp surface is indexed in help {lisp} (help {regex|treesit|recipes} for syntax and worked examples). On failure the error content is a JSON object {ok:false, error, dirty, reports, log} carrying the diagnostics the program emitted before dying; by default a failed run rolls its pre-error edits back (rolled_back:true rides in the failure JSON); dirty=true means they persist — that happens only with keep_partial:true.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "program": { "type": "string", "description": "Emacs-Lisp program, e.g. (while (re-search-forward \"foo\" nil t) (replace-match \"bar\"))." },
                     "full_diff": { "type": "boolean", "description": "Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count." },
+                    "keep_partial": { "type": "boolean", "description": "On program error, KEEP the pre-error edits in the warm buffer (dirty:true in the failure JSON; undo_last reverts them) instead of rolling back to the pre-program state. Default false: a failed run is transactional." },
                     "view": { "type": ["boolean", "integer"], "description": "Add a rendered viewport around point to the report (true = 4 context lines, or a line count)." },
                     "session": session,
                     "path": path,
