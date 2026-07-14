@@ -1460,6 +1460,7 @@ fn resolve_move_selection(
     from_diff: &git2::Diff,
     paths: &[String],
     hunks: &[HunkSel],
+    what: &str,
 ) -> Result<MoveSel, Error> {
     let mut files: Vec<(String, Vec<(u32, u32)>)> = Vec::new();
     for idx in 0..from_diff.deltas().len() {
@@ -1480,7 +1481,7 @@ fn resolve_move_selection(
     let mut whole = std::collections::HashSet::new();
     for p in paths {
         if !files.iter().any(|(f, _)| f == p) {
-            return Err(estr(&format!("move: `from` does not change {p}")));
+            return Err(estr(&format!("{what}: the diff does not change {p}")));
         }
         whole.insert(p.clone());
     }
@@ -1488,16 +1489,19 @@ fn resolve_move_selection(
     for sel in hunks {
         if whole.contains(&sel.path) {
             return Err(estr(&format!(
-                "move: {} is named both by path and by hunk",
+                "{what}: {} is named both by path and by hunk",
                 sel.path
             )));
         }
         let Some((_, hs)) = files.iter().find(|(f, _)| f == &sel.path) else {
-            return Err(estr(&format!("move: `from` does not change {}", sel.path)));
+            return Err(estr(&format!(
+                "{what}: the diff does not change {}",
+                sel.path
+            )));
         };
         if hs.is_empty() {
             return Err(estr(&format!(
-                "move: {} has no text hunks (a rename/mode/binary change — move it by path)",
+                "{what}: {} has no text hunks (a rename/mode/binary change — take it by path)",
                 sel.path
             )));
         }
@@ -1511,7 +1515,7 @@ fn resolve_move_selection(
         }
         if !matched {
             return Err(estr(&format!(
-                "move: no hunk of {} overlaps lines {}-{}",
+                "{what}: no hunk of {} overlaps lines {}-{}",
                 sel.path, sel.lo, sel.hi
             )));
         }
@@ -1565,7 +1569,7 @@ fn move_changes(
     // The move set lives in `from`'s own diff; reject anything `to` also changes.
     let from_parent_tree = fc.parent(0)?.tree()?;
     let from_diff = repo.diff_tree_to_tree(Some(&from_parent_tree), Some(&fc.tree()?), None)?;
-    let sel = resolve_move_selection(&from_diff, paths, hunks)?;
+    let sel = resolve_move_selection(&from_diff, paths, hunks, "move")?;
     let to_changed = changed_paths(repo, &tc.parent(0)?.tree()?, &tc.tree()?)?;
     for p in &sel.paths {
         if to_changed.iter().any(|c| c == p) {
@@ -2240,6 +2244,292 @@ pub fn cmd_fixup(
         "{}{note}",
         outcome_text(&start(&repo, plan).map_err(gerr)?)
     ))
+}
+
+/// A byte-exact snapshot of the worktree files a diff touches. The worktree
+/// fixup runs the replay on a CLEAN tree (the sequencer hard-resets and
+/// replays through the worktree), so the uncommitted state is captured first
+/// and written back verbatim afterwards — after a successful fold the
+/// restored files differ from the new tip by exactly the changes that were
+/// NOT folded.
+struct WorktreeSnapshot(Vec<(std::path::PathBuf, SnapshotFile)>);
+
+/// One snapshotted file: its bytes + executable bit; `None` = the path is
+/// deleted in the worktree.
+type SnapshotFile = Option<(Vec<u8>, bool)>;
+
+fn snapshot_worktree(repo: &Repository, diff: &git2::Diff) -> Result<WorktreeSnapshot, Error> {
+    let workdir = repo.workdir().ok_or_else(|| estr("bare repository"))?;
+    let mut seen = std::collections::HashSet::new();
+    let mut files = Vec::new();
+    for idx in 0..diff.deltas().len() {
+        let Some(delta) = diff.get_delta(idx) else {
+            continue;
+        };
+        for f in [delta.old_file().path(), delta.new_file().path()] {
+            let Some(rel) = f else { continue };
+            if !seen.insert(rel.to_path_buf()) {
+                continue;
+            }
+            let abs = workdir.join(rel);
+            let entry = match std::fs::read(&abs) {
+                Ok(bytes) => {
+                    #[cfg(unix)]
+                    let exec = {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::metadata(&abs)
+                            .map(|m| m.permissions().mode() & 0o111 != 0)
+                            .unwrap_or(false)
+                    };
+                    #[cfg(not(unix))]
+                    let exec = false;
+                    Some((bytes, exec))
+                }
+                Err(_) => None, // deleted in the worktree
+            };
+            files.push((rel.to_path_buf(), entry));
+        }
+    }
+    Ok(WorktreeSnapshot(files))
+}
+
+/// Write a snapshot back over the worktree. Failures are collected and
+/// reported per path, never swallowed — a lost uncommitted change must be
+/// loud (and is still recoverable from the `-worktree` backup ref).
+fn restore_worktree(repo: &Repository, snap: &WorktreeSnapshot) -> Result<(), Error> {
+    let workdir = repo.workdir().ok_or_else(|| estr("bare repository"))?;
+    let mut failed: Vec<String> = Vec::new();
+    for (rel, entry) in &snap.0 {
+        let abs = workdir.join(rel);
+        let outcome = match entry {
+            Some((bytes, exec)) => {
+                if let Some(dir) = abs.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let write = std::fs::write(&abs, bytes);
+                #[cfg(unix)]
+                if write.is_ok() && *exec {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = std::fs::metadata(&abs) {
+                        let mut p = meta.permissions();
+                        p.set_mode(p.mode() | 0o111);
+                        let _ = std::fs::set_permissions(&abs, p);
+                    }
+                }
+                write
+            }
+            None => match std::fs::remove_file(&abs) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            },
+        };
+        if let Err(e) = outcome {
+            failed.push(format!("{} ({e})", rel.display()));
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(estr(&format!(
+            "restoring the worktree failed for: {} — the pre-op worktree is \
+             recoverable from the -worktree backup ref",
+            failed.join(", ")
+        )))
+    }
+}
+
+/// Fold selected UNCOMMITTED changes into `target` — `git add -p` for agents:
+/// build a fixup commit from just those worktree hunks (a dangling commit;
+/// the branch never points at it), relocate it under `target` exactly like
+/// `cmd_fixup`, and hand the unfolded rest of the uncommitted work back
+/// afterwards. An empty selection folds every uncommitted change. A fold
+/// whose tail replay conflicts is aborted whole: branch and worktree come
+/// back exactly as they were (no half-done rebase is ever left over parked
+/// uncommitted work).
+pub fn cmd_fixup_worktree(
+    repo_path: &std::path::Path,
+    target: &str,
+    paths: &[String],
+    hunks: &[HunkSel],
+    rehearse_only: bool,
+) -> Result<String, String> {
+    let repo = open(repo_path)?;
+    let target = resolve_s(&repo, target)?;
+    fixup_worktree(&repo, target, paths, hunks, rehearse_only).map_err(gerr)
+}
+
+fn fixup_worktree(
+    repo: &Repository,
+    target: Oid,
+    paths: &[String],
+    hunks: &[HunkSel],
+    rehearse_only: bool,
+) -> Result<String, Error> {
+    let head = repo.head()?.peel_to_commit()?;
+    let head_tree = head.tree()?;
+    if head.id() != target && !repo.graph_descendant_of(head.id(), target)? {
+        return Err(estr("fixup: target is not an ancestor of HEAD"));
+    }
+    let diff = repo.diff_tree_to_workdir_with_index(Some(&head_tree), None)?;
+    if diff.deltas().len() == 0 {
+        return Err(estr(
+            "fixup: the worktree has no uncommitted changes to fold \
+             (stage a brand-new file first — untracked files are not seen)",
+        ));
+    }
+    // What to fold: the explicit selection, or everything uncommitted.
+    let sel = if paths.is_empty() && hunks.is_empty() {
+        None
+    } else {
+        Some(resolve_move_selection(&diff, paths, hunks, "fixup")?)
+    };
+    let fixup_tree_id = match &sel {
+        None => apply_subset(repo, &head_tree, &diff, |_| true, |_, _, _| true)?,
+        Some(sel) => apply_subset(
+            repo,
+            &head_tree,
+            &diff,
+            |p| sel.whole.contains(p),
+            |p, ns, nl| sel.whole.contains(p) || sel.hunks.contains(&(p.to_string(), ns, nl)),
+        )?,
+    };
+    if fixup_tree_id == head_tree.id() {
+        return Err(estr("fixup: the selection holds no changes"));
+    }
+    let tc = repo.find_commit(target)?;
+    if tc.parent_count() == 0 {
+        return Err(estr("fixup: cannot fold into a root commit"));
+    }
+    let onto = tc.parent(0)?.id();
+    // The fixup source is a DANGLING commit of the selected changes on top of
+    // HEAD — the branch never points at it; the replay only needs the object.
+    // Its identity is discarded by the fold (the target keeps author+message),
+    // so fall back to the target's author when the repo has no user config.
+    let sig = match repo.signature() {
+        Ok(s) => s,
+        Err(_) => {
+            let a = tc.author();
+            git2::Signature::now(
+                a.name().unwrap_or("mime"),
+                a.email().unwrap_or("mime@invalid"),
+            )?
+        }
+    };
+    let fixup_tree = repo.find_tree(fixup_tree_id)?;
+    let fixup = repo.commit(
+        None,
+        &sig,
+        &sig,
+        &format!("fixup! {}", tc.summary().unwrap_or("")),
+        &fixup_tree,
+        &[&head],
+    )?;
+    // commits_since is oldest-first; the fold lands right after the target.
+    let mut steps: Vec<Step> = commits_since(repo, onto)?
+        .into_iter()
+        .map(pick_step)
+        .collect();
+    let pos = steps
+        .iter()
+        .position(|s| s.commit == target)
+        .ok_or_else(|| estr("fixup: target not found in onto..HEAD"))?;
+    let mut fold = pick_step(fixup);
+    fold.action = Action::Fixup;
+    steps.insert(pos + 1, fold);
+    let step_commits: Vec<Oid> = steps.iter().map(|s| s.commit).collect();
+    let plan = Plan { onto, steps };
+    if rehearse_only {
+        return Ok(format!(
+            "{}\n(the unfolded uncommitted changes stay in the worktree)",
+            preview_text(repo, &rehearse(repo, &plan, Mode::Pick)?)
+        ));
+    }
+
+    // Park the uncommitted work: a byte snapshot for the restore, PLUS a
+    // dangling backup commit of the full worktree stamped on a ref — even a
+    // failed restore cannot lose uncommitted changes.
+    let snap = snapshot_worktree(repo, &diff)?;
+    // With no selection the fixup tree already IS the full worktree tree —
+    // don't re-apply the whole diff a second time just for the backup.
+    let wt_tree_id = match &sel {
+        None => fixup_tree_id,
+        Some(_) => apply_subset(repo, &head_tree, &diff, |_| true, |_, _, _| true)?,
+    };
+    let wt_tree = repo.find_tree(wt_tree_id)?;
+    let wt_backup = repo.commit(
+        None,
+        &sig,
+        &sig,
+        "mime worktree backup (pre fixup-from-worktree)",
+        &wt_tree,
+        &[&head],
+    )?;
+    let short_branch = repo.head()?.shorthand().unwrap_or("HEAD").replace('/', "-");
+    repo.reference(
+        &format!("refs/mime-backup/{short_branch}-worktree"),
+        wt_backup,
+        true,
+        "mime sequencer worktree backup",
+    )?;
+    // The sequencer replays through the worktree and refuses to start dirty:
+    // run it on a clean tree, then hand the parked changes back.
+    hard_reset(repo, head.id())?;
+    let outcome = match begin(repo, plan, Mode::Pick) {
+        Ok(o) => o,
+        Err(e) => {
+            // begin can die AFTER detaching HEAD and writing the state file
+            // (an I/O error mid-replay, not a conflict): abort any
+            // half-started operation first, so the "nothing changed"
+            // contract holds for hard errors too.
+            let mut e = e;
+            if status(repo).ok().flatten().is_some()
+                && let Err(a) = abort(repo)
+            {
+                e = estr(&format!(
+                    "{e}; and aborting the half-started operation failed: {a} — \
+                     git_abort to recover"
+                ));
+            }
+            restore_worktree(repo, &snap)?;
+            return Err(e);
+        }
+    };
+    match outcome {
+        Outcome::Done { .. } => {
+            restore_worktree(repo, &snap)?;
+            Ok(format!(
+                "{}\n(the uncommitted changes NOT folded are back in the worktree){}",
+                outcome_text(&outcome),
+                backup_note(repo)
+            ))
+        }
+        Outcome::Conflict { step, files } => {
+            // Never strand a half-done rebase over parked uncommitted work:
+            // abort the whole fold and put the worktree back.
+            abort(repo)?;
+            restore_worktree(repo, &snap)?;
+            let culprit = step_commits
+                .get(step)
+                .map(|c| short(*c))
+                .unwrap_or_default();
+            Err(estr(&format!(
+                "fixup: replaying {culprit} over the folded change conflicts \
+                 in {} — nothing changed (worktree restored). A later commit \
+                 reshapes those lines: pick THAT commit as the target \
+                 (git_blame {{worktree: true}} names it), or commit the change \
+                 and drive the conflict interactively via git_fixup {{source}}.",
+                files.join(", ")
+            )))
+        }
+        Outcome::Paused { step, .. } => {
+            // No `edit` step exists in this plan; a pause would be a bug.
+            Err(estr(&format!(
+                "fixup: unexpected pause at step {step} — git_status/git_abort \
+                 the operation; the uncommitted changes are on the -worktree \
+                 backup ref"
+            )))
+        }
+    }
 }
 
 pub fn cmd_rebase(
@@ -3265,6 +3555,141 @@ mod tests {
         let side = commit(&repo, &[base], &[("z", "1\n")], "side branch");
         let err = cmd_fixup(&dir, &side.to_string(), &c3.to_string(), true).unwrap_err();
         assert!(err.contains("same line of history"), "{err}");
+    }
+
+    /// The blob `path` holds in `commit`'s tree.
+    fn at_commit(repo: &Repository, commit: Oid, path: &str) -> String {
+        let tree = repo.find_commit(commit).unwrap().tree().unwrap();
+        let e = tree.get_path(std::path::Path::new(path)).unwrap();
+        String::from_utf8(repo.find_blob(e.id()).unwrap().content().to_vec()).unwrap()
+    }
+
+    #[test]
+    fn fixup_worktree_folds_a_path_and_hands_back_the_rest() {
+        let dir = tmp("fixup-wt");
+        let (repo, _base, _c1, _c2, c3) = fixup_fixture(&dir);
+        // Uncommitted: a fix to `a` (belongs in c3, "fix a") and an unrelated
+        // edit to `b` that must survive as uncommitted work.
+        std::fs::write(dir.join("a"), "3\n").unwrap();
+        std::fs::write(dir.join("b"), "keep me\n").unwrap();
+
+        let out =
+            cmd_fixup_worktree(&dir, &c3.to_string(), &["a".to_string()], &[], false).unwrap();
+        assert!(out.contains("back in the worktree"), "{out}");
+
+        // History: the tip amends c3 (same message), now carrying the fold;
+        // `b` in history is untouched.
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary().unwrap(), "fix a");
+        assert_eq!(at_commit(&repo, head.id(), "a"), "3\n");
+        assert_eq!(at_commit(&repo, head.id(), "b"), "1\n");
+        // Worktree: byte-identical to before — `b` still holds the edit.
+        assert_eq!(read(&repo, "a"), "3\n");
+        assert_eq!(read(&repo, "b"), "keep me\n");
+        // The worktree parachute ref exists and holds the full pre-op state.
+        let wt = repo
+            .refname_to_id("refs/mime-backup/main-worktree")
+            .unwrap();
+        assert_eq!(at_commit(&repo, wt, "b"), "keep me\n");
+    }
+
+    #[test]
+    fn fixup_worktree_folds_one_hunk_of_a_file_keeping_the_other() {
+        let dir = tmp("fixup-wt-hunk");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("x", "0\n")], "base");
+        let body = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n";
+        let c1 = commit(&repo, &[base], &[("x", "0\n"), ("f", body)], "add f");
+        on_branch(&repo, "main", c1);
+        // Two edits far enough apart to be separate hunks; fold only line 1.
+        std::fs::write(dir.join("f"), "L1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nL9\nl10\n").unwrap();
+
+        cmd_fixup_worktree(
+            &dir,
+            &c1.to_string(),
+            &[],
+            &[HunkSel {
+                path: "f".to_string(),
+                lo: 1,
+                hi: 1,
+            }],
+            false,
+        )
+        .unwrap();
+
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        // History took the L1 hunk only; the L9 edit stays uncommitted.
+        assert_eq!(
+            at_commit(&repo, head.id(), "f"),
+            "L1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n"
+        );
+        assert_eq!(
+            read(&repo, "f"),
+            "L1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nL9\nl10\n"
+        );
+    }
+
+    #[test]
+    fn fixup_worktree_empty_selection_folds_everything() {
+        let dir = tmp("fixup-wt-all");
+        let (repo, _base, _c1, _c2, c3) = fixup_fixture(&dir);
+        std::fs::write(dir.join("a"), "3\n").unwrap();
+        std::fs::write(dir.join("b"), "2\n").unwrap();
+
+        cmd_fixup_worktree(&dir, &c3.to_string(), &[], &[], false).unwrap();
+
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(at_commit(&repo, head.id(), "a"), "3\n");
+        assert_eq!(at_commit(&repo, head.id(), "b"), "2\n");
+        // Everything folded → nothing uncommitted remains.
+        assert!(
+            !is_dirty(&repo).unwrap(),
+            "worktree clean after a full fold"
+        );
+    }
+
+    #[test]
+    fn fixup_worktree_conflict_aborts_whole_and_restores() {
+        let dir = tmp("fixup-wt-conflict");
+        let (repo, _base, c1, _c2, c3) = fixup_fixture(&dir);
+        // The worktree edit to `a` is based on c3's content ("2\n"); folding it
+        // into c1 (where `a` is "1\n") cannot apply — the fold conflicts.
+        std::fs::write(dir.join("a"), "conflict me\n").unwrap();
+        std::fs::write(dir.join("b"), "keep me\n").unwrap();
+
+        let err =
+            cmd_fixup_worktree(&dir, &c1.to_string(), &["a".to_string()], &[], false).unwrap_err();
+        assert!(
+            err.contains("nothing changed") && err.contains("target"),
+            "the error explains the abort and the fix: {err}"
+        );
+        // Branch untouched; the whole uncommitted state is back, byte-exact.
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), c3);
+        assert_eq!(read(&repo, "a"), "conflict me\n");
+        assert_eq!(read(&repo, "b"), "keep me\n");
+        // No half-done operation is left behind.
+        assert!(status(&repo).unwrap().is_none(), "no op in progress");
+    }
+
+    #[test]
+    fn fixup_worktree_rehearse_mutates_nothing() {
+        let dir = tmp("fixup-wt-rehearse");
+        let (repo, _base, _c1, _c2, c3) = fixup_fixture(&dir);
+        std::fs::write(dir.join("a"), "3\n").unwrap();
+
+        let out = cmd_fixup_worktree(&dir, &c3.to_string(), &["a".to_string()], &[], true).unwrap();
+        assert!(
+            out.contains("fix a"),
+            "preview lists the fold target: {out}"
+        );
+
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), c3);
+        assert_eq!(read(&repo, "a"), "3\n", "worktree untouched");
+        assert!(
+            repo.refname_to_id("refs/mime-backup/main-worktree")
+                .is_err(),
+            "no backup ref from a rehearsal"
+        );
     }
 
     #[test]

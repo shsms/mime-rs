@@ -2453,12 +2453,35 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
             bool_arg(args, "rehearse"),
             bool_arg(args, "reapply_cherry_picks"),
         ),
-        "git_fixup" => seq::cmd_fixup(
-            &repo,
-            &str_arg(args, "target")?,
-            &str_arg(args, "source")?,
-            bool_arg(args, "rehearse"),
-        ),
+        "git_fixup" => {
+            let paths = opt_str_list(args, "paths");
+            let hunks = hunk_sels_arg(args, "hunks");
+            let from_worktree =
+                bool_arg(args, "worktree") || !paths.is_empty() || !hunks.is_empty();
+            if from_worktree {
+                if args.get("source").is_some() {
+                    return Err(
+                        "git_fixup: pass source (a committed fixup) OR worktree/paths/hunks \
+                         (an uncommitted one), not both"
+                            .to_string(),
+                    );
+                }
+                seq::cmd_fixup_worktree(
+                    &repo,
+                    &str_arg(args, "target")?,
+                    &paths,
+                    &hunks,
+                    bool_arg(args, "rehearse"),
+                )
+            } else {
+                seq::cmd_fixup(
+                    &repo,
+                    &str_arg(args, "target")?,
+                    &str_arg(args, "source")?,
+                    bool_arg(args, "rehearse"),
+                )
+            }
+        }
         "git_cherry_pick" => seq::cmd_cherry_pick(&repo, &str_list_arg(args, "commits")?),
         "git_revert" => seq::cmd_revert(&repo, &str_list_arg(args, "commits")?),
         "git_continue" => seq::cmd_continue(&repo, bool_arg(args, "force")),
@@ -2680,16 +2703,30 @@ fn git_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "git_fixup",
-            "description": "Fold `source`'s changes into `target` (a one-call autosquash for a committed source): `target` keeps its own — already signed-off — message, `source` is relocated under it as a fixup, and the rest of the branch is auto-picked. `source` and `target` must be on one line of history. rehearse:true previews. For a full custom plan use git_rebase; to fold uncommitted work, commit it first (raw `git -s`, to fire the sign-off hook) then git_fixup that commit.",
+            "description": "Fold changes into `target`, which keeps its own — already signed-off — message; the rest of the branch is auto-picked. Two sources: a COMMITTED `source` (a one-call autosquash; source and target must be on one line of history), or the UNCOMMITTED worktree — pass `paths`/`hunks` to fold just those working-tree changes (`git add -p` for agents), or `worktree: true` to fold every uncommitted change; the unfolded rest stays in the worktree, byte-identical (also parked on a refs/mime-backup/<branch>-worktree ref). A worktree fold whose tail replay conflicts is aborted whole — branch and worktree come back untouched, and the error names the reshaping commit to target instead (git_blame {worktree: true} finds fold targets). rehearse:true previews either mode. For a full custom plan use git_rebase.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "repo": repo,
                     "target": { "type": "string", "description": "The commit to fold into — keeps its message (oid/ref/revspec)." },
-                    "source": { "type": "string", "description": "The commit whose changes to fold in (oid/ref/revspec)." },
+                    "source": { "type": "string", "description": "A COMMITTED commit whose changes to fold in (oid/ref/revspec). Omit to fold from the worktree instead (paths/hunks/worktree)." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Worktree mode: whole files whose uncommitted changes to fold (repo-relative). Untracked files must be staged first to be seen." },
+                    "hunks": {
+                        "type": "array",
+                        "description": "Worktree mode: specific uncommitted hunks to fold — each {path, lines: [start, end]} takes every worktree diff-hunk of `path` whose current-file line range overlaps [start, end] (1-based inclusive; the spans git_blame {worktree: true} reports).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "File whose hunks to fold." },
+                                "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based inclusive line span in the CURRENT worktree file." }
+                            },
+                            "required": ["path", "lines"]
+                        }
+                    },
+                    "worktree": { "type": "boolean", "description": "Fold EVERY uncommitted change into target (no path/hunk selection needed). Default false." },
                     "rehearse": { "type": "boolean", "description": "Preview the resulting history without applying." }
                 },
-                "required": ["repo", "target", "source"],
+                "required": ["repo", "target"],
             },
         }),
     ]

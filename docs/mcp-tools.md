@@ -263,10 +263,13 @@ Relocate a change from commit `from` to the adjacent commit `to` (one the direct
 
 ## git_fixup
 
-Fold `source`'s changes into `target` (a one-call autosquash for a committed source): `target` keeps its own — already signed-off — message, `source` is relocated under it as a fixup, and the rest of the branch is auto-picked. `source` and `target` must be on one line of history. rehearse:true previews. For a full custom plan use git_rebase; to fold uncommitted work, commit it first (raw `git -s`, to fire the sign-off hook) then git_fixup that commit.
+Fold changes into `target`, which keeps its own — already signed-off — message; the rest of the branch is auto-picked. Two sources: a COMMITTED `source` (a one-call autosquash; source and target must be on one line of history), or the UNCOMMITTED worktree — pass `paths`/`hunks` to fold just those working-tree changes (`git add -p` for agents), or `worktree: true` to fold every uncommitted change; the unfolded rest stays in the worktree, byte-identical (also parked on a refs/mime-backup/<branch>-worktree ref). A worktree fold whose tail replay conflicts is aborted whole — branch and worktree come back untouched, and the error names the reshaping commit to target instead (git_blame {worktree: true} finds fold targets). rehearse:true previews either mode. For a full custom plan use git_rebase.
 
+- `hunks` — Worktree mode: specific uncommitted hunks to fold — each {path, lines: [start, end]} takes every worktree diff-hunk of `path` whose current-file line range overlaps [start, end] (1-based inclusive; the spans git_blame {worktree: true} reports).
+- `paths` — Worktree mode: whole files whose uncommitted changes to fold (repo-relative). Untracked files must be staged first to be seen.
 - `rehearse` — Preview the resulting history without applying.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
-- `source` (required) — The commit whose changes to fold in (oid/ref/revspec).
+- `source` — A COMMITTED commit whose changes to fold in (oid/ref/revspec). Omit to fold from the worktree instead (paths/hunks/worktree).
 - `target` (required) — The commit to fold into — keeps its message (oid/ref/revspec).
+- `worktree` — Fold EVERY uncommitted change into target (no path/hunk selection needed). Default false.
 
