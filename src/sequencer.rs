@@ -324,13 +324,28 @@ pub struct Status {
 
 /// A dry-run of a plan: the commits it WOULD produce (oldest→newest, with
 /// summaries) and the resulting tree, computed entirely in the object DB without
-/// moving HEAD/refs or touching the worktree. `conflict` is set (and the commit
-/// list truncated) at the first step a real run would stop on.
+/// moving HEAD/refs or touching the worktree. Unlike a real run, the rehearsal
+/// does NOT stop at the first conflicting step: the step's change is skipped and
+/// the preview continues, so ONE pass lists every step that needs attention
+/// (later conflicts can be knock-on effects of an earlier skipped change).
 #[derive(Debug)]
 pub struct Preview {
     pub commits: Vec<(Oid, String)>,
     pub final_tree: Oid,
-    pub conflict: Option<(usize, Vec<String>)>,
+    pub conflicts: Vec<PreviewConflict>,
+}
+
+/// One step a real run would stop on, with the WHY an agent needs to repair
+/// the plan: per conflicted file, the commit that last set those lines at
+/// this point of the replayed history — usually the right fold target.
+#[derive(Debug)]
+pub struct PreviewConflict {
+    pub step: usize,
+    pub commit: Oid,
+    pub summary: String,
+    pub files: Vec<String>,
+    /// Rendered "file: last set by <short> <subject>" lines.
+    pub why: Vec<String>,
 }
 
 /// In-progress operation state, persisted to `.git/mime-sequencer.json`.
@@ -704,6 +719,7 @@ fn rehearse(repo: &Repository, plan: &Plan, mode: Mode) -> Result<Preview, Error
     }
     let mut current = plan.onto;
     let mut commits = Vec::new();
+    let mut conflicts = Vec::new();
     for (i, step) in plan.steps.iter().enumerate() {
         if step.action == Action::Drop {
             continue;
@@ -716,11 +732,36 @@ fn rehearse(repo: &Repository, plan: &Plan, mode: Mode) -> Result<Preview, Error
             Mode::Revert => repo.revert_commit(&pick, &current_commit, 0, None)?,
         };
         if index.has_conflicts() {
-            return Ok(Preview {
-                commits,
-                final_tree: current_commit.tree_id(),
-                conflict: Some((i, conflict_paths(&index))),
+            // Skip the step's change and keep previewing: one rehearsal lists
+            // EVERY step that needs attention, not just the first (a real run
+            // still stops there). The why names the commit that last set the
+            // conflicted lines at this point of the replay — usually the
+            // fold target the step should have named.
+            let files = conflict_paths(&index);
+            // The context the step patches lives in its ORIGINAL history (a
+            // fixup is built against the tip, where later commits already
+            // reshaped the lines) — so blame from the step's original parent
+            // down to the base, not from the half-replayed new history.
+            let why = files
+                .iter()
+                .filter_map(|f| {
+                    let from = pick.parent(0).ok()?.id();
+                    last_toucher(repo, from, plan.onto, f).map(|(o, s)| {
+                        format!(
+                            "{f}: the context it patches was last reshaped by {} {s}",
+                            short(o)
+                        )
+                    })
+                })
+                .collect();
+            conflicts.push(PreviewConflict {
+                step: i,
+                commit: step.commit,
+                summary: pick.summary().unwrap_or("").to_string(),
+                files,
+                why,
             });
+            continue;
         }
         let tree = repo.find_tree(index.write_tree_to(repo)?)?;
         if step.action == Action::Split {
@@ -748,8 +789,33 @@ fn rehearse(repo: &Repository, plan: &Plan, mode: Mode) -> Result<Preview, Error
     Ok(Preview {
         commits,
         final_tree: repo.find_commit(current)?.tree_id(),
-        conflict: None,
+        conflicts,
     })
+}
+
+/// The most recent commit at-or-below `from` (stopping at `stop`) whose diff
+/// against its first parent touches `path` — the "who last reshaped these
+/// lines" half of a rehearsal conflict explanation. Bounded walk; `None`
+/// when nothing in range touches the path.
+fn last_toucher(repo: &Repository, from: Oid, stop: Oid, path: &str) -> Option<(Oid, String)> {
+    let mut walk = repo.revwalk().ok()?;
+    walk.push(from).ok()?;
+    walk.hide(stop).ok()?;
+    walk.set_sorting(Sort::TOPOLOGICAL).ok()?;
+    for oid in walk.flatten().take(200) {
+        let c = repo.find_commit(oid).ok()?;
+        let tree = c.tree().ok()?;
+        let parent_tree = c.parent(0).ok().and_then(|p| p.tree().ok());
+        let mut dopts = git2::DiffOptions::new();
+        dopts.pathspec(path);
+        let diff = repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut dopts))
+            .ok()?;
+        if diff.deltas().len() > 0 {
+            return Some((oid, c.summary().unwrap_or("").to_string()));
+        }
+    }
+    None
 }
 
 /// Resume after the agent resolved a conflict in the worktree: stage the
@@ -2120,28 +2186,41 @@ pub fn preview_text(repo: &Repository, preview: &Preview) -> String {
     for (oid, summary) in &preview.commits {
         out.push_str(&format!("  {} {summary}\n", short(*oid)));
     }
-    match &preview.conflict {
-        Some((step, files)) => out.push_str(&format!(
-            "  stops at step {} on a conflict: {}\n",
-            step + 1,
-            files.join(", ")
-        )),
-        None => {
-            let head_tree = repo
-                .head()
-                .ok()
-                .and_then(|h| h.peel_to_tree().ok())
-                .map(|t| t.id());
+    if preview.conflicts.is_empty() {
+        let head_tree = repo
+            .head()
+            .ok()
+            .and_then(|h| h.peel_to_tree().ok())
+            .map(|t| t.id());
+        out.push_str(&format!(
+            "  -> {} commit(s); resulting tree {} current HEAD\n",
+            preview.commits.len(),
+            if head_tree == Some(preview.final_tree) {
+                "IDENTICAL to (pure reorder/fold)"
+            } else {
+                "DIFFERS from"
+            },
+        ));
+    } else {
+        for c in &preview.conflicts {
             out.push_str(&format!(
-                "  -> {} commit(s); resulting tree {} current HEAD\n",
-                preview.commits.len(),
-                if head_tree == Some(preview.final_tree) {
-                    "IDENTICAL to (pure reorder/fold)"
-                } else {
-                    "DIFFERS from"
-                },
+                "  step {} ({} {}) would conflict in: {}\n",
+                c.step + 1,
+                short(c.commit),
+                c.summary,
+                c.files.join(", ")
             ));
+            for w in &c.why {
+                out.push_str(&format!("    {w}\n"));
+            }
         }
+        out.push_str(&format!(
+            "  -> {} conflicting step(s); a real run stops at the first. Each skipped \
+             change is missing from the preview after its step, so later conflicts \
+             may be knock-on. Repair the plan (the last-set commit is usually the \
+             right target) and rehearse again.\n",
+            preview.conflicts.len()
+        ));
     }
     out
 }
@@ -4138,7 +4217,7 @@ mod tests {
         };
         let preview = rehearse(&repo, &plan, Mode::Pick).unwrap();
         assert_eq!(preview.commits.len(), 1);
-        assert!(preview.conflict.is_none());
+        assert!(preview.conflicts.is_empty());
         // Nothing mutated: branch tip, attached HEAD, no state file.
         assert_eq!(repo.refname_to_id("refs/heads/topic").unwrap(), before);
         assert!(!repo.head_detached().unwrap());
@@ -4195,10 +4274,66 @@ mod tests {
             Mode::Pick,
         )
         .unwrap();
-        assert_eq!(preview.conflict, Some((0, vec!["a".to_string()])));
+        assert_eq!(preview.conflicts.len(), 1);
+        assert_eq!(preview.conflicts[0].step, 0);
+        assert_eq!(preview.conflicts[0].files, vec!["a".to_string()]);
         assert!(preview.commits.is_empty());
         assert!(!repo.head_detached().unwrap(), "no mutation");
         assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn rehearse_reports_every_conflicting_step_with_its_reshaper() {
+        let dir = tmp("rehearse-multi-conflict");
+        let repo = Repository::init(&dir).unwrap();
+        // Two files, each rewritten by a later commit; two fixups that target
+        // the ORIGINAL commits conflict independently — one rehearsal must
+        // name both, each with the commit that last reshaped its lines.
+        let base = commit(&repo, &[], &[("a", "1\n"), ("b", "1\n")], "base");
+        let add = commit(
+            &repo,
+            &[base],
+            &[("a", "a1\n"), ("b", "b1\n")],
+            "add a and b",
+        );
+        let ra = commit(&repo, &[add], &[("a", "a2\n"), ("b", "b1\n")], "reshape a");
+        let rb = commit(&repo, &[ra], &[("a", "a2\n"), ("b", "b2\n")], "reshape b");
+        // Fixups built against the TIP's content — they cannot apply at `add`.
+        let fa = commit(&repo, &[rb], &[("a", "a3\n"), ("b", "b2\n")], "fixup a");
+        let fb = commit(&repo, &[fa], &[("a", "a3\n"), ("b", "b3\n")], "fixup b");
+        on_branch(&repo, "main", fb);
+
+        let steps = autosquash_steps(
+            &repo,
+            base,
+            &[(fa, add, Action::Fixup), (fb, add, Action::Fixup)],
+        )
+        .unwrap();
+        let preview = rehearse(&repo, &Plan { onto: base, steps }, Mode::Pick).unwrap();
+
+        assert_eq!(preview.conflicts.len(), 2, "{:?}", preview.conflicts);
+        // autosquash inserts the LAST directive right after the target, so
+        // fb replays first (conflicting in b), then fa (in a).
+        let files: Vec<&str> = preview
+            .conflicts
+            .iter()
+            .flat_map(|c| c.files.iter().map(String::as_str))
+            .collect();
+        assert_eq!(files, vec!["b", "a"], "both fixups reported in one pass");
+        // The why names the reshaping commits — the targets the fixups
+        // should have used.
+        assert!(
+            preview.conflicts[0].why[0].contains("reshape b"),
+            "{:?}",
+            preview.conflicts[0].why
+        );
+        assert!(
+            preview.conflicts[1].why[0].contains("reshape a"),
+            "{:?}",
+            preview.conflicts[1].why
+        );
+        // Nothing moved: rehearsal only, branch tip intact.
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), fb);
     }
 
     #[test]
@@ -4965,7 +5100,7 @@ mod tests {
         .unwrap();
         let msgs: Vec<&str> = preview.commits.iter().map(|(_, m)| m.as_str()).collect();
         assert_eq!(msgs, vec!["add b", "add c"], "both parts previewed");
-        assert!(preview.conflict.is_none());
+        assert!(preview.conflicts.is_empty());
         assert!(!repo.head_detached().unwrap(), "no mutation");
         assert!(!state_path(&repo).exists());
     }

@@ -185,7 +185,7 @@ Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `
 - `onto` (required) — The new base — oid/ref/revspec the commits are replayed onto.
 - `plan` — Explicit steps (omit to pick all of onto..HEAD in order). List order is the new commit order.
 - `reapply_cherry_picks` — Plan-less pick-all only: keep commits already present in `onto` by patch-id instead of dropping them. Default false — like `git rebase`, a commit whose change already sits in the new base (e.g. after the base was reordered/amended below the merge-base) is skipped so a stacked branch isn't duplicated; the skipped commits are reported. Set true to replay them anyway. Ignored when an explicit `plan` or `autosquash` is given.
-- `rehearse` — Dry-run: preview the resulting commits and whether the tree is unchanged (a pure reorder/fold), applying nothing. Default false.
+- `rehearse` — Dry-run: preview the resulting commits and whether the tree is unchanged (a pure reorder/fold), applying nothing. Unlike a real run, the rehearsal does NOT stop at the first conflict: it lists EVERY step that would conflict, each with the commit that last reshaped the conflicted lines (usually the right fold target) — repair the whole plan in one pass. Default false.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 
 ## git_cherry_pick

@@ -176,7 +176,9 @@ git_fixup).
   git_rebase {onto, plan?}  plan = [{commit, action, message?, message_edits?,
     into?}], action = pick|reword|squash|fixup|edit|split|drop; list order is the
     new commit order. Omit plan to replay all of onto..HEAD. rehearse:true
-    previews the result (and whether it is a pure reorder/fold) without applying.
+    previews the result (and whether it is a pure reorder/fold) without applying;
+    it lists EVERY step that would conflict — each with the commit that last
+    reshaped those lines (usually the right fold target) — not just the first.
     An `edit` step applies the commit then PAUSES with it checked out: edit the
     worktree, then git_continue folds the changes into that commit. message_edits
     ([{find, replace?}] to replace/delete literal text, [{append}] to add a
