@@ -1286,6 +1286,40 @@ fn run_batch_edits(
 /// rolls the already-edited ones back via their undo rings, so a cross-file
 /// rename is one call that either lands everywhere or nowhere. With
 /// `save: true` the files are saved only after every edit succeeded.
+/// Rewind the already-edited sessions of a failed cross-file call (newest
+/// first) and describe the outcome: the all-rolled-back reassurance, or — if
+/// any session could not be rewound — a LOUD list of the files whose warm
+/// buffers may still hold the aborted edit, so a broken all-or-nothing
+/// promise never reads as kept.
+fn rollback_files(
+    sessions: &mut HashMap<String, Workspace>,
+    done: &[(String, String, usize)],
+) -> String {
+    let mut failed: Vec<&str> = Vec::new();
+    for (f, session, _) in done.iter().rev() {
+        let undone = sessions
+            .get_mut(session)
+            .map(|ws| ws.undo_last().is_ok())
+            .unwrap_or(false);
+        if !undone {
+            failed.push(f);
+        }
+    }
+    if failed.is_empty() {
+        format!(
+            "nothing changed — the {} file(s) edited before it were rolled back",
+            done.len()
+        )
+    } else {
+        format!(
+            "ROLLBACK INCOMPLETE — the warm session(s) for {} may still hold \
+             the aborted edit (undo_last each, or close_session {{force: true}} \
+             to discard)",
+            failed.join(", ")
+        )
+    }
+}
+
 fn tool_replace_files(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
@@ -1330,32 +1364,20 @@ fn tool_replace_files(
     // Apply per file; on any failure undo the files already edited so the
     // whole call is all-or-nothing in the warm buffers.
     let mut done: Vec<(String, String, usize)> = Vec::new(); // (path, session, n)
-    let rollback = |sessions: &mut HashMap<String, Workspace>, done: &[(String, String, usize)]| {
-        for (_, session, _) in done.iter().rev() {
-            if let Some(ws) = sessions.get_mut(session) {
-                let _ = ws.undo_last();
-            }
-        }
-    };
     for f in &files {
         let session = match resolve_session(&json!({ "path": f }), sessions) {
             Ok(s) => s,
             Err(e) => {
-                rollback(sessions, &done);
-                return Err(format!(
-                    "{f}: {e}\nnothing changed — the {} file(s) edited before it were rolled back",
-                    done.len()
-                ));
+                let note = rollback_files(sessions, &done);
+                return Err(format!("{f}: {e}\n{note}"));
             }
         };
         match run_batch_edits(sessions, &session, &items, &scope) {
             Ok(n) => done.push((f.clone(), session, n)),
             Err(e) => {
-                rollback(sessions, &done);
-                return Err(format!(
-                    "{f}: {e}\nnothing changed — the {} file(s) edited before it were rolled back",
-                    done.len()
-                ));
+                let stale = stale_edit_note(sessions, &session);
+                let note = rollback_files(sessions, &done);
+                return Err(format!("{f}: {e}{stale}\n{note}"));
             }
         }
     }
