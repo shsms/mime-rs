@@ -2250,7 +2250,8 @@ fn tools_list_result() -> Value {
 // the plain editing tools: same `MIME_ROOTS` confinement (the repo path runs
 // through `safety::check_path`), and the library does everything in-process —
 // no network, no hooks/filters/exec. Each destructive op first stamps a
-// `refs/mime-backup/<branch>` recovery ref (see `sequencer`). All git2 use lives
+// `refs/mime-backup/<branch>/0` recovery ref — a ring: /1, /2 hold the two
+// ops before (see `sequencer`). All git2 use lives
 // in `crate::sequencer`.
 
 /// Resolve + confine the `repo` argument to the allowed roots.

@@ -49,10 +49,56 @@ fn hard_reset(repo: &Repository, oid: Oid) -> Result<(), Error> {
 /// refname). Lives under `refs/mime-backup/` so it stays out of `git branch` yet
 /// is trivially recoverable (`git reset --hard <ref>`).
 fn backup_ref(branch: &str) -> String {
+    backup_slot(branch, 0)
+}
+
+/// Slot `n` of the branch's backup ring — /0 is the most recent op's pre-tip.
+fn backup_slot(branch: &str, n: usize) -> String {
     format!(
-        "refs/mime-backup/{}",
+        "refs/mime-backup/{}/{n}",
         branch.strip_prefix("refs/heads/").unwrap_or(branch)
     )
+}
+
+/// How many pre-op tips a branch keeps. One rope was not enough: in a
+/// multi-rebase session the next op overwrote the only backup, so every op
+/// after the first ran without a net.
+const BACKUP_RING: usize = 3;
+
+/// Rotate the ring and stamp `orig` as the newest slot. A pre-ring FLAT ref
+/// (refs/mime-backup/<branch>) occupies the path the ring's directory needs,
+/// so it is folded in as the previous newest and deleted.
+fn rotate_backup_ring(repo: &Repository, branch: &str, orig: Oid) -> Result<(), Error> {
+    let flat = format!(
+        "refs/mime-backup/{}",
+        branch.strip_prefix("refs/heads/").unwrap_or(branch)
+    );
+    let mut slots: Vec<Option<Oid>> = (0..BACKUP_RING)
+        .map(|n| repo.refname_to_id(&backup_slot(branch, n)).ok())
+        .collect();
+    if let Ok(old) = repo.refname_to_id(&flat) {
+        slots[0] = Some(old);
+        if let Ok(mut r) = repo.find_reference(&flat) {
+            r.delete()?;
+        }
+    }
+    for n in (0..BACKUP_RING - 1).rev() {
+        if let Some(oid) = slots[n] {
+            repo.reference(
+                &backup_slot(branch, n + 1),
+                oid,
+                true,
+                "mime sequencer: backup rotate",
+            )?;
+        }
+    }
+    repo.reference(
+        &backup_slot(branch, 0),
+        orig,
+        true,
+        "mime sequencer: pre-op backup",
+    )?;
+    Ok(())
 }
 
 /// Whether the working tree or index has uncommitted changes to TRACKED files.
@@ -622,13 +668,10 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
 
     // Stamp a recovery ref at the pre-op tip BEFORE touching anything, so the
     // original branch state is always reachable (history rewriting is otherwise
-    // only recoverable via the reflog) — even after a clean finish.
-    repo.reference(
-        &backup_ref(&branch),
-        orig,
-        true,
-        "mime sequencer: pre-op backup",
-    )?;
+    // only recoverable via the reflog) — even after a clean finish. A ring of
+    // three: /0 this op's pre-tip, /1 and /2 the ops before it, so a
+    // multi-rebase session keeps its earlier ropes too.
+    rotate_backup_ring(repo, &branch, orig)?;
 
     // Detach onto the base and clean the worktree to it.
     repo.set_head_detached(plan.onto)?;
@@ -2128,7 +2171,7 @@ fn backup_note(repo: &Repository) -> String {
     match repo.head().ok().and_then(|h| h.name().map(str::to_string)) {
         Some(b) if b.starts_with("refs/heads/") => {
             format!(
-                "\n  pre-op tip backed up at {} (the next op on this branch overwrites it)",
+                "\n  pre-op tip backed up at {} (ring of {BACKUP_RING}: /1, /2 hold the ops before)",
                 backup_ref(&b)
             )
         }
@@ -4035,8 +4078,48 @@ mod tests {
         )
         .unwrap();
         // The pre-op tip is recoverable even after a clean finish moved the branch.
-        assert_eq!(repo.refname_to_id("refs/mime-backup/topic").unwrap(), f1);
+        assert_eq!(repo.refname_to_id("refs/mime-backup/topic/0").unwrap(), f1);
         assert_ne!(repo.refname_to_id("refs/heads/topic").unwrap(), f1);
+    }
+
+    #[test]
+    fn backup_ring_keeps_earlier_ops_and_migrates_a_flat_ref() {
+        let dir = tmp("backup-ring");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let t1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        on_branch(&repo, "topic", t1);
+        // A pre-ring flat backup (an older mime stamped it) must fold into the
+        // ring instead of blocking the /0 ref with a D/F conflict.
+        repo.reference("refs/mime-backup/topic", base, true, "legacy")
+            .unwrap();
+
+        // Three ops in a row: reword, reword, reword — each pre-tip is kept.
+        let mut tips = vec![t1];
+        for n in 1..=3 {
+            let head = repo.head().unwrap().peel_to_commit().unwrap().id();
+            let msg = format!("reword {n}");
+            start(
+                &repo,
+                Plan {
+                    onto: base,
+                    steps: vec![step(head, Action::Reword, Some(&msg))],
+                },
+            )
+            .unwrap();
+            tips.push(repo.head().unwrap().peel_to_commit().unwrap().id());
+        }
+        let slot = |n: usize| {
+            repo.refname_to_id(&format!("refs/mime-backup/topic/{n}"))
+                .unwrap()
+        };
+        // /0 = the last op's pre-tip, /1 and /2 the two before.
+        assert_eq!(slot(0), tips[2]);
+        assert_eq!(slot(1), tips[1]);
+        assert_eq!(slot(2), tips[0]);
+        // The legacy flat ref was consumed (rotated to /1 by the first op,
+        // then aged out) and no longer exists.
+        assert!(repo.refname_to_id("refs/mime-backup/topic").is_err());
     }
 
     #[test]
