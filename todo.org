@@ -1139,8 +1139,9 @@ commit + byte-snapshot restore + refs/mime-backup/<branch>-worktree parachute;
 conflict aborts whole with a target-the-reshaper hint; rehearse previews.
 Verified end-to-end through the MCP server on a scratch repo.
 
-** TODO [#B] git_rebase rehearse: report ALL conflicting steps, and why :git:dogfooding:
+** DONE [#B] git_rebase rehearse: report ALL conflicting steps, and why :git:dogfooding:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:53]
 - State "TODO"       from              [2026-07-14 Di 12:08]
 :END:
 
