@@ -673,6 +673,52 @@ fn auto_revert_refreshes_clean_reads_while_modified_reads_warn() {
 }
 
 #[test]
+fn edit_tools_flag_a_stale_dirty_buffer_on_results_and_misses() {
+    let dir = temp_dir("stale-edit");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\nbeta\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+
+    // Dirty the warm buffer, then drift the file: the genuine conflict that
+    // auto-revert deliberately leaves alone.
+    s.call_ok(
+        1,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "ALPHA" }),
+    );
+    std::fs::write(&file, "rewritten externally, different length\n").unwrap();
+
+    // The read tools warned already; the EDIT tools are where staleness
+    // actually bites, and a miss is the moment the diagnosis is needed: the
+    // pattern exists on disk but the match ran against the warm buffer.
+    let err = s.call_err(
+        2,
+        "replace_text",
+        json!({ "path": p, "pattern": "rewritten externally", "replacement": "x" }),
+    );
+    assert!(err.contains("no match"), "got: {err}");
+    assert!(
+        err.contains("changed on disk"),
+        "the miss must carry the stale note: {err}"
+    );
+
+    // A successful edit's result carries it too — the edit landed in a warm
+    // buffer that no longer matches the file it came from.
+    let ok = s.call_ok(
+        3,
+        "replace_text",
+        json!({ "path": p, "pattern": "beta", "replacement": "BETA" }),
+    );
+    assert!(
+        ok.contains("changed on disk"),
+        "the edit result must carry the stale note: {ok}"
+    );
+    let ok = s.call_ok(4, "insert_text", json!({ "path": p, "text": "tail\n" }));
+    assert!(ok.contains("changed on disk"), "insert_text too: {ok}");
+}
+
+#[test]
 fn rehearse_auto_reverts_a_clean_drifted_buffer_like_a_run_would() {
     // A clean drifted buffer auto-reverts BEFORE the rehearse snapshot: the
     // revert discards nothing, and without it the preview would run against

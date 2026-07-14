@@ -737,6 +737,22 @@ fn unsaved_note(sessions: &HashMap<String, Workspace>, session: &str) -> &'stati
     }
 }
 
+/// The stale warning for the EDIT tools and their errors — the counterpart of
+/// [`stale_note`] on the read side. A stale buffer at edit time necessarily
+/// holds unsaved edits (a clean drifted buffer auto-reverts before the
+/// program runs), so the wording names the actual situation: the edit ran
+/// against the warm buffer, not the file now on disk. Empty when not stale.
+fn stale_edit_note(sessions: &HashMap<String, Workspace>, session: &str) -> &'static str {
+    if sessions.get(session).is_some_and(|ws| ws.is_stale()) {
+        "\nNOTE: the visited file changed on disk after it was opened and this \
+         buffer holds unsaved edits — the edit ran against the warm buffer, \
+         not the file now on disk; run_program (revert-buffer) discards the \
+         warm edits and re-reads the file"
+    } else {
+        ""
+    }
+}
+
 /// Evaluate `(message EXPR)` in the session and hand back the logged string
 /// verbatim. `message` stores its argument *raw* in the log, so rendered text
 /// comes back without tulisp's string re-quoting (`report` would print
@@ -842,9 +858,10 @@ fn tool_insert_text(
         String::new()
     };
     let unsaved = unsaved_note(sessions, &session);
+    let stale = stale_edit_note(sessions, &session);
     let view = view_echo(args, sessions, &session);
     Ok(format!(
-        "inserted {chars} chars; point is now {point}{saved}{unsaved}{view}"
+        "inserted {chars} chars; point is now {point}{saved}{unsaved}{stale}{view}"
     ))
 }
 
@@ -951,8 +968,9 @@ fn tool_replace_text(
         }
         Err(e) if unique && e.contains("__miss__") => {
             return Err(format!(
-                "replace_text: no match for the pattern {:?}",
-                truncate_for_error(&pattern)
+                "replace_text: no match for the pattern {:?}{}",
+                truncate_for_error(&pattern),
+                stale_edit_note(sessions, &session)
             ));
         }
         Err(e) => return Err(e),
@@ -963,8 +981,9 @@ fn tool_replace_text(
         .unwrap_or(0);
     if n == 0 {
         return Err(format!(
-            "replace_text: no match for the pattern {:?}",
-            truncate_for_error(&pattern)
+            "replace_text: no match for the pattern {:?}{}",
+            truncate_for_error(&pattern),
+            stale_edit_note(sessions, &session)
         ));
     }
     let more: usize = report_value(&report, "more")
@@ -978,18 +997,19 @@ fn tool_replace_text(
         String::new()
     };
     let unsaved = unsaved_note(sessions, &session);
+    let stale = stale_edit_note(sessions, &session);
     let view = view_echo(args, sessions, &session);
     Ok(match (all, more) {
         (true, _) => format!(
-            "replaced {n} occurrence(s), last at line {line}; point is now {point}{saved}{unsaved}{view}"
+            "replaced {n} occurrence(s), last at line {line}; point is now {point}{saved}{unsaved}{stale}{view}"
         ),
         (false, 0) => format!(
-            "replaced 1 occurrence at line {line}; point is now {point}{saved}{unsaved}{view}"
+            "replaced 1 occurrence at line {line}; point is now {point}{saved}{unsaved}{stale}{view}"
         ),
         (false, more) => format!(
             "replaced 1 occurrence at line {line}; point is now {point}; {more} more \
              match(es) remain (pass all:true to replace every occurrence, or \
-             expect_unique:true to make ambiguity an error){saved}{unsaved}{view}"
+             expect_unique:true to make ambiguity an error){saved}{unsaved}{stale}{view}"
         ),
     })
 }
@@ -1120,16 +1140,18 @@ fn replace_text_batch(
         .filter(|a| !a.is_empty())
         .ok_or_else(|| "\"edits\" must be a non-empty array".to_string())?;
     let scope = scope_prelude(args)?;
-    let total = run_batch_edits(sessions, session, items, &scope)?;
+    let total = run_batch_edits(sessions, session, items, &scope)
+        .map_err(|e| format!("{e}{}", stale_edit_note(sessions, session)))?;
     let saved = if bool_arg(args, "save") {
         save_visited(sessions, session)?
     } else {
         String::new()
     };
     let unsaved = unsaved_note(sessions, session);
+    let stale = stale_edit_note(sessions, session);
     let view = view_echo(args, sessions, session);
     Ok(format!(
-        "applied {} edit(s), {total} replacement(s){saved}{unsaved}{view}",
+        "applied {} edit(s), {total} replacement(s){saved}{unsaved}{stale}{view}",
         items.len()
     ))
 }
