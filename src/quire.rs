@@ -1260,11 +1260,8 @@ impl Quire {
                         }
                         target -= c;
                     }
-                    match next {
-                        Some(n) => node = n,
-                        // `target` ran past the last child → end of document.
-                        None => return None,
-                    }
+                    // `target` ran past the last child → end of document.
+                    node = next?;
                 }
                 Node::Leaf { pieces, .. } => {
                     for piece in pieces {
