@@ -3207,7 +3207,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "conflicts",
-            "description": "Overview of the merge-conflict hunks in the buffer: number, position + line, branch labels, side sizes; warns about marker lines it could not parse (malformed/nested). Read-only, but the resolution entry point — don't hand-edit markers with replace_text/insert_text; resolve via run_program: (conflict-keep SIDE &optional N) with ours|theirs|both, or base|all on diff3 hunks only; (conflict-keep-all SIDE) to take one side over every remaining hunk at once; (conflict-replace TEXT &optional N) for a hand-crafted merge; (conflict-resolve-trivial) to sweep the safe ones; (conflict-diff &optional N) to see what differs; (conflict-text SIDE &optional N) to read one side. Mutating calls return the remaining count — wrap them in (report \"left\" …) to see it in run_program's JSON. N is 1-based and refreshes after each edit; nil N = the hunk at point. @positions are absolute, L labels narrowing-relative; a narrowing that cuts through a hunk hides it entirely — widen before resolving.",
+            "description": "Overview of the merge-conflict hunks in the buffer: number, position + line, branch labels, side sizes; warns about marker lines it could not parse (malformed/nested). Read-only, but the resolution entry point — don't hand-edit markers with replace_text/insert_text; resolve via run_program: (conflict-keep SIDE &optional N) with ours|theirs|both, or base|all on diff3 hunks only; (conflict-keep-all SIDE) to take one side over every remaining hunk at once; (conflict-replace TEXT &optional N) for a hand-crafted merge; (conflict-resolve-trivial) to sweep the safe ones; (conflict-diff &optional N) to see what differs; (conflict-text SIDE &optional N) to read one side; (conflict-context &optional N LINES) to see one hunk WITH its surrounding code — the decision view; (conflict-goto &optional N) to jump to a hunk; (conflict-count) the remaining count ((conflict-hunks) renders this same overview). Mutating calls return the remaining count — wrap them in (report \"left\" …) to see it in run_program's JSON. N is 1-based and refreshes after each edit; nil N = the hunk at point. @positions are absolute, L labels narrowing-relative; a narrowing that cuts through a hunk hides it entirely — widen before resolving.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3574,6 +3574,52 @@ mod git_tool_tests {
                 d.name()
             );
         }
+    }
+
+    #[test]
+    fn conflicts_description_names_every_conflict_builtin() {
+        // The conflicts tool description ENUMERATES the resolve vocabulary,
+        // and an enumerated list reads as exhaustive — a verb it omits is
+        // effectively hidden (agents don't consult help for what already
+        // looks complete; conflict-context was invisible exactly this way).
+        // Harvest the registered conflict-* builtins from the source and
+        // require each one in the description.
+        let src = include_str!("builtins.rs");
+        let re = regex::Regex::new(r#""(conflict-[a-z-]+)""#).unwrap();
+        let desc = tool_schemas()
+            .iter()
+            .find(|t| t["name"] == "conflicts")
+            .expect("conflicts tool exists")["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut names: Vec<&str> = re
+            .captures_iter(src)
+            .map(|c| c.get(1).unwrap().as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        assert!(!names.is_empty(), "harvest found no conflict builtins");
+        let missing: Vec<&str> = names.into_iter().filter(|n| !desc.contains(n)).collect();
+        assert!(
+            missing.is_empty(),
+            "the conflicts description omits: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn unprint_string_value_unescapes_only_one_printed_string() {
+        // One printed string comes back raw: quotes stripped, escapes undone.
+        assert_eq!(
+            unprint_string_value("\"@@ -1 +1\\n+x\\ttab\\\\s\\\"q\\\"\"").as_deref(),
+            Some("@@ -1 +1\n+x\ttab\\s\"q\"")
+        );
+        // Everything else keeps the printed form: non-strings, several
+        // printed values (interior unescaped quote), unknown escapes.
+        assert_eq!(unprint_string_value("42"), None);
+        assert_eq!(unprint_string_value("(\"a\" \"b\")"), None);
+        assert_eq!(unprint_string_value("\"a\" \"b\""), None);
+        assert_eq!(unprint_string_value("\"bad \\z escape\""), None);
     }
 
     #[test]
