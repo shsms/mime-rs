@@ -254,6 +254,42 @@ fn validate_args(name: &str, args: &Value) -> Result<(), String> {
             valid.join(", ")
         ));
     }
+    // Then descend: nested objects (plan steps, message_edits, edits, scope,
+    // …) are validated against the same schema, so a typo'd nested key can't
+    // silently change meaning (message_edits [{find, replcae}] would DELETE —
+    // an absent `replace` means delete — instead of replacing).
+    for (k, v) in obj {
+        if let Some(sub) = props.get(k) {
+            validate_nested(sub, v, k)?;
+        }
+    }
+    Ok(())
+}
+
+/// Recursively reject unknown keys in nested objects/arrays, driven by the
+/// schema's `properties`/`items`. A schema level that declares no
+/// `properties` leaves its objects unconstrained (nothing to validate
+/// against); `path` names where the offender sits (e.g.
+/// `plan[0].message_edits[1]`).
+fn validate_nested(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
+    if let (Some(props), Some(obj)) = (schema["properties"].as_object(), value.as_object()) {
+        for (k, v) in obj {
+            let Some(sub) = props.get(k) else {
+                let mut valid: Vec<&str> = props.keys().map(String::as_str).collect();
+                valid.sort_unstable();
+                return Err(format!(
+                    "unknown key \"{k}\" in {path}; valid keys: {}",
+                    valid.join(", ")
+                ));
+            };
+            validate_nested(sub, v, &format!("{path}.{k}"))?;
+        }
+    }
+    if let (Some(items), Some(arr)) = (schema.get("items"), value.as_array()) {
+        for (i, v) in arr.iter().enumerate() {
+            validate_nested(items, v, &format!("{path}[{i}]"))?;
+        }
+    }
     Ok(())
 }
 
@@ -2255,95 +2291,116 @@ fn repo_path(args: &Value) -> Result<std::path::PathBuf, String> {
 }
 
 /// The `git_rebase` plan array → (commit, action, message, message_edits, split
-/// parts) tuples. A split part with no `paths` key is the catch-all.
-fn plan_arg(args: &Value) -> Option<Vec<crate::sequencer::PlanItem>> {
-    args.get("plan").and_then(Value::as_array).map(|arr| {
-        arr.iter()
-            .map(|s| {
-                let edits = s
-                    .get("message_edits")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .map(|e| crate::sequencer::MsgEditSpec {
-                                find: e.get("find").and_then(Value::as_str).map(str::to_string),
-                                replace: e
-                                    .get("replace")
+/// parts) tuples. A split part with no `paths` key is the catch-all. `Err`
+/// when a message edit contradicts itself (see [`msg_edit_specs`]).
+fn plan_arg(args: &Value) -> Result<Option<Vec<crate::sequencer::PlanItem>>, String> {
+    let Some(arr) = args.get("plan").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let items = arr
+        .iter()
+        .map(|s| {
+            let edits = match s.get("message_edits").and_then(Value::as_array) {
+                Some(a) => msg_edit_specs(a)?,
+                None => Vec::new(),
+            };
+            let into = s
+                .get("into")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .map(|p| {
+                            let paths_key = p.get("paths");
+                            let hunks_key = p.get("hunks");
+                            crate::sequencer::SplitPart {
+                                message: p
+                                    .get("message")
                                     .and_then(Value::as_str)
-                                    .map(str::to_string),
-                                append: e.get("append").and_then(Value::as_str).map(str::to_string),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let into = s
-                    .get("into")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .map(|p| {
-                                let paths_key = p.get("paths");
-                                let hunks_key = p.get("hunks");
-                                crate::sequencer::SplitPart {
-                                    message: p
-                                        .get("message")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .to_string(),
-                                    paths: paths_key
-                                        .and_then(Value::as_array)
-                                        .map(|ps| {
-                                            ps.iter()
-                                                .filter_map(|x| x.as_str().map(str::to_string))
-                                                .collect()
-                                        })
-                                        .unwrap_or_default(),
-                                    hunks: hunks_key
-                                        .and_then(Value::as_array)
-                                        .map(|hs| {
-                                            hs.iter()
-                                                .filter_map(|h| {
-                                                    let path = h
-                                                        .get("path")
-                                                        .and_then(Value::as_str)?
-                                                        .to_string();
-                                                    let lines =
-                                                        h.get("lines").and_then(Value::as_array)?;
-                                                    let lo =
-                                                        lines.first().and_then(Value::as_u64)?
-                                                            as u32;
-                                                    let hi = lines.get(1).and_then(Value::as_u64)?
-                                                        as u32;
-                                                    Some(crate::sequencer::HunkSel { path, lo, hi })
-                                                })
-                                                .collect()
-                                        })
-                                        .unwrap_or_default(),
-                                    // The catch-all is the part with NEITHER a `paths` nor a
-                                    // `hunks` key; a present-but-non-array key stays a
-                                    // non-catch-all (rejected later, no silent promotion).
-                                    rest: paths_key.is_none() && hunks_key.is_none(),
-                                }
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                (
-                    s.get("commit")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    s.get("action")
-                        .and_then(Value::as_str)
-                        .unwrap_or("pick")
-                        .to_string(),
-                    s.get("message").and_then(Value::as_str).map(str::to_string),
-                    edits,
-                    into,
-                )
+                                    .unwrap_or("")
+                                    .to_string(),
+                                paths: paths_key
+                                    .and_then(Value::as_array)
+                                    .map(|ps| {
+                                        ps.iter()
+                                            .filter_map(|x| x.as_str().map(str::to_string))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                                hunks: hunks_key
+                                    .and_then(Value::as_array)
+                                    .map(|hs| {
+                                        hs.iter()
+                                            .filter_map(|h| {
+                                                let path = h
+                                                    .get("path")
+                                                    .and_then(Value::as_str)?
+                                                    .to_string();
+                                                let lines =
+                                                    h.get("lines").and_then(Value::as_array)?;
+                                                let lo =
+                                                    lines.first().and_then(Value::as_u64)? as u32;
+                                                let hi =
+                                                    lines.get(1).and_then(Value::as_u64)? as u32;
+                                                Some(crate::sequencer::HunkSel { path, lo, hi })
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                                // The catch-all is the part with NEITHER a `paths` nor a
+                                // `hunks` key; a present-but-non-array key stays a
+                                // non-catch-all (rejected later, no silent promotion).
+                                rest: paths_key.is_none() && hunks_key.is_none(),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok((
+                s.get("commit")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                s.get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pick")
+                    .to_string(),
+                s.get("message").and_then(Value::as_str).map(str::to_string),
+                edits,
+                into,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Some(items))
+}
+
+/// Parse `message_edits` items. `delete: true` is the explicit spelling of
+/// "omit replace" — both mean "delete the found text" — so the intent is in
+/// the call, not in an absence. It contradicts a present `replace` and needs
+/// a `find`, and either mismatch is an error instead of a silent deletion.
+fn msg_edit_specs(a: &[Value]) -> Result<Vec<crate::sequencer::MsgEditSpec>, String> {
+    a.iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let delete = e.get("delete").and_then(Value::as_bool).unwrap_or(false);
+            if delete && e.get("replace").is_some() {
+                return Err(format!(
+                    "message edit {}: delete: true contradicts replace — pass one or the other",
+                    i + 1
+                ));
+            }
+            if delete && e.get("find").is_none() {
+                return Err(format!(
+                    "message edit {}: delete: true needs a find naming the text to delete",
+                    i + 1
+                ));
+            }
+            Ok(crate::sequencer::MsgEditSpec {
+                find: e.get("find").and_then(Value::as_str).map(str::to_string),
+                replace: e.get("replace").and_then(Value::as_str).map(str::to_string),
+                append: e.get("append").and_then(Value::as_str).map(str::to_string),
             })
-            .collect()
-    })
+        })
+        .collect()
 }
 
 /// The optional `lines` blame window: a 2-element `[start, end]` array, 1-based
@@ -2444,7 +2501,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
         "git_rebase" => seq::cmd_rebase(
             &repo,
             &str_arg(args, "onto")?,
-            plan_arg(args),
+            plan_arg(args)?,
             autosquash_arg(args),
             bool_arg(args, "rehearse"),
             bool_arg(args, "reapply_cherry_picks"),
@@ -2548,12 +2605,13 @@ fn git_tool_schemas() -> Vec<Value> {
                                 "message": { "type": "string", "description": "New message (reword/edit) or melded message (squash); ignored otherwise." },
                                 "message_edits": {
                                     "type": "array",
-                                    "description": "Edits applied in order to the message (reword/squash/fixup/edit), keeping the rest (e.g. the sign-off) intact — use instead of retyping the whole message. Each item is {find, replace?} (replace the first occurrence of literal `find`; omit replace to delete; errors if `find` is absent) or {append} (append as a trailing line).",
+                                    "description": "Edits applied in order to the message (reword/squash/fixup/edit), keeping the rest (e.g. the sign-off) intact — use instead of retyping the whole message. Each item is {find, replace?} (replace the first occurrence of literal `find`; omitting replace — or saying it explicitly with delete: true — deletes the found text; errors if `find` is absent) or {append} (append as a trailing line).",
                                     "items": {
                                         "type": "object",
                                         "properties": {
                                             "find": { "type": "string", "description": "Literal text to find in the existing message." },
                                             "replace": { "type": "string", "description": "Replacement for `find` (omit = delete)." },
+                                            "delete": { "type": "boolean", "description": "Explicit spelling of \"omit replace\": delete the found text. Contradicts a present replace; needs find." },
                                             "append": { "type": "string", "description": "Text to append as a trailing line." }
                                         }
                                     }
@@ -3201,7 +3259,7 @@ fn build_tool_schemas() -> Vec<Value> {
                     "expect_unique": { "type": "boolean", "description": "Require the pattern to match exactly once: more than one match is an error (listing the match lines) and nothing is replaced. RECOMMENDED whenever the anchor text could plausibly repeat — first-match semantics would silently edit the wrong site. Default false." },
                     "scope": scope,
                     "view": { "type": ["boolean", "integer"], "description": "Append a rendered viewport around point after the edit (true = 4 context lines, or a line count)." },
-                    "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?}, …] applied in order inside ONE transaction — all-or-nothing; a miss (or a failed uniqueness check) rolls everything back and names the failed edit.", "items": { "type": "object" } },
+                    "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?}, …] applied in order inside ONE transaction — all-or-nothing; a miss (or a failed uniqueness check) rolls everything back and names the failed edit.", "items": { "type": "object", "properties": { "pattern": { "type": "string" }, "replacement": { "type": "string" }, "all": { "type": "boolean" }, "expect_unique": { "type": "boolean" } } } },
                     "session": session,
                     "path": path,
                     "save": save,
@@ -3220,7 +3278,7 @@ fn build_tool_schemas() -> Vec<Value> {
                     "replacement": { "type": "string", "description": "The literal replacement text." },
                     "all": { "type": "boolean", "description": "Replace every occurrence per file (default false: first only)." },
                     "expect_unique": { "type": "boolean", "description": "Require the pattern to match exactly once per file — more is an error and nothing is applied anywhere. Default false." },
-                    "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?}, …] applied in order inside ONE transaction per file — all-or-nothing across the whole call.", "items": { "type": "object" } },
+                    "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?}, …] applied in order inside ONE transaction per file — all-or-nothing across the whole call.", "items": { "type": "object", "properties": { "pattern": { "type": "string" }, "replacement": { "type": "string" }, "all": { "type": "boolean" }, "expect_unique": { "type": "boolean" } } } },
                     "scope": scope,
                     "save": save,
                 },
@@ -3495,7 +3553,7 @@ mod git_tool_tests {
 
     #[test]
     fn plan_arg_treats_only_an_absent_paths_key_as_the_split_catch_all() {
-        let plan = plan_arg(&json!({
+        let plan = ok_plan_arg(&json!({
             "plan": [{
                 "commit": "abc",
                 "action": "split",
@@ -3505,8 +3563,7 @@ mod git_tool_tests {
                     {"message": "m3"}
                 ]
             }]
-        }))
-        .unwrap();
+        }));
         let parts = &plan[0].4;
         assert!(!parts[0].rest && parts[0].paths == ["x"], "explicit paths");
         assert!(
@@ -3514,6 +3571,59 @@ mod git_tool_tests {
             "malformed paths is NOT silently promoted to the catch-all"
         );
         assert!(parts[2].rest, "an absent paths key IS the catch-all");
+    }
+
+    /// `plan_arg` for a plan known to parse: unwrap both layers.
+    fn ok_plan_arg(args: &Value) -> Vec<crate::sequencer::PlanItem> {
+        plan_arg(args).unwrap().unwrap()
+    }
+
+    #[test]
+    fn validate_args_rejects_nested_unknown_keys() {
+        // A typo'd nested key must error, not silently change meaning: an
+        // absent `replace` means DELETE, so {find, replcae} would erase the
+        // found text instead of replacing it.
+        let bad = json!({
+            "repo": "r", "onto": "x",
+            "plan": [{ "commit": "c", "action": "reword",
+                       "message_edits": [{ "find": "a", "replcae": "b" }] }]
+        });
+        let err = validate_args("git_rebase", &bad).unwrap_err();
+        assert!(
+            err.contains("replcae") && err.contains("plan[0].message_edits[0]"),
+            "{err}"
+        );
+        // The edit-batch items of replace_text are constrained too.
+        let bad = json!({ "edits": [{ "pattern": "a", "replacment": "b" }] });
+        let err = validate_args("replace_text", &bad).unwrap_err();
+        assert!(err.contains("replacment"), "{err}");
+        // A valid nested call — including the explicit delete form — passes.
+        validate_args(
+            "git_rebase",
+            &json!({ "repo": "r", "onto": "x",
+                     "plan": [{ "commit": "c", "action": "reword",
+                                "message_edits": [{ "find": "a", "delete": true }] }] }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn message_edit_delete_is_explicit_and_contradiction_checked() {
+        // delete: true parses to the same spec as omitting replace.
+        let plan = ok_plan_arg(&json!({
+            "plan": [{ "commit": "c", "action": "reword",
+                       "message_edits": [{ "find": "x", "delete": true }] }]
+        }));
+        assert_eq!(plan[0].3[0].replace, None);
+        // A half-typo'd edit errors instead of silently deleting.
+        for bad in [
+            json!({ "plan": [{ "commit": "c", "action": "reword",
+                               "message_edits": [{ "find": "x", "replace": "y", "delete": true }] }] }),
+            json!({ "plan": [{ "commit": "c", "action": "reword",
+                               "message_edits": [{ "append": "x", "delete": true }] }] }),
+        ] {
+            assert!(plan_arg(&bad).is_err(), "contradiction accepted: {bad}");
+        }
     }
 
     #[test]
