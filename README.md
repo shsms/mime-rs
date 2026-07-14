@@ -132,7 +132,7 @@ the code. The edits that matter:
 
 ```json
 replace_text {path, pattern, replacement, expect_unique: true, save: true}
-replace_text {files: [a, b, c], pattern, replacement, all: true, save: true}
+replace_in_files {files: [a, b, c], pattern, replacement, all: true, save: true}
 insert_text  {path, text, anchor: {defun: "parse_args", where: "after"}}
 outline      {path}            // KIND START END NAME, per defun
 rehearse     {path, program}   // dry-run any lisp program; inspect the diff

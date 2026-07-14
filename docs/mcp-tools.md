@@ -73,12 +73,11 @@ Insert literal text at point (or at `pos`). Pass the text as a plain string — 
 
 ## replace_text
 
-Replace the FIRST occurrence of a literal pattern with literal replacement text (searching from the top of the accessible region); pass all:true to replace every occurrence. Both strings are plain — no Lisp escaping, no regex, no backref expansion (insert_text's counterpart; the fix for quote-heavy edits). Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Edits the warm buffer; call save_buffer to persist. For regex or position-scoped replacement, use run_program.
+Replace the FIRST occurrence of a literal pattern with literal replacement text (searching from the top of the accessible region); pass all:true to replace every occurrence. Both strings are plain — no Lisp escaping, no regex, no backref expansion (insert_text's counterpart; the fix for quote-heavy edits). Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Edits the warm buffer; call save_buffer to persist. For regex or position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.
 
 - `all` — Replace every occurrence (default false: first only).
 - `edits` — Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?}, …] applied in order inside ONE transaction — all-or-nothing; a miss (or a failed uniqueness check) rolls everything back and names the failed edit.
 - `expect_unique` — Require the pattern to match exactly once: more than one match is an error (listing the match lines) and nothing is replaced. RECOMMENDED whenever the anchor text could plausibly repeat — first-match semantics would silently edit the wrong site. Default false.
-- `files` — Apply the SAME edit spec (pattern/replacement or edits) to every listed file in one call — the cross-file rename. Atomic across the set: a failure in any file rolls the already-edited ones back; with save:true the files are saved only after every edit succeeded. Each path must contain the pattern (a miss is an error — list exactly the files you grepped). Not combinable with path/session.
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `pattern` — The exact text to find (literal, not regex).
 - `replacement` — The literal replacement text.
@@ -86,6 +85,19 @@ Replace the FIRST occurrence of a literal pattern with literal replacement text 
 - `scope` — Restrict this call to one part of the buffer without writing a program. {"defun": "name"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.
 - `session` — Warm session id; defaults to "default" when omitted.
 - `view` — Append a rendered viewport around point after the edit (true = 4 context lines, or a line count).
+
+## replace_in_files
+
+Apply the SAME literal edit spec to EVERY listed file in one call — the cross-file rename. Give pattern/replacement (with all/expect_unique), or `edits` for a transactional batch per file; the absolute paths grep prints feed `files` directly. Atomic ACROSS the set: a failure in any file (a miss, a failed uniqueness check) rolls the already-edited ones back and the error names the file — every listed path must contain the pattern, so list exactly the files you grepped. Edits land in the warm buffers; with save:true the files are saved only after every file's edit succeeded. For a single file use replace_text.
+
+- `all` — Replace every occurrence per file (default false: first only).
+- `edits` — Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?}, …] applied in order inside ONE transaction per file — all-or-nothing across the whole call.
+- `expect_unique` — Require the pattern to match exactly once per file — more is an error and nothing is applied anywhere. Default false.
+- `files` (required) — The files to edit — each must match the edit spec.
+- `pattern` — The exact text to find (literal, not regex).
+- `replacement` — The literal replacement text.
+- `save` — After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.
+- `scope` — Restrict this call to one part of the buffer without writing a program. {"defun": "name"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.
 
 ## occur
 
@@ -102,7 +114,7 @@ Overview of every line matching a pattern in the whole accessible region (compos
 
 ## grep
 
-Read-only cross-file search: which files (and lines) mention a pattern — occur across the filesystem. Walks `dir` (default: every allowed root) recursively, skipping dot-entries (.git …), symlinks, and git-ignored-and-untracked paths (target/ …; tracked files are always searched), keeping paths that match `glob`. Per file: a header + matching lines (line number + absolute char position, long lines clamped, optional context). The file paths it lists feed replace_text {files: […]} directly. Caps files scanned (5000) and matches rendered. Needs no session — reads files within MIME_ROOTS. Use occur for one already-open buffer; grep to find which files to touch.
+Read-only cross-file search: which files (and lines) mention a pattern — occur across the filesystem. Walks `dir` (default: every allowed root) recursively, skipping dot-entries (.git …), symlinks, and git-ignored-and-untracked paths (target/ …; tracked files are always searched), keeping paths that match `glob`. Per file: a header + matching lines (line number + absolute char position, long lines clamped, optional context). The file paths it lists feed replace_in_files {files: […]} directly. Caps files scanned (5000) and matches rendered. Needs no session — reads files within MIME_ROOTS. Use occur for one already-open buffer; grep to find which files to touch.
 
 - `case_insensitive` — Match case-insensitively (both modes). Default false.
 - `dir` — Directory to search (must resolve inside an allowed root). Omit to search every root.

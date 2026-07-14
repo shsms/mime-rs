@@ -251,7 +251,7 @@ reverts them."#;
 const RECIPES: &str = r#"— recipes —
 Cross-file rename (one call, atomic across the set, saved only if every
 file succeeds — list exactly the files you grepped):
-  replace_text {files: [p1, p2, …], pattern, replacement, all: true, save: true}
+  replace_in_files {files: [p1, p2, …], pattern, replacement, all: true, save: true}
 Replace inside one function (no program needed):
   replace_text {path, pattern, replacement, scope: {defun: "name"}}
 Add a function after another:

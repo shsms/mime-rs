@@ -207,6 +207,7 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         "view" => tool_view(&args, sessions),
         "insert_text" => tool_insert_text(&args, sessions),
         "replace_text" => tool_replace_text(&args, sessions),
+        "replace_in_files" => tool_replace_files(&args, sessions),
         "occur" => tool_occur(&args, sessions),
         "grep" => tool_grep(&args),
         "outline" => tool_outline(&args, sessions),
@@ -909,9 +910,6 @@ fn tool_replace_text(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
-    if args.get("files").is_some() {
-        return tool_replace_files(args, sessions);
-    }
     let session = resolve_session(args, sessions)?;
     if let Some(edits) = args.get("edits") {
         if args.get("pattern").is_some() || args.get("replacement").is_some() {
@@ -1281,11 +1279,11 @@ fn run_batch_edits(
     Ok(total)
 }
 
-/// The `files: [path…]` form of `replace_text`: the same edit spec applied
-/// to EVERY listed file, atomically ACROSS the set — a failure in any file
-/// rolls the already-edited ones back via their undo rings, so a cross-file
-/// rename is one call that either lands everywhere or nowhere. With
-/// `save: true` the files are saved only after every edit succeeded.
+/// `replace_in_files {files, pattern/replacement | edits, …}`: the same edit
+/// spec applied to EVERY listed file, atomically ACROSS the set — a failure
+/// in any file rolls the already-edited ones back via their undo rings, so a
+/// cross-file rename is one call that either lands everywhere or nowhere.
+/// With `save: true` the files are saved only after every edit succeeded.
 /// Rewind the already-edited sessions of a failed cross-file call (newest
 /// first) and describe the outcome: the all-rolled-back reassurance, or — if
 /// any session could not be rewound — a LOUD list of the files whose warm
@@ -1324,9 +1322,6 @@ fn tool_replace_files(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
-    if args.get("path").is_some() || args.get("session").is_some() {
-        return Err("pass \"files\" OR path/session, not both".to_string());
-    }
     let files: Vec<String> = args
         .get("files")
         .and_then(Value::as_array)
@@ -1349,7 +1344,7 @@ fn tool_replace_files(
         None => {
             let pattern = str_arg(args, "pattern")?;
             if pattern.is_empty() {
-                return Err("replace_text: pattern must not be empty".to_string());
+                return Err("replace_in_files: pattern must not be empty".to_string());
             }
             vec![json!({
                 "pattern": pattern,
@@ -1678,7 +1673,7 @@ impl Walk<'_> {
 /// tracked files are always searched), keeping only paths that match `glob`
 /// (relative to the search dir; `**` crosses directories). Line-oriented like
 /// occur. Prints
-/// CANONICAL absolute paths that feed `replace_text {files: …}` directly. No
+/// CANONICAL absolute paths that feed `replace_in_files {files: …}` directly. No
 /// session needed — reads files within the sandbox (each routed through the
 /// path chokepoint). Caps files visited and matches rendered.
 fn tool_grep(args: &Value) -> Result<String, String> {
@@ -1761,7 +1756,7 @@ fn tool_grep(args: &Value) -> Result<String, String> {
         for full in files {
             // Route every file through the canonical chokepoint: resolves
             // symlinks/.. and confirms it is inside the roots, and yields the
-            // absolute path replace_text {files:} can consume verbatim.
+            // absolute path replace_in_files {files:} can consume verbatim.
             let Ok(canonical) = crate::safety::check_path(&full) else {
                 continue;
             };
@@ -2906,7 +2901,12 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
         "replace_text" => (
             Editing,
             A::append(),
-            "replace literal text (first/all/scoped/cross-file)",
+            "replace literal text (first/all/scoped) in one buffer",
+        ),
+        "replace_in_files" => (
+            Editing,
+            A::append(),
+            "apply one literal edit spec across many files, atomically",
         ),
 
         "outline" => (
@@ -3018,7 +3018,7 @@ fn instructions() -> String {
          changes, plus in-process git rebase/cherry-pick/revert and merge-conflict \
          resolution. For lookup, reach for it where warm state pays: outline to survey a \
          file, occur to grep an open buffer (narrowing-aware), view / read_region around \
-         an edit site, and grep to find the files a cross-file replace_text will touch. \
+         an edit site, and grep to find the files a cross-file replace_in_files will touch. \
          Opening is implicit: pass `path` to any tool and the \
          file becomes a warm session (or `session` for an in-memory buffer); buffers stay \
          warm and NOTHING is written until you save (`save: true` on an edit, or save_buffer). \
@@ -3191,7 +3191,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "replace_text",
-            "description": "Replace the FIRST occurrence of a literal pattern with literal replacement text (searching from the top of the accessible region); pass all:true to replace every occurrence. Both strings are plain — no Lisp escaping, no regex, no backref expansion (insert_text's counterpart; the fix for quote-heavy edits). Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Edits the warm buffer; call save_buffer to persist. For regex or position-scoped replacement, use run_program.",
+            "description": "Replace the FIRST occurrence of a literal pattern with literal replacement text (searching from the top of the accessible region); pass all:true to replace every occurrence. Both strings are plain — no Lisp escaping, no regex, no backref expansion (insert_text's counterpart; the fix for quote-heavy edits). Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Edits the warm buffer; call save_buffer to persist. For regex or position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3202,12 +3202,29 @@ fn build_tool_schemas() -> Vec<Value> {
                     "scope": scope,
                     "view": { "type": ["boolean", "integer"], "description": "Append a rendered viewport around point after the edit (true = 4 context lines, or a line count)." },
                     "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?}, …] applied in order inside ONE transaction — all-or-nothing; a miss (or a failed uniqueness check) rolls everything back and names the failed edit.", "items": { "type": "object" } },
-                    "files": { "type": "array", "description": "Apply the SAME edit spec (pattern/replacement or edits) to every listed file in one call — the cross-file rename. Atomic across the set: a failure in any file rolls the already-edited ones back; with save:true the files are saved only after every edit succeeded. Each path must contain the pattern (a miss is an error — list exactly the files you grepped). Not combinable with path/session.", "items": { "type": "string" } },
                     "session": session,
                     "path": path,
                     "save": save,
                 },
                 "required": [],
+            },
+        }),
+        json!({
+            "name": "replace_in_files",
+            "description": "Apply the SAME literal edit spec to EVERY listed file in one call — the cross-file rename. Give pattern/replacement (with all/expect_unique), or `edits` for a transactional batch per file; the absolute paths grep prints feed `files` directly. Atomic ACROSS the set: a failure in any file (a miss, a failed uniqueness check) rolls the already-edited ones back and the error names the file — every listed path must contain the pattern, so list exactly the files you grepped. Edits land in the warm buffers; with save:true the files are saved only after every file's edit succeeded. For a single file use replace_text.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "files": { "type": "array", "items": { "type": "string" }, "description": "The files to edit — each must match the edit spec." },
+                    "pattern": { "type": "string", "description": "The exact text to find (literal, not regex)." },
+                    "replacement": { "type": "string", "description": "The literal replacement text." },
+                    "all": { "type": "boolean", "description": "Replace every occurrence per file (default false: first only)." },
+                    "expect_unique": { "type": "boolean", "description": "Require the pattern to match exactly once per file — more is an error and nothing is applied anywhere. Default false." },
+                    "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?}, …] applied in order inside ONE transaction per file — all-or-nothing across the whole call.", "items": { "type": "object" } },
+                    "scope": scope,
+                    "save": save,
+                },
+                "required": ["files"],
             },
         }),
         json!({
@@ -3234,7 +3251,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "grep",
-            "description": "Read-only cross-file search: which files (and lines) mention a pattern — occur across the filesystem. Walks `dir` (default: every allowed root) recursively, skipping dot-entries (.git …), symlinks, and git-ignored-and-untracked paths (target/ …; tracked files are always searched), keeping paths that match `glob`. Per file: a header + matching lines (line number + absolute char position, long lines clamped, optional context). The file paths it lists feed replace_text {files: […]} directly. Caps files scanned (5000) and matches rendered. Needs no session — reads files within MIME_ROOTS. Use occur for one already-open buffer; grep to find which files to touch.",
+            "description": "Read-only cross-file search: which files (and lines) mention a pattern — occur across the filesystem. Walks `dir` (default: every allowed root) recursively, skipping dot-entries (.git …), symlinks, and git-ignored-and-untracked paths (target/ …; tracked files are always searched), keeping paths that match `glob`. Per file: a header + matching lines (line number + absolute char position, long lines clamped, optional context). The file paths it lists feed replace_in_files {files: […]} directly. Caps files scanned (5000) and matches rendered. Needs no session — reads files within MIME_ROOTS. Use occur for one already-open buffer; grep to find which files to touch.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

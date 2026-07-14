@@ -1421,7 +1421,7 @@ fn multi_file_replace_is_atomic_across_the_set() {
     // The cross-file rename: one call, saved only after both succeeded.
     let ok = s.call_ok(
         1,
-        "replace_text",
+        "replace_in_files",
         json!({
             "files": [pa.clone(), pb.clone()],
             "pattern": "old_name", "replacement": "new_name", "all": true,
@@ -1440,13 +1440,22 @@ fn multi_file_replace_is_atomic_across_the_set() {
     // anywhere (warm buffers included).
     let err = s.call_err(
         2,
-        "replace_text",
+        "replace_in_files",
         json!({
             "files": [pa.clone(), pb.clone()],
             "pattern": "new_name here", "replacement": "X",
         }),
     );
     assert!(err.contains("rolled back"), "got: {err}");
+
+    // The files form no longer rides on replace_text — the argument guard
+    // points at what IS accepted.
+    let err = s.call_err(
+        21,
+        "replace_text",
+        json!({ "files": [pa.clone()], "pattern": "x", "replacement": "y" }),
+    );
+    assert!(err.contains("unknown argument \"files\""), "got: {err}");
     let txt = s.call_ok(
         3,
         "read_region",
