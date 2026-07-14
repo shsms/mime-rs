@@ -1152,8 +1152,9 @@ history terms — "the fixup's hunks touch regions that do not exist at the
 target; last reshaped by <sha> <subject>" — a blame of the fixup's hunk
 ranges, which mime already has.
 
-** TODO [#C] Backup ref ring instead of one overwritten ref  :git:dogfooding:
+** DONE [#C] Backup ref ring instead of one overwritten ref  :git:dogfooding:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:49]
 - State "TODO"       from              [2026-07-14 Di 12:08]
 :END:
 
