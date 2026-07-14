@@ -63,8 +63,15 @@ outside it. Switch the searches to it and the divergence (documented on
 ~Buffer::re_search_forward~) closes.
 
 ** TODO Per-program resource limits
+
 A wall-clock/CPU bound per program — blocked on tulisp cooperative
 cancellation (eval interruption), see the wishlist below.
+
+Note [2026-07-14]: re-raised by the MCP interface review — a (while t) from a
+confused agent hangs the single-threaded server and takes every warm unsaved
+buffer with it, so the blast radius includes unsaved work. If tulisp eval
+interruption stays far off, consider a crude fuel counter in the eval loop as
+an interim bound.
 
 * MCP / agent UX
 
@@ -1027,6 +1034,205 @@ Stock ~git rebase~ drops commits already present upstream by patch-id (cherry-pi
 Fix: on the plan-less rebase, omit commits in ~onto..HEAD~ whose patch-id already exists in ~onto~ (match git's cherry-pick detection), or at minimum WARN and report them so the duplication isn't silent. Consider a ~reapply_cherry_picks~ flag for the rare keep-them case. rehearse already lists the resulting commits — flagging the would-be duplicates there would catch it pre-apply too.
 
 Done [2026-07-07] on branch ~rebase-drop-cherry-picks~: the plan-less pick-all now drops commits already present in ~onto~ by patch-id (matches git's ~--no-reapply-cherry-picks~ default) and REPORTS the skipped commits so it's never silent; a ~reapply_cherry_picks~ flag overrides. An explicit ~plan~/~autosquash~ is unaffected. Cross-checked the drop set against real ~git rebase~.
+
+** DONE [#A] Stale note on the edit tools and their no-match errors :mcp:dogfooding:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:19]
+- State "TODO"       from              [2026-07-14 Di 12:07]
+:END:
+
+From docs/agent-feedback.md (agent field notes, 2026-07-14; NOT committed).
+~stale_note~ rides the read tools and ~run_program~ (~stale: true~), but
+~replace_text~ / ~insert_text~ — the tools an agent is driving when staleness
+bites — carry only the ~unsaved~ note. Worst case is the dirty-buffer +
+external-change scenario auto-revert deliberately skips: ~replace_text~ then
+fails with a bare "no match for the pattern" and no hint that the buffer
+diverged from disk. Append the stale note to the edit tools' results AND to
+their no-match errors ("the visited file changed on disk and this buffer has
+unsaved edits; matching ran against the warm buffer"). The failure moment is
+the most-read doc surface the interface has.
+
+Done [2026-07-14]: new =stale_edit_note= (dirty-buffer wording) on
+insert_text/replace_text results, both no-match error sites, the edits batch,
+and the per-file error of the files form; integration test covers miss +
+success + insert_text.
+
+** DONE [#B] conflicts description omits conflict-context — add it + drift-guard the verb list :mcp:dogfooding:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:19]
+- State "TODO"       from              [2026-07-14 Di 12:07]
+:END:
+
+The ~conflicts~ tool description enumerates conflict-keep / conflict-keep-all /
+conflict-replace / conflict-resolve-trivial / conflict-diff / conflict-text but
+NOT conflict-context — an enumerated list reads as exhaustive, so the field
+agent asked for "context in the overview", the exact feature the omitted verb
+provides. Add it, and add a drift-guard test asserting the description names
+every registered conflict-* builtin (same class of guard as
+~meta_covers_every_tool~).
+
+** DONE [#B] instructions(): state the staleness contract (auto-revert) in one line :mcp:dogfooding:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:19]
+- State "TODO"       from              [2026-07-14 Di 12:07]
+:END:
+
+Auto-revert of clean drifted buffers is documented only in help {sessions} and
+is silent when it fires — invisible to an agent (the field notes filed a
+feature request for behaviour that already exists). One sentence in the
+instructions preamble: a clean buffer auto-reverts when its file changes on
+disk; a buffer with unsaved edits does not and is flagged stale instead.
+
+** DONE [#B] Failed run_program error: put the recovery action in the text :mcp:dogfooding:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:19]
+- State "TODO"       from              [2026-07-14 Di 12:07]
+:END:
+
+The failure JSON already carries ~dirty: true~; when set, add the prose hint
+"edits applied before the failure persist — undo_last reverts them" so the
+recovery action is in the error itself (field-notes "smaller wishes").
+
+** DONE [#B] run_program: transactional by default (opt-out)            :mcp:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:19]
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+A failed program's partial edits persisting is the interface's biggest
+documented footgun (warned about in three places — a sign the default is
+wrong). ~rehearse~'s snapshot machinery suggests the engine can support
+wrapping every run in an implicit transaction that rolls back on error, with
+an opt-out flag (or ~(commit)~-style escape) for programs that want partial
+effects. Field notes rated the current default only a "smaller wish", so the
+error-text hint task covers the interim.
+
+Done [2026-07-14]: failed dirty run auto-rewinds via the pre-program undo
+snapshot; =keep_partial:true= opts out (schema-gated, so rehearse rejects it).
+Failure JSON: =rolled_back:true= + dirty:false on rollback; dirty:true only
+with keep_partial. Docs updated: instructions preamble, run_program schema,
+help {sessions}, docs/mcp-tools.md regenerated. This subsumed the
+recovery-hint task: the error text names the recovery in BOTH modes.
+
+** TODO [#A] git_fixup from working-tree hunks — git add -p for agents :git:dogfooding:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+Top remaining workflow gap in the field notes: make all review fixes at once,
+then split them into fixup commits for different targets. When one file
+carries hunks for two targets the only route today is snapshot / checkout /
+re-apply / commit, twice. Wanted:
+  git_fixup {target, hunks: [{path, lines: [start, end]}]}
+creating the fixup commit from just those working-tree hunks and leaving the
+rest of the tree in place. The pieces exist: hunk selection in git_rebase
+split, target discovery in git_blame {worktree}. Committing selected worktree
+hunks is the missing third.
+Magit inspiration: magit-commit-instant-fixup (create the fixup AND fold it
+in one move) and magit-commit-absorb / git-absorb (auto-pick the target per
+hunk — we have the blame half already); staging by hunk/region is the
+underlying primitive.
+
+** TODO [#B] git_rebase rehearse: report ALL conflicting steps, and why :git:dogfooding:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+Rehearsal stops at the first conflicting step, so planning a 5-fixup
+autosquash took three rehearse rounds. Wanted: a mode that continues past
+conflicts and lists every step that would conflict (with the files), so the
+plan is repaired in one pass. Related: explain WHY a fixup conflicts in
+history terms — "the fixup's hunks touch regions that do not exist at the
+target; last reshaped by <sha> <subject>" — a blame of the fixup's hunk
+ranges, which mime already has.
+
+** TODO [#C] Backup ref ring instead of one overwritten ref  :git:dogfooding:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+refs/mime-backup/<branch> is overwritten by the next op on the branch — "a
+three-rebase session feels like walking without a rope after the first one".
+A small ring (refs/mime-backup/<branch>/{0,1,2}) covers it. Magit note: magit
+leans on the reflog for this; a ring of named refs is the agent-legible
+equivalent (git_log can show them, no reflog spelunking).
+
+** DONE [#C] Render string-valued run_program results raw, not tulisp-printed :mcp:dogfooding:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:19]
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+(conflict-diff N) comes back as a JSON-escaped quoted string inside ~value~
+("\"@@ ...\\n+def ...\"") — every other prose-returning surface renders plain
+text. When the final value is a string, render it raw (the way message/view
+output already is); fixes readability for every string-returning inspector at
+once.
+
+** TODO [#B] Hostile-string round-trip tests for every literal-taking tool :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+The convenience tools work by splicing user strings into generated tulisp via
+lisp_literal/lisp_escape; the occur exact/ci path layers regex_dialect::quote
+under lisp_escape. Centralised and careful, but injection-shaped: one missed
+path is a correctness or sandbox bug. Add a fuzz-ish test that round-trips
+hostile strings (backslashes, quotes, newlines/tabs, regex metachars, unicode)
+through insert_text / replace_text (single, edits, files) / occur / grep and
+asserts byte-exact results.
+
+** DONE [#C] tool_replace_files: rollback failure is silent (let _ = undo_last) :mcp:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:19]
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+The cross-file all-or-nothing promise rolls back via each session's undo ring
+with ~let _ = ws.undo_last()~ — a rollback failure is swallowed, the one spot
+left that violates the interface's no-silent-failure ethic. Surface it in the
+error ("rollback of <file> may be incomplete").
+
+** TODO [#C] Split replace_text {files:} into its own tool              :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+replace_text is three tools in one (pattern/replacement | edits[] | files[])
+with required: [] because the forms are mutually exclusive — the schema no
+longer says what a valid call looks like; agents learn by rejection. Splitting
+the cross-file form (replace_in_files) lets each schema regain an honest
+required list. Tension: more tools = bigger always-loaded surface; weigh
+against the intent-shaped redesign task already on this list.
+
+** DONE [#C] instructions(): soften the ALL-lookup claim to where mime wins :mcp:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:19]
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+"DEFAULT for ALL file editing AND lookup, in preference to built-in file
+tools" oversells the read side: for a one-shot read of a file, a harness's
+native Read is equivalent and cheaper (no session, no hop) and integrates
+with its context management. Keep the strong claim for edits; scope the
+lookup claim to warm buffers, narrowing-aware views, outline, and
+cross-file-edit-feeding grep.
+
+** TODO [#C] Survey magit for agent-worthy git features                 :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+Magit is decades of interactive-git UX; mine it for what translates to a
+non-interactive agent surface. Obvious candidates beyond the fixup/absorb
+tasks above: instant fixup (create + fold in one op), branch-scoped log/diff
+views shaped for planning (magit-log's --graph equivalent as structured
+data), range-diff (compare a branch before/after a rewrite — would pair
+perfectly with rehearse), stash/snapshot as a first-class safety net
+(magit-stash-worktree ~ our backup refs, but for the worktree), and
+worktree-level "discard this hunk" (the destructive sibling of staging by
+hunk). Criterion: keep the no-network/no-hooks/no-exec envelope; prefer
+verbs that reduce agent round trips.
 
 * Structural editing
 
