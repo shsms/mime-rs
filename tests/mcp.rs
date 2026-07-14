@@ -463,6 +463,122 @@ fn replace_text_is_literal_counted_and_quote_safe() {
     );
 }
 
+/// Every literal-taking tool escapes user strings into generated tulisp on
+/// the server (lisp_literal; occur adds regexp-quote / regex_dialect::quote
+/// underneath); one missed path is a silent wrong edit or a false miss.
+/// Round-trip a gauntlet of hostile strings through insert_text →
+/// read_region, occur, replace_text, and the edits batch, requiring
+/// byte-exact results everywhere.
+#[test]
+fn literal_tools_round_trip_hostile_strings() {
+    let mut s = Server::spawn();
+    let cases: &[&str] = &[
+        "back\\slash and trailing \\",
+        "dou\"ble \"quo\"tes",
+        "real\nnewlines\nand\ttabs",
+        "crlf\r\nline",
+        ".*+?[](){}|^$ regex metachars",
+        "emacs \\(group\\) \\| alt x\\{2,3\\}",
+        "mixed \"\\\" quote-slash \\\" edge",
+        "unicode αβγ 🦀 ñé",
+        "\\n literal backslash-n (not a newline)",
+        "semi;colons 'single' `backtick` $dollar (report \"k\" 1)",
+    ];
+    let mut id = 0;
+    for (i, case) in cases.iter().enumerate() {
+        let sess = format!("h{i}");
+        id += 1;
+        s.call_ok(id, "open_text", json!({ "text": "AB", "session": sess }));
+        // Insert between A and B; the buffer must read back byte-exact.
+        id += 1;
+        s.call_ok(
+            id,
+            "insert_text",
+            json!({ "session": sess, "text": case, "pos": 2 }),
+        );
+        let n = case.chars().count() as i64;
+        id += 1;
+        let txt = s.call_ok(
+            id,
+            "read_region",
+            json!({ "session": sess, "start": 1, "end": n + 3 }),
+        );
+        assert_eq!(txt, format!("A{case}B"), "insert round trip, case {i}");
+        // occur (exact mode) must find the literal — single-line cases only
+        // (occur is line-oriented).
+        if !case.contains('\n') && !case.contains('\r') {
+            id += 1;
+            let out = s.call_ok(id, "occur", json!({ "session": sess, "pattern": case }));
+            assert!(out.contains(case), "occur finds case {i}: {out}");
+        }
+        // Replace the literal with another hostile literal, byte-exact.
+        let repl = format!("R\"\\{case}\\\"R");
+        id += 1;
+        let ok = s.call_ok(
+            id,
+            "replace_text",
+            json!({ "session": sess, "pattern": case, "replacement": repl, "expect_unique": true }),
+        );
+        assert!(ok.contains("replaced 1 occurrence"), "case {i}: {ok}");
+        let m = repl.chars().count() as i64;
+        id += 1;
+        let txt = s.call_ok(
+            id,
+            "read_region",
+            json!({ "session": sess, "start": 1, "end": m + 3 }),
+        );
+        assert_eq!(txt, format!("A{repl}B"), "replace round trip, case {i}");
+    }
+
+    // The edits batch rides the same escaping inside with-transaction.
+    id += 1;
+    s.call_ok(
+        id,
+        "open_text",
+        json!({ "text": "x \"q\\s\" y", "session": "batch" }),
+    );
+    id += 1;
+    s.call_ok(
+        id,
+        "replace_text",
+        json!({
+            "session": "batch",
+            "edits": [
+                { "pattern": "\"q\\s\"", "replacement": "\"Q\\S\"", "expect_unique": true },
+                { "pattern": "x ", "replacement": "x\t\n" },
+            ],
+        }),
+    );
+    id += 1;
+    let txt = s.call_ok(
+        id,
+        "read_region",
+        json!({ "session": "batch", "start": 1, "end": 11 }),
+    );
+    assert_eq!(txt, "x\t\n\"Q\\S\" y", "batch round trip");
+}
+
+/// grep compiles the exact-mode pattern with RE2 escaping (a separate path
+/// from occur's in-engine regexp-quote) — hostile literals must match there
+/// too, and the file's rendered line must survive clamping intact.
+#[test]
+fn grep_exact_matches_hostile_literals() {
+    let dir = temp_dir("grep-hostile");
+    let cases = [
+        "we\\d+ \"quo\" \\(x\\) .*+?[]{}|^$",
+        "tab\there $dollar `tick`",
+    ];
+    std::fs::write(dir.join("h.txt"), cases.join("\n")).unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    for (i, c) in cases.iter().enumerate() {
+        let out = s.call_ok(i as i64 + 1, "grep", json!({ "pattern": c }));
+        assert!(
+            out.contains("1 match") && out.contains("h.txt"),
+            "case {i}: {out}"
+        );
+    }
+}
+
 #[test]
 fn failed_run_carries_the_programs_reports_and_log() {
     let mut s = Server::spawn();
