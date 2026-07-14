@@ -1177,8 +1177,9 @@ text. When the final value is a string, render it raw (the way message/view
 output already is); fixes readability for every string-returning inspector at
 once.
 
-** TODO [#B] Hostile-string round-trip tests for every literal-taking tool :mcp:
+** DONE [#B] Hostile-string round-trip tests for every literal-taking tool :mcp:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 13:58]
 - State "TODO"       from              [2026-07-14 Di 12:08]
 :END:
 
@@ -1201,8 +1202,9 @@ with ~let _ = ws.undo_last()~ — a rollback failure is swallowed, the one spot
 left that violates the interface's no-silent-failure ethic. Surface it in the
 error ("rollback of <file> may be incomplete").
 
-** TODO [#C] Split replace_text {files:} into its own tool              :mcp:
+** DONE [#C] Split replace_text {files:} into its own tool              :mcp:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 13:58]
 - State "TODO"       from              [2026-07-14 Di 12:08]
 :END:
 
@@ -1226,8 +1228,9 @@ with its context management. Keep the strong claim for edits; scope the
 lookup claim to warm buffers, narrowing-aware views, outline, and
 cross-file-edit-feeding grep.
 
-** TODO [#C] Survey magit for agent-worthy git features                 :git:
+** DONE [#C] Survey magit for agent-worthy git features                 :git:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 13:58]
 - State "TODO"       from              [2026-07-14 Di 12:08]
 :END:
 
@@ -1241,6 +1244,59 @@ perfectly with rehearse), stash/snapshot as a first-class safety net
 worktree-level "discard this hunk" (the destructive sibling of staging by
 hunk). Criterion: keep the no-network/no-hooks/no-exec envelope; prefer
 verbs that reduce agent round trips.
+
+Survey done [2026-07-14]. Already covered by mime: instant fixup
+(git_fixup {worktree/hunks}), autosquash, interactive-rebase verbs
+(edit/split/reword/message_edits), blame incl. absorb-target discovery,
+recovery ropes (backup ring ≈ magit's reflog reliance, but agent-legible).
+Spun out as new tasks: git_absorb (auto-target dirty hunks), git_range_diff
+(old-vs-new history after a rewrite, pairs with the backup ring), and
+git_discard (drop worktree hunks behind the -worktree parachute ref).
+Judged not worth porting: magit's status/log *views* (git_log/git_show
+cover the data; rendering is the harness's job), branch/remote management
+(network is out of envelope by design), and stash as a first-class store
+(warm sessions + the -worktree parachute cover the agent need).
+
+** TODO [#B] git_absorb: auto-target every dirty hunk (magit-commit-absorb) :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-14 Di 13:58]
+:END:
+
+The automated composition of two things mime already has: git_blame
+{worktree: true} maps each uncommitted hunk to the commit that owns its
+lines, and git_fixup {hunks} folds selected hunks into a target. absorb
+runs the loop: blame every dirty hunk, group by owning commit, fold each
+group — one call, no target names. Hunks whose owner is ambiguous (outside
+the branch, or split ownership) stay in the worktree and are reported.
+rehearse:true previews the grouping. Modeled on magit-commit-absorb /
+git-absorb.
+
+** TODO [#C] git_range_diff: compare a branch before/after a rewrite    :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-14 Di 13:58]
+:END:
+
+magit surfaces git range-diff for exactly the question our rewrites raise:
+"what changed between the old and new history?" Natural pairing with the
+backup ring — git_range_diff {old: refs/mime-backup/<branch>/0, new: HEAD}
+after any rebase/fixup answers "did the rewrite change anything it should
+not have" commit by commit (message + patch drift per pair). Also useful
+against a rehearse preview. libgit2 has no range-diff; needs a patch-id
+based pairing pass plus per-pair diff-of-diffs (or an approximation:
+pair by patch-id / summary, then diff the paired trees).
+
+** TODO [#C] git_discard: drop selected worktree hunks, with a parachute :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-14 Di 13:58]
+:END:
+
+The destructive sibling of the worktree git_fixup: discard chosen
+uncommitted hunks ({paths, hunks} selectors, same shapes) instead of
+folding them. Magit pairs discard with automatic stash snapshots; ours
+stamps the same refs/mime-backup/<branch>-worktree dangling commit the
+worktree fixup already uses before touching anything, so a discard is
+always recoverable. Reuses snapshot_worktree/apply_subset — the inverse
+selection is kept, the selected hunks reset to HEAD content.
 
 * Structural editing
 
