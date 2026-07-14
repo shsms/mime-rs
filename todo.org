@@ -1298,6 +1298,30 @@ worktree fixup already uses before touching anything, so a discard is
 always recoverable. Reuses snapshot_worktree/apply_subset — the inverse
 selection is kept, the selected hunks reset to HEAD content.
 
+** TODO Move the transactional run_program rollback into the engine     :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-14 Di 14:22]
+:END:
+
+Review finding (2026-07-14, altitude): the failed-run rollback lives in the
+MCP front-end (tool_run_program calls undo_last), so the CLI and daemon
+front-ends still leave partial edits behind on a program error — divergent
+semantics for the same engine operation. Move the snapshot/rollback into
+Workspace::run (with a keep-partial escape) so all three front-ends share
+one contract. Related smaller item: run_value could return a typed value so
+the MCP layer stops re-parsing the printed string (unprint_string_value).
+
+** TODO last_toucher: one walk per conflict, not per file               :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-14 Di 14:22]
+:END:
+
+Review finding (2026-07-14, efficiency): the rehearse conflict "why" runs a
+fresh 200-commit revwalk + pathspec'd diff per conflicted FILE, so a
+many-conflict rehearsal over a long branch does O(conflicts x files x
+commits) tree diffs. Walk once per conflicting step (or once per rehearsal),
+bucket touched paths per commit, and answer all files from that map.
+
 * Structural editing
 
 ** TODO Incremental re-parse (~InputEdit~s) [#C]
