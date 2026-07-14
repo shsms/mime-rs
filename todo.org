@@ -1114,8 +1114,9 @@ with keep_partial. Docs updated: instructions preamble, run_program schema,
 help {sessions}, docs/mcp-tools.md regenerated. This subsumed the
 recovery-hint task: the error text names the recovery in BOTH modes.
 
-** TODO [#A] git_fixup from working-tree hunks — git add -p for agents :git:dogfooding:
+** DONE [#A] git_fixup from working-tree hunks — git add -p for agents :git:dogfooding:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:45]
 - State "TODO"       from              [2026-07-14 Di 12:08]
 :END:
 
@@ -1132,6 +1133,11 @@ Magit inspiration: magit-commit-instant-fixup (create the fixup AND fold it
 in one move) and magit-commit-absorb / git-absorb (auto-pick the target per
 hunk — we have the blame half already); staging by hunk/region is the
 underlying primitive.
+
+Done [2026-07-14]: paths / hunks / worktree:true on git_fixup; dangling fixup
+commit + byte-snapshot restore + refs/mime-backup/<branch>-worktree parachute;
+conflict aborts whole with a target-the-reshaper hint; rehearse previews.
+Verified end-to-end through the MCP server on a scratch repo.
 
 ** TODO [#B] git_rebase rehearse: report ALL conflicting steps, and why :git:dogfooding:
 :LOGBOOK:
