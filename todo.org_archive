@@ -1,0 +1,1179 @@
+#    -*- mode: org -*-
+
+
+Archived entries from file /vagrant/mime-rs/todo.org
+
+
+* DONE [#C] Survey magit for agent-worthy git features                  :git:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 13:58]
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+Magit is decades of interactive-git UX; mine it for what translates to a
+non-interactive agent surface. Obvious candidates beyond the fixup/absorb
+tasks above: instant fixup (create + fold in one op), branch-scoped log/diff
+views shaped for planning (magit-log's --graph equivalent as structured
+data), range-diff (compare a branch before/after a rewrite — would pair
+perfectly with rehearse), stash/snapshot as a first-class safety net
+(magit-stash-worktree ~ our backup refs, but for the worktree), and
+worktree-level "discard this hunk" (the destructive sibling of staging by
+hunk). Criterion: keep the no-network/no-hooks/no-exec envelope; prefer
+verbs that reduce agent round trips.
+
+Survey done [2026-07-14]. Already covered by mime: instant fixup
+(git_fixup {worktree/hunks}), autosquash, interactive-rebase verbs
+(edit/split/reword/message_edits), blame incl. absorb-target discovery,
+recovery ropes (backup ring ≈ magit's reflog reliance, but agent-legible).
+Spun out as new tasks: git_absorb (auto-target dirty hunks), git_range_diff
+(old-vs-new history after a rewrite, pairs with the backup ring), and
+git_discard (drop worktree hunks behind the -worktree parachute ref).
+Judged not worth porting: magit's status/log *views* (git_log/git_show
+cover the data; rendering is the harness's job), branch/remote management
+(network is out of envelope by design), and stash as a first-class store
+(warm sessions + the -worktree parachute cover the agent need).
+
+
+* DONE [#C] instructions(): soften the ALL-lookup claim to where mime wins :mcp:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:19]
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+"DEFAULT for ALL file editing AND lookup, in preference to built-in file
+tools" oversells the read side: for a one-shot read of a file, a harness's
+native Read is equivalent and cheaper (no session, no hop) and integrates
+with its context management. Keep the strong claim for edits; scope the
+lookup claim to warm buffers, narrowing-aware views, outline, and
+cross-file-edit-feeding grep.
+
+
+* DONE [#C] Split replace_text {files:} into its own tool               :mcp:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 13:58]
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+replace_text is three tools in one (pattern/replacement | edits[] | files[])
+with required: [] because the forms are mutually exclusive — the schema no
+longer says what a valid call looks like; agents learn by rejection. Splitting
+the cross-file form (replace_in_files) lets each schema regain an honest
+required list. Tension: more tools = bigger always-loaded surface; weigh
+against the intent-shaped redesign task already on this list.
+
+
+* DONE [#C] tool_replace_files: rollback failure is silent (let _ = undo_last) :mcp:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:19]
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+The cross-file all-or-nothing promise rolls back via each session's undo ring
+with ~let _ = ws.undo_last()~ — a rollback failure is swallowed, the one spot
+left that violates the interface's no-silent-failure ethic. Surface it in the
+error ("rollback of <file> may be incomplete").
+
+
+* DONE [#B] Hostile-string round-trip tests for every literal-taking tool :mcp:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 13:58]
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+The convenience tools work by splicing user strings into generated tulisp via
+lisp_literal/lisp_escape; the occur exact/ci path layers regex_dialect::quote
+under lisp_escape. Centralised and careful, but injection-shaped: one missed
+path is a correctness or sandbox bug. Add a fuzz-ish test that round-trips
+hostile strings (backslashes, quotes, newlines/tabs, regex metachars, unicode)
+through insert_text / replace_text (single, edits, files) / occur / grep and
+asserts byte-exact results.
+
+
+* DONE [#C] Render string-valued run_program results raw, not tulisp-printed :mcp:dogfooding:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:19]
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+(conflict-diff N) comes back as a JSON-escaped quoted string inside ~value~
+("\"@@ ...\\n+def ...\"") — every other prose-returning surface renders plain
+text. When the final value is a string, render it raw (the way message/view
+output already is); fixes readability for every string-returning inspector at
+once.
+
+
+* DONE [#C] Backup ref ring instead of one overwritten ref   :git:dogfooding:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:49]
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+refs/mime-backup/<branch> is overwritten by the next op on the branch — "a
+three-rebase session feels like walking without a rope after the first one".
+A small ring (refs/mime-backup/<branch>/{0,1,2}) covers it. Magit note: magit
+leans on the reflog for this; a ring of named refs is the agent-legible
+equivalent (git_log can show them, no reflog spelunking).
+
+
+* DONE [#B] git_rebase rehearse: report ALL conflicting steps, and why :git:dogfooding:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:53]
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+Rehearsal stops at the first conflicting step, so planning a 5-fixup
+autosquash took three rehearse rounds. Wanted: a mode that continues past
+conflicts and lists every step that would conflict (with the files), so the
+plan is repaired in one pass. Related: explain WHY a fixup conflicts in
+history terms — "the fixup's hunks touch regions that do not exist at the
+target; last reshaped by <sha> <subject>" — a blame of the fixup's hunk
+ranges, which mime already has.
+
+
+* DONE [#A] git_fixup from working-tree hunks — git add -p for agents :git:dogfooding:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:45]
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+Top remaining workflow gap in the field notes: make all review fixes at once,
+then split them into fixup commits for different targets. When one file
+carries hunks for two targets the only route today is snapshot / checkout /
+re-apply / commit, twice. Wanted:
+  git_fixup {target, hunks: [{path, lines: [start, end]}]}
+creating the fixup commit from just those working-tree hunks and leaving the
+rest of the tree in place. The pieces exist: hunk selection in git_rebase
+split, target discovery in git_blame {worktree}. Committing selected worktree
+hunks is the missing third.
+Magit inspiration: magit-commit-instant-fixup (create the fixup AND fold it
+in one move) and magit-commit-absorb / git-absorb (auto-pick the target per
+hunk — we have the blame half already); staging by hunk/region is the
+underlying primitive.
+
+Done [2026-07-14]: paths / hunks / worktree:true on git_fixup; dangling fixup
+commit + byte-snapshot restore + refs/mime-backup/<branch>-worktree parachute;
+conflict aborts whole with a target-the-reshaper hint; rehearse previews.
+Verified end-to-end through the MCP server on a scratch repo.
+
+
+* DONE [#B] run_program: transactional by default (opt-out)             :mcp:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:19]
+- State "TODO"       from              [2026-07-14 Di 12:08]
+:END:
+
+A failed program's partial edits persisting is the interface's biggest
+documented footgun (warned about in three places — a sign the default is
+wrong). ~rehearse~'s snapshot machinery suggests the engine can support
+wrapping every run in an implicit transaction that rolls back on error, with
+an opt-out flag (or ~(commit)~-style escape) for programs that want partial
+effects. Field notes rated the current default only a "smaller wish", so the
+error-text hint task covers the interim.
+
+Done [2026-07-14]: failed dirty run auto-rewinds via the pre-program undo
+snapshot; =keep_partial:true= opts out (schema-gated, so rehearse rejects it).
+Failure JSON: =rolled_back:true= + dirty:false on rollback; dirty:true only
+with keep_partial. Docs updated: instructions preamble, run_program schema,
+help {sessions}, docs/mcp-tools.md regenerated. This subsumed the
+recovery-hint task: the error text names the recovery in BOTH modes.
+
+
+* DONE [#B] Failed run_program error: put the recovery action in the text :mcp:dogfooding:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:19]
+- State "TODO"       from              [2026-07-14 Di 12:07]
+:END:
+
+The failure JSON already carries ~dirty: true~; when set, add the prose hint
+"edits applied before the failure persist — undo_last reverts them" so the
+recovery action is in the error itself (field-notes "smaller wishes").
+
+
+* DONE [#B] instructions(): state the staleness contract (auto-revert) in one line :mcp:dogfooding:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:19]
+- State "TODO"       from              [2026-07-14 Di 12:07]
+:END:
+
+Auto-revert of clean drifted buffers is documented only in help {sessions} and
+is silent when it fires — invisible to an agent (the field notes filed a
+feature request for behaviour that already exists). One sentence in the
+instructions preamble: a clean buffer auto-reverts when its file changes on
+disk; a buffer with unsaved edits does not and is flagged stale instead.
+
+
+* DONE [#B] conflicts description omits conflict-context — add it + drift-guard the verb list :mcp:dogfooding:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:19]
+- State "TODO"       from              [2026-07-14 Di 12:07]
+:END:
+
+The ~conflicts~ tool description enumerates conflict-keep / conflict-keep-all /
+conflict-replace / conflict-resolve-trivial / conflict-diff / conflict-text but
+NOT conflict-context — an enumerated list reads as exhaustive, so the field
+agent asked for "context in the overview", the exact feature the omitted verb
+provides. Add it, and add a drift-guard test asserting the description names
+every registered conflict-* builtin (same class of guard as
+~meta_covers_every_tool~).
+
+
+* DONE [#A] Stale note on the edit tools and their no-match errors :mcp:dogfooding:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-14 Di 12:19]
+- State "TODO"       from              [2026-07-14 Di 12:07]
+:END:
+
+From docs/agent-feedback.md (agent field notes, 2026-07-14; NOT committed).
+~stale_note~ rides the read tools and ~run_program~ (~stale: true~), but
+~replace_text~ / ~insert_text~ — the tools an agent is driving when staleness
+bites — carry only the ~unsaved~ note. Worst case is the dirty-buffer +
+external-change scenario auto-revert deliberately skips: ~replace_text~ then
+fails with a bare "no match for the pattern" and no hint that the buffer
+diverged from disk. Append the stale note to the edit tools' results AND to
+their no-match errors ("the visited file changed on disk and this buffer has
+unsaved edits; matching ran against the warm buffer"). The failure moment is
+the most-read doc surface the interface has.
+
+Done [2026-07-14]: new =stale_edit_note= (dirty-buffer wording) on
+insert_text/replace_text results, both no-match error sites, the edits batch,
+and the per-file error of the files form; integration test covers miss +
+success + insert_text.
+
+
+* DONE git_rebase default pick-all doesn't drop commits already in `onto` (patch-id) — duplicates when rebasing a stacked branch onto a rewritten base :git:dogfooding:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-07 Di 10:24]
+- State "TODO"       from              [2026-07-07 Di 08:31]
+:END:
+
+From driving mime to rebase a stacked branch (2026-07-07): branch B sits on base A; A's top commits were REORDERED (rewritten to new oids, identical patch-ids). Re-rebasing B onto the rewritten A via ~git_rebase {onto: A}~ with the DEFAULT (plan-less) pick-all replayed A's rewritten commits a second time — B ended up with duplicate commits — because the merge-base with the rewritten A had moved BELOW the rewrite, so ~onto..HEAD~ still contained B's old copies of those commits and pick-all replayed every one verbatim.
+
+Stock ~git rebase~ drops commits already present upstream by patch-id (cherry-pick / already-applied detection — the ~--no-reapply-cherry-picks~ default), so the same "reorder the base, then rebase the stack" sequence yields NO duplicates. mime's default pick-all has no such detection, so the natural stacked-branch workflow silently duplicates; recovering needs an explicit plan with a ~drop~ on each rewritten commit (what I did to fix it).
+
+Fix: on the plan-less rebase, omit commits in ~onto..HEAD~ whose patch-id already exists in ~onto~ (match git's cherry-pick detection), or at minimum WARN and report them so the duplication isn't silent. Consider a ~reapply_cherry_picks~ flag for the rare keep-them case. rehearse already lists the resulting commits — flagging the would-be duplicates there would catch it pre-apply too.
+
+Done [2026-07-07] on branch ~rebase-drop-cherry-picks~: the plan-less pick-all now drops commits already present in ~onto~ by patch-id (matches git's ~--no-reapply-cherry-picks~ default) and REPORTS the skipped commits so it's never silent; a ~reapply_cherry_picks~ flag overrides. An explicit ~plan~/~autosquash~ is unaffected. Cross-checked the drop set against real ~git rebase~.
+
+
+* DONE git_rebase rehearse preview doesn't fold fixup/squash steps :bug:git_rebase:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-02 Do 16:01]
+- State "TODO"       from              [2026-07-01 Mi 13:51]
+:END:
+
+In ~git_rebase~ with ~rehearse: true~, ~fixup~/~squash~ plan steps are not folded
+in the preview: the rehearsal lists one commit line per plan step (each
+~fixup~/~squash~ step shown as a separate commit carrying the melded message) and
+its "-> N commit(s)" summary reports the unfolded step count.
+
+A real (non-rehearse) apply of the identical plan folds correctly — verified on
+an 8-commit branch: a [~reword~, ~fixup~] pair produced 7 commits with a
+byte-identical tree.
+
+The misleading preview makes it look like ~fixup~/~squash~ won't fold, which
+nearly caused abandoning a valid mime fold in favour of a manual
+~git reset --soft~.
+
+Fix: ~rehearse~ should simulate the fold so the previewed commit list and count
+match what apply produces.
+
+DONE (2026-07): rehearse now replaces the superseded entry for a squash/fixup step
+(the fold re-parents onto the previous commit's parent), so the previewed commit
+list and "-> N commits" count match a real apply. Test asserts preview==apply.
+
+
+* DONE git_rebase: autosquash/absorb — fold a change into the commit that owns it :git:dogfooding:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-02 Do 15:58]
+- State "TODO"       from              [2026-06-30 Di 12:13]
+:END:
+
+From driving mime to rewrite this repo's own history (2026-06): the common
+task "I just made this change — fold it into the commit it belongs to" has no
+one-call path. Each fold took (a) a raw ~git add~ + ~git commit~ to make a temp
+fixup (mime has no stage/commit primitive — correctly, since its git ops run no
+hooks, so commit CREATION should stay on raw ~git -s~ to fire the sign-off
+commit-msg hook), then (b) a ~git_rebase~ with the ENTIRE plan hand-authored:
+every commit oid from the target onward listed in order with the fixup slotted
+in. Step (b) is the friction — transcribing untouched ~pick~ steps just to say
+"fixup A into B"; on a long branch it is tedious and easy to drop or reorder a
+commit. ~rehearse~ (tree-IDENTICAL check) makes it safe, not quick.
+
+Two improvements, smallest first:
+
+1. *Autosquash-style SPARSE plans for ~git_rebase~.* Let the plan express only
+   the RELATIONSHIP and auto-pick the rest of ~onto..HEAD~ in order — e.g.
+   ~plan: [{action: fixup, commit: X, into: Y}]~ moves X to sit under Y as a
+   fixup and picks every other commit unchanged. This is git's
+   ~--autosquash~ semantics as data (no ~fixup!~-subject magic needed). Removes
+   the enumerate-untouched-commits chore with no new tool.
+
+2. *A ~git_fixup~ / absorb tool.* One rehearsable call taking a target commit +
+   a source — a commit, OR the staged/worktree changes directly — that does the
+   temp-commit → move-under-target → fixup dance internally and lands the
+   amended history. A mime-created temp commit is fine here even though mime
+   runs no hooks: ~fixup~ DISCARDS the temp message and PRESERVES the target's
+   existing (already-signed) message, so no sign-off is dropped. Stretch: a
+   ~git absorb~-style AUTO-TARGET that maps each worktree hunk to the commit
+   that last touched those lines — i.e. the find-the-commit half tracked under
+   the blame-shaped read item — so "I edited line X, tuck it into whatever
+   commit introduced X" becomes one call.
+
+Relation to existing items: the blame-shaped "which commit owns this?" read is
+the DISCOVERY half (find the target); this is the ACTION half (fold into it).
+The split/move item is the inverse — repartition what is ALREADY committed.
+Together they are one vocabulary: find-the-commit → fold-in / split-out.
+
+DONE (2026-07): both fold paths shipped.
+- ~git_rebase~ ~autosquash = [{commit, into, action?}]~: sparse plan that relocates
+  only the named commits (fixup/squash under their target) and auto-picks the rest
+  of onto..HEAD — the enumerate-untouched-commits chore is gone.
+- ~git_fixup {target, source}~: one-call fold of a COMMITTED source into target
+  (target keeps its signed message); infers the base, reuses the sequencer.
+Intentionally NOT done: worktree/staged AUTO-absorb (commit-from-worktree). Commit
+creation stays on raw ~git -s~ to fire the sign-off hook, per the driver design; a
+committed source covers the fold. The ~git absorb~ auto-target (hunk -> owning
+commit) still belongs with the blame-the-hunk half of [[git-blame]].
+
+
+* DONE save_buffer {to:} copy-out can clobber another live session's visited file [#C] :mcp:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-03 Fr 11:31]
+:END:
+
+From the mcp-surface-review code review (2026-06-24). ~Workspace::write_copy_to~
+writes a different path with no stale guard and no cross-session awareness, so
+~save_buffer {path: A, to: B}~ where B is the visited file of ANOTHER warm
+session with unsaved edits silently overwrites B — and B's own stale guard never
+fires (the change happened out from under it). Pre-existing in spirit (the old
+~save_to~ also skipped the guard for a non-visited path), but the explicit
+copy branch is now the documented route. Low severity (localhost, single-user,
+cp-like intent), but worth a guard: before the copy, check whether ~to~ is
+canonically some other live session's visited path and refuse / warn.
+
+DONE (2026-07): save_buffer's copy-out branch now refuses when the target is
+canonically the visited file of a DIFFERENT live session with unsaved edits
+(clobbers_unsaved_session), naming it. A clean session or an unrelated path is
+fine. Unit test covers the dirty-collision, clean, own-session, and no-collision
+cases.
+
+
+* DONE Discoverability: structural + conflict-resolution verbs hidden in ~run_program~ [#C]
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX/MCP command-surface review — prune the middle, grow power via params
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:ARCHIVE_ITAGS: mcp
+:END:
+Structural editing (treesit nodes/queries) is surfaced only as ~outline~; the
+conflict RESOLUTION verbs (~conflict-keep~ etc.) are ~run_program~ functions,
+not tools (the ~conflicts~ tool only reports). ~help {treesit|conflicts}~
+bridges both, but it is a discovery step. Decide whether that is the intended
+"small surface, deep engine" tradeoff (then document it as such) or worth one
+more surfaced affordance.
+
+DONE: chose to keep the small surface and make the tradeoff explicit — the
+~instructions~ now say the deep vocabulary (regex / treesit / conflict-keep …)
+lives inside ~run_program~ by design, reached via help {topic|tool}.
+
+
+* DONE Clarify ~rehearse~ vs ~run_program~ (no save) [#C]
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX/MCP command-surface review — prune the middle, grow power via params
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:ARCHIVE_ITAGS: mcp
+:END:
+Both "don't touch disk", but ~rehearse~ also rolls the BUFFER back while
+~run_program~ persists buffer edits (just not to the file) — easy to conflate.
+A naming or doc fix (the ~instructions~ preamble only half-covers it) so the
+buffer-persist vs full-rollback line is unmistakable.
+
+DONE: the ~instructions~ preamble now spells out the three persistence levels —
+rehearse rolls the buffer back / run_program + edit tools persist to the warm
+buffer (not disk) / save writes to disk.
+
+
+* DONE Reconcile the dual buffer addressing (~session~ id vs ~path~) [#B]
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX/MCP command-surface review — prune the middle, grow power via params
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:ARCHIVE_ITAGS: mcp
+:END:
+Every editing tool takes BOTH a warm ~session~ id and an auto-opening ~path~;
+that overlap is the root of the ~save_buffer {to:}~ footgun and makes
+~open_file~ partly redundant with implicit-open. Decide one coherent model
+(e.g. ~path~ is sugar resolving to a canonical session; a destination like ~to~
+never doubles as the selector) and align every tool + doc to it. Subsumes the
+standalone ~save_buffer {to:}~ item.
+
+DONE: the model (~path~/~session~ select the session; ~to~ is the only
+destination) was already consistent across tools — the one wart was the
+footgun, now fixed: ~save_buffer {to: other}~ writes a copy via
+~Workspace::write_copy_to~ and does NOT rebind the session. Resolves the
+standalone footgun item below.
+
+
+* DONE Reconsider ~search~ as a standalone tool [#C]
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX/MCP command-surface review — prune the middle, grow power via params
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:ARCHIVE_ITAGS: mcp
+:END:
+It is a single ~re-search-forward~ that MOVES POINT as a side effect — a subtle
+stateful gotcha beside read-only ~occur~, and otherwise ~run_program~ territory.
+Either drop it (lean on ~occur~ for orientation + ~run_program~ to navigate) or
+fold a "move point to first match" option into ~occur~.
+
+DONE: dropped the tool. Orientation = ~occur~ (read-only); moving point for a
+follow-up edit = ~run_program~ (goto-char / re-search-forward). The lisp search
+functions are unaffected.
+
+
+* DONE Trim or demote the manual checkpoint trio [#C]
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX/MCP command-surface review — prune the middle, grow power via params
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:ARCHIVE_ITAGS: mcp
+:END:
+~checkpoint~ / ~list_checkpoints~ / ~restore_checkpoint~ are three tools for a
+deliberate-restore-point workflow agents rarely use; automatic ~undo_last~
+(every mutation, ring of 8) covers most "oops". Either fold them into one
+~checkpoint {action: save|list|restore}~, or keep them but explicitly position
+them as advanced with ~undo_last~ as the default net. Net: ~−2 tools of context.
+
+DONE: dropped ~list_checkpoints~; its labels now ride in ~session_status~
+(new ~Workspace::checkpoint_labels~). ~checkpoint~/~restore_checkpoint~ kept but
+repositioned as advanced (descriptions point at ~undo_last~ + ~session_status~).
+Not merged into one ~{action}~ tool — that would force one annotation across
+save (append) + restore (destructive), mis-gating like the run_program case.
+
+
+* DONE MCP command-surface review — prune the middle, grow power via params :mcp:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-06-24 Mi]
+- State "TODO"       from              [2026-06-24 Mi]
+:END:
+
+Outcome (2026-06-24, branch ~mcp-surface-review~): all five items below done;
+surface 29 → 27 tools, no new ones. Cross-file ~grep~ (the "too little") stays
+its own TODO.
+
+Verdict (analysis 2026-06-24): the 29-tool surface is coherent at the macro
+level — two domains (a buffer you edit; a repo you rewrite) bridged by a shared
+conflict surface (~conflicts~ + the ~conflict-*~ lisp verbs serve both a merge
+file and a rebase stop; the planned rebase ~edit~/~break~ action deepens the
+bridge). The new ~instructions~ index + annotations offset the raw count. The
+fat is in Sessions/Editing; the confusion is a few specific seams. Guiding
+principle — already shown by the two ~git_rebase~ items above: GROW POWER VIA
+PARAMETERS, not new tools; trim the marginal verbs rather than let the count
+creep past ~30. Already tracked elsewhere: the cross-file ~grep~ gap (the main
+"too little") and the ~save_buffer {to:}~ addressing footgun.
+
+
+* DONE Sequencer internals cleanup (post-review tidy)                   :git:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-02 Do 16:09]
+:END:
+
+Non-blocking code-quality items from the 2026-06-29 pre-PR review of the
+edit / message_edits / split work — no correctness impact:
+- The =if step.action == Action::Split { land_split } else { land_step }=
+  dispatch is duplicated verbatim in =drive= and =continue_op=; fold into one
+  =land()= helper so a future special-landing action (or a land_* signature
+  change) is edited once, not in two places that can drift.
+- =changed_paths= extracts diff paths via =diff.foreach= (four closure args)
+  while =show= already does the same =new_file()/old_file()= pick over the
+  simpler =diff.deltas()= iterator — share one helper.
+- =split_assignment= does =touched.iter().any(...)= per assigned path (O(n*m))
+  though =touched= is sorted+deduped and =assigned= is already a HashSet; use a
+  =HashSet= (or =binary_search=) for symmetric O(1) membership.
+- =split_commits= re-runs =changed_paths= + =split_assignment= that =begin=
+  already validated, and calls =repo.find_commit(current)= twice per part
+  (prev_tree + parent) — fetch the commit once and reuse.
+- =message_edits= / =split_into= are parsed in three hand-rolled forms with
+  divergent keys: =plan_arg= reads {find, replace, append} / {message, paths,
+  into}; =save_state= writes {find, with} / {…, rest}; =load_state= reads them
+  back. The persisted-vs-input key mismatch (=replace= vs =with=, absent-paths
+  vs =rest=) is easy to break silently — unify, ideally via serde derives on
+  the structs.
+
+DONE (2026-07): all five items addressed. land() helper folds the dispatch;
+changed_paths/show share delta_path; split_assignment uses a HashSet;
+split_commits fetches the current commit once. The message-edit persist keys now
+match the MCP input ({find, replace, append}, was {find, with}) — a state
+round-trip test guards the drift the review flagged. Went with matching keys
+rather than a full serde-derive migration: rewriting working, tested persistence
+for a cosmetic gain wasn't worth the risk, and the round-trip test covers it.
+
+
+* DONE Inspect the need for a git-blame-shaped "which commit owns this?" read :git:dogfooding:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-02 Do 16:14]
+:END:
+
+The edit / squash / fixup / split work all assume the agent ALREADY knows
+which commit to target. But the common real task is the reverse: the agent has
+an uncommitted change (a hunk in the worktree, or lines it just edited) and
+needs to find the commit it logically belongs to — to fold it in via an =edit=
+amend, a =fixup=, or a =move= into the right commit. Without a blame-shaped
+read it falls back to shelling out to =git blame= / =git log -L=.
+
+Investigate (NOT yet committed to building): a read-only =git_blame {repo, path,
+lines?}=-style tool reporting, per line (or per worktree-hunk), the last commit
+that touched it — oid + summary, ideally scoped to the current op's range so the
+answer is "which of MY commits owns this", not "any commit in history". Output
+should compose into the other git tools: the reported oid feeds =git_rebase=
+plan {commit, action: fixup|edit} or a =move= directive directly, so
+find-the-commit → fold-in is one vocabulary.
+
+Open questions to settle first: (1) is per-line blame the right granularity, or
+blame-the-hunk (map a worktree diff hunk → the commit that last touched those
+lines)? (2) confine to onto..HEAD by default? (3) does git2 expose
+=Repository::blame_file= with the options we need, and is it fast enough on big
+files (it re-walks history)? (4) is this even needed once =edit= lands, or do
+agents naturally drive it via git_log + git_show? Measure on real sessions
+before building.
+
+DONE (2026-07): shipped a read-only ~git_blame~ MCP tool — ~git_blame {repo, path,
+lines?}~. Per-line "which commit last touched this", collapsed into contiguous
+same-commit hunks (oid + summary); optional ~[start, end]~ line window; accepts an
+absolute path (what grep/occur return) or a workdir-relative one. Built on git2's
+~blame_file~ — the find-the-commit half that feeds a ~git_rebase~ plan {commit,
+action: fixup|edit}. Landed with a sequencer test + doc/help/schema wiring.
+
+Remaining: (1) history-scope — confine the blame to ~onto..HEAD~ by default so the
+answer is "which of MY commits owns this", not any commit in history
+(~BlameOptions~ newest/oldest); (2) blame-the-hunk — map a worktree diff hunk (not
+just a line span) to the commit that last touched those lines, so an uncommitted
+change routes straight into a ~fixup~/~move~.
+
+DONE (2026-07): the two remaining enhancements shipped.
+- ~since~ param scopes blame to ~since..~ (oldest_commit boundary) — "which of MY
+  commits owns this line".
+- ~worktree: true~ maps each UNCOMMITTED hunk to the commit that last set the lines
+  it touches (git-absorb-style target discovery); each oid feeds git_fixup/git_move.
+This closes the find-the-commit -> fold-in vocabulary end to end.
+
+
+* DONE git_rebase: split a commit + move changes between commits :git:dogfooding:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-02 Do 15:47]
+:END:
+
+The plan reorders / squashes / drops WHOLE commits, and the planned =edit=
+action (above) amends one commit's tree in place — but nothing REPARTITIONS
+what is already committed:
+- split one commit into two or more along path or hunk boundaries (e.g. code
+  in one commit, docs/notes in another);
+- move a file or hunk OUT of one commit and INTO an adjacent one.
+(Reordering whole commits is already covered by plan order.)
+
+Without these, an agent asked to "put these changes in a different commit"
+must abandon the in-process sequencer and hand-drive =git reset --soft= +
+selective =git add= + recommit — error-prone (easy to mis-stage and silently
+change the resulting tree) and exactly the transactional, rehearsable job mime
+is built for.
+
+Shape: extend the plan with a =split= action ({commit, into: [{message, paths
+| hunks}, …]}) and/or a =move= directive ({from, to, paths | hunks}), reusing
+the path / hunk selection the engine already has (treesit nodes, occur / grep
+hunks). Offer a =rehearse= of the resulting history — the tree-diff of each new
+commit — so a mis-partition is caught before it is written, not after.
+
+DONE so far (branch =sequencer-tree-edits=): PATH-based =split=. The =split= action
+takes =into = [{message, paths}]=; it partitions a commit's changes by file path
+into N commits (one part may omit =paths= as the catch-all), pre-validated in
+=begin= against the commit's own diff so a bad partition fails before mutation, and
+=rehearse=-able. Trees are built in-memory, never touching the worktree.
+Remaining: HUNK-level split (partial-hunk application, =git add -p=-grade) and the
+=move= directive (relocate changes between existing adjacent commits).
+
+DONE (2026-07): both halves shipped.
+- HUNK-level split: a split part now takes ~hunks = [{path, lines:[a,b]}]~ (new-side
+  spans, the numbers grep/blame return) alongside/instead of ~paths~; splits that
+  name hunks route through an ~apply_to_tree~ builder that reassembles the exact
+  original tree in the final part. Path-only splits keep the old blob-copy builder.
+- MOVE: new ~git_move {from, to, paths?, hunks?}~ relocates a change between two
+  ADJACENT commits (must be in ~from~, not ~to~) and replays the tail via the
+  sequencer. Invariant: the branch's final tree is unchanged — only the split point
+  moves. Both validated at begin time, before mutation; tests + docs + help + schema.
+
+
+* DONE git_rebase: let `reword`/`squash` take a message edit, not the whole message :git:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-06-29 Mo 12:09]
+- State "TODO"       from              [2026-06-24 Mi 18:59]
+:END:
+
+=reword= / =squash= currently require the entire replacement message as one
+string. For a small change (strip a trailing trailer line, fix one paragraph)
+the agent must reproduce the whole multi-line message verbatim — verbose and
+error-prone.
+
+Accept a message /edit/ instead: e.g. =edits: [{pattern, replacement}]= applied
+to the existing message, or directives like delete-trailer / append-line. Should
+compose with any sign-off / trailer validation.
+
+DONE (branch =sequencer-tree-edits=): a reword/squash/fixup/edit step can carry
+=message_edits= — an ordered list applied to the action's default message, each
+either ={find, replace?}= (replace the first literal occurrence; omit replace to
+delete; errors if =find= is absent) or ={append}= (add a trailing line). Preserves
+the rest of the message, so the =Signed-off-by= a full reword would drop survives.
+Reword/edit finds are pre-validated in =begin= before any mutation.
+
+
+* DONE git_rebase: add an `edit`/`break` step action                    :git:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-06-29 Mo 12:09]
+- State "TODO"       from              [2026-06-24 Mi 18:59]
+:END:
+
+The rebase plan supports only pick/reword/squash/fixup/drop. Add an =edit= (or
+=break=) action that pauses the rebase with the target commit checked out, lets
+the agent run the normal editing tools (=replace_text= / =run_program=) and the
+existing conflict tools against the worktree, then resumes via =git_continue=.
+
+Without it, an agent that needs to amend a commit's tree mid-rebase has to
+abandon the in-process sequencer and drive =git rebase -i= + manual continue via
+the shell — defeating the point of owning the rebase in-process. Pairs naturally
+with the conflict surface already present.
+
+DONE (branch =sequencer-tree-edits=): implemented =edit=. The step applies its
+commit then PAUSES with it checked out; =git_continue= folds the worktree changes
+into it (an amend), =git_skip= discards the pending edits and resumes, =git_abort=
+bails. A conflicted edit step resolves through the existing conflict tools first,
+then pauses. Standalone =break= (a no-commit pause) was intentionally OMITTED: an
+agent can inspect via =git_status= / =git_show=, and it would force =Step.commit=
+to become optional for marginal value.
+
+
+* DONE Rebase / cherry-pick driver                                      :git:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-02 Do 15:21]
+- State "TODO"       from              [2026-06-18 Do 09:27]
+:END:
+
+Agent-driven rebase / cherry-pick belongs here, not as a separate MCP
+server: the agent-hostile 80% is conflict resolution during replay, which
+mime already owns (~conflicts~, ~conflict-resolve-trivial~, ~conflict-keep~,
+~conflict-replace~, ~conflict-context~ — conflict.rs + builtins.rs
+1742–1965). A clean rebase needs no editing tool; a conflicted one needs
+exactly this surface.
+
+CLOSED (2026-07): the last non-blocking follow-up — ~git_show~ full unified diff —
+is now implemented, so the driver is complete end to end. Remaining note is the
+~gix~ migration, which stays a FUTURE consideration (blocked on gix's
+conflict-marker merge going production-grade); not tracked as active work.
+
+** Approach (decided 2026-06-24): in-process git sequencer on a Rust git library — do NOT shell out to ~git~
+
+Three approaches were weighed:
+
+1. Shell out to ~git rebase -i~ with editor shims (~GIT_SEQUENCE_EDITOR~ /
+   ~GIT_EDITOR~ → a ~mime~ sub-process that hosts the todo/message file and
+   blocks until the agent resumes). REJECTED. (a) The MCP server is
+   stdio-only and holds sessions in-process (~HashMap<String, Workspace>~,
+   mcp.rs:76); a separately-spawned shim CANNOT see the agent's warm
+   sessions, so the rendezvous degrades to an on-disk scratch file + sentinel
+   handshake. (b) Shelling out re-opens every side-channel that makes ~git~
+   unsafe for a sandboxed agent — hooks, ~--exec~, gitattributes
+   clean/smudge filters, ~core.fsmonitor~, ~ext::~/ssh transports — i.e.
+   arbitrary code execution + network. (c) Breaks the "no process spawn"
+   invariant (safety.rs:1-10).
+
+2. MCP server spawns the ~git~ binary directly. REJECTED for (b)+(c) above:
+   ~git rebase --exec~ and hooks run arbitrary code, so a sandboxed agent
+   able to invoke ~git~ has a full sandbox escape.
+
+3. *In-process git "sequencer" on a Rust git library (CHOSEN).* Drive
+   rebase / cherry-pick / revert as a sequence of pick → 3-way-merge →
+   commit steps that mime owns end to end. This dissolves the ~$EDITOR~
+   problem: history manipulation (reorder / squash / reword / drop) is DATA
+   the agent passes or edits, never an editor invocation. The only hard
+   primitive is a 3-way merge that writes conflict markers into the worktree
+   — which routes straight into the existing conflict tools.
+
+Why a library, not the ~git~ binary:
+- No process spawn → mime's "no shell, no process spawn, no network"
+  invariant (safety.rs:1-10) is PRESERVED. Git becomes in-process Rust calls,
+  like the existing file ops.
+- No shell-out side-channels. ~git~ is dangerous in a sandbox not for its
+  data ops but for hooks / ~--exec~ / clean+smudge filters / fsmonitor /
+  pager / editor / ~ext::~ transports. A library has none of these unless we
+  wire them — "git minus code-execution" is the DEFAULT, not something we
+  fight the binary to suppress.
+- Network blocked by OMISSION, not by filtering flags. fetch / push / clone /
+  remote are a SEPARATE API surface; the sequencer never calls or exposes
+  them. Defense in depth: reject any op needing a remote; never register
+  remote/transport tools. (This is the clean form of "block push/pull/remote"
+  — clean because it's a different code path, not a flag on one omnipotent
+  binary.)
+
+Security checklist — block the non-network arbitrary-code channels too (they
+are subtler than the network ones):
+- Hooks: never run ~.git/hooks~. (libgit2 does not run hooks itself; if
+  hand-rolled, never invoke them. Bonus: deterministic, no surprise side
+  effects.)
+- ~--exec~ / arbitrary step commands: do not implement.
+- gitattributes process filters (clean/smudge): never register process-filter
+  callbacks; built-in ident/crlf are fine.
+- ~core.fsmonitor~ / ~core.sshCommand~ / ~core.pager~ / ~core.editor~ /
+  aliases / ~http.*~ / ~url.*.insteadOf~: moot once remote/exec/editor paths
+  are unexposed, but audit that the chosen lib honors no repo-local config
+  key that shells out.
+- Confine to repos under MIME_ROOTS: ~safety::check_path~ the repo path,
+  refuse repos outside the allowlist (mirrors open_file, mcp.rs:551).
+
+Library: ~git2~ (libgit2 bindings) — DECIDED 2026-06-24. It has complete,
+mature merge / cherry-pick / checkout-with-conflict-style TODAY, so the
+DISCRIMINATING capability (3-way merge → diff3 markers in the worktree) is
+proven, not in-flight — exactly the risk gix carried. Pure-Rust ~gix~ was
+considered and DEFERRED: ~gix-merge~ (its conflict-marker merge) is the newer,
+less-proven piece; revisit a migration once it is production-grade (the
+sequencer's library surface is small, so a later swap is contained).
+- C dependency: build libgit2 from source via the ~git2~ ~vendored~ feature
+  (no system libgit2 needed; adds a ~cc~ toolchain + build time — fine, the
+  VM can install build tools).
+- KEY API NUANCE: do NOT use libgit2's high-level ~Repository::rebase~ — it
+  replays the commits between upstream and branch as plain picks and does NOT
+  express reorder / squash / reword / drop. HAND-ROLL the sequencer over the
+  low-level primitives: ~cherrypick_commit~ / ~merge_commits~ → in-memory
+  ~Index~; ~checkout_index~ with ~CheckoutBuilder::conflict_style_diff3~ to
+  write markers to the worktree; ~index.write_tree~ + ~Repository::commit~ to
+  land each step; ref update to move the branch; ~reset(.., Hard)~ to the
+  pre-op snapshot for ~git_abort~. (Verify exact signatures against the
+  installed ~git2~ version — they drift; knowledge cutoff 2026-01.)
+- Hooks: libgit2 does not run ~.git/hooks~ — nothing to suppress, but never
+  add hook execution. Do not register custom (process) filters; built-in
+  crlf/ident are harmless.
+- Smoke-test (DONE 2026-06-24, sequencer.rs): ~cherrypick_commit~ of two
+  conflicting commits + ~checkout_index~ diff3 → conflict.rs's scanner parses
+  the markers, base section and all (it understands ours/theirs/base + flags
+  strays, builtins.rs:1773-1778). git2 ~vendored-libgit2~ builds with just
+  ~cc~ (no cmake) in the VM.
+
+** The sequencer
+
+mime implements git's "sequencer" — replay a list of pick/commit steps with
+conflict stops — unified across rebase, cherry-pick, and revert (git unifies
+these too: .git/sequencer + CHERRY_PICK_HEAD / REBASE_HEAD).
+
+State lives in ~.git~ (re-entrant + crash-safe, mirrors git), NOT only in the
+warm session: each tool call re-opens the repo and reads the in-progress
+operation from our own ~.git/mime-sequencer~ state file (the plan is
+hand-rolled over git2's cherrypick primitives — see Approach — so libgit2's
+own rebase state is unused). So ~rebase~ → ~continue~ → ~continue~ survives a
+server restart and never desyncs.
+
+Step loop, per planned commit:
+1. 3-way merge (cherry-pick) the commit onto current HEAD;
+2. clean → create the commit (planned message for reword/squash), advance,
+   recurse;
+3. conflicted → write markers to the worktree, RELOAD any warm buffer whose
+   file changed (mime is the worktree authority — it knows exactly which
+   files moved; reuse ~Quire::rebase_to~, quire.rs:852 / revert), then STOP,
+   returning a conflict state.
+
+** Agent-facing MCP tools (new ~git_*~ group)
+
+History ops (start an operation; each may return a conflict stop):
+- ~git_rebase~ {repo, upstream | onto, plan?} — plan = list of {commit,
+  action: pick|reword|squash|fixup|drop, message?}; list order = new order.
+  Omit plan → pick-all in order. No ~$EDITOR~, no todo buffer; the plan is
+  data. (Optional sugar: expose the plan as an editable buffer for users who
+  prefer to hand-edit it — not required.)
+- ~git_cherry_pick~ {repo, commits, onto?}
+- ~git_revert~ {repo, commits}
+
+Sequencer control (polymorphic over the in-progress op, like git's
+sequencer — not per-op):
+- ~git_continue~ {repo} — after the agent resolves conflicts with the
+  existing conflict tools and saves, commit the resolved tree and advance;
+  returns next state (another conflict stop, or done). Pre-check: refuse if
+  ~conflict-count~ > 0 — a free safety net.
+- ~git_skip~ {repo} — drop the current step, advance.
+- ~git_abort~ {repo} — restore HEAD/refs/worktree to the pre-op snapshot.
+- ~git_status~ {repo} — {operation, current_step, done/remaining steps,
+  conflicted_files, head}. The poll/inspect call.
+
+Read/inspect (safe; for building a plan):
+- ~git_log~ {repo, range?} — commits (hash, subject, author).
+- ~git_show~ {repo, commit} — metadata + diff.
+
+Conflict resolution adds NO new surface — the agent uses the existing
+~conflicts~ / ~conflict-context~ / ~conflict-keep~ / ~conflict-replace~ /
+~conflict-resolve-trivial~ tools on the conflicted worktree files, saves,
+then calls ~git_continue~. Naming: ~git_*~ prefix groups them; verbs mirror
+git so the agent's git mental model transfers.
+
+** Safety (decided 2026-06-24: always-on + recovery ref)
+
+History rewriting is higher-CONSEQUENCE than text editing (a bad reset/rebase
+can orphan committed work, otherwise recoverable only via the reflog), but it
+adds no new AMBIENT AUTHORITY: same MIME_ROOTS confinement (~check_path~ on the
+repo path), no shell/network/hooks/exec. We were initially going to gate it
+behind an opt-in env (~MIME_ENABLE_GIT~, default OFF); decided instead — sole
+users — to make it ALWAYS-ON and meet the blast-radius concern with a
+first-class safety net: each destructive op stamps ~refs/mime-backup/<branch>~
+at the pre-op tip BEFORE touching anything, so the original state is always one
+~git reset --hard~ away (not reflog archaeology). Revisit a gate / safer default
+(and/or a read-only vs mutating split) if mime grows non-trusting users.
+
+** Interim (works today, zero mime changes)
+
+The agent can already drive ~git rebase~ via Bash and open the conflicted
+files in mime to resolve them — that is the stop-gap. The sequencer is the
+productized, deterministic, ~$EDITOR~-free version that makes mime the single
+worktree authority.
+
+** Progress (branch ~rebase-sequencer~)
+
+- [X] git2 ~vendored-libgit2~ added (builds with ~cc~ alone, no cmake).
+- [X] Smoke test: cherrypick conflict → diff3 worktree markers → conflict.rs
+  parses them (~src/sequencer.rs~).
+- [X] Sequencer core in ~sequencer.rs~ (~Plan~ / ~Step~ / ~Action~, the
+  ~start~ / ~continue_op~ / ~abort~ / ~status~ surface). Step loop:
+  ~Repository::cherrypick~ onto a detached, moving HEAD with a diff3 checkout →
+  clean: commit & advance / conflicted: stop with markers in the worktree.
+  State persisted to ~.git/mime-sequencer.json~ (re-entrant); ~abort~ =
+  ~reset --hard~ to the pre-op snapshot; branch ref only moves at ~finish~.
+  Pick / reword / drop + conflict→continue + abort covered by unit tests.
+- [X] Squash / fixup (~land_step~): re-parent on ~current~'s parent + meld the
+  message (squash concatenates, fixup keeps the first); a leading squash/fixup
+  is rejected. Cherry-pick (~onto~ = HEAD) and revert (inverse, ~Mode::Revert~)
+  share the loop. ~git_skip~ drops the stopped step.
+- [X] Worktree authority: handled by mime's EXISTING auto-revert — clean
+  drifted buffers re-read on next session use (~auto_revert_if_clean~,
+  engine.rs:620, called on the run path mcp.rs:435), modified buffers are
+  save-guarded. No proactive reload hook needed, matching the paged-reader
+  decision; the sequencer stays a free function over a ~git2::Repository~.
+- [X] ~git_*~ MCP tools (always-on): ~git_rebase~ (with a ~rehearse~ dry-run) /
+  ~git_cherry_pick~ / ~git_revert~ / ~git_continue~ / ~git_skip~ / ~git_abort~ /
+  ~git_status~ / ~git_log~ / ~git_show~; repo path ~check_path~-confined. git2
+  stays entirely in ~sequencer.rs~ via path-facing ~cmd_*~ wrappers. Each
+  destructive op stamps ~refs/mime-backup/<branch>~ first (recovery ref).
+  Verified end-to-end through the real MCP JSON-RPC server, and the restructure
+  of this branch's own history was driven by ~git_rebase~ (dogfood).
+
+DONE — the sequencer is feature-complete and tested. Optional follow-ups, not
+blocking:
+- ~git_show~ shows changed-file status only; full unified diff could be added.
+- Migrate to pure-Rust ~gix~ once its conflict-marker merge is production-grade
+  (the ~cmd_*~/typed API is the small surface to swap).
+
+/Exit: ~git_rebase~ with a squash+reword plan over a 3-commit range, one
+conflicted step resolved via the existing conflict tools + ~git_continue~,
+yields the same tree as ~git~; ~git_abort~ mid-conflict restores the pre-op
+state exactly; no network/exec/hook code path is reachable from any ~git_*~
+tool./
+
+
+* DONE conflict-replace eats the trailing newline                :dogfooding:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-03 Fr 11:30]
+- State "TODO"       from              [2026-06-11 Do 23:45]
+:END:
+
+Twice in the same session ~(conflict-replace TEXT N)~ joined the
+replacement onto the line following the conflict block
+(~mod a;mod b;~) because TEXT lacked a trailing newline.
+Replacing a conflict hunk is line-oriented; ensure a final newline on
+the replacement (or take lines, not raw text).
+
+DONE (2026-07): conflict_splice now newline-terminates a non-empty replacement
+that lacks one (the hunk region ends past the trailing newline, so raw text fused
+onto the next line). Skipped for a removal (empty) or the buffer's final
+newline-less line. Fix is in the shared splice, so every conflict resolver is
+covered; regression test for fuse / no-double / EOF cases.
+
+
+* DONE Pattern translation misses: escaped metachars and alternation :dogfooding:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-06-29 Mo 11:07]
+- State "TODO"       from              [2026-06-11 Do 23:45]
+:END:
+
+DONE (2026-06, commit ~4d16fd8~): ~src/regex_dialect.rs~ is an Emacs→RE2
+syntax translator at the ~cached_regex~ compile chokepoint — it maps ~\|~
+alternation, ~\(...\)~ groups, ~\{n,m\}~, ~\(?:...\)~ shy groups and the
+~\`~ / ~\'~ anchors, treats bare ~( | {~ as literals, and errors clearly on
+constructs RE2 can't express (backreferences, ~\=~, ~\_<~ / ~\_>~, ~\s~ / ~\S~
+classes). ~regexp-quote~ / occur's literal-quoting now emit Emacs-style
+escaping so quoted text isn't re-read as group syntax. The original "no
+match" on ~\|~ alternation + escaped metachars is fixed; the supported
+dialect is documented in help{regex}.
+
+Original report follows.
+
+From an agent session (2026-06-11) driving git-conflict resolution
+and TOML/Rust edits via MCP: ~replace_text~ patterns
+with RE2-style escapes (~\[features\]~) and ~occur~ with ~|~
+alternation returned "no match" where the literal text (and ~search~
+exact mode) matched fine — occur even echoed the translated emacs
+regex ~features\|dependencies~ yet found nothing. Agents fall back to
+literal patterns, losing regex entirely. Reproduce, fix the RE2→emacs
+translation (or document the supported dialect precisely), and add
+round-trip tests for escaped metachars + alternation.
+
+
+* DONE save_buffer {to:} rebinds the visited file — a footgun for path-keyed sessions [#B] :dogfooding:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+DONE (2026-06-24, branch ~mcp-surface-review~): implemented exactly the fix
+below — ~to:~ to a different file is a pure copy-out (~Workspace::write_copy_to~,
+no rebind, visited file + baseline untouched); same-path ~to:~ stays an in-place
+save. See the surface-review item that subsumed this.
+
+
+Hit during the 2026-06-11 switchyard session. Recovery sequence after a
+bad save: ~save_buffer {path: X, to: TMP}~ to park the good buffer, then
+~mv TMP X~ — but the save-as had REBOUND the session's visited file to
+TMP, so the next ~save: true~ on the same session hit TMP's stale-guard
+("deleted on disk") instead of writing X, and the fix was a second
+save-as back onto X itself.
+
+Emacs' ~write-file~ does rebind, but mime's sessions are KEYED by
+canonical path — a session opened as X that silently starts visiting TMP
+breaks the addressing contract (the warm session is still listed under
+X, yet saves target TMP). For an agent, save-as is almost always "export
+a copy", not "move my session".
+
+Fix: make ~to:~ a pure copy-out (write the bytes, leave the visited file
+and stale-guard baseline untouched). If a true rename-the-session
+operation is ever wanted, make it explicit (~rebind: true~ or a separate
+tool). Also worth a line in ~help {topic: "sessions"}~ either way.
+
+
+* DONE Cross-file search: a grep tool (or occur over files/glob) [#B] :dogfooding:
+:PROPERTIES:
+:ARCHIVE_TIME: 2026-07-14 Di 15:36
+:ARCHIVE_FILE: /vagrant/mime-rs/todo.org
+:ARCHIVE_OLPATH: MCP / agent UX
+:ARCHIVE_CATEGORY: todo
+:ARCHIVE_TODO: DONE
+:END:
+DONE (2026-06, commits ~a3379ef~ + ~85ddf0e~ hardening): a read-only ~grep
+{pattern, files | glob, mode, nlines}~ tool landed with occur's output shape,
+per-file headers and a hit cap, sandbox-confined to ~$MIME_ROOTS~; its file
+list feeds ~replace_text {files: …}~ as planned.
+
+The biggest reason the agent still shells out to =grep -rn= / =sed -n=
+mid-edit: =occur= is per-buffer, so "which files mention X" and "show
+me that region in three files" have no MCP answer — every multi-file
+question drops to Bash, then comes BACK to mime for the edit. The
+sandbox already confines paths to =$MIME_ROOTS=, so a read-only
+=grep {pattern, files | glob, mode, nlines}= tool (occur's output
+shape, one header per file, hit cap) fits the tier. Bonus: its file
+list feeds =replace_text {files: …}= directly — search and cross-file
+edit would share one vocabulary. A =read_region {path, start_line,
+end_line}= alias for "lines 120–140 of X" already exists; the gap is
+purely the multi-file fan-out.
+
