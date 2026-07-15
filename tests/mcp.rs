@@ -463,6 +463,110 @@ fn replace_text_is_literal_counted_and_quote_safe() {
     );
 }
 
+#[test]
+fn replace_text_regex_mode_expands_backrefs() {
+    let mut s = Server::spawn();
+    s.call_ok(
+        1,
+        "open_text",
+        json!({ "text": "Doe, John\nRoe, Jane\nplain line\n" }),
+    );
+
+    // mode:"regex" + all: the one-call form of the re-search-forward /
+    // replace-match loop, \1 backrefs and all.
+    let out = s.call_ok(
+        2,
+        "replace_text",
+        json!({
+            "pattern": "\\([A-Za-z]+\\), \\([A-Za-z]+\\)",
+            "replacement": "\\2 \\1",
+            "mode": "regex",
+            "all": true
+        }),
+    );
+    assert!(out.contains("replaced 2 occurrence(s)"), "got: {out}");
+    let text = s.call_ok(3, "read_region", json!({ "start": 1, "end": 31 }));
+    assert_eq!(text, "John Doe\nJane Roe\nplain line\n");
+
+    // Single regex replace reports the remaining matches.
+    s.call_ok(
+        4,
+        "open_text",
+        json!({ "text": "x1 x2 x3\n", "session": "q" }),
+    );
+    let out = s.call_ok(
+        5,
+        "replace_text",
+        json!({ "pattern": "x[0-9]", "replacement": "y\\&", "mode": "regex", "session": "q" }),
+    );
+    assert!(out.contains("replaced 1 occurrence"), "got: {out}");
+    assert!(out.contains("2 more match(es) remain"), "got: {out}");
+    let text = s.call_ok(
+        6,
+        "read_region",
+        json!({ "start": 1, "end": 10, "session": "q" }),
+    );
+    assert_eq!(text, "yx1 x2 x3");
+
+    // expect_unique keeps its semantics per pattern: an ambiguous regex is
+    // an error listing the match lines, and nothing is replaced.
+    let err = s.call_err(
+        7,
+        "replace_text",
+        json!({
+            "pattern": "x[0-9]",
+            "replacement": "z",
+            "mode": "regex",
+            "expect_unique": true,
+            "session": "q"
+        }),
+    );
+    assert!(err.contains("expect_unique"), "got: {err}");
+    let text = s.call_ok(
+        8,
+        "read_region",
+        json!({ "start": 1, "end": 10, "session": "q" }),
+    );
+    assert_eq!(text, "yx1 x2 x3", "ambiguity replaced nothing");
+
+    // A regex miss errors like the literal one.
+    let err = s.call_err(
+        9,
+        "replace_text",
+        json!({ "pattern": "q[0-9]+", "replacement": "z", "mode": "regex", "session": "q" }),
+    );
+    assert!(err.contains("no match"), "got: {err}");
+
+    // In edits[] batches a top-level mode is the default per entry.
+    let out = s.call_ok(
+        10,
+        "replace_text",
+        json!({
+            "mode": "regex",
+            "edits": [
+                { "pattern": "y\\(x1\\)", "replacement": "\\1" },
+                { "pattern": "x3", "replacement": "done", "mode": "exact" },
+            ],
+            "session": "q"
+        }),
+    );
+    assert!(out.contains("applied 2 edit(s)"), "got: {out}");
+    let text = s.call_ok(
+        11,
+        "read_region",
+        json!({ "start": 1, "end": 9, "session": "q" }),
+    );
+    assert_eq!(text, "x1 x2 do");
+
+    // An unknown mode is a loud error.
+    let err = s.call_err(
+        12,
+        "replace_text",
+        json!({ "pattern": "a", "replacement": "b", "mode": "fuzzy", "session": "q" }),
+    );
+    assert!(err.contains("mode"), "got: {err}");
+}
+
 /// Every literal-taking tool escapes user strings into generated tulisp on
 /// the server (lisp_literal; occur adds regexp-quote / regex_dialect::quote
 /// underneath); one missed path is a silent wrong edit or a false miss.

@@ -73,14 +73,15 @@ Insert literal text at point (or at `pos`). Pass the text as a plain string — 
 
 ## replace_text
 
-Replace the FIRST occurrence of a literal pattern with literal replacement text (searching from the top of the accessible region); pass all:true to replace every occurrence. Both strings are plain — no Lisp escaping, no regex, no backref expansion (insert_text's counterpart; the fix for quote-heavy edits). Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Edits the warm buffer; call save_buffer to persist. For regex or position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.
+Replace the FIRST occurrence of a pattern (searching from the top of the accessible region); pass all:true to replace every occurrence. By default both strings are plain literals — no Lisp escaping, no regex (insert_text's counterpart; the fix for quote-heavy edits). mode:"regex" switches the pattern to the Emacs regex dialect (as occur/grep) with \1..\9 and \& backrefs expanding in the replacement — the one-call form of the goto-char/while/re-search-forward/replace-match loop. Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Edits the warm buffer; call save_buffer to persist. For position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.
 
 - `all` — Replace every occurrence (default false: first only).
-- `edits` — Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?}, …] applied in order inside ONE transaction — all-or-nothing; a miss (or a failed uniqueness check) rolls everything back and names the failed edit.
+- `edits` — Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?, mode?}, …] applied in order inside ONE transaction — all-or-nothing; a miss (or a failed uniqueness check) rolls everything back and names the failed edit.
 - `expect_unique` — Require the pattern to match exactly once: more than one match is an error (listing the match lines) and nothing is replaced. RECOMMENDED whenever the anchor text could plausibly repeat — first-match semantics would silently edit the wrong site. Default false.
+- `mode` — exact (default): literal search and replacement. regex: Emacs-dialect pattern with backref expansion in the replacement. With `edits`, acts as the default for entries that don't set their own.
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
-- `pattern` — The exact text to find (literal, not regex).
-- `replacement` — The literal replacement text.
+- `pattern` — The text to find — literal by default; the Emacs regex dialect with mode:"regex".
+- `replacement` — The replacement text — literal by default; with mode:"regex", \1..\9 insert the numbered capture group and \& the whole match.
 - `save` — After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.
 - `scope` — Restrict this call to one part of the buffer without writing a program. {"defun": "name"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.
 - `session` — Warm session id; defaults to "default" when omitted.
@@ -88,14 +89,15 @@ Replace the FIRST occurrence of a literal pattern with literal replacement text 
 
 ## replace_in_files
 
-Apply the SAME literal edit spec to EVERY listed file in one call — the cross-file rename. Give pattern/replacement (with all/expect_unique), or `edits` for a transactional batch per file; the absolute paths grep prints feed `files` directly. Atomic ACROSS the set: a failure in any file (a miss, a failed uniqueness check) rolls the already-edited ones back and the error names the file — every listed path must contain the pattern, so list exactly the files you grepped. Edits land in the warm buffers; with save:true the files are saved only after every file's edit succeeded. For a single file use replace_text.
+Apply the SAME edit spec to EVERY listed file in one call — the cross-file rename. Give pattern/replacement (with all/expect_unique, and mode:"regex" for the Emacs dialect with backrefs), or `edits` for a transactional batch per file; the absolute paths grep prints feed `files` directly. Atomic ACROSS the set: a failure in any file (a miss, a failed uniqueness check) rolls the already-edited ones back and the error names the file — every listed path must contain the pattern, so list exactly the files you grepped. Edits land in the warm buffers; with save:true the files are saved only after every file's edit succeeded. For a single file use replace_text.
 
 - `all` — Replace every occurrence per file (default false: first only).
-- `edits` — Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?}, …] applied in order inside ONE transaction per file — all-or-nothing across the whole call.
+- `edits` — Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?, mode?}, …] applied in order inside ONE transaction per file — all-or-nothing across the whole call.
 - `expect_unique` — Require the pattern to match exactly once per file — more is an error and nothing is applied anywhere. Default false.
 - `files` (required) — The files to edit — each must match the edit spec.
-- `pattern` — The exact text to find (literal, not regex).
-- `replacement` — The literal replacement text.
+- `mode` — exact (default): literal. regex: Emacs-dialect pattern with backref expansion. With `edits`, acts as the default for entries that don't set their own.
+- `pattern` — The text to find — literal by default; the Emacs regex dialect with mode:"regex".
+- `replacement` — The replacement text — with mode:"regex", \1..\9/\& backrefs expand.
 - `save` — After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.
 - `scope` — Restrict this call to one part of the buffer without writing a program. {"defun": "name"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.
 

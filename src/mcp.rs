@@ -1029,6 +1029,7 @@ fn tool_replace_text(
     if unique && all {
         return Err("expect_unique contradicts all:true (every occurrence is wanted)".to_string());
     }
+    let regex = regex_mode(args, "replace_text")?;
     let (pat, rep) = (lisp_literal(&pattern), lisp_literal(&replacement));
     let all_flag = if all { "t" } else { "nil" };
     // search → delete → insert per hit, tracking the line of the last
@@ -1043,7 +1044,23 @@ fn tool_replace_text(
     // the replacement back) if the pattern still matches afterwards — a
     // repeated anchor means the FIRST hit may not be the intended one, so
     // ambiguity is an error, not a silent edit.
-    let program = if unique {
+    let program = if unique && regex {
+        // Same transaction + ambiguity post-check as the literal form, with
+        // the regex search/replace pair (replace-match expands \\1 backrefs).
+        format!(
+            "(with-transaction (let ((n 0) (line 0))\
+               (goto-char (point-min))\
+               (while (and (= n 0) (re-search-forward \"{pat}\" nil t))\
+                 (replace-match \"{rep}\")\
+                 (setq line (line-number-at-pos (point)))\
+                 (setq n (+ n 1)))\
+               (if (= n 0) (error \"__miss__\"))\
+               (if (re-search-forward \"{pat}\" nil t) (error \"__ambiguous__\"))\
+               (report \"n\" n)\
+               (report \"line\" line)\
+               (report \"point\" (point))))"
+        )
+    } else if unique {
         format!(
             "(with-transaction (let ((n 0) (line 0))\
                (goto-char (point-min))\
@@ -1056,6 +1073,33 @@ fn tool_replace_text(
                (if (search-forward \"{pat}\" nil t) (error \"__ambiguous__\"))\
                (report \"n\" n)\
                (report \"line\" line)\
+               (report \"point\" (point))))"
+        )
+    } else if regex && all {
+        // The bulk pass is the native replace-regexp: one call locates every
+        // match, expands its backrefs, and steps over zero-width matches.
+        format!(
+            "(progn (let ((p0 (point)))\
+               (goto-char (point-min))\
+               (let ((n (replace-regexp \"{pat}\" \"{rep}\")))\
+                 (if (= n 0) (goto-char p0))\
+                 (report \"n\" n)\
+                 (report \"line\" (line-number-at-pos (point)))\
+                 (report \"more\" 0)\
+                 (report \"point\" (point)))))"
+        )
+    } else if regex {
+        format!(
+            "(progn (let ((p0 (point)) (n 0) (line 0))\
+               (goto-char (point-min))\
+               (if (re-search-forward \"{pat}\" nil t)\
+                   (progn (replace-match \"{rep}\")\
+                          (setq line (line-number-at-pos (point)))\
+                          (setq n 1)))\
+               (if (= n 0) (goto-char p0))\
+               (report \"n\" n)\
+               (report \"line\" line)\
+               (report \"more\" (count-matches \"{pat}\"))\
                (report \"point\" (point))))"
         )
     } else {
@@ -1089,7 +1133,7 @@ fn tool_replace_text(
             ));
         }
         Err(e) if unique && e.contains("__ambiguous__") => {
-            let lines = match_lines(sessions, &session, &pat);
+            let lines = match_lines(sessions, &session, &pat, regex);
             return Err(format!(
                 "replace_text: pattern {:?} matches at lines {lines} — expect_unique \
                  requires exactly one; nothing was replaced. Refine the anchor \
@@ -1230,14 +1274,42 @@ fn no_defun_error(sessions: &mut HashMap<String, Workspace>, session: &str, name
     }
 }
 
-/// Line numbers of every occurrence of the (already lisp-escaped) literal
+/// `mode: "exact" | "regex"` — the search dialect switch replace_text shares
+/// with occur/grep. Exact (the default) is a literal search; regex is the
+/// Emacs dialect, with `\\1`..`\\9`/`\\&` backrefs expanding in the
+/// replacement. `what` names the tool (or batch edit) in the error.
+fn regex_mode(args: &Value, what: &str) -> Result<bool, String> {
+    match args.get("mode").and_then(Value::as_str) {
+        None | Some("exact") => Ok(false),
+        Some("regex") => Ok(true),
+        Some(other) => Err(format!(
+            "{what}: unknown mode {other:?} — \"exact\" (default) or \"regex\""
+        )),
+    }
+}
+
+/// Line numbers of every occurrence of the (already lisp-escaped) pattern
 /// `pat`, as "12, 40, 73" clamped to the first eight — the detail an
 /// expect_unique ambiguity error needs to be actionable. Point is preserved.
-fn match_lines(sessions: &mut HashMap<String, Workspace>, session: &str, pat: &str) -> String {
+/// The regex form steps over zero-width matches so the sweep terminates.
+fn match_lines(
+    sessions: &mut HashMap<String, Workspace>,
+    session: &str,
+    pat: &str,
+    regex: bool,
+) -> String {
+    let search = if regex {
+        "re-search-forward"
+    } else {
+        "search-forward"
+    };
     let program = format!(
         "(save-excursion (goto-char (point-min))\
-           (while (search-forward \"{pat}\" nil t)\
-             (report \"line\" (line-number-at-pos (match-beginning 0)))))"
+           (let ((stop nil))\
+             (while (and (not stop) ({search} \"{pat}\" nil t))\
+               (report \"line\" (line-number-at-pos (match-beginning 0)))\
+               (if (= (match-beginning 0) (match-end 0))\
+                   (if (< (point) (point-max)) (forward-char 1) (setq stop t))))))"
     );
     let lines: Vec<String> = run_in_session(sessions, session, &program)
         .map(|r| {
@@ -1270,8 +1342,10 @@ fn replace_text_batch(
         .as_array()
         .filter(|a| !a.is_empty())
         .ok_or_else(|| "\"edits\" must be a non-empty array".to_string())?;
+    // A top-level `mode` is the default for edits that don't name their own.
+    let items = with_default_mode(args, items);
     let scope = scope_prelude(args)?;
-    let total = run_batch_edits(sessions, session, items, &scope)
+    let total = run_batch_edits(sessions, session, &items, &scope)
         .map_err(|e| format!("{e}{}", stale_edit_note(sessions, session)))?;
     let saved = if bool_arg(args, "save") {
         save_visited(sessions, session)?
@@ -1285,6 +1359,25 @@ fn replace_text_batch(
         "applied {} edit(s), {total} replacement(s){saved}{unsaved}{stale}{view}",
         items.len()
     ))
+}
+
+/// Copy `items`, filling in a top-level `mode` (exact|regex) as the default
+/// for entries that don't set their own.
+fn with_default_mode(args: &Value, items: &[Value]) -> Vec<Value> {
+    let default = args.get("mode").cloned();
+    items
+        .iter()
+        .cloned()
+        .map(|mut it| {
+            if let Some(m) = &default
+                && it.is_object()
+                && it.get("mode").is_none()
+            {
+                it["mode"] = m.clone();
+            }
+            it
+        })
+        .collect()
 }
 
 /// Build + run the transactional edit batch against ONE session and return
@@ -1312,6 +1405,7 @@ fn run_batch_edits(
                 i + 1
             ));
         }
+        let regex = regex_mode(item, &format!("edit {}", i + 1))?;
         let (pat, rep) = (lisp_literal(&pattern), lisp_literal(&replacement));
         // The error messages that abort (and roll back) the transaction name
         // the edit; the pattern is echoed clamped.
@@ -1331,22 +1425,45 @@ fn run_batch_edits(
         // replacement), so a later genuine occurrence aborts the whole
         // transaction — evaluated against the buffer as the previous edits
         // left it, like everything else in the batch.
+        let search = if regex {
+            "re-search-forward"
+        } else {
+            "search-forward"
+        };
         let unique_check = if unique {
-            format!("(if (search-forward \"{pat}\" nil t) (error \"{ambiguous}\"))")
+            format!("(if ({search} \"{pat}\" nil t) (error \"{ambiguous}\"))")
         } else {
             String::new()
         };
-        body.push_str(&format!(
-            "(goto-char (point-min))\
-             (let ((n 0))\
-               (while (and (or {all_flag} (= n 0)) (search-forward \"{pat}\" nil t))\
-                 (delete-region (match-beginning 0) (point))\
-                 (insert \"{rep}\")\
-                 (setq n (+ n 1)))\
-               (if (= n 0) (error \"{miss}\"))\
-               {unique_check}\
-               (report \"n\" n))"
-        ));
+        if regex {
+            // replace-match expands \\N backrefs; a zero-width match steps
+            // one char forward so the sweep terminates.
+            body.push_str(&format!(
+                "(goto-char (point-min))\
+                 (let ((n 0) (stop nil))\
+                   (while (and (not stop) (or {all_flag} (= n 0))\
+                               (re-search-forward \"{pat}\" nil t))\
+                     (let ((empty (= (match-beginning 0) (match-end 0))))\
+                       (replace-match \"{rep}\")\
+                       (setq n (+ n 1))\
+                       (if empty (if (< (point) (point-max)) (forward-char 1) (setq stop t)))))\
+                   (if (= n 0) (error \"{miss}\"))\
+                   {unique_check}\
+                   (report \"n\" n))"
+            ));
+        } else {
+            body.push_str(&format!(
+                "(goto-char (point-min))\
+                 (let ((n 0))\
+                   (while (and (or {all_flag} (= n 0)) (search-forward \"{pat}\" nil t))\
+                     (delete-region (match-beginning 0) (point))\
+                     (insert \"{rep}\")\
+                     (setq n (+ n 1)))\
+                   (if (= n 0) (error \"{miss}\"))\
+                   {unique_check}\
+                   (report \"n\" n))"
+            ));
+        }
     }
     let program = match scope {
         Some((_, prelude)) => format!("(save-restriction {prelude} (with-transaction {body}))"),
@@ -1438,11 +1555,13 @@ fn tool_replace_files(
     // Normalize the edit spec: an explicit `edits` array, or the single
     // pattern/replacement promoted to a one-item batch.
     let items: Vec<Value> = match args.get("edits") {
-        Some(edits) => edits
-            .as_array()
-            .filter(|a| !a.is_empty())
-            .ok_or_else(|| "\"edits\" must be a non-empty array".to_string())?
-            .clone(),
+        Some(edits) => with_default_mode(
+            args,
+            edits
+                .as_array()
+                .filter(|a| !a.is_empty())
+                .ok_or_else(|| "\"edits\" must be a non-empty array".to_string())?,
+        ),
         None => {
             let pattern = str_arg(args, "pattern")?;
             if pattern.is_empty() {
@@ -1453,6 +1572,7 @@ fn tool_replace_files(
                 "replacement": str_arg(args, "replacement")?,
                 "all": bool_arg(args, "all"),
                 "expect_unique": bool_arg(args, "expect_unique"),
+                "mode": args.get("mode").and_then(Value::as_str).unwrap_or("exact"),
             })]
         }
     };
@@ -3351,17 +3471,18 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "replace_text",
-            "description": "Replace the FIRST occurrence of a literal pattern with literal replacement text (searching from the top of the accessible region); pass all:true to replace every occurrence. Both strings are plain — no Lisp escaping, no regex, no backref expansion (insert_text's counterpart; the fix for quote-heavy edits). Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Edits the warm buffer; call save_buffer to persist. For regex or position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.",
+            "description": "Replace the FIRST occurrence of a pattern (searching from the top of the accessible region); pass all:true to replace every occurrence. By default both strings are plain literals — no Lisp escaping, no regex (insert_text's counterpart; the fix for quote-heavy edits). mode:\"regex\" switches the pattern to the Emacs regex dialect (as occur/grep) with \\1..\\9 and \\& backrefs expanding in the replacement — the one-call form of the goto-char/while/re-search-forward/replace-match loop. Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Edits the warm buffer; call save_buffer to persist. For position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string", "description": "The exact text to find (literal, not regex)." },
-                    "replacement": { "type": "string", "description": "The literal replacement text." },
+                    "pattern": { "type": "string", "description": "The text to find — literal by default; the Emacs regex dialect with mode:\"regex\"." },
+                    "replacement": { "type": "string", "description": "The replacement text — literal by default; with mode:\"regex\", \\1..\\9 insert the numbered capture group and \\& the whole match." },
+                    "mode": { "type": "string", "enum": ["exact", "regex"], "description": "exact (default): literal search and replacement. regex: Emacs-dialect pattern with backref expansion in the replacement. With `edits`, acts as the default for entries that don't set their own." },
                     "all": { "type": "boolean", "description": "Replace every occurrence (default false: first only)." },
                     "expect_unique": { "type": "boolean", "description": "Require the pattern to match exactly once: more than one match is an error (listing the match lines) and nothing is replaced. RECOMMENDED whenever the anchor text could plausibly repeat — first-match semantics would silently edit the wrong site. Default false." },
                     "scope": scope,
                     "view": { "type": ["boolean", "integer"], "description": "Append a rendered viewport around point after the edit (true = 4 context lines, or a line count)." },
-                    "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?}, …] applied in order inside ONE transaction — all-or-nothing; a miss (or a failed uniqueness check) rolls everything back and names the failed edit.", "items": { "type": "object", "properties": { "pattern": { "type": "string" }, "replacement": { "type": "string" }, "all": { "type": "boolean" }, "expect_unique": { "type": "boolean" } } } },
+                    "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?, mode?}, …] applied in order inside ONE transaction — all-or-nothing; a miss (or a failed uniqueness check) rolls everything back and names the failed edit.", "items": { "type": "object", "properties": { "pattern": { "type": "string" }, "replacement": { "type": "string" }, "all": { "type": "boolean" }, "expect_unique": { "type": "boolean" }, "mode": { "type": "string", "enum": ["exact", "regex"] } } } },
                     "session": session,
                     "path": path,
                     "save": save,
@@ -3371,16 +3492,17 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "replace_in_files",
-            "description": "Apply the SAME literal edit spec to EVERY listed file in one call — the cross-file rename. Give pattern/replacement (with all/expect_unique), or `edits` for a transactional batch per file; the absolute paths grep prints feed `files` directly. Atomic ACROSS the set: a failure in any file (a miss, a failed uniqueness check) rolls the already-edited ones back and the error names the file — every listed path must contain the pattern, so list exactly the files you grepped. Edits land in the warm buffers; with save:true the files are saved only after every file's edit succeeded. For a single file use replace_text.",
+            "description": "Apply the SAME edit spec to EVERY listed file in one call — the cross-file rename. Give pattern/replacement (with all/expect_unique, and mode:\"regex\" for the Emacs dialect with backrefs), or `edits` for a transactional batch per file; the absolute paths grep prints feed `files` directly. Atomic ACROSS the set: a failure in any file (a miss, a failed uniqueness check) rolls the already-edited ones back and the error names the file — every listed path must contain the pattern, so list exactly the files you grepped. Edits land in the warm buffers; with save:true the files are saved only after every file's edit succeeded. For a single file use replace_text.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "files": { "type": "array", "items": { "type": "string" }, "description": "The files to edit — each must match the edit spec." },
-                    "pattern": { "type": "string", "description": "The exact text to find (literal, not regex)." },
-                    "replacement": { "type": "string", "description": "The literal replacement text." },
+                    "pattern": { "type": "string", "description": "The text to find — literal by default; the Emacs regex dialect with mode:\"regex\"." },
+                    "replacement": { "type": "string", "description": "The replacement text — with mode:\"regex\", \\1..\\9/\\& backrefs expand." },
+                    "mode": { "type": "string", "enum": ["exact", "regex"], "description": "exact (default): literal. regex: Emacs-dialect pattern with backref expansion. With `edits`, acts as the default for entries that don't set their own." },
                     "all": { "type": "boolean", "description": "Replace every occurrence per file (default false: first only)." },
                     "expect_unique": { "type": "boolean", "description": "Require the pattern to match exactly once per file — more is an error and nothing is applied anywhere. Default false." },
-                    "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?}, …] applied in order inside ONE transaction per file — all-or-nothing across the whole call.", "items": { "type": "object", "properties": { "pattern": { "type": "string" }, "replacement": { "type": "string" }, "all": { "type": "boolean" }, "expect_unique": { "type": "boolean" } } } },
+                    "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?, mode?}, …] applied in order inside ONE transaction per file — all-or-nothing across the whole call.", "items": { "type": "object", "properties": { "pattern": { "type": "string" }, "replacement": { "type": "string" }, "all": { "type": "boolean" }, "expect_unique": { "type": "boolean" }, "mode": { "type": "string", "enum": ["exact", "regex"] } } } },
                     "scope": scope,
                     "save": save,
                 },

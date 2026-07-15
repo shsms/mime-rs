@@ -510,7 +510,8 @@ fresh guesses died the same way — replace_text {old, new} (pattern /
 replacement), insert_text {location} (pos / anchor), view {view: [a,b]}
 (lines). Same fix applies; the aliases would have absorbed all three.
 
-** TODO [#B] replace_text: regex mode with backrefs                     :mcp:
+** DONE [#B] replace_text: regex mode with backrefs                     :mcp:
+CLOSED: [2026-07-15]
 :LOGBOOK:
 - State "TODO"       from              [2026-07-15 Mi 16:07]
 :END:
@@ -520,6 +521,13 @@ goto-char/while/re-search-forward/replace-match loop. A mode:"regex" on
 replace_text (like occur already has), with \1 backrefs in replacement,
 turns five-line programs into one edits[] entry. Keep expect_unique
 semantics per pattern.
+
+DONE [2026-07-15]: ~mode: "exact"|"regex"~ on replace_text AND
+replace_in_files (single form, and per-edit in edits[] with the
+top-level mode as default). Regex+all rides the native ~replace-regexp~
+(zero-width safe, backrefs); single/unique use
+re-search-forward/replace-match with the same expect_unique
+transaction + match-line listing.
 
 ** TODO [#C] Batched edits error: say that nothing was applied          :mcp:
 :LOGBOOK:
