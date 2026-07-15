@@ -169,10 +169,11 @@ const GIT: &str = r#"— git history workflow —
 In-process rebase/cherry-pick/revert: no network, no hooks, no exec; the
 worktree is the warm buffer set. Plan with git_log (oid + summary over a
 range like main..HEAD) and git_show (a commit's diff + metadata). git_blame
-{path, lines?, since?, worktree?} reports which commit last touched each line —
+{path?, lines?, since?, worktree?} reports which commit last touched each line —
 the find-the-commit half for a fixup/edit plan; `since` scopes to your commits,
-`worktree` maps each UNCOMMITTED hunk to the commit that owns it (feed into
-git_fixup).
+`worktree` maps each UNCOMMITTED hunk to the commit that owns it (omit path to
+sweep the whole tree; group_by: "commit" buckets the hunks per owner — feed
+into git_fixup, or let git_absorb fold them all).
   git_rebase {onto, plan?}  plan = [{commit, action, message?, message_edits?,
     into?}], action = pick|reword|squash|fixup|edit|split|drop; list order is the
     new commit order. Omit plan to replay all of onto..HEAD. rehearse:true
@@ -196,6 +197,11 @@ git_fixup).
     of onto..HEAD — no need to transcribe untouched commits.
   git_fixup {target, source}  one-call fold of `source` into `target` (keeps
     target's signed message); auto-picks the rest. Commit uncommitted work first.
+  git_absorb {since?}  fold EVERY uncommitted hunk into the commit that owns
+    its lines (blame + fixup composed): hunks group by owner and fold in one
+    replay; unclear ones (new lines, split ownership) stay in the worktree and
+    are reported. rehearse:true previews the grouping. `since` bounds how far
+    back history may be rewritten.
 Each STOPS on the first conflict. Then, per stop:
   git_status     which step of how many + the unresolved files
   resolve each file with the conflicts vocabulary (help conflicts), SAVE

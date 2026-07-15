@@ -2543,12 +2543,29 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
         "git_status" => seq::cmd_status(&repo),
         "git_log" => seq::cmd_log(&repo, args.get("range").and_then(Value::as_str)),
         "git_show" => seq::cmd_show(&repo, &str_arg(args, "commit")?),
-        "git_blame" => seq::cmd_blame(
+        "git_blame" => {
+            let group_by = match args.get("group_by").and_then(Value::as_str) {
+                None => false,
+                Some("commit") => true,
+                Some(other) => {
+                    return Err(format!(
+                        "git_blame: unknown group_by {other:?} — only \"commit\" exists"
+                    ));
+                }
+            };
+            seq::cmd_blame(
+                &repo,
+                args.get("path").and_then(Value::as_str),
+                lines_arg(args),
+                args.get("since").and_then(Value::as_str),
+                bool_arg(args, "worktree"),
+                group_by,
+            )
+        }
+        "git_absorb" => seq::cmd_absorb(
             &repo,
-            &str_arg(args, "path")?,
-            lines_arg(args),
             args.get("since").and_then(Value::as_str),
-            bool_arg(args, "worktree"),
+            bool_arg(args, "rehearse"),
         ),
         "git_move" => seq::cmd_move(
             &repo,
@@ -2724,9 +2741,10 @@ fn git_tool_schemas() -> Vec<Value> {
                         "description": "Optional [start, end] 1-based inclusive line range; omit to blame the whole file.",
                     },
                     "since": { "type": "string", "description": "Scope history to `since..` (oid/ref/revspec, e.g. main): lines older than it collapse to the boundary, so the answer is 'which of MY commits owns this'." },
-                    "worktree": { "type": "boolean", "description": "Instead of blaming committed lines, map each UNCOMMITTED hunk of `path` to the commit that last set the lines it changes — the target for a git_fixup/git_move." }
+                    "worktree": { "type": "boolean", "description": "Instead of blaming committed lines, map each UNCOMMITTED hunk to the commit that last set the lines it changes — the target for a git_fixup/git_move (or git_absorb, which folds them all). Omit `path` to sweep the whole worktree." },
+                    "group_by": { "type": "string", "enum": ["commit"], "description": "Worktree mode only: group the hunks under their owning commit — the natural absorb preview ({commit: [hunks]})." }
                 },
-                "required": ["repo", "path"],
+                "required": ["repo"],
             },
         }),
         json!({
@@ -2781,6 +2799,19 @@ fn git_tool_schemas() -> Vec<Value> {
                     "rehearse": { "type": "boolean", "description": "Preview the resulting history without applying." }
                 },
                 "required": ["repo", "target"],
+            },
+        }),
+        json!({
+            "name": "git_absorb",
+            "description": "Fold EVERY uncommitted hunk into the commit that owns its lines, automatically — git_blame {worktree: true} + git_fixup {hunks} composed into one call (magit-commit-absorb / git-absorb). Each dirty hunk is blamed, hunks are grouped by their owning commit, and every group folds into its owner in ONE replay; the target commits keep their own messages. Hunks without a single clear owner (new lines, split ownership, owners at the `since` boundary or off the branch line) stay in the worktree and are reported — route those by hand with git_fixup (review fixes sometimes belong with a commit TOPIC, not the blamed lines). rehearse:true previews the grouping and resulting history without touching anything. A replay conflict aborts the whole absorb — branch and worktree come back untouched.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": repo,
+                    "since": { "type": "string", "description": "Scope owners to `since..HEAD` (oid/ref/revspec, e.g. main — usually the branch base): hunks owned at or beyond the boundary stay in the worktree instead of rewriting history past it. Recommended on shared-history branches." },
+                    "rehearse": { "type": "boolean", "description": "Preview the hunk→commit grouping and the resulting history without applying." }
+                },
+                "required": ["repo"],
             },
         }),
     ]
@@ -3018,6 +3049,11 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             Git,
             A::destructive(),
             "fold a commit's changes into another (autosquash)",
+        ),
+        "git_absorb" => (
+            Git,
+            A::destructive(),
+            "fold every dirty hunk into the commit that owns its lines",
         ),
 
         "read_region" => (
@@ -3837,6 +3873,7 @@ mod git_tool_tests {
             "git_blame",
             "git_move",
             "git_fixup",
+            "git_absorb",
         ] {
             assert!(names.contains(&expected), "missing schema for {expected}");
         }

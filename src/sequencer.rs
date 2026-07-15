@@ -2054,30 +2054,37 @@ pub fn blame(
     Ok(out)
 }
 
-/// "Which commit owns each uncommitted change" for `rel`: diff HEAD→worktree,
-/// then blame the OLD-side lines each hunk touches (the lines as they stand in
-/// HEAD) to name the commit that last set them. The absorb-target discovery —
-/// each reported oid feeds a git_fixup/git_move for that hunk. A pure insertion
-/// borrows the owner of the line it sits after.
-fn blame_worktree(repo: &Repository, rel: &Path, since: Option<Oid>) -> Result<String, Error> {
-    let head_tree = repo.head()?.peel_to_tree()?;
-    let mut dopts = git2::DiffOptions::new();
-    dopts.pathspec(rel.to_string_lossy().as_ref());
-    dopts.context_lines(0);
-    let diff = repo.diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut dopts))?;
+/// One uncommitted diff-hunk and the commit(s) that own the lines it changes.
+struct WorktreeHunk {
+    path: String,
+    /// The hunk's identity in the diff it came from (new-side start/lines) —
+    /// the key `apply_subset`'s callbacks match on.
+    ns: u32,
+    nl: u32,
+    /// "L10-12" over the CURRENT file — the span blame/fixup reports use.
+    span: String,
+    /// Deduped owners of the old-side lines this hunk changes; empty = new
+    /// lines (or an added file with no committed version to blame).
+    owners: Vec<Oid>,
+}
 
-    let mut bopts = BlameOptions::new();
-    if let Some(s) = since {
-        bopts.oldest_commit(s);
-    }
-    // The file may be newly added (untracked) → no committed version to blame.
-    let blame = repo.blame_file(rel, Some(&mut bopts)).ok();
-
-    let mut out = String::new();
+/// Map every hunk of `diff` (HEAD→worktree, context 0) to the commit(s) that
+/// last set the lines it changes — the shared discovery behind the worktree
+/// blame and absorb. Blames the OLD-side lines (as they stand in HEAD); a
+/// pure insertion borrows the owner of the line it sits after.
+fn worktree_hunk_owners(
+    repo: &Repository,
+    diff: &git2::Diff,
+    since: Option<Oid>,
+) -> Result<Vec<WorktreeHunk>, Error> {
+    let mut blames: std::collections::HashMap<String, Option<git2::Blame>> =
+        std::collections::HashMap::new();
+    let mut out = Vec::new();
     for idx in 0..diff.deltas().len() {
-        let Some(patch) = git2::Patch::from_diff(&diff, idx)? else {
+        let Some(patch) = git2::Patch::from_diff(diff, idx)? else {
             continue;
         };
+        let path = delta_path(diff.get_delta(idx));
         for h in 0..patch.num_hunks() {
             let (dh, _) = patch.hunk(h)?;
             let (os, ol, ns, nl) = (
@@ -2098,8 +2105,16 @@ fn blame_worktree(repo: &Repository, rel: &Path, since: Option<Oid>) -> Result<S
             } else {
                 (os..os + ol).collect()
             };
+            // The file may be newly added → no committed version to blame.
+            let blame = blames.entry(path.clone()).or_insert_with(|| {
+                let mut bopts = BlameOptions::new();
+                if let Some(s) = since {
+                    bopts.oldest_commit(s);
+                }
+                repo.blame_file(Path::new(&path), Some(&mut bopts)).ok()
+            });
             let mut owners: Vec<Oid> = Vec::new();
-            if let Some(b) = &blame {
+            if let Some(b) = blame {
                 for ln in lines {
                     if let Some(bh) = b.get_line(ln as usize) {
                         let oid = bh.final_commit_id();
@@ -2109,22 +2124,115 @@ fn blame_worktree(repo: &Repository, rel: &Path, since: Option<Oid>) -> Result<S
                     }
                 }
             }
-            if owners.is_empty() {
-                out.push_str(&format!("  {span}\t(no prior owner — new lines)\n"));
+            out.push(WorktreeHunk {
+                path: path.clone(),
+                ns,
+                nl,
+                span,
+                owners,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The HEAD→worktree diff (context 0) for one path or the whole tree — the
+/// input both the worktree blame and absorb discover owners on.
+fn worktree_diff<'r>(repo: &'r Repository, rel: Option<&Path>) -> Result<git2::Diff<'r>, Error> {
+    let head_tree = repo.head()?.peel_to_tree()?;
+    let mut dopts = git2::DiffOptions::new();
+    if let Some(rel) = rel {
+        dopts.pathspec(rel.to_string_lossy().as_ref());
+    }
+    dopts.context_lines(0);
+    repo.diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut dopts))
+}
+
+/// "Which commit owns each uncommitted change": per hunk (`rel` or the whole
+/// worktree), the commit that last set the lines it touches. The
+/// absorb-target discovery — each reported oid feeds a git_fixup/git_move for
+/// that hunk (or git_absorb folds them all). With `group_by_commit`, hunks are
+/// grouped under their owning commit — the natural absorb preview.
+fn blame_worktree(
+    repo: &Repository,
+    rel: Option<&Path>,
+    since: Option<Oid>,
+    group_by_commit: bool,
+) -> Result<String, Error> {
+    let diff = worktree_diff(repo, rel)?;
+    let hunks = worktree_hunk_owners(repo, &diff, since)?;
+    let summary_of = |oid: Oid| {
+        repo.find_commit(oid)
+            .ok()
+            .and_then(|c| c.summary().map(str::to_string))
+            .unwrap_or_default()
+    };
+    // A path column only when several files can appear (whole-tree mode).
+    let loc = |h: &WorktreeHunk| {
+        if rel.is_some() {
+            h.span.clone()
+        } else {
+            format!("{} {}", h.path, h.span)
+        }
+    };
+    let mut out = String::new();
+    if group_by_commit {
+        let mut order: Vec<Oid> = Vec::new();
+        let mut by: std::collections::HashMap<Oid, Vec<String>> = std::collections::HashMap::new();
+        let mut unowned: Vec<String> = Vec::new();
+        for h in &hunks {
+            match h.owners.as_slice() {
+                [] => unowned.push(format!("  {} (no prior owner — new lines)\n", loc(h))),
+                [one] => {
+                    if !order.contains(one) {
+                        order.push(*one);
+                    }
+                    by.entry(*one).or_default().push(format!("  {}\n", loc(h)));
+                }
+                many => unowned.push(format!(
+                    "  {} (split ownership: {})\n",
+                    loc(h),
+                    many.iter()
+                        .map(|o| short(*o))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            }
+        }
+        for oid in order {
+            out.push_str(&format!("{} {}\n", short(oid), summary_of(oid)));
+            for line in &by[&oid] {
+                out.push_str(line);
+            }
+        }
+        if !unowned.is_empty() {
+            out.push_str("(not attributable to one commit)\n");
+            for line in unowned {
+                out.push_str(&line);
+            }
+        }
+    } else {
+        for h in &hunks {
+            if h.owners.is_empty() {
+                out.push_str(&format!("  {}\t(no prior owner — new lines)\n", loc(h)));
             } else {
-                for oid in owners {
-                    let summary = repo
-                        .find_commit(oid)
-                        .ok()
-                        .and_then(|c| c.summary().map(str::to_string))
-                        .unwrap_or_default();
-                    out.push_str(&format!("  {span}\t{}\t{summary}\n", short(oid)));
+                for &oid in &h.owners {
+                    out.push_str(&format!(
+                        "  {}\t{}\t{}\n",
+                        loc(h),
+                        short(oid),
+                        summary_of(oid)
+                    ));
                 }
             }
         }
     }
     if out.is_empty() {
-        out.push_str("(no uncommitted changes to this path)\n");
+        out.push_str(if rel.is_some() {
+            "(no uncommitted changes to this path)\n"
+        } else {
+            "(no uncommitted changes)\n"
+        });
     }
     Ok(out)
 }
@@ -2480,6 +2588,213 @@ pub fn cmd_fixup_worktree(
     fixup_worktree(&repo, target, paths, hunks, rehearse_only).map_err(gerr)
 }
 
+/// Absorb: fold EVERY uncommitted hunk into the commit that owns its lines —
+/// `git_blame {worktree}` composed with `git_fixup {hunks}` in one call
+/// (magit-commit-absorb / git-absorb). Hunks without a single clear owner
+/// (new lines, split ownership, owners at the `since` boundary or off the
+/// branch line, root commits) stay in the worktree and are reported; the
+/// clear ones fold in ONE replay. `rehearse_only` previews the grouping and
+/// the resulting history without touching anything.
+pub fn cmd_absorb(
+    repo_path: &std::path::Path,
+    since: Option<&str>,
+    rehearse_only: bool,
+) -> Result<String, String> {
+    let repo = open(repo_path)?;
+    let since = since.map(|s| resolve_s(&repo, s)).transpose()?;
+    absorb(&repo, since, rehearse_only).map_err(gerr)
+}
+
+fn absorb(repo: &Repository, since: Option<Oid>, rehearse_only: bool) -> Result<String, Error> {
+    let head = repo.head()?.peel_to_commit()?;
+    let head_tree = head.tree()?;
+    let diff = worktree_diff(repo, None)?;
+    if diff.deltas().len() == 0 {
+        return Err(estr(
+            "absorb: the worktree has no uncommitted changes to fold \
+             (stage a brand-new file first — untracked files are not seen)",
+        ));
+    }
+    let hunks = worktree_hunk_owners(repo, &diff, since)?;
+
+    // Partition: hunks with one clear owner group under it; the rest stay in
+    // the worktree, each with its reason.
+    let mut groups: Vec<(Oid, Vec<&WorktreeHunk>)> = Vec::new();
+    let mut left: Vec<(String, String)> = Vec::new();
+    for h in &hunks {
+        let reason = match h.owners.as_slice() {
+            [] => Some("no prior owner — new lines".to_string()),
+            [one] => {
+                if since == Some(*one) {
+                    // With `oldest_commit`, older lines collapse to the
+                    // boundary — indistinguishable from genuinely owned there.
+                    Some("owned at or beyond the since boundary".to_string())
+                } else if repo.find_commit(*one)?.parent_count() == 0 {
+                    Some("owned by the root commit (nothing to fold into)".to_string())
+                } else {
+                    None
+                }
+            }
+            many => Some(format!(
+                "split ownership: {}",
+                many.iter()
+                    .map(|o| short(*o))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        };
+        match reason {
+            Some(r) => left.push((format!("{} {}", h.path, h.span), r)),
+            None => {
+                let owner = h.owners[0];
+                match groups.iter_mut().find(|(t, _)| *t == owner) {
+                    Some((_, hs)) => hs.push(h),
+                    None => groups.push((owner, vec![h])),
+                }
+            }
+        }
+    }
+    let nothing = |left: &[(String, String)]| {
+        estr(&format!(
+            "absorb: no uncommitted hunk has a single owning commit on the \
+             branch — nothing to fold\n{}",
+            left.iter()
+                .map(|(loc, why)| format!("  {loc} ({why})"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))
+    };
+    if groups.is_empty() {
+        return Err(nothing(&left));
+    }
+
+    // The oldest owning commit anchors the replay.
+    let mut oldest = groups[0].0;
+    for (t, _) in &groups[1..] {
+        if repo.graph_descendant_of(oldest, *t)? {
+            oldest = *t;
+        }
+    }
+    let onto = repo.find_commit(oldest)?.parent(0)?.id();
+    let base = commits_since(repo, onto)?;
+    // An owner off the replayed line (e.g. inside a merged side branch) can't
+    // take a fold — leave its hunks in the worktree.
+    groups.retain(|(t, hs)| {
+        if base.contains(t) {
+            return true;
+        }
+        for h in hs {
+            left.push((
+                format!("{} {}", h.path, h.span),
+                format!("owner {} is not on the branch line", short(*t)),
+            ));
+        }
+        false
+    });
+    if groups.is_empty() {
+        return Err(nothing(&left));
+    }
+
+    // One dangling fixup commit per owning commit (the branch never points at
+    // them; the fold discards their identity, so any signature works).
+    let sig = match repo.signature() {
+        Ok(s) => s,
+        Err(_) => {
+            let a = head.author();
+            git2::Signature::now(
+                a.name().unwrap_or("mime"),
+                a.email().unwrap_or("mime@invalid"),
+            )?
+        }
+    };
+    let mut fixup_for: Vec<(Oid, Oid)> = Vec::new();
+    for (target, hs) in &groups {
+        let keys: std::collections::HashSet<(String, u32, u32)> =
+            hs.iter().map(|h| (h.path.clone(), h.ns, h.nl)).collect();
+        let tree_id = apply_subset(
+            repo,
+            &head_tree,
+            &diff,
+            |_| false,
+            |p, ns, nl| keys.contains(&(p.to_string(), ns, nl)),
+        )?;
+        if tree_id == head_tree.id() {
+            continue;
+        }
+        let tc = repo.find_commit(*target)?;
+        let fixup = repo.commit(
+            None,
+            &sig,
+            &sig,
+            &format!("fixup! {}", tc.summary().unwrap_or("")),
+            &repo.find_tree(tree_id)?,
+            &[&head],
+        )?;
+        fixup_for.push((*target, fixup));
+    }
+
+    // Picks in branch order, each group's fold right after its target.
+    let mut steps: Vec<Step> = Vec::new();
+    for c in base {
+        steps.push(pick_step(c));
+        if let Some((_, f)) = fixup_for.iter().find(|(t, _)| *t == c) {
+            let mut fold = pick_step(*f);
+            fold.action = Action::Fixup;
+            steps.push(fold);
+        }
+    }
+    let step_commits: Vec<Oid> = steps.iter().map(|s| s.commit).collect();
+    let plan = Plan { onto, steps };
+
+    let mut report = format!(
+        "absorb: {} hunk(s) → {} commit(s){}",
+        groups.iter().map(|(_, hs)| hs.len()).sum::<usize>(),
+        groups.len(),
+        if left.is_empty() {
+            String::new()
+        } else {
+            format!("; {} hunk(s) stay in the worktree", left.len())
+        }
+    );
+    for (t, hs) in &groups {
+        let summary = repo
+            .find_commit(*t)
+            .ok()
+            .and_then(|c| c.summary().map(str::to_string))
+            .unwrap_or_default();
+        report.push_str(&format!("\n  into {} {summary}:", short(*t)));
+        for h in hs {
+            report.push_str(&format!("\n    {} {}", h.path, h.span));
+        }
+    }
+    if !left.is_empty() {
+        report.push_str("\n  left in the worktree:");
+        for (loc, why) in &left {
+            report.push_str(&format!("\n    {loc} ({why})"));
+        }
+    }
+
+    if rehearse_only {
+        return Ok(format!(
+            "{}\n{report}\n(the hunks left in the worktree stay uncommitted)",
+            preview_text(repo, &rehearse(repo, &plan, Mode::Pick)?)
+        ));
+    }
+    let snap = snapshot_worktree(repo, &diff)?;
+    let wt_tree_id = apply_subset(repo, &head_tree, &diff, |_| true, |_, _, _| true)?;
+    let done = run_plan_over_parked_worktree(
+        repo,
+        plan,
+        &step_commits,
+        snap,
+        wt_tree_id,
+        &sig,
+        &head,
+        "absorb",
+    )?;
+    Ok(format!("{report}\n{done}"))
+}
+
 fn fixup_worktree(
     repo: &Repository,
     target: Oid,
@@ -2577,14 +2892,43 @@ fn fixup_worktree(
         None => fixup_tree_id,
         Some(_) => apply_subset(repo, &head_tree, &diff, |_| true, |_, _, _| true)?,
     };
+    run_plan_over_parked_worktree(
+        repo,
+        plan,
+        &step_commits,
+        snap,
+        wt_tree_id,
+        &sig,
+        &head,
+        "fixup",
+    )
+}
+
+/// Park the uncommitted work (the byte `snap` for the restore, plus a dangling
+/// full-worktree backup commit on the `-worktree` ref), replay `plan` over a
+/// clean tree, then hand the parked changes back. The shared execution tail of
+/// the worktree fixup and absorb; `what` names the operation in messages. A
+/// replay conflict aborts the WHOLE operation — branch and worktree come back
+/// exactly as they were.
+#[allow(clippy::too_many_arguments)]
+fn run_plan_over_parked_worktree(
+    repo: &Repository,
+    plan: Plan,
+    step_commits: &[Oid],
+    snap: WorktreeSnapshot,
+    wt_tree_id: Oid,
+    sig: &git2::Signature,
+    head: &git2::Commit,
+    what: &str,
+) -> Result<String, Error> {
     let wt_tree = repo.find_tree(wt_tree_id)?;
     let wt_backup = repo.commit(
         None,
-        &sig,
-        &sig,
-        "mime worktree backup (pre fixup-from-worktree)",
+        sig,
+        sig,
+        &format!("mime worktree backup (pre {what}-from-worktree)"),
         &wt_tree,
-        &[&head],
+        &[head],
     )?;
     let short_branch = repo.head()?.shorthand().unwrap_or("HEAD").replace('/', "-");
     repo.reference(
@@ -2635,7 +2979,7 @@ fn fixup_worktree(
                 .map(|c| short(*c))
                 .unwrap_or_default();
             Err(estr(&format!(
-                "fixup: replaying {culprit} over the folded change conflicts \
+                "{what}: replaying {culprit} over the folded change conflicts \
                  in {} — nothing changed (worktree restored). A later commit \
                  reshapes those lines: pick THAT commit as the target \
                  (git_blame {{worktree: true}} names it), or commit the change \
@@ -2646,7 +2990,7 @@ fn fixup_worktree(
         Outcome::Paused { step, .. } => {
             // No `edit` step exists in this plan; a pause would be a bug.
             Err(estr(&format!(
-                "fixup: unexpected pause at step {step} — git_status/git_abort \
+                "{what}: unexpected pause at step {step} — git_status/git_abort \
                  the operation; the uncommitted changes are on the -worktree \
                  backup ref"
             )))
@@ -2809,29 +3153,42 @@ pub fn cmd_show(repo_path: &std::path::Path, commit: &str) -> Result<String, Str
 
 pub fn cmd_blame(
     repo_path: &std::path::Path,
-    path: &str,
+    path: Option<&str>,
     lines: Option<(usize, usize)>,
     since: Option<&str>,
     worktree: bool,
+    group_by_commit: bool,
 ) -> Result<String, String> {
     let repo = open(repo_path)?;
     let since = since.map(|s| resolve_s(&repo, s)).transpose()?;
+    if group_by_commit && !worktree {
+        return Err("git_blame: group_by applies to worktree mode only".to_string());
+    }
     // Accept an absolute path (what grep/occur hand back) or one already
     // relative to the workdir; blame_file wants it workdir-relative.
-    let p = std::path::Path::new(path);
-    let rel = if p.is_absolute() {
-        let wd = repo
-            .workdir()
-            .ok_or_else(|| "bare repo has no working tree to blame".to_string())?;
-        p.strip_prefix(wd)
-            .map_err(|_| format!("path is outside the repo: {path}"))?
-            .to_path_buf()
-    } else {
-        p.to_path_buf()
-    };
+    let rel = path
+        .map(|path| -> Result<std::path::PathBuf, String> {
+            let p = std::path::Path::new(path);
+            if p.is_absolute() {
+                let wd = repo
+                    .workdir()
+                    .ok_or_else(|| "bare repo has no working tree to blame".to_string())?;
+                Ok(p.strip_prefix(wd)
+                    .map_err(|_| format!("path is outside the repo: {path}"))?
+                    .to_path_buf())
+            } else {
+                Ok(p.to_path_buf())
+            }
+        })
+        .transpose()?;
     if worktree {
-        blame_worktree(&repo, &rel, since).map_err(gerr)
+        blame_worktree(&repo, rel.as_deref(), since, group_by_commit).map_err(gerr)
     } else {
+        let rel = rel.ok_or_else(|| {
+            "git_blame: pass `path` (blaming committed lines is per-file; only \
+             worktree mode can sweep the whole tree)"
+                .to_string()
+        })?;
         blame(&repo, &rel, lines, since).map_err(gerr)
     }
 }
@@ -3326,7 +3683,7 @@ mod tests {
         let c2 = commit(&repo, &[c1], &[("f.txt", "one\nTWO\n")], "change two");
         on_branch(&repo, "main", c2);
 
-        let out = cmd_blame(&dir, "f.txt", None, None, false).unwrap();
+        let out = cmd_blame(&dir, Some("f.txt"), None, None, false, false).unwrap();
         let lines: Vec<&str> = out.lines().collect();
         // Line 1 is still c1's; line 2 now belongs to c2. Hunks are one line each.
         assert!(
@@ -3339,7 +3696,7 @@ mod tests {
         );
 
         // A `lines` window blames only that span.
-        let just2 = cmd_blame(&dir, "f.txt", Some((2, 2)), None, false).unwrap();
+        let just2 = cmd_blame(&dir, Some("f.txt"), Some((2, 2)), None, false, false).unwrap();
         assert!(
             just2.contains("change two") && !just2.contains("add one and two"),
             "windowed blame: {just2}"
@@ -3347,7 +3704,8 @@ mod tests {
 
         // An absolute path (what grep/occur hand back) resolves the same way.
         let abs = dir.join("f.txt");
-        let via_abs = cmd_blame(&dir, abs.to_str().unwrap(), None, None, false).unwrap();
+        let via_abs =
+            cmd_blame(&dir, Some(abs.to_str().unwrap()), None, None, false, false).unwrap();
         assert_eq!(via_abs, out, "absolute path blames identically");
     }
 
@@ -3361,11 +3719,11 @@ mod tests {
         on_branch(&repo, "main", c2);
 
         // Unscoped: line 1 ("a") is still base's.
-        let full = cmd_blame(&dir, "f", None, None, false).unwrap();
+        let full = cmd_blame(&dir, Some("f"), None, None, false, false).unwrap();
         assert!(full.contains(&short(base)), "base owns line 1: {full}");
         // Scoped to c1..: base predates the boundary, so its line collapses to c1
         // and base's oid no longer appears; c2 still owns its own line.
-        let scoped = cmd_blame(&dir, "f", None, Some(&c1.to_string()), false).unwrap();
+        let scoped = cmd_blame(&dir, Some("f"), None, Some(&c1.to_string()), false, false).unwrap();
         assert!(
             !scoped.contains(&short(base)),
             "base hidden by since: {scoped}"
@@ -3386,13 +3744,134 @@ mod tests {
 
         // Re-edit line 2 (which c1 last set) WITHOUT committing.
         std::fs::write(repo.workdir().unwrap().join("f"), b"a\nB2\nc\n").unwrap();
-        let out = cmd_blame(&dir, "f", None, None, true).unwrap();
+        let out = cmd_blame(&dir, Some("f"), None, None, true, false).unwrap();
         // The uncommitted hunk at new line 2 is owned by c1.
         assert!(
             out.contains(&short(c1)) && out.contains("edit line 2"),
             "worktree hunk maps to c1: {out}"
         );
         assert!(out.contains("L2"), "{out}");
+    }
+
+    /// base sets f's five lines; c1 owns line 2, c2 owns line 4.
+    fn absorb_fixture(tag: &str) -> (std::path::PathBuf, Repository, Oid, Oid, Oid) {
+        let dir = tmp(tag);
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("f", "l1\nl2\nl3\nl4\nl5\n")], "base");
+        let c1 = commit(&repo, &[base], &[("f", "l1\nc1\nl3\nl4\nl5\n")], "edit two");
+        let c2 = commit(&repo, &[c1], &[("f", "l1\nc1\nl3\nc2\nl5\n")], "edit four");
+        on_branch(&repo, "main", c2);
+        (dir, repo, base, c1, c2)
+    }
+
+    #[test]
+    fn absorb_folds_each_hunk_into_its_owning_commit() {
+        let (dir, repo, base, _c1, _c2) = absorb_fixture("absorb");
+        // Two uncommitted hunks: line 2 (c1's) and line 4 (c2's).
+        std::fs::write(repo.workdir().unwrap().join("f"), b"l1\nw1\nl3\nw2\nl5\n").unwrap();
+
+        let out = cmd_absorb(&dir, None, false).unwrap();
+        assert!(out.contains("2 hunk(s) → 2 commit(s)"), "{out}");
+        // History re-sliced, not grown; each commit carries its fix and keeps
+        // its message; nothing is left uncommitted.
+        let branch = commits_since(&repo, base).unwrap();
+        assert_eq!(branch.len(), 2, "{out}");
+        let (n1, n2) = (branch[0], branch[1]);
+        assert!(at_commit(&repo, n1, "f").contains("w1"));
+        assert!(!at_commit(&repo, n1, "f").contains("w2"));
+        assert!(at_commit(&repo, n2, "f").contains("w2"));
+        assert_eq!(repo.find_commit(n1).unwrap().summary(), Some("edit two"));
+        assert_eq!(repo.find_commit(n2).unwrap().summary(), Some("edit four"));
+        assert_eq!(read(&repo, "f"), "l1\nw1\nl3\nw2\nl5\n");
+        assert!(!is_dirty(&repo).unwrap(), "everything folded: {out}");
+    }
+
+    #[test]
+    fn absorb_leaves_ambiguous_hunks_in_the_worktree() {
+        // Wider fixture so the split hunk and the clear hunk stay separate:
+        // c1 owns line 2, c2 owns line 6.
+        let dir = tmp("absorb-ambig");
+        let repo = Repository::init(&dir).unwrap();
+        let all = "l1\nl2\nl3\nl4\nl5\nl6\nl7\n";
+        let base = commit(&repo, &[], &[("f", all)], "base");
+        let c1 = commit(
+            &repo,
+            &[base],
+            &[("f", "l1\nc1\nl3\nl4\nl5\nl6\nl7\n")],
+            "edit two",
+        );
+        let c2 = commit(
+            &repo,
+            &[c1],
+            &[("f", "l1\nc1\nl3\nl4\nl5\nc2\nl7\n")],
+            "edit six",
+        );
+        on_branch(&repo, "main", c2);
+        // One hunk spans lines owned by two commits (line 2: c1, line 3:
+        // base) — split ownership; the line-6 hunk is clearly c2's.
+        std::fs::write(
+            repo.workdir().unwrap().join("f"),
+            b"l1\nx\ny\nl4\nl5\nw6\nl7\n",
+        )
+        .unwrap();
+
+        let out = cmd_absorb(&dir, None, false).unwrap();
+        assert!(out.contains("left in the worktree"), "{out}");
+        assert!(out.contains("split ownership"), "{out}");
+        // The clear hunk folded; the ambiguous one is back, uncommitted.
+        assert_eq!(
+            read(&repo, "f"),
+            "l1\nx\ny\nl4\nl5\nw6\nl7\n",
+            "worktree restored"
+        );
+        assert!(is_dirty(&repo).unwrap());
+        let branch = commits_since(&repo, base).unwrap();
+        let tip_file = at_commit(&repo, branch[1], "f");
+        assert!(
+            tip_file.contains("w6") && !tip_file.contains("x\ny"),
+            "only the clear hunk folded: {tip_file}"
+        );
+    }
+
+    #[test]
+    fn absorb_rehearse_mutates_nothing() {
+        let (dir, repo, _base, _c1, _c2) = absorb_fixture("absorb-dry");
+        std::fs::write(repo.workdir().unwrap().join("f"), b"l1\nw1\nl3\nw2\nl5\n").unwrap();
+        let head_before = repo.head().unwrap().target().unwrap();
+
+        let out = cmd_absorb(&dir, None, true).unwrap();
+        assert!(out.contains("2 hunk(s) → 2 commit(s)"), "{out}");
+        assert_eq!(repo.head().unwrap().target().unwrap(), head_before);
+        assert_eq!(read(&repo, "f"), "l1\nw1\nl3\nw2\nl5\n");
+    }
+
+    #[test]
+    fn absorb_with_nothing_attributable_refuses() {
+        let (dir, repo, _base, _c1, _c2) = absorb_fixture("absorb-none");
+        // The only dirty hunk has split ownership — nothing to fold.
+        std::fs::write(repo.workdir().unwrap().join("f"), b"l1\nx\ny\nc2\nl5\n").unwrap();
+        let err = cmd_absorb(&dir, None, false).unwrap_err();
+        assert!(err.contains("nothing to fold"), "{err}");
+        assert!(err.contains("split ownership"), "{err}");
+        assert_eq!(read(&repo, "f"), "l1\nx\ny\nc2\nl5\n", "untouched");
+    }
+
+    #[test]
+    fn grouped_worktree_blame_buckets_hunks_by_commit() {
+        let (dir, repo, _base, c1, c2) = absorb_fixture("blame-group");
+        std::fs::write(repo.workdir().unwrap().join("f"), b"l1\nw1\nl3\nw2\nl5\n").unwrap();
+
+        // Whole-tree sweep (no path), grouped under the owning commits.
+        let out = cmd_blame(&dir, None, None, None, true, true).unwrap();
+        assert!(out.contains(&format!("{} edit two", short(c1))), "{out}");
+        assert!(out.contains(&format!("{} edit four", short(c2))), "{out}");
+        assert!(out.contains("f L2"), "{out}");
+        assert!(out.contains("f L4"), "{out}");
+        // group_by needs worktree mode; committed blame needs a path.
+        let err = cmd_blame(&dir, Some("f"), None, None, false, true).unwrap_err();
+        assert!(err.contains("worktree"), "{err}");
+        let err = cmd_blame(&dir, None, None, None, false, false).unwrap_err();
+        assert!(err.contains("path"), "{err}");
     }
 
     #[test]

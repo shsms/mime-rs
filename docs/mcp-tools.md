@@ -257,11 +257,12 @@ A commit's metadata, message, the files it changed vs its first parent, and the 
 
 Which commit last touched each line of `path` (oid + summary), collapsed into contiguous same-commit hunks. Read-only. The find-the-commit half of a fixup/edit: feed a reported oid into a git_rebase plan {commit, action: fixup|edit}. Pass `lines` to blame just a span; `since` to scope to your own commits; `worktree` to map each UNCOMMITTED change to the commit that owns the lines it touches (absorb-target discovery — feed that oid into git_fixup).
 
+- `group_by` — Worktree mode only: group the hunks under their owning commit — the natural absorb preview ({commit: [hunks]}).
 - `lines` — Optional [start, end] 1-based inclusive line range; omit to blame the whole file.
-- `path` (required) — File to blame — absolute (as grep/occur return) or relative to the repo root.
+- `path` — File to blame — absolute (as grep/occur return) or relative to the repo root.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 - `since` — Scope history to `since..` (oid/ref/revspec, e.g. main): lines older than it collapse to the boundary, so the answer is 'which of MY commits owns this'.
-- `worktree` — Instead of blaming committed lines, map each UNCOMMITTED hunk of `path` to the commit that last set the lines it changes — the target for a git_fixup/git_move.
+- `worktree` — Instead of blaming committed lines, map each UNCOMMITTED hunk to the commit that last set the lines it changes — the target for a git_fixup/git_move (or git_absorb, which folds them all). Omit `path` to sweep the whole worktree.
 
 ## git_move
 
@@ -284,4 +285,12 @@ Fold changes into `target`, which keeps its own — already signed-off — messa
 - `source` — A COMMITTED commit whose changes to fold in (oid/ref/revspec). Omit to fold from the worktree instead (paths/hunks/worktree).
 - `target` (required) — The commit to fold into — keeps its message (oid/ref/revspec).
 - `worktree` — Fold EVERY uncommitted change into target (no path/hunk selection needed). Default false.
+
+## git_absorb
+
+Fold EVERY uncommitted hunk into the commit that owns its lines, automatically — git_blame {worktree: true} + git_fixup {hunks} composed into one call (magit-commit-absorb / git-absorb). Each dirty hunk is blamed, hunks are grouped by their owning commit, and every group folds into its owner in ONE replay; the target commits keep their own messages. Hunks without a single clear owner (new lines, split ownership, owners at the `since` boundary or off the branch line) stay in the worktree and are reported — route those by hand with git_fixup (review fixes sometimes belong with a commit TOPIC, not the blamed lines). rehearse:true previews the grouping and resulting history without touching anything. A replay conflict aborts the whole absorb — branch and worktree come back untouched.
+
+- `rehearse` — Preview the hunk→commit grouping and the resulting history without applying.
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+- `since` — Scope owners to `since..HEAD` (oid/ref/revspec, e.g. main — usually the branch base): hunks owned at or beyond the boundary stay in the worktree instead of rewriting history past it. Recommended on shared-history branches.
 

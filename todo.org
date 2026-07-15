@@ -373,7 +373,17 @@ test (like ~meta_covers_every_tool~) asserting every registered builtin appears
 in vocabulary.md — so it cannot silently drift again. (~string-trim-left~ /
 ~string-trim-right~ are already covered as a compound token; not missing.)
 
-** TODO [#B] git_absorb: auto-target every dirty hunk (magit-commit-absorb) :git:
+** DONE [#B] git_absorb: auto-target every dirty hunk (magit-commit-absorb) :git:
+CLOSED: [2026-07-15]
+DONE [2026-07-15]: ~git_absorb {repo, since?, rehearse?}~ blames every dirty
+hunk (shared ~worktree_hunk_owners~ discovery), groups by owning commit, and
+folds all groups in ONE replay over the parked worktree (shared execution
+tail with the worktree git_fixup). Unclear hunks (new lines, split
+ownership, since-boundary, off the branch line, root) stay in the worktree,
+each with its reason. The grouped blame view landed too:
+~git_blame {worktree: true, group_by: "commit"}~, with ~path~ now optional in
+worktree mode (whole-tree sweep). By-name routing stays expressible via
+git_fixup {hunks} on the reported leftovers.
 :LOGBOOK:
 - State "TODO"       from              [2026-07-14 Di 13:58]
 :END:
