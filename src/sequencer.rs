@@ -45,6 +45,51 @@ fn hard_reset(repo: &Repository, oid: Oid) -> Result<(), Error> {
     repo.reset(&repo.find_object(oid, None)?, ResetType::Hard, None)
 }
 
+/// [`hard_reset`], but carry the autostashed paths' CURRENT worktree bytes
+/// across the reset. The plan never rewrites these paths, so an edit the user
+/// made there during the operation is theirs — the teardown reset must not
+/// silently revert it.
+fn hard_reset_keeping_autostash(repo: &Repository, oid: Oid, st: &State) -> Result<(), Error> {
+    if st.autostash.is_empty() {
+        return hard_reset(repo, oid);
+    }
+    let workdir = repo.workdir().ok_or_else(|| estr("bare repository"))?;
+    // Only a clean read or a clean not-found participates — an unreadable
+    // path (permissions, transient I/O) is left to the plain reset rather
+    // than mistaken for a deletion.
+    let read_opt = |p: &str| -> Option<Option<Vec<u8>>> {
+        match std::fs::read(workdir.join(p)) {
+            Ok(b) => Some(Some(b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+            Err(_) => None,
+        }
+    };
+    let kept: Vec<(String, Option<Vec<u8>>)> = st
+        .autostash
+        .iter()
+        .filter_map(|p| read_opt(p).map(|bytes| (p.clone(), bytes)))
+        .collect();
+    hard_reset(repo, oid)?;
+    for (p, bytes) in kept {
+        let abs = workdir.join(&p);
+        if read_opt(&p) == Some(bytes.clone()) {
+            continue;
+        }
+        match bytes {
+            Some(b) => {
+                if let Some(dir) = abs.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(&abs, b);
+            }
+            None => {
+                let _ = std::fs::remove_file(&abs);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The recovery ref a `begin` stamps with the pre-op tip of `branch` (a full
 /// refname). Lives under `refs/mime-backup/` so it stays out of `git branch` yet
 /// is trivially recoverable (`git reset --hard <ref>`).
@@ -322,6 +367,10 @@ impl Mode {
 pub enum Outcome {
     Done {
         head: Oid,
+        /// Autostashed paths whose restore was skipped because the user
+        /// edited them during the operation — the parked bytes stay on the
+        /// `-autostash` ref. Empty on a clean restore (or no autostash).
+        kept: Vec<String>,
     },
     Conflict {
         step: usize,
@@ -383,6 +432,9 @@ struct State {
     mode: Mode,
     /// True while paused at a landed `edit` step, awaiting the amend on continue.
     editing: bool,
+    /// Paths of uncommitted changes autostashed at begin (their bytes live on
+    /// the `-autostash` backup ref); restored by finish/abort. Empty = none.
+    autostash: Vec<String>,
 }
 
 fn state_path(repo: &Repository) -> std::path::PathBuf {
@@ -428,6 +480,7 @@ fn save_state(repo: &Repository, st: &State) -> Result<(), Error> {
         "steps": steps,
         "mode": st.mode.as_str(),
         "editing": st.editing,
+        "autostash": st.autostash,
     });
     std::fs::write(state_path(repo), serde_json::to_vec_pretty(&v).unwrap())
         .map_err(|e| estr(&format!("cannot write sequencer state: {e}")))
@@ -525,6 +578,14 @@ fn load_state(repo: &Repository) -> Result<State, Error> {
         steps,
         mode: Mode::parse(v["mode"].as_str().unwrap_or("pick")),
         editing: v["editing"].as_bool().unwrap_or(false),
+        autostash: v["autostash"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -675,12 +736,52 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
     if repo.head_detached()? {
         return Err(estr("HEAD is detached — check out a branch first"));
     }
-    // Like `git rebase`, refuse to start over uncommitted work the hard reset
-    // below would silently destroy.
+    // Uncommitted work the hard reset below would silently destroy: changes to
+    // paths this operation REWRITES refuse (like `git rebase`; restoring their
+    // bytes over the rewrite would silently mix old and new content). Unstaged
+    // changes confined to untouched paths are AUTOSTASHED instead — parked on
+    // the `-autostash` backup ref and restored when the operation finishes or
+    // aborts (a path edited again during a pause keeps the later edit).
+    let mut autostash_diff = None;
     if is_dirty(repo)? {
-        return Err(estr(
-            "the working tree has uncommitted changes — commit or stash them first",
-        ));
+        let head_tree = repo.head()?.peel_to_tree()?;
+        let mut dopts = git2::DiffOptions::new();
+        dopts.context_lines(0);
+        let dirty_diff =
+            repo.diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut dopts))?;
+        let dirty = diff_paths(&dirty_diff);
+        let touched = plan_touched_paths(repo, &plan)?;
+        let mut clash: Vec<&String> = dirty.intersection(&touched).collect();
+        clash.sort();
+        if !clash.is_empty() {
+            return Err(estr(&format!(
+                "the working tree has uncommitted changes to paths this operation \
+                 rewrites ({}) — commit them (or fold them in via git_absorb / \
+                 git_fixup) first",
+                clash
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        // The autostash restores WORKTREE bytes only. Staged changes would
+        // come back with the staged/unstaged split flattened — and content
+        // that is staged but reverted in the worktree would not be captured
+        // at all. Refuse those instead of quietly losing index state.
+        let idx_tree_id = repo.index()?.write_tree()?;
+        if idx_tree_id != head_tree.id() {
+            let idx_tree = repo.find_tree(idx_tree_id)?;
+            let staged = repo.diff_tree_to_tree(Some(&head_tree), Some(&idx_tree), None)?;
+            let mut names: Vec<String> = diff_paths(&staged).into_iter().collect();
+            names.sort();
+            return Err(estr(&format!(
+                "the index has staged changes ({}) — the autostash cannot carry \
+                 staged state; commit or unstage them first",
+                names.join(", ")
+            )));
+        }
+        autostash_diff = Some(dirty_diff);
     }
     // is_dirty ignores untracked files, but the hard reset to `onto` would still
     // clobber an untracked file colliding with a path in onto's tree — git rebase
@@ -712,6 +813,37 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
     // multi-rebase session keeps its earlier ropes too.
     rotate_backup_ring(repo, &branch, orig)?;
 
+    // Park the autostash: a full-worktree dangling commit on the -autostash
+    // ref carries the dirty files' bytes across processes (a conflict pause
+    // may be finished by a later invocation).
+    let mut autostash: Vec<String> = Vec::new();
+    if let Some(diff) = &autostash_diff {
+        let head_commit = repo.find_commit(orig)?;
+        let head_tree = head_commit.tree()?;
+        let wt_tree_id = apply_subset(repo, &head_tree, diff, |_| true, |_, _, _| true)?;
+        let sig = match repo.signature() {
+            Ok(s) => s,
+            Err(_) => {
+                let a = head_commit.author();
+                git2::Signature::now(
+                    a.name().unwrap_or("mime"),
+                    a.email().unwrap_or("mime@invalid"),
+                )?
+            }
+        };
+        let stash = repo.commit(
+            None,
+            &sig,
+            &sig,
+            "mime autostash (uncommitted changes parked during a rewrite)",
+            &repo.find_tree(wt_tree_id)?,
+            &[&head_commit],
+        )?;
+        repo.reference(&autostash_ref(&branch), stash, true, "mime autostash")?;
+        autostash = diff_paths(diff).into_iter().collect();
+        autostash.sort();
+    }
+
     // Detach onto the base and clean the worktree to it.
     repo.set_head_detached(plan.onto)?;
     hard_reset(repo, plan.onto)?;
@@ -725,9 +857,161 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
         steps: plan.steps,
         mode,
         editing: false,
+        autostash,
     };
     save_state(repo, &st)?;
     drive(repo, st)
+}
+
+/// Every path a diff mentions (old and new side).
+fn diff_paths(diff: &git2::Diff) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for i in 0..diff.deltas().len() {
+        let Some(delta) = diff.get_delta(i) else {
+            continue;
+        };
+        for f in [delta.old_file().path(), delta.new_file().path()] {
+            if let Some(p) = f.and_then(|p| p.to_str()) {
+                out.insert(p.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Every path a plan can possibly rewrite: the net onto↔HEAD diff plus each
+/// step commit's own diff (a step can touch a path with zero net change).
+fn plan_touched_paths(
+    repo: &Repository,
+    plan: &Plan,
+) -> Result<std::collections::HashSet<String>, Error> {
+    let mut out = std::collections::HashSet::new();
+    let onto_tree = repo.find_commit(plan.onto)?.tree()?;
+    let head_tree = repo.head()?.peel_to_tree()?;
+    let d = repo.diff_tree_to_tree(Some(&onto_tree), Some(&head_tree), None)?;
+    out.extend(diff_paths(&d));
+    for s in &plan.steps {
+        let c = repo.find_commit(s.commit)?;
+        let parent_tree = c.parent(0).ok().map(|p| p.tree()).transpose()?;
+        let d = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&c.tree()?), None)?;
+        out.extend(diff_paths(&d));
+    }
+    Ok(out)
+}
+
+/// The ref the autostash bytes are parked on — sibling of the `-worktree`
+/// backup ref the worktree fixup uses.
+fn autostash_ref(branch: &str) -> String {
+    format!(
+        "refs/mime-backup/{}-autostash",
+        branch
+            .strip_prefix("refs/heads/")
+            .unwrap_or(branch)
+            .replace('/', "-")
+    )
+}
+
+/// Put the autostashed files back, byte-exact, from the `-autostash` ref
+/// (paths absent from the stash tree were deleted in the worktree). Deletes
+/// the ref afterwards. A path the user edited DURING the operation keeps the
+/// later edit — the parked bytes then stay on the ref, and the caller's
+/// result says so. Failures name the paths and leave the ref in place — the
+/// bytes stay recoverable. Returns the kept (skipped) paths.
+fn restore_autostash(repo: &Repository, st: &State) -> Result<Vec<String>, Error> {
+    if st.autostash.is_empty() {
+        return Ok(Vec::new());
+    }
+    let refname = autostash_ref(&st.branch);
+    let stash = repo.refname_to_id(&refname).map_err(|_| {
+        estr(&format!(
+            "the autostash ref {refname} is missing — the parked uncommitted \
+             changes cannot be restored ({})",
+            st.autostash.join(", ")
+        ))
+    })?;
+    let tree = repo.find_commit(stash)?.tree()?;
+    let head_tree = repo.head()?.peel_to_tree()?;
+    let workdir = repo.workdir().ok_or_else(|| estr("bare repository"))?;
+    let blob_bytes = |entry: &git2::TreeEntry| -> Option<Vec<u8>> {
+        repo.find_blob(entry.id())
+            .ok()
+            .map(|b| b.content().to_vec())
+    };
+    let mut failed: Vec<String> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    for p in &st.autostash {
+        let abs = workdir.join(p);
+        let stash_entry = tree.get_path(Path::new(p)).ok();
+        let stash_bytes = stash_entry.as_ref().and_then(&blob_bytes);
+        let wt_bytes = std::fs::read(&abs).ok();
+        if wt_bytes == stash_bytes {
+            // The bytes already match — but a mode-only change (chmod) still
+            // needs the stash entry's mode applied below.
+            apply_stash_mode(&abs, stash_entry.as_ref());
+            continue;
+        }
+        let head_bytes = head_tree
+            .get_path(Path::new(p))
+            .ok()
+            .as_ref()
+            .and_then(&blob_bytes);
+        if wt_bytes != head_bytes {
+            // The user changed this path during the operation — their later
+            // edit wins; the parked bytes stay recoverable on the ref.
+            kept.push(p.clone());
+            continue;
+        }
+        let outcome = match &stash_entry {
+            Some(entry) => (|| -> std::io::Result<()> {
+                if let Some(dir) = abs.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                std::fs::write(&abs, stash_bytes.as_deref().unwrap_or_default())?;
+                apply_stash_mode(&abs, Some(entry));
+                Ok(())
+            })(),
+            None => match std::fs::remove_file(&abs) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            },
+        };
+        if let Err(e) = outcome {
+            failed.push(format!("{p} ({e})"));
+        }
+    }
+    if !failed.is_empty() {
+        return Err(estr(&format!(
+            "restoring the autostashed changes failed for: {} — the bytes stay \
+             recoverable on {refname}",
+            failed.join(", ")
+        )));
+    }
+    if kept.is_empty()
+        && let Ok(mut r) = repo.find_reference(&refname)
+    {
+        let _ = r.delete();
+    }
+    Ok(kept)
+}
+
+/// Set a restored file's exec bits to match the stash entry's mode exactly —
+/// on for 100755, off otherwise. No-op off unix or when there is no entry.
+fn apply_stash_mode(abs: &std::path::Path, entry: Option<&git2::TreeEntry>) {
+    #[cfg(unix)]
+    if let Some(entry) = entry
+        && let Ok(meta) = std::fs::metadata(abs)
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = meta.permissions();
+        if entry.filemode() == 0o100755 {
+            perm.set_mode(perm.mode() | 0o111);
+        } else {
+            perm.set_mode(perm.mode() & !0o111);
+        }
+        let _ = std::fs::set_permissions(abs, perm);
+    }
+    #[cfg(not(unix))]
+    let _ = (abs, entry);
 }
 
 /// Dry-run a plan: compute the commits it would produce, entirely in the object
@@ -892,6 +1176,29 @@ fn amend_step(repo: &Repository, mut st: State) -> Result<Outcome, Error> {
     index.update_all(["*"], None)?;
     index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)?;
     index.write()?;
+    // Autostashed paths never belong to the plan — a pause-time edit there
+    // is the user's live change and must not be folded into this commit
+    // (the restore logic keeps it in the worktree instead).
+    if !st.autostash.is_empty() {
+        let target = repo.find_object(st.current, None)?;
+        // reset_default matches pathspecs with fnmatch globbing — escape the
+        // metacharacters so a literal path like `notes[1]` matches itself
+        // and nothing else.
+        let literal: Vec<String> = st
+            .autostash
+            .iter()
+            .map(|p| {
+                p.chars()
+                    .flat_map(|c| match c {
+                        '*' | '?' | '[' | ']' | '\\' => vec!['\\', c],
+                        _ => vec![c],
+                    })
+                    .collect()
+            })
+            .collect();
+        repo.reset_default(Some(&target), &literal)?;
+        index = repo.index()?;
+    }
     let tree = repo.find_tree(index.write_tree()?)?;
     // Amend in place: same author/committer/message, the worktree's tree, the
     // same parent. An unedited worktree reproduces the identical commit (no-op).
@@ -987,7 +1294,7 @@ pub fn skip(repo: &Repository) -> Result<Outcome, Error> {
     if st.editing {
         // Skipping an edit pause = abandon the pending worktree edits and resume,
         // leaving the landed commit unchanged.
-        hard_reset(repo, st.current)?;
+        hard_reset_keeping_autostash(repo, st.current, &st)?;
         let _ = repo.cleanup_state();
         st.editing = false;
         save_state(repo, &st)?;
@@ -997,7 +1304,7 @@ pub fn skip(repo: &Repository) -> Result<Outcome, Error> {
         return Err(estr("nothing to skip"));
     }
     // Discard the in-progress merge residue, back to the last good tip.
-    hard_reset(repo, st.current)?;
+    hard_reset_keeping_autostash(repo, st.current, &st)?;
     let _ = repo.cleanup_state();
     st.next += 1;
     save_state(repo, &st)?;
@@ -1008,7 +1315,7 @@ pub fn skip(repo: &Repository) -> Result<Outcome, Error> {
 /// We never move the branch ref during an op (only `finish` does), so resetting
 /// to the branch's present tip — not the recorded `orig` — preserves any commits
 /// another process added while we were paused, instead of clobbering them.
-pub fn abort(repo: &Repository) -> Result<(), Error> {
+pub fn abort(repo: &Repository) -> Result<Vec<String>, Error> {
     let st = load_state(repo)?;
     // Where to land: the branch's current tip if it still exists (preserve a
     // concurrent advance), else the pre-op backup, else the recorded orig. If
@@ -1020,10 +1327,18 @@ pub fn abort(repo: &Repository) -> Result<(), Error> {
         .unwrap_or(st.orig);
     repo.reference(&st.branch, tip, true, "mime sequencer: abort")?;
     repo.set_head(&st.branch)?;
-    hard_reset(repo, tip)?;
+    hard_reset_keeping_autostash(repo, tip, &st)?;
     let _ = repo.cleanup_state();
     let _ = std::fs::remove_file(state_path(repo));
-    Ok(())
+    // An aborted op hands the autostashed uncommitted changes back too. The
+    // abort itself is already complete — a restore failure must say so.
+    restore_autostash(repo, &st).map_err(|e| {
+        estr(&format!(
+            "the abort completed (back on {}) — but {}",
+            st.branch,
+            e.message()
+        ))
+    })
 }
 
 /// The in-progress operation, or `None` when the tree is clean.
@@ -1867,13 +2182,17 @@ fn drive(repo: &Repository, mut st: State) -> Result<Outcome, Error> {
             });
         }
     }
-    finish(repo, &st)?;
-    Ok(Outcome::Done { head: st.current })
+    let kept = finish(repo, &st)?;
+    Ok(Outcome::Done {
+        head: st.current,
+        kept,
+    })
 }
 
 /// Land the rebased history: move the branch ref to the new tip, reattach
-/// HEAD, clean the worktree, drop the state.
-fn finish(repo: &Repository, st: &State) -> Result<(), Error> {
+/// HEAD, clean the worktree, drop the state. Returns the autostash paths
+/// whose restore was skipped in favor of a pause-time edit.
+fn finish(repo: &Repository, st: &State) -> Result<Vec<String>, Error> {
     // Only land if the branch still points where `begin` left it. If another
     // process moved it (would drop their commits) or deleted it (recreating it
     // would resurrect a ref the user removed), refuse and leave the replay for
@@ -1895,10 +2214,22 @@ fn finish(repo: &Repository, st: &State) -> Result<(), Error> {
     }
     repo.reference(&st.branch, st.current, true, "rebase (mime sequencer)")?;
     repo.set_head(&st.branch)?;
-    hard_reset(repo, st.current)?;
+    hard_reset_keeping_autostash(repo, st.current, st)?;
     let _ = repo.cleanup_state();
     let _ = std::fs::remove_file(state_path(repo));
-    Ok(())
+    // Hand back any autostashed uncommitted changes. The paths were checked
+    // disjoint from everything the plan rewrites, so this can't mix old and
+    // new content; a path the user edited during the operation keeps the
+    // later edit (the parked bytes stay on the ref). The rewrite itself has
+    // already landed — a restore failure must say so, not read as a failed
+    // operation.
+    restore_autostash(repo, st).map_err(|e| {
+        estr(&format!(
+            "the rewrite LANDED (new tip {}) — but {}",
+            short(st.current),
+            e.message()
+        ))
+    })
 }
 
 // ---- read-only inspection -------------------------------------------------
@@ -2311,9 +2642,36 @@ fn blame_worktree(
 fn outcome_with_tree_note(repo: &Repository, out: &Outcome) -> String {
     let text = outcome_text(out);
     match out {
-        Outcome::Done { .. } => format!("{text}{}", tree_identity_note(repo)),
-        _ => text,
+        Outcome::Done { kept, .. } => {
+            format!("{text}{}{}", tree_identity_note(repo), kept_note(kept))
+        }
+        // A pause with an autostash in flight: say where the uncommitted
+        // changes went and when they come back.
+        Outcome::Conflict { .. } | Outcome::Paused { .. } => match load_state(repo) {
+            Ok(st) if !st.autostash.is_empty() => format!(
+                "{text}\n  (your uncommitted changes are autostashed on {}; \
+                     they are restored when the operation finishes or aborts — \
+                     a parked file you edit again during the pause keeps your \
+                     edit instead)",
+                autostash_ref(&st.branch)
+            ),
+            _ => text,
+        },
     }
+}
+
+/// One line naming the autostashed paths whose restore was skipped because
+/// they were edited during the operation — the later edits were kept and
+/// the parked bytes stayed on the `-autostash` ref. Empty on a clean restore.
+fn kept_note(kept: &[String]) -> String {
+    if kept.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n  {} edited during the operation — those edits were kept; the parked \
+         bytes stay on the -autostash ref",
+        kept.join(", ")
+    )
 }
 
 /// One line comparing HEAD's tree with the pre-op tip's (backup ring slot 0).
@@ -2360,7 +2718,7 @@ fn tree_identity_note(repo: &Repository) -> String {
 /// The agent-facing summary of an [`Outcome`].
 pub fn outcome_text(out: &Outcome) -> String {
     match out {
-        Outcome::Done { head } => format!("done — new tip {}", short(*head)),
+        Outcome::Done { head, .. } => format!("done — new tip {}", short(*head)),
         Outcome::Conflict { step, files } => format!(
             "stopped on a conflict at step {} — resolve {} file(s) with the conflict tools \
              (conflicts / conflict-keep / …), then git_continue (or git_skip / git_abort):\n  {}",
@@ -3561,8 +3919,12 @@ pub fn cmd_skip(repo_path: &std::path::Path) -> Result<String, String> {
 }
 
 pub fn cmd_abort(repo_path: &std::path::Path) -> Result<String, String> {
-    abort(&open(repo_path)?).map_err(gerr)?;
-    Ok("aborted — restored to the pre-operation state".to_string())
+    let repo = open(repo_path)?;
+    let kept = abort(&repo).map_err(gerr)?;
+    Ok(format!(
+        "aborted — restored to the pre-operation state{}",
+        kept_note(&kept)
+    ))
 }
 
 pub fn cmd_status(repo_path: &std::path::Path) -> Result<String, String> {
@@ -4331,7 +4693,12 @@ mod tests {
         let dir = tmp("exec-over-untracked");
         let repo = Repository::init(&dir).unwrap();
         let base = commit(&repo, &[], &[("f", "1\n")], "base");
-        let c1 = commit(&repo, &[base], &[("f", "1\n"), ("gen", "old\n")], "track gen");
+        let c1 = commit(
+            &repo,
+            &[base],
+            &[("f", "1\n"), ("gen", "old\n")],
+            "track gen",
+        );
         let c2 = commit(&repo, &[c1], &[("f", "2\n")], "drop gen");
         on_branch(&repo, "main", c2);
         // `gen` is untracked at HEAD, but checking out c1 would overwrite it
@@ -4344,6 +4711,201 @@ mod tests {
         std::fs::remove_file(dir.join("gen")).unwrap();
         let out = exec_over(&repo, &format!("{base}..HEAD"), "true").unwrap();
         assert!(out.contains("all passed"), "{out}");
+    }
+
+    #[test]
+    fn rebase_autostashes_dirty_files_the_plan_does_not_touch() {
+        let dir = tmp("autostash");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n"), ("notes", "n\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "2\n"), ("notes", "n\n")], "f1");
+        let m1 = commit(
+            &repo,
+            &[base],
+            &[("a", "1\n"), ("b", "1\n"), ("notes", "n\n")],
+            "m1",
+        );
+        on_branch(&repo, "topic", f1);
+        // An unrelated uncommitted edit: `notes` is touched by NO step and
+        // does not differ between onto and HEAD.
+        std::fs::write(dir.join("notes"), "scratch\n").unwrap();
+
+        // m1 adds b; rebase f1 onto m1. `notes` is untouched.
+        let out = cmd_rebase(&dir, &m1.to_string(), None, None, false, false).unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        assert_eq!(
+            read(&repo, "notes"),
+            "scratch\n",
+            "autostashed edit restored after the rebase"
+        );
+        assert_eq!(read(&repo, "a"), "2\n", "the rebase itself landed");
+        assert!(
+            repo.refname_to_id(&autostash_ref("topic")).is_err(),
+            "the autostash ref is cleaned up after the restore"
+        );
+    }
+
+    #[test]
+    fn rebase_refuses_dirty_files_the_plan_rewrites() {
+        let dir = tmp("autostash-clash");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "2\n")], "f1");
+        let m1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "m1");
+        on_branch(&repo, "topic", f1);
+        std::fs::write(dir.join("a"), "uncommitted\n").unwrap();
+        let err = cmd_rebase(&dir, &m1.to_string(), None, None, false, false).unwrap_err();
+        assert!(err.contains("uncommitted changes"), "{err}");
+        assert!(err.contains('a'), "names the clashing path: {err}");
+        assert_eq!(read(&repo, "a"), "uncommitted\n", "nothing destroyed");
+    }
+
+    #[test]
+    fn autostash_survives_a_conflict_pause_and_an_abort() {
+        let dir = tmp("autostash-conflict");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n"), ("notes", "n\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "2\n"), ("notes", "n\n")], "f1");
+        let m1 = commit(&repo, &[base], &[("a", "3\n"), ("notes", "n\n")], "m1");
+        on_branch(&repo, "topic", f1);
+        std::fs::write(dir.join("notes"), "scratch\n").unwrap();
+
+        // f1 conflicts with m1 on `a`; `notes` rides the autostash.
+        let out = cmd_rebase(&dir, &m1.to_string(), None, None, false, false).unwrap();
+        assert!(out.contains("conflict"), "{out}");
+        assert!(out.contains("autostashed"), "the pause says where: {out}");
+        assert_ne!(
+            read(&repo, "notes"),
+            "scratch\n",
+            "parked during the operation"
+        );
+        // Abort hands the parked change back.
+        cmd_abort(&dir).unwrap();
+        assert_eq!(read(&repo, "notes"), "scratch\n", "restored on abort");
+        assert_eq!(repo.head().unwrap().target(), Some(f1));
+        assert!(repo.refname_to_id(&autostash_ref("topic")).is_err());
+    }
+
+    #[test]
+    fn autostash_keeps_edits_made_during_a_conflict_pause() {
+        let dir = tmp("autostash-pause-edit");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n"), ("notes", "n\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "2\n"), ("notes", "n\n")], "f1");
+        let m1 = commit(&repo, &[base], &[("a", "3\n"), ("notes", "n\n")], "m1");
+        on_branch(&repo, "topic", f1);
+        std::fs::write(dir.join("notes"), "scratch\n").unwrap();
+
+        // f1 conflicts with m1 on `a`; `notes` rides the autostash.
+        let out = cmd_rebase(&dir, &m1.to_string(), None, None, false, false).unwrap();
+        assert!(out.contains("conflict"), "{out}");
+        // During the pause the user writes `notes` again — the later edit
+        // must win over the parked bytes.
+        std::fs::write(dir.join("notes"), "newer\n").unwrap();
+        std::fs::write(dir.join("a"), "3\n").unwrap();
+        let out = cmd_continue(&dir, false).unwrap();
+        assert!(out.contains("done"), "{out}");
+        assert_eq!(read(&repo, "notes"), "newer\n", "pause-time edit kept");
+        assert!(
+            out.contains("edited during the operation"),
+            "the result says the stash was not applied: {out}"
+        );
+        // The parked bytes stay recoverable on the ref.
+        let stash = repo.refname_to_id(&autostash_ref("topic")).unwrap();
+        let tree = repo.find_commit(stash).unwrap().tree().unwrap();
+        let entry = tree.get_path(Path::new("notes")).unwrap();
+        let blob = repo.find_blob(entry.id()).unwrap();
+        assert_eq!(blob.content(), b"scratch\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn autostash_restores_a_mode_only_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("autostash-mode");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n"), ("run.sh", "s\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "2\n"), ("run.sh", "s\n")], "f1");
+        let m1 = commit(
+            &repo,
+            &[base],
+            &[("a", "1\n"), ("b", "1\n"), ("run.sh", "s\n")],
+            "m1",
+        );
+        on_branch(&repo, "topic", f1);
+        // The only dirty change is chmod +x — same bytes, different mode.
+        let abs = dir.join("run.sh");
+        let mut perm = std::fs::metadata(&abs).unwrap().permissions();
+        perm.set_mode(perm.mode() | 0o111);
+        std::fs::set_permissions(&abs, perm).unwrap();
+        let out = cmd_rebase(&dir, &m1.to_string(), None, None, false, false).unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        let mode = std::fs::metadata(&abs).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0, "the exec bit came back");
+        assert!(
+            repo.refname_to_id(&autostash_ref("topic")).is_err(),
+            "a clean restore deletes the ref"
+        );
+    }
+
+    #[test]
+    fn edit_pause_amend_keeps_autostash_paths_out_of_the_commit() {
+        let dir = tmp("autostash-edit-amend");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n"), ("notes", "n\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "2\n"), ("notes", "n\n")], "f1");
+        on_branch(&repo, "topic", f1);
+        std::fs::write(dir.join("notes"), "scratch\n").unwrap();
+        let out = start(
+            &repo,
+            Plan {
+                onto: base,
+                steps: vec![step(f1, Action::Edit, None)],
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, Outcome::Paused { .. }));
+        // During the edit pause the user edits a plan file AND the parked path.
+        std::fs::write(dir.join("a"), "3\n").unwrap();
+        std::fs::write(dir.join("notes"), "newer\n").unwrap();
+        let out = continue_op(&repo, false).unwrap();
+        assert!(matches!(out, Outcome::Done { .. }));
+        // The amended commit carries `a` but NOT the parked path's edit...
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        let t = tip.tree().unwrap();
+        let a = repo
+            .find_blob(t.get_path(Path::new("a")).unwrap().id())
+            .unwrap();
+        assert_eq!(a.content(), b"3\n");
+        let n = repo
+            .find_blob(t.get_path(Path::new("notes")).unwrap().id())
+            .unwrap();
+        assert_eq!(n.content(), b"n\n", "parked path stays out of the amend");
+        // ...the worktree keeps the pause-time edit, the stash stays parked.
+        assert_eq!(read(&repo, "notes"), "newer\n");
+        assert!(repo.refname_to_id(&autostash_ref("topic")).is_ok());
+    }
+
+    #[test]
+    fn autostash_refuses_staged_changes() {
+        let dir = tmp("autostash-staged");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n"), ("notes", "n\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "2\n"), ("notes", "n\n")], "f1");
+        let m1 = commit(&repo, &[base], &[("a", "3\n"), ("notes", "n\n")], "m1");
+        on_branch(&repo, "topic", f1);
+        // Stage a change to a path no step touches — the autostash cannot
+        // carry index state, so this refuses instead of flattening it.
+        std::fs::write(dir.join("notes"), "staged\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("notes")).unwrap();
+        index.write().unwrap();
+        let err = cmd_rebase(&dir, &m1.to_string(), None, None, false, false).unwrap_err();
+        assert!(err.contains("staged changes"), "{err}");
+        assert!(err.contains("notes"), "{err}");
+        // Nothing moved: branch tip and the staged bytes are untouched.
+        assert_eq!(repo.head().unwrap().target(), Some(f1));
+        assert_eq!(read(&repo, "notes"), "staged\n");
     }
 
     #[test]
@@ -4883,6 +5445,7 @@ mod tests {
             orig: base,
             onto: base,
             current: base,
+            autostash: vec!["parked.txt".to_string()],
             next: 1,
             steps: vec![
                 Step {

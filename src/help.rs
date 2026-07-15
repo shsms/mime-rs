@@ -196,7 +196,7 @@ into git_fixup, or let git_absorb fold them all).
     the named commits (fixup/squash `commit` under `into`), auto-picking the rest
     of onto..HEAD — no need to transcribe untouched commits.
   git_fixup {target, source}  one-call fold of `source` into `target` (keeps
-    target's signed message); auto-picks the rest. Commit uncommitted work first.
+    target's signed message); auto-picks the rest.
   git_msg_rewrite {range, message_edits}  apply one message_edits vocabulary
     to EVERY commit of the range (must end at HEAD): the bulk trailer
     strip/add or symbol sweep. Only messages change — every tree stays
@@ -210,6 +210,10 @@ into git_fixup, or let git_absorb fold them all).
     replay; unclear ones (new lines, split ownership) stay in the worktree and
     are reported. rehearse:true previews the grouping. `since` bounds how far
     back history may be rewritten.
+Rewrites autostash unstaged changes to paths the plan does not touch
+(parked on a backup ref, restored at finish/abort; a file you edit again
+during a pause keeps your later edit, the parked bytes stay on the ref);
+staged changes and dirty REWRITTEN paths refuse, naming them.
 Each STOPS on the first conflict. Then, per stop:
   git_status     which step of how many + the unresolved files
   resolve each file with the conflicts vocabulary (help conflicts), SAVE

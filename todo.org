@@ -683,7 +683,17 @@ changed when false) for free at rewrite time. Cheap sibling of
 git_range_diff: the boolean answers the common question; range-diff
 answers the deep one.
 
-** TODO git_rebase: autostash around a dirty worktree                   :git:
+** DONE git_rebase: autostash around a dirty worktree                   :git:
+CLOSED: [2026-07-15]
+DONE [2026-07-15]: implemented the refuse-only-on-intersection variant
+inside ~begin~, so every plan-driven op (rebase/fixup/move/cherry-pick/
+revert) gets it: dirty paths disjoint from everything the plan rewrites
+(net onto↔HEAD diff ∪ each step's own diff) are parked byte-exact on a
+~-autostash~ backup ref, recorded in the op state, and restored by
+finish AND abort — surviving conflict pauses across processes. Dirty
+REWRITTEN paths refuse, naming them (restoring their bytes over the
+rewrite would mix old and new content — the reason a blanket autostash
+like native git's can conflict; ours can't).
 :LOGBOOK:
 - State "TODO"       from              [2026-07-15 Mi 16:19]
 :END:
