@@ -71,8 +71,38 @@ pub fn run() {
     match verb.as_str() {
         "repl" => run_repl(&args),
         "describe-mcp" => describe_mcp(),
+        "tui" => run_tui(&args),
         "run" | "rehearse" if !uses_daemon(&args) => run_local(&args, &verb),
         _ => run_daemon(&args, &verb),
+    }
+}
+
+/// `mime tui PROG.tl --file F [--write]` — the script stepper (Phase 0 of the
+/// TUI cockpit): watch the program land form by form. Behind the `tui`
+/// feature so the default build stays lean.
+fn run_tui(args: &Args) {
+    let (Some(prog), Some(file)) = (args.prog_path.as_deref(), args.file.as_deref()) else {
+        eprintln!("usage: mime tui PROG.tl --file FILE [--write]");
+        exit(2);
+    };
+    #[cfg(feature = "tui")]
+    {
+        if let Err(e) = crate::tui::run(
+            std::path::Path::new(prog),
+            std::path::Path::new(file),
+            args.write_back,
+        ) {
+            eprintln!("{e}");
+            exit(1);
+        }
+    }
+    #[cfg(not(feature = "tui"))]
+    {
+        let _ = (prog, file);
+        eprintln!(
+            "this mime was built without the TUI — rebuild with `cargo build --features tui`"
+        );
+        exit(2);
     }
 }
 
@@ -131,7 +161,8 @@ fn parse(argv: &[String]) -> Args {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "run" | "rehearse" | "open" | "status" | "save" | "close" | "repl" | "describe-mcp"
+            "run" | "rehearse" | "open" | "status" | "save" | "close" | "repl" | "tui"
+            | "describe-mcp"
                 if a.verb.is_none() =>
             {
                 a.verb = Some(argv[i].clone());
@@ -606,6 +637,10 @@ fn usage() {
         (
             "mime describe-mcp",
             "the MCP tool catalogue as markdown (from the live schemas)",
+        ),
+        (
+            "mime tui PROG.tl --file FILE [--write]",
+            "step a script form by form (needs a build with --features tui)",
         ),
         (
             "mime --session S run PROG.tl",

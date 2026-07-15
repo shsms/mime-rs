@@ -24,6 +24,9 @@ pub mod sequencer;
 pub mod store;
 pub mod strings;
 pub mod syntax;
+#[cfg(feature = "tui")]
+pub mod tui;
+pub mod tui_step;
 
 pub use buffer::Buffer;
 pub use engine::{Workspace, run_program};

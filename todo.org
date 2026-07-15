@@ -753,7 +753,8 @@ if daily use pulls it there. Two entry modes sharing one shell:
 crossterm behind a ~tui~ feature flag so the core stays lean; the
 single-threaded ~Rc~ engine fits a TUI event loop as-is.
 
-** TODO Phase 0 — script stepper spike [#B]
+** DONE Phase 0 — script stepper spike [#B]
+CLOSED: [2026-07-15]
 ~mime tui SCRIPT.tl --file F~: in-process trusted Workspace, three panes
 — buffer viewport (rendered from read_region + point, not the gutter'd
 ~window~ string), program pane (top-level forms, current one
@@ -766,6 +767,19 @@ Prerequisites:
 - per-step diff: store snapshot before each form, ~unified_diff~ after
   (snapshots are O(log n) for Quire — cheap even per step).
 /Exit: watch a conflict-resolution script land hunk by hunk./
+
+DONE [2026-07-15]: landed behind ~--features tui~ (ratatui/crossterm
+optional deps; the default build is untouched). Form-by-form eval
+needed NO tulisp change: a source-level top-level-form splitter
+(~tui_step::split_forms~ — paren/string/comment/char-literal aware,
+unit-tested) feeds each form's text to ~Workspace::run~, so the
+per-step diff/reports/log come from the existing RunReport machinery
+and defuns/buffer persist across steps. ~tui_step::Stepper~ is the
+always-compiled, tested core; src/tui.rs is a thin renderer. A failed
+form shows its error (engine rolls its edits back) and stepping may
+continue. --write persists only a COMPLETED run. Remaining: a manual
+pass in a real terminal (the spike is only smoke-tested headless);
+the exit criterion (watch a conflict-resolution script) awaits that.
 
 ** TODO Phase 1 — playback controls
 Auto-play with a speed setting (delay per form), pause/resume, restart
