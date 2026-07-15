@@ -4646,4 +4646,45 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn vocabulary_doc_lists_every_registered_builtin() {
+        // docs/vocabulary.md is hand-written (make docs regenerates only
+        // mcp-tools.md), so it drifts silently — this is the drift guard, in
+        // the same spirit as meta_covers_every_tool: every `defun`/`defspecial`
+        // registered in the builtin sources must appear in the doc as a
+        // `name` code token (compound tokens like `string-trim`(`-left`) count
+        // via substring).
+        let doc = include_str!("../docs/vocabulary.md");
+        let sources = [
+            include_str!("builtins.rs"),
+            include_str!("strings.rs"),
+            include_str!("syntax.rs"),
+        ];
+        let re = regex::Regex::new(r#"def(?:un|special)\(\s*"([^"]+)""#).unwrap();
+        let mut missing: Vec<&str> = Vec::new();
+        for src in sources {
+            // Only the non-test half registers real builtins.
+            let src = src.split("#[cfg(test)]").next().expect("split is total");
+            for cap in re.captures_iter(src) {
+                let name = cap.get(1).expect("group 1").as_str();
+                // A doc mention is a backticked token; compound spellings
+                // (`string-trim`(`-left`/`-right`)) resolve via substring on
+                // the backticked text.
+                let mentioned = doc.contains(&format!("`{name}`"))
+                    || doc
+                        .split('`')
+                        .skip(1)
+                        .step_by(2)
+                        .any(|tok| name.starts_with(tok) || tok.contains(name));
+                if !mentioned && !missing.contains(&name) {
+                    missing.push(name);
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "builtins registered but absent from docs/vocabulary.md: {missing:?}"
+        );
+    }
 }

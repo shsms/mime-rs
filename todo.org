@@ -359,7 +359,12 @@ Tension: each removes a tool but hides an INTENT (preview-first; grep-the-tree).
 Lean toward KEEPING rehearse (and probably grep) as named tools — visibility
 beats minimalism for agent ergonomics. Options, not decisions.
 
-** TODO vocabulary.md drifts from the registered builtins (hand-written, unguarded) [#C] :mcp:
+** DONE vocabulary.md drifts from the registered builtins (hand-written, unguarded) [#C] :mcp:
+CLOSED: [2026-07-15]
+DONE [2026-07-15]: the 7 missing builtins + the ~recipes~ topic added;
+drift guard ~vocabulary_doc_lists_every_registered_builtin~ scans the
+non-test half of builtins/strings/syntax sources for defun/defspecial
+registrations and asserts each name appears backticked in the doc.
 ~docs/vocabulary.md~ lists the ~run_program~ Emacs-Lisp builtins by group, but it
 is hand-written — ~make docs~ only regenerates ~mcp-tools.md~ — so it drifts. As
 of 2026-06-24 it claims nothing false, but 7 registered builtins (all in
