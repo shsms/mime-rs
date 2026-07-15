@@ -304,6 +304,15 @@ Fold EVERY uncommitted hunk into the commit that owns its lines, automatically �
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 - `since` — Scope owners to `since..HEAD` (oid/ref/revspec, e.g. main — usually the branch base): hunks owned at or beyond the boundary stay in the worktree instead of rewriting history past it. Recommended on shared-history branches.
 
+## git_discard
+
+Drop selected UNCOMMITTED changes — the destructive sibling of git_fixup's worktree mode, with the same selectors: `paths` (whole files) and/or `hunks` ({path, lines: [start, end]} — the spans git_blame {worktree: true} reports). The chosen hunks reset to HEAD content; everything else stays, unstaged. Always recoverable: the FULL pre-discard worktree is stamped on refs/mime-backup/<branch>-worktree first. A selection is mandatory — no discard-everything shorthand. rehearse:true lists what would go.
+
+- `hunks` — Specific uncommitted hunks to discard — each {path, lines: [start, end]} takes every worktree diff-hunk of `path` whose current-file line range overlaps [start, end] (1-based inclusive).
+- `paths` — Whole files whose uncommitted changes to discard (repo-relative).
+- `rehearse` — List what would be discarded without touching anything.
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+
 ## git_reword
 
 Change ONE commit's message — `message` replaces it wholesale, `message_edits` tweak it in place ({find, replace?} every occurrence / {append} a trailing line), or both (edits apply to the provided message). A sparse rewrite: the commit and its descendants are re-created with their own trees (byte-identical, nothing can conflict) — no plan to transcribe. rehearse:true previews the new message. For every commit of a range use git_msg_rewrite; to change content too, use git_rebase {action: reword|edit}.

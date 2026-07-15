@@ -445,7 +445,13 @@ against a rehearse preview. libgit2 has no range-diff; needs a patch-id
 based pairing pass plus per-pair diff-of-diffs (or an approximation:
 pair by patch-id / summary, then diff the paired trees).
 
-** TODO [#C] git_discard: drop selected worktree hunks, with a parachute :git:
+** DONE [#C] git_discard: drop selected worktree hunks, with a parachute :git:
+CLOSED: [2026-07-15]
+DONE [2026-07-15]: ~git_discard {paths?, hunks?, rehearse?}~ — same
+selectors as the worktree fixup, full pre-discard worktree stamped on
+the ~-worktree~ ref first, selected hunks reset to HEAD content (the
+rest stays, unstaged). Selection is mandatory — no discard-everything
+shorthand, deliberately.
 :LOGBOOK:
 - State "TODO"       from              [2026-07-14 Di 13:58]
 :END:

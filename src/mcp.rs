@@ -2965,6 +2965,12 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
                 bool_arg(args, "rehearse"),
             )
         }
+        "git_discard" => seq::cmd_discard(
+            &repo,
+            &opt_str_list(args, "paths"),
+            &hunk_sels_arg(args, "hunks"),
+            bool_arg(args, "rehearse"),
+        ),
         "git_move" => seq::cmd_move(
             &repo,
             &str_arg(args, "from")?,
@@ -3208,6 +3214,31 @@ fn git_tool_schemas() -> Vec<Value> {
                     "repo": repo,
                     "since": { "type": "string", "description": "Scope owners to `since..HEAD` (oid/ref/revspec, e.g. main — usually the branch base): hunks owned at or beyond the boundary stay in the worktree instead of rewriting history past it. Recommended on shared-history branches." },
                     "rehearse": { "type": "boolean", "description": "Preview the hunk→commit grouping and the resulting history without applying." }
+                },
+                "required": ["repo"],
+            },
+        }),
+        json!({
+            "name": "git_discard",
+            "description": "Drop selected UNCOMMITTED changes — the destructive sibling of git_fixup's worktree mode, with the same selectors: `paths` (whole files) and/or `hunks` ({path, lines: [start, end]} — the spans git_blame {worktree: true} reports). The chosen hunks reset to HEAD content; everything else stays, unstaged. Always recoverable: the FULL pre-discard worktree is stamped on refs/mime-backup/<branch>-worktree first. A selection is mandatory — no discard-everything shorthand. rehearse:true lists what would go.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": repo,
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Whole files whose uncommitted changes to discard (repo-relative)." },
+                    "hunks": {
+                        "type": "array",
+                        "description": "Specific uncommitted hunks to discard — each {path, lines: [start, end]} takes every worktree diff-hunk of `path` whose current-file line range overlaps [start, end] (1-based inclusive).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "File whose hunks to discard." },
+                                "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based inclusive line span in the CURRENT worktree file." }
+                            },
+                            "required": ["path", "lines"]
+                        }
+                    },
+                    "rehearse": { "type": "boolean", "description": "List what would be discarded without touching anything." }
                 },
                 "required": ["repo"],
             },
@@ -3538,6 +3569,11 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             Git,
             A::destructive(),
             "change one commit's message (tree untouched, no plan needed)",
+        ),
+        "git_discard" => (
+            Git,
+            A::destructive(),
+            "drop selected uncommitted hunks (pre-state on a backup ref)",
         ),
 
         "read_region" => (
@@ -4425,6 +4461,7 @@ mod git_tool_tests {
             "git_exec_over",
             "git_msg_rewrite",
             "git_reword",
+            "git_discard",
         ] {
             assert!(names.contains(&expected), "missing schema for {expected}");
         }

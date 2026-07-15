@@ -208,6 +208,9 @@ into git_fixup, or let git_absorb fold them all).
     range, oldest-first (the pr-prep "does every commit build?" gate); stops
     on the first failure naming the commit, HEAD restored either way.
     Disabled unless the server was launched with MIME_EXEC=1.
+  git_discard {paths?/hunks?}  drop selected UNCOMMITTED hunks (same
+    selectors as the worktree fixup); the full pre-discard worktree is
+    stamped on the -worktree backup ref first. Selection is mandatory.
   git_absorb {since?}  fold EVERY uncommitted hunk into the commit that owns
     its lines (blame + fixup composed): hunks group by owner and fold in one
     replay; unclear ones (new lines, split ownership) stay in the worktree and

@@ -3062,6 +3062,168 @@ pub fn cmd_fixup_worktree(
     fixup_worktree(&repo, target, paths, hunks, rehearse_only).map_err(gerr)
 }
 
+/// Discard selected UNCOMMITTED hunks — the destructive sibling of the
+/// worktree git_fixup: the same {paths, hunks} selectors, but the chosen
+/// changes reset to HEAD content instead of folding into a commit. Always
+/// recoverable: the FULL pre-discard worktree is stamped on the
+/// `-worktree` backup ref before anything is touched. Selection is
+/// mandatory (discarding "everything" must be said path by path).
+pub fn cmd_discard(
+    repo_path: &std::path::Path,
+    paths: &[String],
+    hunks: &[HunkSel],
+    rehearse_only: bool,
+) -> Result<String, String> {
+    let repo = open(repo_path)?;
+    if paths.is_empty() && hunks.is_empty() {
+        return Err(
+            "git_discard: select what to drop ({paths} and/or {hunks}) — there is \
+             no discard-everything shorthand, deliberately"
+                .to_string(),
+        );
+    }
+    discard(&repo, paths, hunks, rehearse_only).map_err(gerr)
+}
+
+fn discard(
+    repo: &Repository,
+    paths: &[String],
+    hunks: &[HunkSel],
+    rehearse_only: bool,
+) -> Result<String, Error> {
+    let head = repo.head()?.peel_to_commit()?;
+    let head_tree = head.tree()?;
+    let diff = worktree_diff(repo, None)?;
+    if diff.deltas().len() == 0 {
+        return Err(estr("discard: the worktree has no uncommitted changes"));
+    }
+    let sel = resolve_move_selection(&diff, paths, hunks, "discard")?;
+
+    // What would go: every selected hunk, listed per path.
+    let mut dropped: Vec<String> = Vec::new();
+    for idx in 0..diff.deltas().len() {
+        let Some(patch) = git2::Patch::from_diff(&diff, idx)? else {
+            continue;
+        };
+        let path = delta_path(diff.get_delta(idx));
+        if patch.num_hunks() == 0 {
+            if sel.whole.contains(&path) {
+                dropped.push(format!("{path} (whole — rename/mode/binary)"));
+            }
+            continue;
+        }
+        for h in 0..patch.num_hunks() {
+            let (dh, _) = patch.hunk(h)?;
+            let (ns, nl) = (dh.new_start(), dh.new_lines());
+            if sel.takes(&path, ns, nl) {
+                let span = if nl == 0 {
+                    format!("L{ns}")
+                } else {
+                    format!("L{ns}-{}", ns + nl - 1)
+                };
+                dropped.push(format!("{path} {span}"));
+            }
+        }
+    }
+    if dropped.is_empty() {
+        return Err(estr("discard: the selection holds no changes"));
+    }
+    let listing = dropped
+        .iter()
+        .map(|d| format!("  {d}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if rehearse_only {
+        return Ok(format!(
+            "rehearse: would discard {} uncommitted hunk(s):\n{listing}\n(nothing changed)",
+            dropped.len()
+        ));
+    }
+
+    // The parachute FIRST: the full pre-discard worktree as a dangling commit
+    // on the -worktree ref — a discard is destructive by intent, never by
+    // accident.
+    let sig = match repo.signature() {
+        Ok(s) => s,
+        Err(_) => {
+            let a = head.author();
+            git2::Signature::now(
+                a.name().unwrap_or("mime"),
+                a.email().unwrap_or("mime@invalid"),
+            )?
+        }
+    };
+    let wt_tree_id = apply_subset(repo, &head_tree, &diff, |_| true, |_, _, _| true)?;
+    let wt_backup = repo.commit(
+        None,
+        &sig,
+        &sig,
+        "mime worktree backup (pre discard)",
+        &repo.find_tree(wt_tree_id)?,
+        &[&head],
+    )?;
+    let short_branch = repo.head()?.shorthand().unwrap_or("HEAD").replace('/', "-");
+    let backup_ref = format!("refs/mime-backup/{short_branch}-worktree");
+    repo.reference(&backup_ref, wt_backup, true, "mime discard backup")?;
+
+    // The KEPT tree: HEAD plus every change NOT selected; the discarded spans
+    // fall back to HEAD content. Touched paths take their bytes from it, and
+    // their index entries reset to HEAD (like the other worktree ops, what
+    // remains is unstaged).
+    let kept_id = apply_subset(
+        repo,
+        &head_tree,
+        &diff,
+        |p| !sel.whole.contains(p),
+        |p, ns, nl| !sel.takes(p, ns, nl),
+    )?;
+    let kept = repo.find_tree(kept_id)?;
+    let workdir = repo.workdir().ok_or_else(|| estr("bare repository"))?;
+    let touched: Vec<String> = {
+        let mut v: Vec<String> = diff_paths(&diff).into_iter().collect();
+        v.sort();
+        v
+    };
+    for p in &touched {
+        let abs = workdir.join(p);
+        match kept.get_path(Path::new(p)) {
+            Ok(entry) => {
+                if let Some(dir) = abs.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let blob = repo.find_blob(entry.id())?;
+                std::fs::write(&abs, blob.content()).map_err(|e| {
+                    estr(&format!(
+                        "cannot write {p}: {e} — the pre-discard worktree is on {backup_ref}"
+                    ))
+                })?;
+                #[cfg(unix)]
+                if entry.filemode() == 0o100755 {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = std::fs::metadata(&abs) {
+                        let mut perm = meta.permissions();
+                        perm.set_mode(perm.mode() | 0o111);
+                        let _ = std::fs::set_permissions(&abs, perm);
+                    }
+                }
+            }
+            Err(_) => match std::fs::remove_file(&abs) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(estr(&format!(
+                        "cannot remove {p}: {e} — the pre-discard worktree is on {backup_ref}"
+                    )));
+                }
+                _ => {}
+            },
+        }
+    }
+    repo.reset_default(Some(head.as_object()), touched.iter())?;
+    Ok(format!(
+        "discarded {} uncommitted hunk(s):\n{listing}\n  pre-discard worktree recoverable from {backup_ref}",
+        dropped.len()
+    ))
+}
+
 /// Absorb: fold EVERY uncommitted hunk into the commit that owns its lines —
 /// `git_blame {worktree}` composed with `git_fixup {hunks}` in one call
 /// (magit-commit-absorb / git-absorb). Hunks without a single clear owner
@@ -5015,6 +5177,50 @@ mod tests {
         // Nothing moved: branch tip and the staged bytes are untouched.
         assert_eq!(repo.head().unwrap().target(), Some(f1));
         assert_eq!(read(&repo, "notes"), "staged\n");
+    }
+
+    #[test]
+    fn discard_drops_selected_hunks_with_a_parachute() {
+        let (dir, repo, _base, _c1, _c2) = absorb_fixture("discard");
+        // Two separate dirty hunks: line 2 and line 4.
+        std::fs::write(repo.workdir().unwrap().join("f"), b"l1\nw1\nl3\nw2\nl5\n").unwrap();
+
+        // Rehearse lists, touches nothing.
+        let sel = [HunkSel {
+            path: "f".into(),
+            lo: 2,
+            hi: 2,
+        }];
+        let out = cmd_discard(&dir, &[], &sel, true).unwrap();
+        assert!(
+            out.contains("would discard") && out.contains("f L2"),
+            "{out}"
+        );
+        assert_eq!(read(&repo, "f"), "l1\nw1\nl3\nw2\nl5\n");
+
+        // Discard just the line-2 hunk: it resets to HEAD content ("c1"),
+        // the line-4 hunk stays, and the parachute holds the full pre-state.
+        let out = cmd_discard(&dir, &[], &sel, false).unwrap();
+        assert!(out.contains("discarded 1"), "{out}");
+        assert_eq!(read(&repo, "f"), "l1\nc1\nl3\nw2\nl5\n");
+        let backup = repo
+            .refname_to_id("refs/mime-backup/main-worktree")
+            .unwrap();
+        let tree = repo.find_commit(backup).unwrap().tree().unwrap();
+        let e = tree.get_path(Path::new("f")).unwrap();
+        assert_eq!(
+            repo.find_blob(e.id()).unwrap().content(),
+            b"l1\nw1\nl3\nw2\nl5\n",
+            "the pre-discard bytes are on the backup ref"
+        );
+
+        // No selection / an empty selection are loud errors.
+        let err = cmd_discard(&dir, &[], &[], false).unwrap_err();
+        assert!(err.contains("select what to drop"), "{err}");
+        // Whole-file discard drops the remaining hunk.
+        cmd_discard(&dir, &["f".to_string()], &[], false).unwrap();
+        assert_eq!(read(&repo, "f"), "l1\nc1\nl3\nc2\nl5\n");
+        assert!(!is_dirty(&repo).unwrap());
     }
 
     #[test]
