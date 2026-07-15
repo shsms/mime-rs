@@ -1050,6 +1050,25 @@ fn unsaved_edits_are_flagged_until_saved() {
     );
     assert!(msg.contains("unsaved"), "edit-tool message reminds: {msg}");
 
+    // The read side is authoritative too: grep (disk) flags the file, view
+    // (buffer) says which state it shows, and unsaved_diff answers "what
+    // exactly have I not saved".
+    let hits = s.call_ok(50, "grep", json!({ "pattern": "alpha" }));
+    assert!(
+        hits.contains("UNSAVED"),
+        "grep flags a file whose warm buffer differs from disk: {hits}"
+    );
+    let vp = s.call_ok(51, "view", json!({ "path": p }));
+    assert!(
+        vp.contains("unsaved"),
+        "view says it shows the warm buffer: {vp}"
+    );
+    let d = s.call_ok(52, "unsaved_diff", json!({ "path": p }));
+    assert!(
+        d.contains("+ALPHA") && d.contains("-alpha") && d.contains("+beta"),
+        "the diff is disk → buffer: {d}"
+    );
+
     // Saving clears the flag everywhere.
     s.call_ok(
         6,

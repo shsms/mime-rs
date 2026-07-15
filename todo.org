@@ -706,7 +706,14 @@ lost track of whose stash was whose. Native git has rebase
 only when the dirty paths INTERSECT the rebase's touched paths, since
 an untouched-file edit is provably safe to keep in place).
 
-** TODO grep/read: flag files whose warm buffer has unsaved edits       :mcp:
+** DONE grep/read: flag files whose warm buffer has unsaved edits       :mcp:
+CLOSED: [2026-07-15]
+DONE [2026-07-15]: grep headers flag files with a warm unsaved buffer
+("disk shown; occur/view read the buffer; unsaved_diff shows the
+difference"); view appends a showing-the-warm-buffer note when the
+session is unsaved; new read-only ~unsaved_diff {path|session}~ returns
+the disk→buffer unified diff (what a save would write), never
+auto-opening.
 :LOGBOOK:
 - State "TODO"       from              [2026-07-15 Mi 16:19]
 :END:

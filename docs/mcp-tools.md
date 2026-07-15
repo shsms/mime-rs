@@ -186,6 +186,13 @@ Reference briefs served on demand: the callable Lisp-surface index, the regex di
 - `tool` — A tool name — return that tool's full description + annotations from the registry.
 - `topic` — Which brief to fetch; omit to list them.
 
+## unsaved_diff
+
+The unified diff between a warm buffer and its visited file on disk — 'what exactly have I not saved' in one call (what a save would write). Read-only; never auto-opens (a freshly opened buffer trivially matches disk). session_status lists which sessions are unsaved; grep flags files whose warm buffer differs.
+
+- `path` — The visited file — matches the warm session opened for it.
+- `session` — Warm session id; defaults to "default" when omitted. Pass path OR session, not both.
+
 ## session_status
 
 Report engine status: per live session the current buffer, its visited file, and whether it is narrowed, stale (its file drifted on disk), or unsaved (has edits not yet written to that file — so a forgotten save is visible); plus the allowed filesystem roots that open_file/save_buffer are confined to (MIME_ROOTS, default cwd), and whether the audit journal is on. Check the roots before opening or saving to learn the writable sandbox up front.

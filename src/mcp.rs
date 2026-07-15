@@ -215,7 +215,7 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         "replace_text" => tool_replace_text(&args, sessions),
         "replace_in_files" => tool_replace_files(&args, sessions),
         "occur" => tool_occur(&args, sessions),
-        "grep" => tool_grep(&args),
+        "grep" => tool_grep(&args, sessions),
         "outline" => tool_outline(&args, sessions),
         "conflicts" => tool_conflicts(&args, sessions),
         "checkpoint" => tool_checkpoint(&args, sessions),
@@ -224,6 +224,7 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         "close_session" => tool_close_session(&args, sessions),
         "save_buffer" => tool_save_buffer(&args, sessions),
         "session_status" => tool_session_status(sessions),
+        "unsaved_diff" => tool_unsaved_diff(&args, sessions),
         "help" => tool_help(&args),
         git if git.starts_with("git_") => dispatch_git(git, &args),
         other => Err(format!("unknown tool: {other}")),
@@ -943,7 +944,62 @@ fn tool_view(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result<
         (None, Some(p)) => format!("(window 4 {p})"),
         (None, None) => "(window)".to_string(),
     };
-    run_message(sessions, &session, &call, "view")
+    // A view of a buffer with unsaved edits says so — an agent alternating
+    // mime reads with shell reads (disk) must see which state it is looking
+    // at, at the moment of looking.
+    let text = run_message(sessions, &session, &call, "view")?;
+    Ok(format!("{text}{}", unsaved_view_note(sessions, &session)))
+}
+
+/// The read-side sibling of [`unsaved_note`]: appended to a viewport when the
+/// warm buffer differs from the visited file on disk.
+fn unsaved_view_note(sessions: &HashMap<String, Workspace>, session: &str) -> &'static str {
+    if is_unsaved(sessions, session) {
+        "\n(showing the warm buffer — it has unsaved edits, so the file on disk \
+         differs; unsaved_diff shows exactly how)"
+    } else {
+        ""
+    }
+}
+
+/// `unsaved_diff {path?|session?}` — the unified diff between a warm buffer
+/// and its visited file on disk: "what exactly have I not saved". Read-only;
+/// never auto-opens (a fresh buffer trivially matches disk).
+fn tool_unsaved_diff(
+    args: &Value,
+    sessions: &mut HashMap<String, Workspace>,
+) -> Result<String, String> {
+    let session = resolve_existing_session(args, sessions)?;
+    let Some(ws) = sessions.get(&session) else {
+        return Err(no_such_session(sessions, &session));
+    };
+    let Some(path) = ws.visited_path() else {
+        return Err(format!(
+            "unsaved_diff: session \"{session}\" visits no file — nothing to compare against"
+        ));
+    };
+    if !ws.is_modified() {
+        return Ok(format!(
+            "no unsaved edits — the warm buffer matches {} as read",
+            path.display()
+        ));
+    }
+    let disk = std::fs::read_to_string(&path)
+        .map_err(|e| format!("unsaved_diff: cannot read {}: {e}", path.display()))?;
+    let buffer = ws.text();
+    let diff = crate::result::unified_diff(&disk, &buffer);
+    if diff.is_empty() {
+        return Ok(format!(
+            "no unsaved edits — the warm buffer matches {}",
+            path.display()
+        ));
+    }
+    Ok(format!(
+        "disk → buffer for {} (what a save would write):\n{}{}",
+        path.display(),
+        crate::result::clamp_diff(&diff, 200),
+        stale_edit_note(sessions, &session)
+    ))
 }
 
 /// `insert_text {session?, text, pos?}` — insert literal `text` at point (or at
@@ -1898,7 +1954,7 @@ impl Walk<'_> {
 /// CANONICAL absolute paths that feed `replace_in_files {files: …}` directly. No
 /// session needed — reads files within the sandbox (each routed through the
 /// path chokepoint). Caps files visited and matches rendered.
-fn tool_grep(args: &Value) -> Result<String, String> {
+fn tool_grep(args: &Value, sessions: &HashMap<String, Workspace>) -> Result<String, String> {
     const MAX_FILES: usize = 5000;
     const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
     const MAX_LINE: usize = 200;
@@ -2014,15 +2070,23 @@ fn tool_grep(args: &Value) -> Result<String, String> {
             let hit_pos: HashMap<usize, usize> = shown_hits.iter().copied().collect();
 
             files_with_hits += 1;
+            // grep reads DISK; if a warm buffer holds unsaved edits for this
+            // file, the hits may be stale — flag it at the moment of reading.
+            let unsaved_flag = if clobbers_unsaved_session(sessions, "", &canonical).is_some() {
+                "  ⚠ a warm buffer has UNSAVED edits for this file — disk shown \
+                 (occur/view read the buffer; unsaved_diff shows the difference)"
+            } else {
+                ""
+            };
             if render_n < hits.len() {
                 out.push_str(&format!(
-                    "{} (showing {render_n} of {} matches)\n",
+                    "{} (showing {render_n} of {} matches){unsaved_flag}\n",
                     canonical.display(),
                     hits.len()
                 ));
             } else {
                 out.push_str(&format!(
-                    "{} ({} match{})\n",
+                    "{} ({} match{}){unsaved_flag}\n",
                     canonical.display(),
                     hits.len(),
                     if hits.len() == 1 { "" } else { "es" }
@@ -3183,6 +3247,11 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             A::append(),
             "drop a warm session (force discards unsaved edits)",
         ),
+        "unsaved_diff" => (
+            Inspection,
+            A::read(),
+            "what a save would write: warm buffer vs the file on disk",
+        ),
         "session_status" => (
             Session,
             A::read(),
@@ -3712,6 +3781,18 @@ fn build_tool_schemas() -> Vec<Value> {
                 "properties": {
                     "topic": { "type": "string", "enum": ["lisp", "regex", "treesit", "conflicts", "git", "sessions", "recipes"], "description": "Which brief to fetch; omit to list them." },
                     "tool": { "type": "string", "description": "A tool name — return that tool's full description + annotations from the registry." },
+                },
+                "required": [],
+            },
+        }),
+        json!({
+            "name": "unsaved_diff",
+            "description": "The unified diff between a warm buffer and its visited file on disk — 'what exactly have I not saved' in one call (what a save would write). Read-only; never auto-opens (a freshly opened buffer trivially matches disk). session_status lists which sessions are unsaved; grep flags files whose warm buffer differs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "The visited file — matches the warm session opened for it." },
+                    "session": { "type": "string", "description": "Warm session id; defaults to \"default\" when omitted. Pass path OR session, not both." }
                 },
                 "required": [],
             },
