@@ -116,41 +116,113 @@ pub trait TextStore {
     fn set_coding(&mut self, _coding: crate::coding::FileCoding) {}
 }
 
-/// The latest-starting match of `re` inside `window` (byte offsets), plus its
-/// capture-group texts — the backward-search primitive shared by both stores.
-/// Implemented the way Emacs does it, as repeated forward probes from
-/// successively later starts, so with OVERLAPPING matches the latest start
-/// wins where a plain `find_iter`-take-last would be leftmost-biased
-/// ("aa" in "aaa" must yield the match at 2, not 1). Each probe strictly
-/// advances, so the sweep terminates; an empty-pattern match degenerates to
-/// the window end, like Emacs.
-pub(crate) fn latest_match_in(
+/// The `regex-automata` twin of a compiled `regex::Regex`, for span-bounded
+/// searches. Compiled with `multi_line(true)`, mirroring `build_regex` — the
+/// single compile path every buffer-search regex flows through. Thread-local
+/// cache keyed by pattern (bounded, like the builtin pattern cache); `None`
+/// when the twin fails to build (it shouldn't — the pattern already compiled
+/// under the same syntax), which callers answer with a hard-cut fallback.
+fn meta_twin(re: &regex::Regex) -> Option<std::rc::Rc<regex_automata::meta::Regex>> {
+    use std::{cell::RefCell, collections::HashMap, rc::Rc};
+    thread_local! {
+        static CACHE: RefCell<HashMap<String, Option<Rc<regex_automata::meta::Regex>>>> =
+            RefCell::new(HashMap::new());
+    }
+    CACHE.with(|c| {
+        let mut map = c.borrow_mut();
+        if map.len() >= 128 && !map.contains_key(re.as_str()) {
+            map.clear();
+        }
+        map.entry(re.as_str().to_string())
+            .or_insert_with(|| {
+                regex_automata::meta::Regex::builder()
+                    .syntax(regex_automata::util::syntax::Config::new().multi_line(true))
+                    .build(re.as_str())
+                    .ok()
+                    .map(Rc::new)
+            })
+            .clone()
+    })
+}
+
+/// Leftmost match of `re` confined to `span` of `hay`, with `^`/`$`/`\b`
+/// consulting the context OUTSIDE the span — the Emacs bounded-search
+/// semantics (a match must fit the bound, assertions read the real buffer
+/// past it). Byte offsets into `hay`, plus the capture-group texts. Like
+/// `captures_at`, the match may start anywhere at or after `span.start`.
+pub(crate) fn span_captures(
     re: &regex::Regex,
-    window: &str,
+    hay: &str,
+    span: std::ops::Range<usize>,
+) -> Option<(usize, usize, Vec<Option<String>>)> {
+    match meta_twin(re) {
+        Some(meta) => {
+            let mut caps = meta.create_captures();
+            meta.captures(regex_automata::Input::new(hay).span(span), &mut caps);
+            let whole = caps.get_match()?;
+            let groups = (0..caps.group_len())
+                .map(|i| caps.get_group(i).map(|g| hay[g.start..g.end].to_string()))
+                .collect();
+            Some((whole.start(), whole.end(), groups))
+        }
+        // Fallback: search a haystack hard-cut at the span end (assertions
+        // see the cut, not the buffer).
+        None => {
+            let caps = re.captures_at(&hay[..span.end], span.start)?;
+            let whole = caps.get(0)?;
+            let groups = caps
+                .iter()
+                .map(|g| g.map(|m| m.as_str().to_string()))
+                .collect();
+            Some((whole.start(), whole.end(), groups))
+        }
+    }
+}
+
+/// `span_captures` without the groups — the cheap probe for the backward sweep.
+fn span_find(re: &regex::Regex, hay: &str, span: std::ops::Range<usize>) -> Option<(usize, usize)> {
+    match meta_twin(re) {
+        Some(meta) => meta
+            .find(regex_automata::Input::new(hay).span(span))
+            .map(|m| (m.start(), m.end())),
+        None => re
+            .find_at(&hay[..span.end], span.start)
+            .map(|m| (m.start(), m.end())),
+    }
+}
+
+/// The latest-starting match of `re` confined to `span` of `hay` (byte
+/// offsets), plus its capture-group texts — the backward-search primitive
+/// shared by both stores. `^`/`$`/`\b` consult the context outside the span
+/// (see [`span_captures`]). Implemented the way Emacs does it, as repeated
+/// forward probes from successively later starts, so with OVERLAPPING matches
+/// the latest start wins where a plain `find_iter`-take-last would be
+/// leftmost-biased ("aa" in "aaa" must yield the match at 2, not 1). Each
+/// probe strictly advances, so the sweep terminates; an empty-pattern match
+/// degenerates to the span end, like Emacs.
+pub(crate) fn latest_match_in_span(
+    re: &regex::Regex,
+    hay: &str,
+    span: std::ops::Range<usize>,
 ) -> Option<(usize, usize, Vec<Option<String>>)> {
     let mut best: Option<(usize, usize)> = None;
-    let mut at = 0;
-    while let Some(m) = re.find_at(window, at) {
-        best = Some((m.start(), m.end()));
-        at = m.start() + 1;
-        while at < window.len() && !window.is_char_boundary(at) {
-            at += 1;
-        }
-        if at > window.len() {
+    let mut at = span.start;
+    while at <= span.end {
+        let Some((s, e)) = span_find(re, hay, at..span.end) else {
             break;
+        };
+        best = Some((s, e));
+        at = s + 1;
+        while at < span.end && !hay.is_char_boundary(at) {
+            at += 1;
         }
     }
     let (s, e) = best?;
     // Re-run from the winning start to collect the groups; the leftmost match
     // from `s` is the same span the probe found.
-    let caps = re.captures_at(window, s)?;
-    let whole = caps.get(0)?;
-    debug_assert_eq!((whole.start(), whole.end()), (s, e));
-    let groups = caps
-        .iter()
-        .map(|g| g.map(|m| m.as_str().to_string()))
-        .collect();
-    Some((s, e, groups))
+    let got = span_captures(re, hay, s..span.end)?;
+    debug_assert_eq!((got.0, got.1), (s, e));
+    Some(got)
 }
 
 /// The next content-version stamp (see [`TextStore::version`]): a process-wide

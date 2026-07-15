@@ -168,14 +168,15 @@ impl Buffer {
     ///
     /// The haystack's LEFT edge is Emacs's: it starts at point-min (the
     /// accessible region's beginning counts as a real line/word boundary, so
-    /// `^` matches there) and `captures_at` keeps the pre-point text as
-    /// context, so a mid-line point doesn't pass for a line beginning. The
-    /// RIGHT edge hard-truncates at the bound: `$`/`\b` treat an explicit
-    /// mid-line BOUND as a boundary where Emacs would consult the real buffer
-    /// — a known divergence, accepted because the high-level regex API cannot
-    /// both backtrack a quantifier to fit the bound AND evaluate assertions
-    /// past it (a span-bounded search is a todo). At point-max the cut is
-    /// correct: Emacs's `$` matches at the end of the accessible region.
+    /// `^` matches there) and the pre-point text stays in as context, so a
+    /// mid-line point doesn't pass for a line beginning. The RIGHT edge is
+    /// span-bounded: the match is confined to end at or before the bound,
+    /// while `$`/`\b` at an explicit mid-line BOUND consult the real buffer
+    /// past it up to point-max — Emacs semantics (`regex-automata`'s
+    /// `Input::span`; the high-level regex API could not both backtrack a
+    /// quantifier to fit the bound and evaluate assertions past it). At
+    /// point-max the cut stays a boundary: Emacs's `$` matches at the end of
+    /// the accessible region.
     pub fn re_search_forward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize> {
         let start_b = self.byte_of(self.point);
         let end_b = self.byte_of(bound.unwrap_or_else(|| self.point_max()));
@@ -183,17 +184,14 @@ impl Buffer {
             return None;
         }
         let hay_off = self.byte_of(self.point_min()).min(start_b);
-        let hay = &self.text[hay_off..end_b];
-        // Pull owned data out of the match so the borrow on `self.text` ends
-        // before we mutate `self` below.
+        let ctx_end = self.byte_of(self.point_max()).max(end_b);
         let (ms_b, me_b, groups) = {
-            let caps = re.captures_at(hay, start_b - hay_off)?;
-            let whole = caps.get(0)?;
-            let groups: Vec<Option<String>> = caps
-                .iter()
-                .map(|g| g.map(|m| m.as_str().to_string()))
-                .collect();
-            (hay_off + whole.start(), hay_off + whole.end(), groups)
+            let (s, e, groups) = crate::store::span_captures(
+                re,
+                &self.text[hay_off..ctx_end],
+                (start_b - hay_off)..(end_b - hay_off),
+            )?;
+            (hay_off + s, hay_off + e, groups)
         };
         let start = self.char_of(ms_b);
         let end = self.char_of(me_b);
@@ -205,16 +203,23 @@ impl Buffer {
     /// Regex search backward from point (bounded below by `bound` or
     /// point-min): the latest-starting match wholly inside the window
     /// `[bound, point)`. On a hit: record match-data, move point to the match
-    /// START, return it — Emacs `re-search-backward` semantics. The window
-    /// edges count as line/word boundaries for `^`/`$`/`\b`, the same cut
-    /// divergence the bounded forward search documents.
+    /// START, return it — Emacs `re-search-backward` semantics. The window is
+    /// a span over the accessible region, so `^`/`$`/`\b` at either edge
+    /// consult the real buffer beyond it (see `re_search_forward`), while the
+    /// match itself stays confined to the window.
     pub fn re_search_backward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize> {
         let lo = bound.unwrap_or_else(|| self.point_min()).min(self.point);
         let lo_b = self.byte_of(lo);
         let hi_b = self.byte_of(self.point);
-        let (ms, me, groups) = crate::store::latest_match_in(re, self.text.get(lo_b..hi_b)?)?;
-        let start = self.char_of(lo_b + ms);
-        let end = self.char_of(lo_b + me);
+        let min_b = self.byte_of(self.point_min()).min(lo_b);
+        let max_b = self.byte_of(self.point_max()).max(hi_b);
+        let (ms, me, groups) = crate::store::latest_match_in_span(
+            re,
+            &self.text[min_b..max_b],
+            (lo_b - min_b)..(hi_b - min_b),
+        )?;
+        let start = self.char_of(min_b + ms);
+        let end = self.char_of(min_b + me);
         self.last_match = Some(MatchData { start, end, groups });
         self.point = start;
         Some(start)
@@ -720,11 +725,9 @@ mod tests {
 
     #[test]
     fn bounded_search_fits_quantifiers_and_point_max_is_a_line_end() {
-        // A bound shortens the haystack, so a greedy match backtracks to fit
+        // A bound confines the match, so a greedy match backtracks to fit
         // (Emacs parity); at point-max `$` matches (Emacs: the accessible
-        // region's end is a line end). `$` at an explicit mid-line bound
-        // also matches the cut — a documented divergence from Emacs (see
-        // re_search_forward).
+        // region's end is a line end).
         let mut b = Buffer::from_string("t", "aaa");
         let re = regex::Regex::new("a+").unwrap();
         b.goto_char(1);
@@ -740,6 +743,68 @@ mod tests {
             b.re_search_forward(&re2, None),
             Some(4),
             "point-max IS a line end"
+        );
+    }
+
+    #[test]
+    fn bounded_search_assertions_consult_past_the_bound() {
+        // Span-bounded search: the match must END at or before the bound, but
+        // `$`/`\b` AT the bound judge the real buffer past it, like Emacs —
+        // not the cut.
+        let foo_eol = regex::RegexBuilder::new("foo$")
+            .multi_line(true)
+            .build()
+            .unwrap();
+        let mut b = Buffer::from_string("t", "foobar\n");
+        b.goto_char(1);
+        assert_eq!(
+            b.re_search_forward(&foo_eol, Some(4)),
+            None,
+            "the line continues past the bound"
+        );
+        let mut b = Buffer::from_string("t", "foo\nbar");
+        b.goto_char(1);
+        assert_eq!(
+            b.re_search_forward(&foo_eol, Some(4)),
+            Some(4),
+            "a real line end at the bound"
+        );
+        let word = regex::Regex::new(r"foo\b").unwrap();
+        let mut b = Buffer::from_string("t", "foobar");
+        b.goto_char(1);
+        assert_eq!(b.re_search_forward(&word, Some(4)), None, "mid-word bound");
+        let mut b = Buffer::from_string("t", "foo bar");
+        b.goto_char(1);
+        assert_eq!(b.re_search_forward(&word, Some(4)), Some(4));
+    }
+
+    #[test]
+    fn backward_search_edges_consult_the_real_buffer() {
+        // Right edge (point): the match ends at or before point, but `$`
+        // there reads the real buffer.
+        let foo_eol = regex::RegexBuilder::new("foo$")
+            .multi_line(true)
+            .build()
+            .unwrap();
+        let mut b = Buffer::from_string("t", "foobar\n");
+        b.goto_char(4);
+        assert_eq!(
+            b.re_search_backward(&foo_eol, None),
+            None,
+            "the line continues past point"
+        );
+        let mut b = Buffer::from_string("t", "foo\nbar");
+        b.goto_char(4);
+        assert_eq!(b.re_search_backward(&foo_eol, None), Some(1));
+        // Left edge (an explicit BOUND): `\b` at the bound must not fake a
+        // word boundary out of the cut.
+        let word = regex::Regex::new(r"\boo").unwrap();
+        let mut b = Buffer::from_string("t", "xoo bar");
+        b.goto_char(4);
+        assert_eq!(
+            b.re_search_backward(&word, Some(2)),
+            None,
+            "'oo' at the bound is mid-word"
         );
     }
 

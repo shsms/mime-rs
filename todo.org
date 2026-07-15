@@ -52,7 +52,8 @@ re-insert it.
 
 ** TODO Dirty-span diffs [#C]
 
-** TODO Span-bounded search (anchors past an explicit BOUND)
+** DONE Span-bounded search (anchors past an explicit BOUND)
+CLOSED: [2026-07-15]
 With an explicit search BOUND, ~$~/~\b~ treat the haystack cut as a
 boundary where Emacs consults the real buffer (it backtracks the match
 to fit the bound AND evaluates assertions against the text past it).
@@ -60,6 +61,13 @@ The high-level ~regex~ API can't express both; ~regex-automata~'s
 ~Input::span~ can — matches confined to a span, look-around reading
 outside it. Switch the searches to it and the divergence (documented on
 ~Buffer::re_search_forward~) closes.
+
+DONE [2026-07-15]: all four search paths (Buffer + Quire, forward +
+backward) now run span-bounded via a cached ~regex-automata~ twin of the
+compiled regex (~store::span_captures~ / ~latest_match_in_span~). The
+backward window also gained edge context, so ~$~ at point and ~\b~ at
+the bound judge the real buffer too. Quire stays adaptively windowed;
+only the final window carries one context char past the bound.
 
 ** TODO Per-program resource limits
 

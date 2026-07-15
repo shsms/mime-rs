@@ -1869,47 +1869,56 @@ impl Quire {
     /// point — never crossing point-min, a real line beginning) and run the regex,
     /// stopping the moment the match ends strictly inside the window — so a hit
     /// near point never copies the document tail. A match ending exactly at a
-    /// non-EOF boundary is re-judged against a larger window (it may extend, or be
-    /// a `$`/`\b` artifact of the cut), so the result is identical to scanning the
-    /// whole `[point, bound)` window at once (including the `$`-at-bound divergence
-    /// the oracle documents). A genuine *miss* still grows to the bound — the
-    /// regex must see every byte to say "no", the residual a true streaming DFA
-    /// over the piece tree would close. Capturing `replace_match`'s groups needs
-    /// the matched substrings regardless.
+    /// non-final boundary is re-judged against a larger window (it may extend, or
+    /// be a `$`/`\b` artifact of the cut). The final window carries one char of
+    /// context PAST an explicit bound and confines the match to a span ending at
+    /// the bound, so `$`/`\b` there consult the real buffer — Emacs semantics,
+    /// same as the in-memory oracle. A genuine *miss* still grows to the bound —
+    /// the regex must see every byte to say "no", the residual a true streaming
+    /// DFA over the piece tree would close. Capturing `replace_match`'s groups
+    /// needs the matched substrings regardless.
     fn re_search_forward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize> {
         let from = self.point;
         let to = bound.unwrap_or_else(|| self.point_max());
         if from > to {
             return None;
         }
+        // One char of context past an explicit bound (never past point-max) so
+        // the final window can judge `$`/`\b` at the bound against real text.
+        let ctx_to = if to < self.point_max() { to + 1 } else { to };
         let ctx_from = from.saturating_sub(1).max(self.point_min().min(from));
         let mut span = SEARCH_WINDOW_START;
         loop {
             let hi = (ctx_from + span).min(to);
-            let at_eof = hi >= to;
-            let window = self.collect_range(ctx_from, hi);
+            let at_bound = hi >= to;
+            let win_hi = if at_bound { ctx_to } else { hi };
+            let window = self.collect_range(ctx_from, win_hi);
             let skip = if ctx_from < from {
                 window.chars().next().map_or(0, char::len_utf8)
             } else {
                 0
             };
-            let caps = re.captures_at(&window, skip);
-            // A match ending inside the window is final; one ending at a non-EOF
-            // boundary might extend or be a cut artifact — grow and re-judge.
-            let settled = match &caps {
-                Some(c) => c.get(0).is_none_or(|m| m.end() < window.len()) || at_eof,
-                None => at_eof,
+            // The matchable span excludes the trailing context char, if any.
+            let span_end = window.len()
+                - if win_hi > to {
+                    window.chars().last().map_or(0, char::len_utf8)
+                } else {
+                    0
+                };
+            let hit = crate::store::span_captures(re, &window, skip..span_end);
+            // A match ending inside the window is final; one ending at a
+            // non-final boundary might extend or be a cut artifact — grow and
+            // re-judge. The final window is always conclusive: its span end IS
+            // the bound, with context past it in view.
+            let settled = match &hit {
+                Some((_, me, _)) => at_bound || *me < span_end,
+                None => at_bound,
             };
             if settled {
-                let caps = caps?; // a settled `None` is a genuine miss
-                let whole = caps.get(0)?;
-                let groups: Vec<Option<String>> = caps
-                    .iter()
-                    .map(|g| g.map(|m| m.as_str().to_string()))
-                    .collect();
+                let (ms, me, groups) = hit?; // a settled `None` is a genuine miss
                 // Byte offsets in `window` → char offsets → absolute positions.
-                let start = ctx_from + window[..whole.start()].chars().count();
-                let end = ctx_from + window[..whole.end()].chars().count();
+                let start = ctx_from + window[..ms].chars().count();
+                let end = ctx_from + window[..me].chars().count();
                 self.last_match = Some(MatchData { start, end, groups });
                 self.point = end;
                 return Some(end);
@@ -2193,15 +2202,29 @@ impl Quire {
     /// match wholly inside `[bound|point-min, point)`. On a hit: record
     /// match-data, move point to the match START, return it. Like the exact
     /// backward search, this still materializes the whole window (the
-    /// streaming-search todo covers both); the window edges count as
-    /// boundaries for `^`/`$`/`\b` — the documented cut divergence.
+    /// streaming-search todo covers both) — plus one char of context on each
+    /// side, so `^`/`$`/`\b` at the window edges consult the real buffer while
+    /// the match stays confined to the window (span-bounded, like forward).
     fn re_search_backward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize> {
         let lo = bound.unwrap_or_else(|| self.point_min()).min(self.point);
         let hi = self.point;
-        let window = self.collect_range(lo, hi);
-        let (ms, me, groups) = crate::store::latest_match_in(re, &window)?;
-        let start = lo + window[..ms].chars().count();
-        let end = lo + window[..me].chars().count();
+        let ctx_lo = if lo > self.point_min() { lo - 1 } else { lo };
+        let ctx_hi = if hi < self.point_max() { hi + 1 } else { hi };
+        let window = self.collect_range(ctx_lo, ctx_hi);
+        let left = if ctx_lo < lo {
+            window.chars().next().map_or(0, char::len_utf8)
+        } else {
+            0
+        };
+        let right = if ctx_hi > hi {
+            window.chars().last().map_or(0, char::len_utf8)
+        } else {
+            0
+        };
+        let (ms, me, groups) =
+            crate::store::latest_match_in_span(re, &window, left..window.len() - right)?;
+        let start = ctx_lo + window[..ms].chars().count();
+        let end = ctx_lo + window[..me].chars().count();
         self.last_match = Some(MatchData { start, end, groups });
         self.point = start;
         Some(start)
@@ -2557,6 +2580,79 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(TextStore::re_search_forward(&mut q, &re2, None), Some(4));
+    }
+
+    #[test]
+    fn bounded_search_assertions_consult_past_the_bound() {
+        // Mirror of the Buffer test, plus a window-growth case: `$`/`\b` at
+        // an explicit bound judge the real buffer past it, not the cut.
+        let foo_eol = regex::RegexBuilder::new("foo$")
+            .multi_line(true)
+            .build()
+            .unwrap();
+        let mut q = Quire::from_string("t", "foobar\n");
+        TextStore::goto_char(&mut q, 1);
+        assert_eq!(
+            TextStore::re_search_forward(&mut q, &foo_eol, Some(4)),
+            None,
+            "the line continues past the bound"
+        );
+        let mut q = Quire::from_string("t", "foo\nbar");
+        TextStore::goto_char(&mut q, 1);
+        assert_eq!(
+            TextStore::re_search_forward(&mut q, &foo_eol, Some(4)),
+            Some(4),
+            "a real line end at the bound"
+        );
+        // The bound lies past the initial adaptive window, so the final
+        // window (with its one-char context past the bound) is reached by
+        // growth — and must agree with the in-memory oracle.
+        let mut content = "a".repeat(SEARCH_WINDOW_START + 100);
+        content.push_str("foobar\n");
+        let bound = SEARCH_WINDOW_START + 100 + 4; // right after "foo"
+        let re = regex::RegexBuilder::new("foo$")
+            .multi_line(true)
+            .build()
+            .unwrap();
+        let mut q = Quire::from_string("q", &content);
+        let mut o = crate::buffer::Buffer::from_string("o", &content);
+        TextStore::goto_char(&mut q, 1);
+        TextStore::goto_char(&mut o, 1);
+        assert_eq!(
+            TextStore::re_search_forward(&mut q, &re, Some(bound)),
+            TextStore::re_search_forward(&mut o, &re, Some(bound)),
+            "grown final window must agree with the oracle"
+        );
+        assert_eq!(TextStore::re_search_forward(&mut q, &re, Some(bound)), None);
+    }
+
+    #[test]
+    fn backward_search_edges_consult_the_real_buffer() {
+        let foo_eol = regex::RegexBuilder::new("foo$")
+            .multi_line(true)
+            .build()
+            .unwrap();
+        let mut q = Quire::from_string("t", "foobar\n");
+        TextStore::goto_char(&mut q, 4);
+        assert_eq!(
+            TextStore::re_search_backward(&mut q, &foo_eol, None),
+            None,
+            "the line continues past point"
+        );
+        let mut q = Quire::from_string("t", "foo\nbar");
+        TextStore::goto_char(&mut q, 4);
+        assert_eq!(
+            TextStore::re_search_backward(&mut q, &foo_eol, None),
+            Some(1)
+        );
+        let word = regex::Regex::new(r"\boo").unwrap();
+        let mut q = Quire::from_string("t", "xoo bar");
+        TextStore::goto_char(&mut q, 4);
+        assert_eq!(
+            TextStore::re_search_backward(&mut q, &word, Some(2)),
+            None,
+            "'oo' at the bound is mid-word"
+        );
     }
 
     #[test]

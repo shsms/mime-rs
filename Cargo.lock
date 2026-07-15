@@ -310,6 +310,7 @@ dependencies = [
  "git2",
  "memchr",
  "regex",
+ "regex-automata",
  "serde_json",
  "similar",
  "tiny_http",

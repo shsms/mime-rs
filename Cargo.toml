@@ -21,6 +21,11 @@ git2 = { version = "0.20", default-features = false, features = ["vendored-libgi
 # is a localhost front end, like the daemon's unix socket.
 tiny_http = "0.12"
 regex = "1.12.3"
+# Span-bounded searches: `Input::span` confines a match to [point, BOUND)
+# while `^`/`$`/`\b` still read the real buffer past the span — the Emacs
+# bounded-search semantics the high-level `regex` API cannot express.
+# Already in regex's own tree, so this adds no new code to the build.
+regex-automata = "0.4.14"
 serde_json = "1.0.150"
 similar = "3.1.1"
 tulisp = { version = "0.29.0", features = ["big_functions"] }
