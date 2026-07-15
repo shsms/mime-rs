@@ -172,7 +172,7 @@ pub struct Plan {
 /// retyping the whole message, so the rest (e.g. the sign-off) is preserved.
 #[derive(Clone, Debug)]
 pub enum MsgEdit {
-    /// Replace the first occurrence of `find` with `with` (with = "" deletes).
+    /// Replace EVERY occurrence of `find` with `with` (with = "" deletes).
     Replace { find: String, with: String },
     /// Append `text` as a trailing line.
     Append { text: String },
@@ -243,18 +243,27 @@ impl MsgEdit {
 }
 
 /// Apply `edits` to `msg` in order. A `find` that is absent is an error (a
-/// typo'd anchor fails loudly rather than silently doing nothing).
+/// typo'd anchor fails loudly rather than silently doing nothing); one that
+/// matches replaces EVERY occurrence — zero-or-all, never a silent partial
+/// application. Replacements never re-match text they inserted.
 fn apply_msg_edits(mut msg: String, edits: &[MsgEdit]) -> Result<String, Error> {
     for e in edits {
         match e {
-            MsgEdit::Replace { find, with } => match msg.find(find.as_str()) {
-                Some(pos) => msg.replace_range(pos..pos + find.len(), with),
-                None => {
+            MsgEdit::Replace { find, with } => {
+                let mut n = 0;
+                let mut at = 0;
+                while let Some(i) = msg[at..].find(find.as_str()) {
+                    let pos = at + i;
+                    msg.replace_range(pos..pos + find.len(), with);
+                    at = pos + with.len();
+                    n += 1;
+                }
+                if n == 0 {
                     return Err(estr(&format!(
                         "message edit: text not found in the commit message: {find:?}"
                     )));
                 }
-            },
+            }
             MsgEdit::Append { text } => {
                 if !msg.is_empty() && !msg.ends_with('\n') {
                     msg.push('\n');
@@ -4998,6 +5007,42 @@ mod tests {
             tip.message().unwrap(),
             "New subject\n\nBody paragraph.\n\nSigned-off-by: T <t@e.invalid>\n",
             "only the subject changed; body + sign-off preserved"
+        );
+
+        // A find that occurs several times is replaced EVERYWHERE.
+        let msg = apply_msg_edits(
+            "add old_name\n\nold_name feeds the meter; see old_name docs.\n".to_string(),
+            &[MsgEdit::Replace {
+                find: "old_name".to_string(),
+                with: "new_name".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            msg, "add new_name\n\nnew_name feeds the meter; see new_name docs.\n",
+            "every occurrence replaced"
+        );
+        // Replacement text containing the find must not re-match (no loop,
+        // no double replacement).
+        let msg = apply_msg_edits(
+            "x x\n".to_string(),
+            &[MsgEdit::Replace {
+                find: "x".to_string(),
+                with: "xx".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(msg, "xx xx\n");
+        assert!(
+            apply_msg_edits(
+                "nothing here\n".to_string(),
+                &[MsgEdit::Replace {
+                    find: "absent".to_string(),
+                    with: "y".to_string(),
+                }],
+            )
+            .is_err(),
+            "an absent find stays a loud error"
         );
     }
 

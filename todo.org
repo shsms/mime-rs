@@ -568,7 +568,13 @@ rule was unknown. If the rule is "passing path re-syncs a clean buffer
 from disk; dirty buffers are stale-guarded", say so in the tool docs
 (the engine behavior already exists per the paged-reader entry).
 
-** TODO [#B] message_edits: replace all occurrences, report the count   :git:
+** DONE [#B] message_edits: replace all occurrences, report the count   :git:
+CLOSED: [2026-07-15]
+DONE [2026-07-15]: ~apply_msg_edits~ now replaces EVERY occurrence —
+zero-or-all (an absent find stays a loud error), so partial application
+can no longer happen and a separate count report adds nothing.
+Replacements never re-match their own inserted text. Schema + help
+updated.
 :LOGBOOK:
 - State "TODO"       from              [2026-07-15 Mi 16:07]
 :END:

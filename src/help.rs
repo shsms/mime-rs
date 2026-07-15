@@ -182,7 +182,7 @@ into git_fixup, or let git_absorb fold them all).
     reshaped those lines (usually the right fold target) — not just the first.
     An `edit` step applies the commit then PAUSES with it checked out: edit the
     worktree, then git_continue folds the changes into that commit. message_edits
-    ([{find, replace?}] to replace/delete literal text, [{append}] to add a
+    ([{find, replace?}] to replace/delete EVERY occurrence, [{append}] to add a
     trailing line) tweak a reword/squash/fixup/edit message without retyping it,
     so the sign-off and the rest survive. A `split` step partitions one commit
     into the commits in into = [{message, paths?, hunks?}] — paths takes whole

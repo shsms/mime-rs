@@ -2808,7 +2808,7 @@ fn git_tool_schemas() -> Vec<Value> {
                                 "message": { "type": "string", "description": "New message (reword/edit) or melded message (squash); ignored otherwise." },
                                 "message_edits": {
                                     "type": "array",
-                                    "description": "Edits applied in order to the message (reword/squash/fixup/edit), keeping the rest (e.g. the sign-off) intact — use instead of retyping the whole message. Each item is {find, replace?} (replace the first occurrence of literal `find`; omitting replace — or saying it explicitly with delete: true — deletes the found text; errors if `find` is absent) or {append} (append as a trailing line).",
+                                    "description": "Edits applied in order to the message (reword/squash/fixup/edit), keeping the rest (e.g. the sign-off) intact — use instead of retyping the whole message. Each item is {find, replace?} (replace EVERY occurrence of literal `find` — zero-or-all, never a silent partial application; omitting replace — or saying it explicitly with delete: true — deletes the found text; errors if `find` is absent) or {append} (append as a trailing line).",
                                     "items": {
                                         "type": "object",
                                         "properties": {
