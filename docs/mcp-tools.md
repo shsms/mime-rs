@@ -304,9 +304,19 @@ Fold EVERY uncommitted hunk into the commit that owns its lines, automatically �
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 - `since` — Scope owners to `since..HEAD` (oid/ref/revspec, e.g. main — usually the branch base): hunks owned at or beyond the boundary stay in the worktree instead of rewriting history past it. Recommended on shared-history branches.
 
+## git_reword
+
+Change ONE commit's message — `message` replaces it wholesale, `message_edits` tweak it in place ({find, replace?} every occurrence / {append} a trailing line), or both (edits apply to the provided message). A sparse rewrite: the commit and its descendants are re-created with their own trees (byte-identical, nothing can conflict) — no plan to transcribe. rehearse:true previews the new message. For every commit of a range use git_msg_rewrite; to change content too, use git_rebase {action: reword|edit}.
+
+- `commit` (required) — The commit to reword (oid/ref/revspec); must be on the current branch.
+- `message` — The full replacement message. Omit to edit the commit's own message via message_edits.
+- `message_edits` — Edits applied in order: {find, replace?} replaces every occurrence (omit replace — or say delete: true — to delete); {append} adds a trailing line.
+- `rehearse` — Preview the new message without applying.
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+
 ## git_msg_rewrite
 
-Apply one message_edits vocabulary to EVERY commit of `range` (which must end at HEAD) — the bulk trailer strip/add, or the s/old-symbol/new/ sweep after a rename. A sparse rewrite touching only messages: each commit is re-created with its OWN tree (byte-identical by construction, nothing can conflict) and re-parented; an untouched prefix keeps its identical oids. The report carries per-commit replacement counts, so zero application in one commit is visible; a `find` matching NOWHERE in the range is an error and nothing changes. rehearse:true previews the counts. For one commit's message use git_rebase {action: reword}.
+Apply one message_edits vocabulary to EVERY commit of `range` (which must end at HEAD) — the bulk trailer strip/add, or the s/old-symbol/new/ sweep after a rename. A sparse rewrite touching only messages: each commit is re-created with its OWN tree (byte-identical by construction, nothing can conflict) and re-parented; an untouched prefix keeps its identical oids. The report carries per-commit replacement counts, so zero application in one commit is visible; a `find` matching NOWHERE in the range is an error and nothing changes. rehearse:true previews the counts. For one commit's message use git_reword.
 
 - `message_edits` (required) — Edits applied in order to EVERY message: {find, replace?} replaces every occurrence (omit replace — or say delete: true — to delete); {append} adds a trailing line.
 - `range` (required) — Revision range whose commit messages to rewrite, e.g. main..HEAD; must end at HEAD.

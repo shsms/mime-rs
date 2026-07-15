@@ -197,6 +197,9 @@ into git_fixup, or let git_absorb fold them all).
     of onto..HEAD — no need to transcribe untouched commits.
   git_fixup {target, source}  one-call fold of `source` into `target` (keeps
     target's signed message); auto-picks the rest.
+  git_reword {commit, message?|message_edits?}  change ONE commit's message
+    (wholesale or via edits) as a sparse rewrite — trees byte-identical, no
+    plan to transcribe. The everyday review-comment follow-up.
   git_msg_rewrite {range, message_edits}  apply one message_edits vocabulary
     to EVERY commit of the range (must end at HEAD): the bulk trailer
     strip/add or symbol sweep. Only messages change — every tree stays

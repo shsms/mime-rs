@@ -3262,6 +3262,115 @@ pub fn cmd_msg_rewrite(
     msg_rewrite(&repo, range, &edits, rehearse_only).map_err(gerr)
 }
 
+/// Reword ONE commit's message — `message` replaces it wholesale, or
+/// `message_edits` tweak it in place — as a sparse rewrite: the commit and its
+/// descendants are re-created with their own trees (byte-identical, nothing
+/// can conflict), no plan transcription needed. The everyday follow-up to a
+/// review comment.
+pub fn cmd_reword(
+    repo_path: &std::path::Path,
+    commit: &str,
+    message: Option<&str>,
+    specs: &[MsgEditSpec],
+    rehearse_only: bool,
+) -> Result<String, String> {
+    let repo = open(repo_path)?;
+    if message.is_none() && specs.is_empty() {
+        return Err("git_reword: pass `message` (wholesale) and/or `message_edits`".to_string());
+    }
+    let edits: Vec<MsgEdit> = specs
+        .iter()
+        .map(MsgEdit::from_spec)
+        .collect::<Result<_, _>>()?;
+    let target = resolve_s(&repo, commit)?;
+    reword(&repo, target, message, &edits, rehearse_only).map_err(gerr)
+}
+
+fn reword(
+    repo: &Repository,
+    target: Oid,
+    message: Option<&str>,
+    edits: &[MsgEdit],
+    rehearse_only: bool,
+) -> Result<String, Error> {
+    let head_ref = repo.head()?;
+    if !head_ref.is_branch() {
+        return Err(estr("reword: HEAD is detached — check out a branch"));
+    }
+    let branch = head_ref
+        .name()
+        .ok_or_else(|| estr("HEAD has no branch name"))?
+        .to_string();
+    let head = head_ref.peel_to_commit()?.id();
+    drop(head_ref);
+    if target != head && !repo.graph_descendant_of(head, target)? {
+        return Err(estr("reword: the commit is not on the current branch"));
+    }
+
+    // The new message, validated before anything is created.
+    let tc = repo.find_commit(target)?;
+    let base = message
+        .map(str::to_string)
+        .unwrap_or_else(|| tc.message().unwrap_or("").to_string());
+    let new_msg = apply_msg_edits(base, edits)?;
+    if new_msg == tc.message().unwrap_or("") {
+        return Err(estr("reword: the message is unchanged — nothing to do"));
+    }
+    let tail: Vec<Oid> = commits_since(repo, target)?;
+    if let Some(merge) = tail
+        .iter()
+        .chain(std::iter::once(&target))
+        .find(|o| matches!(repo.find_commit(**o), Ok(c) if c.parent_count() > 1))
+    {
+        return Err(estr(&format!(
+            "reword: {} is a merge — the sparse rewrite handles linear history only",
+            short(*merge)
+        )));
+    }
+    if rehearse_only {
+        return Ok(format!(
+            "rehearse: would reword {} to:\n{}\n(the tree and every descendant's \
+             tree stay byte-identical)",
+            short(target),
+            new_msg.trim_end()
+        ));
+    }
+
+    // Re-create the target with its own tree + the new message, then chain
+    // its descendants (same trees and messages, re-parented).
+    rotate_backup_ring(repo, &branch, head)?;
+    let parents: Vec<git2::Commit> = tc.parents().collect();
+    let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+    let mut tip = repo.commit(
+        None,
+        &tc.author(),
+        &tc.committer(),
+        &new_msg,
+        &tc.tree()?,
+        &parent_refs,
+    )?;
+    let reworded = tip;
+    for oid in tail {
+        let c = repo.find_commit(oid)?;
+        let parent = repo.find_commit(tip)?;
+        tip = repo.commit(
+            None,
+            &c.author(),
+            &c.committer(),
+            c.message().unwrap_or(""),
+            &c.tree()?,
+            &[&parent],
+        )?;
+    }
+    repo.reference(&branch, tip, true, "mime reword")?;
+    Ok(format!(
+        "reworded {} → {}; every tree is byte-identical{}",
+        short(target),
+        short(reworded),
+        backup_note(repo)
+    ))
+}
+
 fn msg_rewrite(
     repo: &Repository,
     range: &str,
@@ -4906,6 +5015,80 @@ mod tests {
         // Nothing moved: branch tip and the staged bytes are untouched.
         assert_eq!(repo.head().unwrap().target(), Some(f1));
         assert_eq!(read(&repo, "notes"), "staged\n");
+    }
+
+    #[test]
+    fn reword_changes_one_message_and_replays_descendants() {
+        let dir = tmp("reword-one");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let c1 = commit(&repo, &[base], &[("a", "2\n")], "midle commit");
+        let c2 = commit(&repo, &[c1], &[("a", "3\n")], "tip");
+        on_branch(&repo, "main", c2);
+
+        // Rehearse shows the new message and moves nothing.
+        let out = cmd_reword(
+            &dir,
+            &c1.to_string(),
+            None,
+            &[MsgEditSpec {
+                find: Some("midle".into()),
+                replace: Some("middle".into()),
+                append: None,
+            }],
+            true,
+        )
+        .unwrap();
+        assert!(out.contains("middle commit"), "{out}");
+        assert_eq!(repo.head().unwrap().target(), Some(c2));
+
+        let out = cmd_reword(
+            &dir,
+            &c1.to_string(),
+            None,
+            &[MsgEditSpec {
+                find: Some("midle".into()),
+                replace: Some("middle".into()),
+                append: None,
+            }],
+            false,
+        )
+        .unwrap();
+        assert!(out.contains("byte-identical"), "{out}");
+        let branch = commits_since(&repo, base).unwrap();
+        let (m1, m2) = (
+            repo.find_commit(branch[0]).unwrap(),
+            repo.find_commit(branch[1]).unwrap(),
+        );
+        assert_eq!(m1.summary(), Some("middle commit"));
+        assert_eq!(m2.summary(), Some("tip"), "descendant message untouched");
+        assert_eq!(m1.tree_id(), repo.find_commit(c1).unwrap().tree_id());
+        assert_eq!(m2.tree_id(), repo.find_commit(c2).unwrap().tree_id());
+        assert_eq!(
+            repo.refname_to_id(&backup_slot("main", 0)).unwrap(),
+            c2,
+            "pre-op tip on the backup ring"
+        );
+
+        // A wholesale message on the tip.
+        let tip = repo.head().unwrap().target().unwrap();
+        cmd_reword(
+            &dir,
+            &tip.to_string(),
+            Some("new tip message\n"),
+            &[],
+            false,
+        )
+        .unwrap();
+        let now = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(now.summary(), Some("new tip message"));
+
+        // Unchanged message / off-branch commit are loud errors.
+        let err = cmd_reword(&dir, "HEAD", Some("new tip message\n"), &[], false).unwrap_err();
+        assert!(err.contains("unchanged"), "{err}");
+        let side = commit(&repo, &[base], &[("z", "9\n")], "side");
+        let err = cmd_reword(&dir, &side.to_string(), Some("x\n"), &[], false).unwrap_err();
+        assert!(err.contains("not on the current branch"), "{err}");
     }
 
     #[test]

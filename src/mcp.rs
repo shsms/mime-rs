@@ -2952,6 +2952,19 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
                 bool_arg(args, "rehearse"),
             )
         }
+        "git_reword" => {
+            let edits = match args.get("message_edits").and_then(Value::as_array) {
+                Some(a) => msg_edit_specs(a)?,
+                None => Vec::new(),
+            };
+            seq::cmd_reword(
+                &repo,
+                &str_arg(args, "commit")?,
+                args.get("message").and_then(Value::as_str),
+                &edits,
+                bool_arg(args, "rehearse"),
+            )
+        }
         "git_move" => seq::cmd_move(
             &repo,
             &str_arg(args, "from")?,
@@ -3200,8 +3213,35 @@ fn git_tool_schemas() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "git_reword",
+            "description": "Change ONE commit's message — `message` replaces it wholesale, `message_edits` tweak it in place ({find, replace?} every occurrence / {append} a trailing line), or both (edits apply to the provided message). A sparse rewrite: the commit and its descendants are re-created with their own trees (byte-identical, nothing can conflict) — no plan to transcribe. rehearse:true previews the new message. For every commit of a range use git_msg_rewrite; to change content too, use git_rebase {action: reword|edit}.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": repo,
+                    "commit": { "type": "string", "description": "The commit to reword (oid/ref/revspec); must be on the current branch." },
+                    "message": { "type": "string", "description": "The full replacement message. Omit to edit the commit's own message via message_edits." },
+                    "message_edits": {
+                        "type": "array",
+                        "description": "Edits applied in order: {find, replace?} replaces every occurrence (omit replace — or say delete: true — to delete); {append} adds a trailing line.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "find": { "type": "string" },
+                                "replace": { "type": "string" },
+                                "delete": { "type": "boolean" },
+                                "append": { "type": "string" }
+                            }
+                        }
+                    },
+                    "rehearse": { "type": "boolean", "description": "Preview the new message without applying." }
+                },
+                "required": ["repo", "commit"],
+            },
+        }),
+        json!({
             "name": "git_msg_rewrite",
-            "description": "Apply one message_edits vocabulary to EVERY commit of `range` (which must end at HEAD) — the bulk trailer strip/add, or the s/old-symbol/new/ sweep after a rename. A sparse rewrite touching only messages: each commit is re-created with its OWN tree (byte-identical by construction, nothing can conflict) and re-parented; an untouched prefix keeps its identical oids. The report carries per-commit replacement counts, so zero application in one commit is visible; a `find` matching NOWHERE in the range is an error and nothing changes. rehearse:true previews the counts. For one commit's message use git_rebase {action: reword}.",
+            "description": "Apply one message_edits vocabulary to EVERY commit of `range` (which must end at HEAD) — the bulk trailer strip/add, or the s/old-symbol/new/ sweep after a rename. A sparse rewrite touching only messages: each commit is re-created with its OWN tree (byte-identical by construction, nothing can conflict) and re-parented; an untouched prefix keeps its identical oids. The report carries per-commit replacement counts, so zero application in one commit is visible; a `find` matching NOWHERE in the range is an error and nothing changes. rehearse:true previews the counts. For one commit's message use git_reword.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3493,6 +3533,11 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             Git,
             A::destructive(),
             "apply message edits to every commit of a range (trees untouched)",
+        ),
+        "git_reword" => (
+            Git,
+            A::destructive(),
+            "change one commit's message (tree untouched, no plan needed)",
         ),
 
         "read_region" => (
@@ -4379,6 +4424,7 @@ mod git_tool_tests {
             "git_absorb",
             "git_exec_over",
             "git_msg_rewrite",
+            "git_reword",
         ] {
             assert!(names.contains(&expected), "missing schema for {expected}");
         }

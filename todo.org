@@ -643,7 +643,13 @@ Recurred [2026-07-15]: three GIT_SEQUENCE_EDITOR=true git rebase -i
 one pr-prep run — autosquash + per-commit exec is exactly the gate's
 shape, and none of it went through mime's git_rebase.
 
-** TODO [#C] git_reword: sparse message-only rewrite                    :git:
+** DONE [#C] git_reword: sparse message-only rewrite                    :git:
+CLOSED: [2026-07-15]
+DONE [2026-07-15]: ~git_reword {commit, message?|message_edits?,
+rehearse?}~ — re-creates the commit with its own tree + the new message
+and chains the descendants (byte-identical trees, no conflicts
+possible), backup ring stamped. Refuses merges, off-branch commits, and
+a no-op message.
 :LOGBOOK:
 - State "TODO"       from              [2026-07-15 Mi 16:07]
 :END:
