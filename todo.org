@@ -666,7 +666,8 @@ message_edits|message} as a sparse one-step rebase — same message_edits
 vocabulary, auto-picking the rest — matches how often a message-only
 fix follows a review.
 
-** TODO [#C] Conflict vocabulary: take one side for a WHOLE file, then edit :git:
+** DONE [#C] Conflict vocabulary: take one side for a WHOLE file, then edit :git:
+CLOSED: [2026-07-15]
 :LOGBOOK:
 - State "TODO"       from              [2026-07-15 Mi 16:07]
 :END:
@@ -677,6 +678,12 @@ wholesale — correct, but off the rails. A blessed verb (conflict-take
 {side} for the whole file, leaving the buffer editable before save)
 would legitimize the escape hatch and keep the stale-guard/undo story
 intact.
+
+DONE [2026-07-15]: the verb already existed — ~conflict-keep-all SIDE~
+IS whole-file take-side (the text between hunks is common to both
+sides), and the buffer stays editable before save. The gap was
+discoverability: ~help {conflicts}~ now says so explicitly
+("take a side wholesale, then patch the exceptions").
 
 ** DONE message_edits over a RANGE: bulk trailer / message rewrite      :git:
 CLOSED: [2026-07-15]

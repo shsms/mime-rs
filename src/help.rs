@@ -156,6 +156,9 @@ diff3/zdiff3 handled; heed its `!` line about unparseable markers).
 Then, via run_program, hunk by hunk:
   (report "left" (conflict-resolve-trivial)) ; sweep the safe hunks first
   (report "left" (conflict-keep-all "ours"|"theirs"|"both")) ; one side, ALL hunks
+    — this IS "take one side for the WHOLE FILE" (the text between hunks
+    is common to both sides), and the buffer stays editable before save:
+    take a side wholesale, then patch the exceptions.
   (conflict-context N)   ; one hunk rendered WITH surrounding code
   (conflict-diff N)      ; just what differs between the sides
   (conflict-text SIDE N) ; read one side
