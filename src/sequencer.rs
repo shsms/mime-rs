@@ -2649,6 +2649,166 @@ pub fn cmd_absorb(
     absorb(&repo, since, rehearse_only).map_err(gerr)
 }
 
+/// Visit every commit of `range` (oldest-first) in the worktree and run
+/// `command` at each — the pr-prep gate loop ("does every commit build?")
+/// that otherwise gets hand-rolled as `for c in rev-list; checkout c; cargo
+/// check` in a shell. Stops on the first failure, naming the commit and the
+/// command's output tail; the original HEAD (branch or detached) is restored
+/// afterwards either way. Refuses on a dirty worktree.
+///
+/// GATED: running an arbitrary command breaks the git tools' default
+/// "no hooks, no exec" posture, so it must be enabled explicitly by whoever
+/// LAUNCHES the server (not the agent): set MIME_EXEC=1 in the environment.
+pub fn cmd_exec_over(
+    repo_path: &std::path::Path,
+    range: &str,
+    command: &str,
+) -> Result<String, String> {
+    let allowed = std::env::var("MIME_EXEC")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !allowed {
+        return Err(
+            "git_exec_over: command execution is disabled by default (the git tools \
+             promise no hooks, no exec). Whoever launches the server can allow it by \
+             setting MIME_EXEC=1 in mime's environment."
+                .to_string(),
+        );
+    }
+    let repo = open(repo_path)?;
+    exec_over(&repo, range, command).map_err(gerr)
+}
+
+fn exec_over(repo: &Repository, range: &str, command: &str) -> Result<String, Error> {
+    if is_dirty(repo)? {
+        return Err(estr(
+            "exec_over: the worktree has uncommitted changes — each commit is checked \
+             out in place, which would clobber them. Commit, absorb, or stash first.",
+        ));
+    }
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| estr("bare repository"))?
+        .to_path_buf();
+    let mut walk = repo.revwalk()?;
+    walk.push_range(range)?;
+    walk.set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE)?;
+    let commits: Vec<Oid> = walk.collect::<Result<_, _>>()?;
+    if commits.is_empty() {
+        return Err(estr(&format!("exec_over: no commits in {range}")));
+    }
+    // is_dirty ignores untracked files, but the force checkouts would still
+    // clobber an untracked file colliding with a path in any visited tree —
+    // and restoring HEAD (where the path is untracked) would then delete it.
+    // begin() refuses this for its one target tree; here every commit of the
+    // range is a target.
+    let mut uopts = git2::StatusOptions::new();
+    uopts
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false);
+    let untracked: Vec<String> = repo
+        .statuses(Some(&mut uopts))?
+        .iter()
+        .filter(|e| e.status().contains(git2::Status::WT_NEW))
+        .filter_map(|e| e.path().map(str::to_string))
+        .collect();
+    if !untracked.is_empty() {
+        for oid in &commits {
+            let tree = repo.find_commit(*oid)?.tree()?;
+            if let Some(p) = untracked
+                .iter()
+                .find(|p| tree.get_path(Path::new(p)).is_ok())
+            {
+                return Err(estr(&format!(
+                    "exec_over: untracked file {p} would be overwritten by checking \
+                     out {} — move or remove it first",
+                    short(*oid)
+                )));
+            }
+        }
+    }
+    // Remember where HEAD points so it can be restored (branch by name;
+    // detached by oid).
+    let head = repo.head()?;
+    let branch = head.is_branch().then(|| head.name().map(str::to_string));
+    let detached = head.target();
+    drop(head);
+
+    let force_checkout = |repo: &Repository| -> Result<(), Error> {
+        let mut co = git2::build::CheckoutBuilder::new();
+        co.force();
+        repo.checkout_head(Some(&mut co))
+    };
+    let summary_of = |oid: Oid| {
+        repo.find_commit(oid)
+            .ok()
+            .and_then(|c| c.summary().map(str::to_string))
+            .unwrap_or_default()
+    };
+    let mut result: Result<String, Error> = Ok(String::new());
+    for oid in &commits {
+        repo.set_head_detached(*oid)?;
+        force_checkout(repo)?;
+        let run = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&workdir)
+            .output();
+        match run {
+            Ok(out) if out.status.success() => {
+                let report = result.as_mut().expect("only set on failure");
+                report.push_str(&format!("  ok  {} {}\n", short(*oid), summary_of(*oid)));
+            }
+            Ok(out) => {
+                // The command's output tail rides in the error — enough to
+                // see WHAT broke without re-running by hand.
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let lines: Vec<&str> = stdout.lines().chain(stderr.lines()).collect();
+                let start = lines.len().saturating_sub(20);
+                result = Err(estr(&format!(
+                    "exec_over: {:?} failed at {} ({}) with {}\n{}",
+                    command,
+                    short(*oid),
+                    summary_of(*oid),
+                    out.status,
+                    lines[start..].join("\n"),
+                )));
+                break;
+            }
+            Err(e) => {
+                result = Err(estr(&format!("exec_over: cannot run {command:?}: {e}")));
+                break;
+            }
+        }
+    }
+    // Put HEAD back where it was, whatever happened above.
+    let put_back = (|| -> Result<(), Error> {
+        match (branch.flatten(), detached) {
+            (Some(name), _) => repo.set_head(&name)?,
+            (None, Some(oid)) => repo.set_head_detached(oid)?,
+            (None, None) => {}
+        }
+        force_checkout(repo)
+    })();
+    match (result, put_back) {
+        (Ok(report), Ok(())) => Ok(format!(
+            "ran {command:?} on {} commit(s) — all passed\n{report}",
+            commits.len()
+        )),
+        (Err(e), Ok(())) => Err(estr(&format!("{e}\n(HEAD restored — nothing changed)"))),
+        (Err(e), Err(r)) => Err(estr(&format!(
+            "{e}; and restoring HEAD failed: {r} — the worktree is on a \
+             detached commit; check out your branch to recover"
+        ))),
+        (Ok(_), Err(r)) => Err(estr(&format!(
+            "exec_over: every commit passed, but restoring HEAD failed: {r} — \
+             the worktree is on a detached commit; check out your branch to recover"
+        ))),
+    }
+}
+
 fn absorb(repo: &Repository, since: Option<Oid>, rehearse_only: bool) -> Result<String, Error> {
     let head = repo.head()?.peel_to_commit()?;
     let head_tree = head.tree()?;
@@ -3898,6 +4058,76 @@ mod tests {
         assert!(err.contains("nothing to fold"), "{err}");
         assert!(err.contains("split ownership"), "{err}");
         assert_eq!(read(&repo, "f"), "l1\nx\ny\nc2\nl5\n", "untouched");
+    }
+
+    #[test]
+    fn exec_over_visits_every_commit_and_restores_head() {
+        let (dir, repo, base, _c1, c2) = absorb_fixture("exec-over");
+        // Log each visited commit's file content — proves the worktree really
+        // holds each commit while the command runs.
+        let log = dir.join("visits.log");
+        let cmd = format!(
+            "head -c 20 f >> {}; echo . >> {}",
+            log.display(),
+            log.display()
+        );
+        let range = format!("{base}..HEAD");
+        let out = exec_over(&repo, &range, &cmd).unwrap();
+        assert!(out.contains("all passed"), "{out}");
+        assert!(
+            out.contains("edit two") && out.contains("edit four"),
+            "{out}"
+        );
+        let visits = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(visits.matches('.').count(), 2, "{visits}");
+        // HEAD is back on the branch, at the same tip.
+        let head = repo.head().unwrap();
+        assert!(head.is_branch(), "restored to the branch");
+        assert_eq!(head.target(), Some(c2));
+
+        // A failing command stops at the offending commit ("c2" is not in the
+        // file until the second commit), names it, and still restores HEAD.
+        let err = exec_over(&repo, &range, "grep -q c2 f").unwrap_err();
+        let msg = err.message();
+        assert!(msg.contains("failed at"), "{msg}");
+        assert!(
+            msg.contains(&short(_c1)),
+            "names the first failing commit: {msg}"
+        );
+        assert!(repo.head().unwrap().is_branch());
+
+        // Dirty worktree refuses.
+        std::fs::write(repo.workdir().unwrap().join("f"), b"dirty\n").unwrap();
+        let err = exec_over(&repo, &range, "true").unwrap_err();
+        assert!(err.message().contains("uncommitted"), "{err}");
+    }
+
+    #[test]
+    fn exec_over_refuses_when_an_untracked_file_collides_with_the_range() {
+        let dir = tmp("exec-over-untracked");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("f", "1\n")], "base");
+        let c1 = commit(&repo, &[base], &[("f", "1\n"), ("gen", "old\n")], "track gen");
+        let c2 = commit(&repo, &[c1], &[("f", "2\n")], "drop gen");
+        on_branch(&repo, "main", c2);
+        // `gen` is untracked at HEAD, but checking out c1 would overwrite it
+        // and the restore to HEAD would then delete it.
+        std::fs::write(dir.join("gen"), b"precious\n").unwrap();
+        let err = exec_over(&repo, &format!("{base}..HEAD"), "true").unwrap_err();
+        assert!(err.message().contains("untracked file gen"), "{err}");
+        assert_eq!(read(&repo, "gen"), "precious\n");
+        // With the collision gone, the same range runs.
+        std::fs::remove_file(dir.join("gen")).unwrap();
+        let out = exec_over(&repo, &format!("{base}..HEAD"), "true").unwrap();
+        assert!(out.contains("all passed"), "{out}");
+    }
+
+    #[test]
+    fn exec_over_is_gated_behind_an_env_opt_in() {
+        // No test sets MIME_EXEC, so the gate must hold here.
+        let (dir, _repo, _base, _c1, _c2) = absorb_fixture("exec-gate");
+        let err = cmd_exec_over(&dir, "HEAD~1..HEAD", "true").unwrap_err();
+        assert!(err.contains("MIME_EXEC"), "{err}");
     }
 
     #[test]

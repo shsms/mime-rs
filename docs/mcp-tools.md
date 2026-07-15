@@ -296,3 +296,11 @@ Fold EVERY uncommitted hunk into the commit that owns its lines, automatically �
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 - `since` — Scope owners to `since..HEAD` (oid/ref/revspec, e.g. main — usually the branch base): hunks owned at or beyond the boundary stay in the worktree instead of rewriting history past it. Recommended on shared-history branches.
 
+## git_exec_over
+
+Run a shell command at EVERY commit of `range`, oldest-first — the pr-prep gate loop (git rebase -x's standalone sibling): each commit is checked out in place (detached), the command runs in the worktree, and the walk stops on the first failure naming the commit and the output tail. HEAD is restored afterwards either way. Refuses on a dirty worktree. DISABLED unless whoever launches the server sets MIME_EXEC=1 (the git tools otherwise promise no hooks, no exec).
+
+- `command` (required) — Shell command to run at each commit (via sh -c), e.g. "cargo check -q".
+- `range` (required) — Revision range whose commits to visit, e.g. main..HEAD.
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+

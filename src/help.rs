@@ -197,6 +197,10 @@ into git_fixup, or let git_absorb fold them all).
     of onto..HEAD — no need to transcribe untouched commits.
   git_fixup {target, source}  one-call fold of `source` into `target` (keeps
     target's signed message); auto-picks the rest. Commit uncommitted work first.
+  git_exec_over {range, command}  run a shell command at every commit of the
+    range, oldest-first (the pr-prep "does every commit build?" gate); stops
+    on the first failure naming the commit, HEAD restored either way.
+    Disabled unless the server was launched with MIME_EXEC=1.
   git_absorb {since?}  fold EVERY uncommitted hunk into the commit that owns
     its lines (blame + fixup composed): hunks group by owner and fold in one
     replay; unclear ones (new lines, split ownership) stay in the worktree and

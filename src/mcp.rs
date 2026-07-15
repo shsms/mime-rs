@@ -2753,6 +2753,9 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
             args.get("since").and_then(Value::as_str),
             bool_arg(args, "rehearse"),
         ),
+        "git_exec_over" => {
+            seq::cmd_exec_over(&repo, &str_arg(args, "range")?, &str_arg(args, "command")?)
+        }
         "git_move" => seq::cmd_move(
             &repo,
             &str_arg(args, "from")?,
@@ -3000,6 +3003,19 @@ fn git_tool_schemas() -> Vec<Value> {
                 "required": ["repo"],
             },
         }),
+        json!({
+            "name": "git_exec_over",
+            "description": "Run a shell command at EVERY commit of `range`, oldest-first — the pr-prep gate loop (git rebase -x's standalone sibling): each commit is checked out in place (detached), the command runs in the worktree, and the walk stops on the first failure naming the commit and the output tail. HEAD is restored afterwards either way. Refuses on a dirty worktree. DISABLED unless whoever launches the server sets MIME_EXEC=1 (the git tools otherwise promise no hooks, no exec).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": repo,
+                    "range": { "type": "string", "description": "Revision range whose commits to visit, e.g. main..HEAD." },
+                    "command": { "type": "string", "description": "Shell command to run at each commit (via sh -c), e.g. \"cargo check -q\"." }
+                },
+                "required": ["repo", "range", "command"],
+            },
+        }),
     ]
 }
 
@@ -3240,6 +3256,11 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             Git,
             A::destructive(),
             "fold every dirty hunk into the commit that owns its lines",
+        ),
+        "git_exec_over" => (
+            Git,
+            A::destructive(),
+            "run a command at every commit of a range (gated: MIME_EXEC=1)",
         ),
 
         "read_region" => (
@@ -4111,6 +4132,7 @@ mod git_tool_tests {
             "git_move",
             "git_fixup",
             "git_absorb",
+            "git_exec_over",
         ] {
             assert!(names.contains(&expected), "missing schema for {expected}");
         }

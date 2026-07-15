@@ -587,7 +587,17 @@ occurrences by default (a message rarely wants just one), or at least
 return a per-edit replacement count so zero-or-partial application is
 visible in the result.
 
-** TODO [#B] Rebase plans: per-commit exec (or git_exec_over {range, command}) :git:
+** DONE [#B] Rebase plans: per-commit exec (or git_exec_over {range, command}) :git:
+CLOSED: [2026-07-15]
+DONE [2026-07-15]: went with the standalone ~git_exec_over {range,
+command}~ (no rebase-state-machine entanglement; autosquash + gate =
+git_fixup/git_rebase then git_exec_over). Visits each commit of the
+range oldest-first in place (detached checkout), stops on first
+failure naming the commit + output tail, restores HEAD either way,
+refuses on a dirty worktree. DESIGN DECISION: gated behind MIME_EXEC=1
+set by whoever LAUNCHES the server — the git tools' documented "no
+hooks, no exec" posture stays the default; flip to always-on if that
+feels too strict in practice.
 :LOGBOOK:
 - State "TODO"       from              [2026-07-15 Mi 16:07]
 :END:
