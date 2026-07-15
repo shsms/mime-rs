@@ -742,18 +742,23 @@ fn rehearse(repo: &Repository, plan: &Plan, mode: Mode) -> Result<Preview, Error
             // fixup is built against the tip, where later commits already
             // reshaped the lines) — so blame from the step's original parent
             // down to the base, not from the half-replayed new history.
-            let why = files
-                .iter()
-                .filter_map(|f| {
-                    let from = pick.parent(0).ok()?.id();
-                    last_toucher(repo, from, plan.onto, f).map(|(o, s)| {
-                        format!(
-                            "{f}: the context it patches was last reshaped by {} {s}",
-                            short(o)
-                        )
-                    })
-                })
-                .collect();
+            let why = match pick.parent(0) {
+                Ok(parent) => {
+                    let touchers = last_touchers(repo, parent.id(), plan.onto, &files);
+                    files
+                        .iter()
+                        .filter_map(|f| {
+                            touchers.get(f).map(|(o, s)| {
+                                format!(
+                                    "{f}: the context it patches was last reshaped by {} {s}",
+                                    short(*o)
+                                )
+                            })
+                        })
+                        .collect()
+                }
+                Err(_) => Vec::new(),
+            };
             conflicts.push(PreviewConflict {
                 step: i,
                 commit: step.commit,
@@ -793,29 +798,59 @@ fn rehearse(repo: &Repository, plan: &Plan, mode: Mode) -> Result<Preview, Error
     })
 }
 
-/// The most recent commit at-or-below `from` (stopping at `stop`) whose diff
-/// against its first parent touches `path` — the "who last reshaped these
-/// lines" half of a rehearsal conflict explanation. Bounded walk; `None`
-/// when nothing in range touches the path.
-fn last_toucher(repo: &Repository, from: Oid, stop: Oid, path: &str) -> Option<(Oid, String)> {
-    let mut walk = repo.revwalk().ok()?;
-    walk.push(from).ok()?;
-    walk.hide(stop).ok()?;
-    walk.set_sorting(Sort::TOPOLOGICAL).ok()?;
+/// Which commit (walking `from` down to `stop`, newest-first, capped at 200)
+/// last touched each of `paths` — the "why" behind a rehearsal conflict. ONE
+/// revwalk with one pathspec'd tree-diff per commit answers every conflicted
+/// file of a step.
+fn last_touchers(
+    repo: &Repository,
+    from: Oid,
+    stop: Oid,
+    paths: &[String],
+) -> std::collections::HashMap<String, (Oid, String)> {
+    let mut out = std::collections::HashMap::new();
+    let mut remaining: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
+    let Ok(mut walk) = repo.revwalk() else {
+        return out;
+    };
+    if walk.push(from).is_err()
+        || walk.hide(stop).is_err()
+        || walk.set_sorting(Sort::TOPOLOGICAL).is_err()
+    {
+        return out;
+    }
     for oid in walk.flatten().take(200) {
-        let c = repo.find_commit(oid).ok()?;
-        let tree = c.tree().ok()?;
+        if remaining.is_empty() {
+            break;
+        }
+        let Ok(c) = repo.find_commit(oid) else { break };
+        let Ok(tree) = c.tree() else { break };
         let parent_tree = c.parent(0).ok().and_then(|p| p.tree().ok());
         let mut dopts = git2::DiffOptions::new();
-        dopts.pathspec(path);
-        let diff = repo
-            .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut dopts))
-            .ok()?;
-        if diff.deltas().len() > 0 {
-            return Some((oid, c.summary().unwrap_or("").to_string()));
+        for p in &remaining {
+            dopts.pathspec(*p);
+        }
+        let Ok(diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut dopts))
+        else {
+            break;
+        };
+        // Newest-first walk: the FIRST commit that touches a path owns it.
+        let summary = c.summary().unwrap_or("").to_string();
+        for i in 0..diff.deltas().len() {
+            let Some(delta) = diff.get_delta(i) else {
+                continue;
+            };
+            for f in [delta.old_file().path(), delta.new_file().path()] {
+                let Some(p) = f.and_then(|p| p.to_str()) else {
+                    continue;
+                };
+                if remaining.remove(p) {
+                    out.insert(p.to_string(), (oid, summary.clone()));
+                }
+            }
         }
     }
-    None
+    out
 }
 
 /// Resume after the agent resolved a conflict in the worktree: stage the

@@ -466,7 +466,8 @@ rollback branch is gone; CLI/daemon failure JSONs now carry
 return — it would churn the public API the CLI repl prints from, for
 marginal gain; unprint_string_value stays.
 
-** TODO last_toucher: one walk per conflict, not per file               :git:
+** DONE last_toucher: one walk per conflict, not per file               :git:
+CLOSED: [2026-07-15]
 :LOGBOOK:
 - State "TODO"       from              [2026-07-14 Di 14:22]
 :END:
@@ -476,6 +477,11 @@ fresh 200-commit revwalk + pathspec'd diff per conflicted FILE, so a
 many-conflict rehearsal over a long branch does O(conflicts x files x
 commits) tree diffs. Walk once per conflicting step (or once per rehearsal),
 bucket touched paths per commit, and answer all files from that map.
+
+DONE [2026-07-15]: ~last_touchers~ walks once per conflicting STEP (a
+step's blame window starts at ITS original parent, so per-rehearsal
+would change answers), diffs each commit against the remaining unowned
+paths only, and stops early once every file has its owner.
 
 ** TODO [#B] Consistent argument names (or aliases) across tools        :mcp:
 :LOGBOOK:
