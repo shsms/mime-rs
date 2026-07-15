@@ -230,7 +230,10 @@ ambiguity-as-error is arguably the right default. Measure the token
 / ergonomics cost on real sessions before flipping (a default flip
 breaks "replace the first TODO" one-shots).
 
-** TODO checkpoint_labels clones every label on each session_status call [#C] :mcp:
+** DONE checkpoint_labels clones every label on each session_status call [#C] :mcp:
+CLOSED: [2026-07-15]
+DONE [2026-07-15]: session_status asks ~has_checkpoints~ first and only
+clones labels when some exist.
 From the mcp-surface-review code review (2026-06-24). ~session_status~ calls
 ~Workspace::checkpoint_labels~ for every warm session, cloning each label
 ~String~ into a fresh ~Vec~. Trivial on an infrequent status call, but needless
@@ -529,7 +532,10 @@ top-level mode as default). Regex+all rides the native ~replace-regexp~
 re-search-forward/replace-match with the same expect_unique
 transaction + match-line listing.
 
-** TODO [#C] Batched edits error: say that nothing was applied          :mcp:
+** DONE [#C] Batched edits error: say that nothing was applied          :mcp:
+CLOSED: [2026-07-15]
+DONE [2026-07-15]: the batch miss error now says "NO edits were applied
+(the batch is transactional; earlier edits rolled back)".
 :LOGBOOK:
 - State "TODO"       from              [2026-07-15 Mi 16:07]
 :END:
@@ -540,7 +546,12 @@ the error ("no edits applied") saves the agent a verification
 round-trip. (2026-07-15 session: had to re-check the buffer to learn
 the batch was atomic.)
 
-** TODO [#C] Docs: view {lines} example; line-based read_region         :mcp:
+** DONE [#C] Docs: view {lines} example; line-based read_region         :mcp:
+CLOSED: [2026-07-15]
+DONE [2026-07-15]: view rejects a non-integer ~lines~/~pos~ loudly,
+pointing at read_region for ranges; read_region takes
+~lines: [a, b]~ (1-based inclusive, goto-line-relative); both schema
+descriptions carry worked examples.
 :LOGBOOK:
 - State "TODO"       from              [2026-07-15 Mi 16:07]
 :END:
@@ -557,7 +568,12 @@ accepted but the output was centered on point, not the range — the
 agent fell back to Read for the rest of the session. Whatever shape
 lines takes, reject the wrong shape loudly instead of ignoring it.
 
-** TODO [#C] Document session re-sync semantics after external changes  :mcp:
+** DONE [#C] Document session re-sync semantics after external changes  :mcp:
+CLOSED: [2026-07-15]
+DONE [2026-07-15]: the rule ("passing path re-reads a clean drifted
+buffer; unsaved buffers are kept and stale-guarded — no defensive
+close_session") is now stated on open_file's schema and in
+~help {sessions}~.
 :LOGBOOK:
 - State "TODO"       from              [2026-07-15 Mi 16:07]
 :END:

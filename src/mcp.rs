@@ -917,6 +917,43 @@ fn tool_read_region(
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
     let session = resolve_session(args, sessions)?;
+    // The line-based form: `lines: [a, b]` (1-based inclusive, narrowing-
+    // relative like goto-line) — the natural shape for "read around this
+    // line"; start/end stay the char-position form conflicts output feeds.
+    if let Some(v) = args.get("lines") {
+        if args.get("start").is_some() || args.get("end").is_some() {
+            return Err("read_region: pass start/end (char positions) OR lines, not both".into());
+        }
+        let range = v.as_array().and_then(|a| {
+            if a.len() == 2 {
+                Some((a[0].as_i64()?, a[1].as_i64()?))
+            } else {
+                None
+            }
+        });
+        let Some((a, b)) = range else {
+            return Err(
+                "read_region: `lines` must be [start, end] — 1-based inclusive line \
+                 numbers, e.g. {lines: [313, 322]}"
+                    .to_string(),
+            );
+        };
+        if a < 1 || b < a {
+            return Err(format!(
+                "read_region: bad line range [{a}, {b}] — need 1 <= start <= end"
+            ));
+        }
+        return run_message(
+            sessions,
+            &session,
+            &format!(
+                "(save-excursion (goto-line {a}) (beginning-of-line) \
+                 (let ((s (point))) (goto-line {b}) (end-of-line) \
+                 (buffer-substring s (point))))"
+            ),
+            "read_region",
+        );
+    }
     let start = int_arg(args, "start")?;
     let end = int_arg(args, "end")?;
     run_message(
@@ -936,8 +973,22 @@ fn tool_view(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result<
     // Both args are optional and map straight onto `(window LINES POS)`; we build
     // the call positionally, dropping trailing args so `window`'s own defaults
     // (4 lines, current point) apply when they're omitted.
-    let lines = args.get("lines").and_then(Value::as_i64);
-    let pos = args.get("pos").and_then(Value::as_i64);
+    // A wrong SHAPE must fail loudly, not silently fall back to the default
+    // viewport.
+    let lines = match args.get("lines") {
+        None => None,
+        Some(v) => Some(v.as_i64().ok_or_else(|| {
+            "view: `lines` is a context-line COUNT around the cursor (an integer, \
+             e.g. {lines: 8}). To read a LINE RANGE, use read_region {lines: [313, 322]}."
+                .to_string()
+        })?),
+    };
+    let pos = match args.get("pos") {
+        None => None,
+        Some(v) => Some(v.as_i64().ok_or_else(|| {
+            "view: `pos` must be a 1-based char position (an integer)".to_string()
+        })?),
+    };
     let call = match (lines, pos) {
         (Some(n), Some(p)) => format!("(window {n} {p})"),
         (Some(n), None) => format!("(window {n})"),
@@ -1466,7 +1517,8 @@ fn run_batch_edits(
         // The error messages that abort (and roll back) the transaction name
         // the edit; the pattern is echoed clamped.
         let miss = lisp_escape(&format!(
-            "edit {}: no match for the pattern {:?}",
+            "edit {}: no match for the pattern {:?} — NO edits were applied \
+             (the batch is transactional; earlier edits rolled back)",
             i + 1,
             truncate_for_error(&pattern)
         ));
@@ -2360,7 +2412,9 @@ fn tool_session_status(sessions: &HashMap<String, Workspace>) -> Result<String, 
                 "narrowed": ws.is_narrowed(),
                 "stale": ws.is_stale(),
                 "unsaved": ws.visited_path().is_some() && ws.is_modified(),
-                "checkpoints": ws.checkpoint_labels(),
+                // Cloning every label on each status call is needless when
+                // there are none (the common case) — ask first.
+                "checkpoints": if ws.has_checkpoints() { json!(ws.checkpoint_labels()) } else { json!([]) },
             });
             // Only when it's not the plain utf-8-unix default, to keep the
             // common case quiet — like Emacs only flagging non-LF in the modeline.
@@ -3500,7 +3554,7 @@ fn build_tool_schemas() -> Vec<Value> {
     vec![
         json!({
             "name": "open_file",
-            "description": "Open a file from disk into a warm session (replacing any existing session of that name). The buffer stays resident so later tools need no file re-reads. The path must resolve inside an allowed root (MIME_ROOTS, default cwd). You rarely need this: every tool's `path` argument auto-opens the file the same way — reach for open_file only to attach it read-only (`read_only: true`) or under a specific session id.",
+            "description": "Open a file from disk into a warm session (replacing any existing session of that name). The buffer stays resident so later tools need no file re-reads. The path must resolve inside an allowed root (MIME_ROOTS, default cwd). You rarely need this: every tool's `path` argument auto-opens the file the same way — reach for open_file only to attach it read-only (`read_only: true`) or under a specific session id. After EXTERNAL changes to the file (a git checkout, another editor) there is nothing to do: passing `path` re-reads a CLEAN drifted buffer from disk automatically; a buffer with unsaved edits is kept and flagged stale instead — no defensive close_session needed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3559,16 +3613,17 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "read_region",
-            "description": "Return the buffer text between two 1-based char positions [start, end). Use this to pull context on demand instead of dumping the whole buffer.",
+            "description": "Return the buffer text between two 1-based char positions [start, end) — or a LINE range via lines: [a, b]. Use this to pull context on demand instead of dumping the whole buffer. Char positions are what conflicts/occur output feeds (@N); the lines form fits 'read around this line'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "start": { "type": "integer", "description": "1-based start position (inclusive)." },
+                    "start": { "type": "integer", "description": "1-based start position (inclusive). Pass start+end OR lines." },
                     "end": { "type": "integer", "description": "1-based end position (exclusive)." },
+                    "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based INCLUSIVE line numbers (narrowing-relative, like goto-line), e.g. {lines: [313, 322]} — instead of char positions." },
                     "session": session,
                     "path": path,
                 },
-                "required": ["start", "end"],
+                "required": [],
             },
         }),
         json!({
@@ -3577,8 +3632,8 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "lines": { "type": "integer", "description": "Context lines on each side of the cursor line (default 4)." },
-                    "pos": { "type": "integer", "description": "1-based position to center on (default: current point)." },
+                    "lines": { "type": "integer", "description": "Context lines on EACH SIDE of the cursor line — a count, not a range (worked example: view {path: \"f.rs\", pos: 3130, lines: 8} renders 17 lines centered on position 3130). For a line RANGE use read_region {lines: [a, b]}." },
+                    "pos": { "type": "integer", "description": "1-based CHAR position to center on (default: current point). To center on a line, first find its position via occur, or read_region {lines: [n, n]}." },
                     "session": session,
                     "path": path,
                 },

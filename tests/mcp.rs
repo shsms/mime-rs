@@ -464,6 +464,31 @@ fn replace_text_is_literal_counted_and_quote_safe() {
 }
 
 #[test]
+fn read_region_takes_line_ranges_and_view_rejects_them_loudly() {
+    let mut s = Server::spawn();
+    s.call_ok(1, "open_text", json!({ "text": "l1\nl2\nl3\nl4\nl5\n" }));
+
+    // The line form: 1-based inclusive.
+    let out = s.call_ok(2, "read_region", json!({ "lines": [2, 4] }));
+    assert_eq!(out, "l2\nl3\nl4");
+
+    // Wrong shapes fail loudly with the right form in the error.
+    let err = s.call_err(3, "read_region", json!({ "lines": "2-4" }));
+    assert!(err.contains("[start, end]"), "{err}");
+    let err = s.call_err(4, "view", json!({ "lines": [2, 4] }));
+    assert!(
+        err.contains("COUNT") && err.contains("read_region"),
+        "a range passed to view names the tool that takes ranges: {err}"
+    );
+    let err = s.call_err(
+        5,
+        "read_region",
+        json!({ "lines": [2, 4], "start": 1, "end": 3 }),
+    );
+    assert!(err.contains("not both"), "{err}");
+}
+
+#[test]
 fn replace_text_regex_mode_expands_backrefs() {
     let mut s = Server::spawn();
     s.call_ok(

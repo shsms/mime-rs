@@ -245,6 +245,12 @@ save refuses and the edit stays warm — re-check, then save_buffer elsewhere or
 writes a different file). A clean-but-drifted buffer auto-reverts before reads,
 programs, and rehearsals.
 
+Re-sync after EXTERNAL changes (a git checkout/rebase, another editor):
+nothing to do — passing `path` re-reads a CLEAN drifted buffer from disk
+before serving the call; a buffer with UNSAVED edits is kept and flagged
+stale instead (the save stays guarded). Closing the session first is never
+needed; unsaved_diff {path} shows buffer-vs-disk when unsure.
+
 Coding: a file's BOM and DOS (`\r\n`) line endings are detected on open and the
 buffer is a normalized VIEW (no BOM character, LF lines — so `\n` patterns and
 char positions behave) over the raw paged file, so even huge CRLF files are NOT

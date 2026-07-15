@@ -736,6 +736,12 @@ impl Workspace {
         s.buffer.version() != s.synced_version
     }
 
+    /// Whether any user checkpoint exists — lets `session_status` skip the
+    /// label cloning for the common no-checkpoints case.
+    pub fn has_checkpoints(&self) -> bool {
+        !self.session.borrow().checkpoints.is_empty()
+    }
+
     /// Labels of the user checkpoints captured in this session, in creation
     /// order (excludes the implicit undo ring). Surfaced by `session_status`.
     pub fn checkpoint_labels(&self) -> Vec<String> {
