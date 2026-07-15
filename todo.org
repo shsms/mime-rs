@@ -38,6 +38,7 @@ lingering on NFS (now gitignored). Remaining idea, if fd pressure ever
 shows up in practice: a re-open-on-demand mode for CLEAN buffers only.
 
 ** TODO Dogfooding friction: MCP "insert relative to a defun/node" [#C]
+
 From driving mime to edit mime-rs itself. DONE: the unsaved state is now
 legible — ~session_status~ carries an ~unsaved~ flag per session and
 ~run_program~/~replace_text~/~insert_text~ flag/note an edit that lives only in
@@ -48,6 +49,15 @@ a defun/node" convenience (or a ~save~-by-default flag) would close the common
 "add a function after X" case without hand-writing a ~run_program~. Possible
 further step: a warm buffer with unsaved edits AND a drifted file is the genuine
 conflict — could surface it more loudly than the per-tool flag.
+
+More shapes from 2026-07-15: (1) append-at-end-of-file has no
+expression — the agent tried location:"eob", then used Bash cat >> for
+every CSS/test append (6+ times); a pos sentinel ("eob") or
+insert_text {append: true} closes it. (2) The wanted anchor is often a
+LITERAL LINE, not a defun ("insert after the line matching X") — an
+anchor {pattern, where} form would have replaced several
+replace_text calls that dragged duplicated context around just to
+re-insert it.
 
 ** TODO Bytecode-compile hot programs [#C]
 
@@ -374,6 +384,25 @@ the branch, or split ownership) stay in the worktree and are reported.
 rehearse:true previews the grouping. Modeled on magit-commit-absorb /
 git-absorb.
 
+Field evidence [2026-07-15]: one review-fix session hand-rolled this
+loop FOUR times (dump -U0 diff, split hunks by blame target with a
+python script, apply+commit per group, autosquash) — the single largest
+avoidable tool-call sink of the session. Two notes from that use: (1) a
+grouped blame view (git_blame {worktree: true, group_by: "commit"} →
+{commit: [hunks]}) is the natural input and useful on its own; (2) some
+hunks need routing by NAME, not blame (a renamed fn's call sites belong
+with the rename commit even when blame says otherwise), so ambiguous or
+overridden routing must stay expressible — absorb the clear ones, leave
+the rest in the worktree, report.
+
+Recurred [2026-07-15, formula-explorer gate]: the same
+distribute-hunks-to-owning-commits loop, hand-rolled with an even
+cruder tool — revert file, re-apply hunk A by editor, git commit
+--fixup=X, re-apply hunk B, fixup Y — four times in one session, plus
+one mis-attributed hunk that had to be re-reverted mid-dance. Every
+occurrence confirms the by-name routing note: review fixes cluster by
+COMMIT TOPIC, not by blame line.
+
 ** TODO [#C] git_range_diff: compare a branch before/after a rewrite    :git:
 :LOGBOOK:
 - State "TODO"       from              [2026-07-14 Di 13:58]
@@ -424,6 +453,190 @@ fresh 200-commit revwalk + pathspec'd diff per conflicted FILE, so a
 many-conflict rehearsal over a long branch does O(conflicts x files x
 commits) tree diffs. Walk once per conflicting step (or once per rehearsal),
 bucket touched paths per commit, and answer all files from that map.
+
+** TODO [#B] Consistent argument names (or aliases) across tools        :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-15 Mi 16:07]
+:END:
+
+Dogfooding friction (2026-07-15, long history-surgery session): five
+first calls died on argument-name guesses — occur {regexp} (it is
+pattern), view {end_line} (lines), help {topics} (topic), replace_text
+{new_text} (replacement), git_blame without {repo}. The "valid
+arguments: ..." error text is what saved each one; still, the names are
+mutually inconsistent. Pick one convention (pattern/replacement
+everywhere, path+repo rules stated once) and/or accept common aliases.
+
+More field evidence [2026-07-15, switchyard migration session]: three
+fresh guesses died the same way — replace_text {old, new} (pattern /
+replacement), insert_text {location} (pos / anchor), view {view: [a,b]}
+(lines). Same fix applies; the aliases would have absorbed all three.
+
+** TODO [#B] replace_text: regex mode with backrefs                     :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-15 Mi 16:07]
+:END:
+
+The most-repeated run_program shape in a long session is the
+goto-char/while/re-search-forward/replace-match loop. A mode:"regex" on
+replace_text (like occur already has), with \1 backrefs in replacement,
+turns five-line programs into one edits[] entry. Keep expect_unique
+semantics per pattern.
+
+** TODO [#C] Batched edits error: say that nothing was applied          :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-15 Mi 16:07]
+:END:
+
+When edit 3 of 5 has no match, the error names edit 3 but not the fate
+of edits 1-2 (they were rolled back — transactional). One sentence in
+the error ("no edits applied") saves the agent a verification
+round-trip. (2026-07-15 session: had to re-check the buffer to learn
+the batch was atomic.)
+
+** TODO [#C] Docs: view {lines} example; line-based read_region         :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-15 Mi 16:07]
+:END:
+
+view {lines: "313-322"} once showed context around point instead of the
+range; the agent never recovered the syntax and used sed for the rest
+of the session. Add a worked example to the schema description. Also:
+read_region takes char positions — natural when fed from conflicts
+output (@point), but a line-based start/end fits the common
+read-around-this-line case.
+
+Recurred [2026-07-15]: view {lines: [315, 380]} (array form) was
+accepted but the output was centered on point, not the range — the
+agent fell back to Read for the rest of the session. Whatever shape
+lines takes, reject the wrong shape loudly instead of ignoring it.
+
+** TODO [#C] Document session re-sync semantics after external changes  :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-15 Mi 16:07]
+:END:
+
+After external git checkouts/rebases moved files under warm buffers,
+the agent defensively close_session'd before re-editing because the
+rule was unknown. If the rule is "passing path re-syncs a clean buffer
+from disk; dirty buffers are stale-guarded", say so in the tool docs
+(the engine behavior already exists per the paged-reader entry).
+
+** TODO [#B] message_edits: replace all occurrences, report the count   :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-15 Mi 16:07]
+:END:
+
+message_edits {find, replace} replaces only the FIRST occurrence. In a
+2026-07-15 rebase this silently left stale identifiers
+(fed_only_through, subtraction_meters) in two commit messages; the miss
+surfaced a whole gate-round later via an external grep. Replace all
+occurrences by default (a message rarely wants just one), or at least
+return a per-edit replacement count so zero-or-partial application is
+visible in the result.
+
+** TODO [#B] Rebase plans: per-commit exec (or git_exec_over {range, command}) :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-15 Mi 16:07]
+:END:
+
+The pr-prep gate builds every commit of a branch; with mime rebases the
+agent hand-rolls "for c in rev-list; checkout c; cargo check" in Bash
+five or six times per session. A plan-level exec: "cargo check -q"
+(native git rebase -x), or a standalone git_exec_over {range, command}
+that visits each commit in a detached worktree, folds that loop into
+the tool that already visits every commit. Stops-on-failure with the
+offending commit named.
+
+Recurred [2026-07-15]: three GIT_SEQUENCE_EDITOR=true git rebase -i
+--autosquash python-client --exec "cargo build --quiet" invocations in
+one pr-prep run — autosquash + per-commit exec is exactly the gate's
+shape, and none of it went through mime's git_rebase.
+
+** TODO [#C] git_reword: sparse message-only rewrite                    :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-15 Mi 16:07]
+:END:
+
+Rewording one commit's message currently needs a full plan (or
+autosquash abuse) transcribing every pick. git_reword {commit,
+message_edits|message} as a sparse one-step rebase — same message_edits
+vocabulary, auto-picking the rest — matches how often a message-only
+fix follows a review.
+
+** TODO [#C] Conflict vocabulary: take one side for a WHOLE file, then edit :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-15 Mi 16:07]
+:END:
+
+A 13-conflict file (module split colliding with a rewritten base) was
+resolved by abandoning per-hunk verbs and Write-ing the merged file
+wholesale — correct, but off the rails. A blessed verb (conflict-take
+{side} for the whole file, leaving the buffer editable before save)
+would legitimize the escape hatch and keep the stale-guard/undo story
+intact.
+
+** TODO message_edits over a RANGE: bulk trailer / message rewrite      :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-15 Mi 16:19]
+:END:
+
+Field evidence [2026-07-15, formula-explorer pr-prep]: stripping a
+Co-Authored-By trailer from every commit of a 7-commit branch needed
+=git filter-branch --msg-filter "sed ..."= in Bash — deprecated,
+warning-squelched, and outside mime's backup ring. git_reword (tracked
+below) covers ONE commit; the recurring gate chore is "apply this
+message_edits vocabulary to EVERY commit in a range" (trailer
+strip/add, s/old-symbol/new/ after a rename). A range form —
+git_msg_rewrite {range, message_edits} — is a sparse rebase that
+touches only messages, keeps trees byte-identical, and reports
+per-commit replacement counts (ties into the message_edits
+count-reporting item).
+
+** TODO Rewrite results: report tree identity vs the backup             :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-15 Mi 16:19]
+:END:
+
+Field evidence [2026-07-15]: after EVERY autosquash/fixup rebase the
+agent hand-compared =git rev-parse HEAD^{tree}= against a manually
+created backup branch to prove the rewrite only re-sliced history (3x
+in one gate). The mutating git tools already stamp
+refs/mime-backup/<branch>/N — their results could carry
+=tree_identical_to_backup: true/false= (plus which commits' trees
+changed when false) for free at rewrite time. Cheap sibling of
+git_range_diff: the boolean answers the common question; range-diff
+answers the deep one.
+
+** TODO git_rebase: autostash around a dirty worktree                   :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-15 Mi 16:19]
+:END:
+
+Field evidence [2026-07-15]: two rebases in one session died on "You
+have unstaged changes" because an unrelated user edit sat in the
+worktree; the Bash workaround (stash push → rebase → stash pop) nearly
+lost track of whose stash was whose. Native git has rebase
+--autostash; mime's git_rebase could do the same (or better: refuse
+only when the dirty paths INTERSECT the rebase's touched paths, since
+an untouched-file edit is provably safe to keep in place).
+
+** TODO grep/read: flag files whose warm buffer has unsaved edits       :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-15 Mi 16:19]
+:END:
+
+Field evidence [2026-07-15]: the agent alternated mime edits
+(save:false, warm buffer ahead of disk) with shell grep/sed/Read
+(disk), and twice reasoned from the stale disk state mid-edit.
+session_status exposes the unsaved flag, but nothing warns at the
+moment of confusion — the disk-side read. mime's own grep (and view on
+a path) could annotate hits in files that have a warm unsaved buffer
+("buffer differs from disk — showing buffer" or at least a flag), and
+an unsaved_diff {path} one-call (buffer vs disk unified diff) would
+answer "what exactly have I not saved" without checkpoint gymnastics.
+External tools can't be fixed, but making mime's own read surface
+authoritative removes the reason to shell out.
 
 * Structural editing
 
@@ -508,4 +721,12 @@ vocabulary and tooling can reflect on a session.
 A ~thread-signal~-style interrupt — unblocks per-program resource limits
 above.
 ** TODO Parity odds & ends
-~assq plist-put pop remhash mapc elt~ / vectors.
+
+~assq plist-put pop remhash mapc elt identity number-sequence~ /
+vectors. (~identity~ and ~number-sequence~ bit a live session on
+2026-07-15: an innocent ~mapcar~ over conflict numbers died on both.)
+
+[2026-07-15]: =insert= rejects multiple args (Emacs accepts &rest;
+needed (concat …) instead); also =\s-= syntax classes in regexes are
+rejected with a good pointer to [[:space:]] — error text fine, worth a
+line in the regex help topic.
