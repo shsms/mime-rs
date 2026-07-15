@@ -80,6 +80,12 @@ buffer with it, so the blast radius includes unsaved work. If tulisp eval
 interruption stays far off, consider a crude fuel counter in the eval loop as
 an interim bound.
 
+Note [2026-07-15]: checked tulisp 0.29's public API — no interrupt or
+fuel hook, and a pure ~(while t)~ never re-enters mime's builtins, so
+even the interim fuel counter must land in tulisp's eval loop
+(upstream change + release + dependency bump). Fully blocked on the
+tulisp wishlist item.
+
 * MCP / agent UX
 
 The agent-facing tool surface. Recurring lens: conveniences that
