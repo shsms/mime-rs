@@ -304,6 +304,14 @@ Fold EVERY uncommitted hunk into the commit that owns its lines, automatically �
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 - `since` — Scope owners to `since..HEAD` (oid/ref/revspec, e.g. main — usually the branch base): hunks owned at or beyond the boundary stay in the worktree instead of rewriting history past it. Recommended on shared-history branches.
 
+## git_range_diff
+
+Compare a branch before and after a rewrite, commit by commit — 'did the rewrite change anything it should not have'. Pass two tips (`old`, `new`); their merge base anchors the two ranges, commits pair by patch-id then by summary, and each pair reports whether its patch and message drifted ('=' unchanged, '!' drifted, '-' dropped, '+' added), plus whether the FINAL trees are identical. Natural after any rebase/fixup: old = refs/mime-backup/<branch>/0 (the pre-op tip the backup ring stamps), new = HEAD. Read-only. An approximation of git range-diff (patch-id equality, not a full diff-of-diffs).
+
+- `new` (required) — The after tip — e.g. HEAD.
+- `old` (required) — The before tip (oid/ref/revspec) — e.g. refs/mime-backup/<branch>/0.
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+
 ## git_discard
 
 Drop selected UNCOMMITTED changes — the destructive sibling of git_fixup's worktree mode, with the same selectors: `paths` (whole files) and/or `hunks` ({path, lines: [start, end]} — the spans git_blame {worktree: true} reports). The chosen hunks reset to HEAD content; everything else stays, unstaged. Always recoverable: the FULL pre-discard worktree is stamped on refs/mime-backup/<branch>-worktree first. A selection is mandatory — no discard-everything shorthand. rehearse:true lists what would go.

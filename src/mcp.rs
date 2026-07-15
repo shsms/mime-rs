@@ -2972,6 +2972,9 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
             &hunk_sels_arg(args, "hunks"),
             bool_arg(args, "rehearse"),
         ),
+        "git_range_diff" => {
+            seq::cmd_range_diff(&repo, &str_arg(args, "old")?, &str_arg(args, "new")?)
+        }
         "git_move" => seq::cmd_move(
             &repo,
             &str_arg(args, "from")?,
@@ -3217,6 +3220,19 @@ fn git_tool_schemas() -> Vec<Value> {
                     "rehearse": { "type": "boolean", "description": "Preview the hunk→commit grouping and the resulting history without applying." }
                 },
                 "required": ["repo"],
+            },
+        }),
+        json!({
+            "name": "git_range_diff",
+            "description": "Compare a branch before and after a rewrite, commit by commit — 'did the rewrite change anything it should not have'. Pass two tips (`old`, `new`); their merge base anchors the two ranges, commits pair by patch-id then by summary, and each pair reports whether its patch and message drifted ('=' unchanged, '!' drifted, '-' dropped, '+' added), plus whether the FINAL trees are identical. Natural after any rebase/fixup: old = refs/mime-backup/<branch>/0 (the pre-op tip the backup ring stamps), new = HEAD. Read-only. An approximation of git range-diff (patch-id equality, not a full diff-of-diffs).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": repo,
+                    "old": { "type": "string", "description": "The before tip (oid/ref/revspec) — e.g. refs/mime-backup/<branch>/0." },
+                    "new": { "type": "string", "description": "The after tip — e.g. HEAD." }
+                },
+                "required": ["repo", "old", "new"],
             },
         }),
         json!({
@@ -3575,6 +3591,11 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             Git,
             A::destructive(),
             "drop selected uncommitted hunks (pre-state on a backup ref)",
+        ),
+        "git_range_diff" => (
+            Git,
+            A::read(),
+            "compare a branch before/after a rewrite, commit by commit",
         ),
 
         "read_region" => (
@@ -4463,6 +4484,7 @@ mod git_tool_tests {
             "git_msg_rewrite",
             "git_reword",
             "git_discard",
+            "git_range_diff",
         ] {
             assert!(names.contains(&expected), "missing schema for {expected}");
         }

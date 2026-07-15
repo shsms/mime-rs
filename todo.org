@@ -431,7 +431,15 @@ one mis-attributed hunk that had to be re-reverted mid-dance. Every
 occurrence confirms the by-name routing note: review fixes cluster by
 COMMIT TOPIC, not by blame line.
 
-** TODO [#C] git_range_diff: compare a branch before/after a rewrite    :git:
+** DONE [#C] git_range_diff: compare a branch before/after a rewrite    :git:
+CLOSED: [2026-07-15]
+DONE [2026-07-15]: ~git_range_diff {old, new}~ — merge base anchors the
+two ranges; commits pair by patch-id, then by summary; per pair the
+report says whether the patch (with the file sets) and the message
+drifted (=/!/-/+), plus a final-trees-identical bottom line. The
+documented approximation (patch-id equality, not a full diff-of-diffs);
+a per-pair diff-of-diffs can layer on later if the boolean isn't
+enough in practice.
 :LOGBOOK:
 - State "TODO"       from              [2026-07-14 Di 13:58]
 :END:

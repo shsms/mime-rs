@@ -3062,6 +3062,164 @@ pub fn cmd_fixup_worktree(
     fixup_worktree(&repo, target, paths, hunks, rehearse_only).map_err(gerr)
 }
 
+/// Compare a branch before and after a rewrite, commit by commit — the
+/// "did the rewrite change anything it should not have" answer, natural
+/// after any rebase/fixup: `git_range_diff {old: refs/mime-backup/<branch>/0,
+/// new: HEAD}`. Commits of `base..old` and `base..new` (base = merge base)
+/// pair by patch-id, then by summary; each pair reports whether its PATCH
+/// and its MESSAGE drifted (an approximation of git range-diff — patch-id
+/// equality instead of a full diff-of-diffs).
+pub fn cmd_range_diff(repo_path: &std::path::Path, old: &str, new: &str) -> Result<String, String> {
+    let repo = open(repo_path)?;
+    let old = resolve_s(&repo, old)?;
+    let new = resolve_s(&repo, new)?;
+    range_diff(&repo, old, new).map_err(gerr)
+}
+
+fn range_diff(repo: &Repository, old: Oid, new: Oid) -> Result<String, Error> {
+    if old == new {
+        return Ok("the two tips are the same commit — nothing to compare".to_string());
+    }
+    let base = repo.merge_base(old, new)?;
+    let commits_between = |tip: Oid| -> Result<Vec<Oid>, Error> {
+        let mut walk = repo.revwalk()?;
+        walk.push(tip)?;
+        walk.hide(base)?;
+        walk.set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE)?;
+        walk.collect()
+    };
+    let olds = commits_between(old)?;
+    let news = commits_between(new)?;
+
+    let summary_of = |oid: Oid| -> String {
+        repo.find_commit(oid)
+            .ok()
+            .and_then(|c| c.summary().map(str::to_string))
+            .unwrap_or_default()
+    };
+    let message_of = |oid: Oid| -> String {
+        repo.find_commit(oid)
+            .ok()
+            .and_then(|c| c.message().map(str::to_string))
+            .unwrap_or_default()
+    };
+    let files_of = |oid: Oid| -> Vec<String> {
+        let Ok(c) = repo.find_commit(oid) else {
+            return Vec::new();
+        };
+        let parent_tree = c.parent(0).ok().and_then(|p| p.tree().ok());
+        let Ok(tree) = c.tree() else {
+            return Vec::new();
+        };
+        match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None) {
+            Ok(d) => {
+                let mut v: Vec<String> = diff_paths(&d).into_iter().collect();
+                v.sort();
+                v
+            }
+            Err(_) => Vec::new(),
+        }
+    };
+
+    // Pair new commits to old ones: identical patch-id first, then the first
+    // unpaired old commit with the same summary (the reworded/reshaped pair).
+    let old_pids: Vec<Option<Oid>> = olds
+        .iter()
+        .map(|o| commit_patch_id(repo, *o).unwrap_or(None))
+        .collect();
+    let mut old_taken = vec![false; olds.len()];
+    let mut pair_of: Vec<Option<usize>> = Vec::with_capacity(news.len());
+    for n in &news {
+        let pid = commit_patch_id(repo, *n).unwrap_or(None);
+        let by_pid =
+            pid.and_then(|p| (0..olds.len()).find(|&i| !old_taken[i] && old_pids[i] == Some(p)));
+        let found = by_pid.or_else(|| {
+            let s = summary_of(*n);
+            (0..olds.len()).find(|&i| !old_taken[i] && summary_of(olds[i]) == s)
+        });
+        if let Some(i) = found {
+            old_taken[i] = true;
+        }
+        pair_of.push(found);
+    }
+
+    let mut out = format!(
+        "{} commit(s) before → {} after (base {})\n",
+        olds.len(),
+        news.len(),
+        short(base)
+    );
+    // Dropped old commits first, in their original order.
+    for (i, o) in olds.iter().enumerate() {
+        if !old_taken[i] {
+            out.push_str(&format!(
+                "  - {}  (dropped) {}\n",
+                short(*o),
+                summary_of(*o)
+            ));
+        }
+    }
+    for (n, pair) in news.iter().zip(&pair_of) {
+        match pair {
+            None => out.push_str(&format!("  + {}  (added) {}\n", short(*n), summary_of(*n))),
+            Some(i) => {
+                let o = olds[*i];
+                let same_patch = {
+                    let (a, b) = (
+                        commit_patch_id(repo, o).unwrap_or(None),
+                        commit_patch_id(repo, *n).unwrap_or(None),
+                    );
+                    a.is_some() && a == b
+                };
+                let same_msg = message_of(o) == message_of(*n);
+                if same_patch && same_msg {
+                    out.push_str(&format!(
+                        "  = {} → {}  {}\n",
+                        short(o),
+                        short(*n),
+                        summary_of(*n)
+                    ));
+                } else {
+                    let mut drift: Vec<String> = Vec::new();
+                    if !same_patch {
+                        let (fa, fb) = (files_of(o), files_of(*n));
+                        drift.push(if fa == fb {
+                            format!("patch changed (same files: {})", fb.join(", "))
+                        } else {
+                            format!(
+                                "patch changed (files before: {}; after: {})",
+                                fa.join(", "),
+                                fb.join(", ")
+                            )
+                        });
+                    }
+                    if !same_msg {
+                        drift.push("message changed".to_string());
+                    }
+                    out.push_str(&format!(
+                        "  ! {} → {}  {} — {}\n",
+                        short(o),
+                        short(*n),
+                        summary_of(*n),
+                        drift.join("; ")
+                    ));
+                }
+            }
+        }
+    }
+    // Also say whether the two final trees are identical.
+    let (ot, nt) = (
+        repo.find_commit(old)?.tree_id(),
+        repo.find_commit(new)?.tree_id(),
+    );
+    out.push_str(if ot == nt {
+        "  final trees identical — the rewrite only re-sliced history\n"
+    } else {
+        "  final trees DIFFER\n"
+    });
+    Ok(out)
+}
+
 /// Discard selected UNCOMMITTED hunks — the destructive sibling of the
 /// worktree git_fixup: the same {paths, hunks} selectors, but the chosen
 /// changes reset to HEAD content instead of folding into a commit. Always
@@ -5177,6 +5335,61 @@ mod tests {
         // Nothing moved: branch tip and the staged bytes are untouched.
         assert_eq!(repo.head().unwrap().target(), Some(f1));
         assert_eq!(read(&repo, "notes"), "staged\n");
+    }
+
+    #[test]
+    fn range_diff_pairs_commits_and_reports_drift() {
+        let dir = tmp("range-diff");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let c1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        let c2 = commit(&repo, &[c1], &[("a", "2\n"), ("b", "1\n")], "add b");
+        let c3 = commit(
+            &repo,
+            &[c2],
+            &[("a", "2\n"), ("b", "1\n"), ("c", "1\n")],
+            "add c",
+        );
+        on_branch(&repo, "main", c3);
+        let before = c3;
+
+        // Rewrite: reword c1 (patch identical, message drifts) and drop the
+        // tip commit ("add c") by moving the branch to its parent.
+        cmd_reword(
+            &dir,
+            &c1.to_string(),
+            Some("change a, better\n"),
+            &[],
+            false,
+        )
+        .unwrap();
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        let parent = tip.parent(0).unwrap().id();
+        repo.reset(
+            &repo.find_object(parent, None).unwrap(),
+            ResetType::Hard,
+            None,
+        )
+        .unwrap(); // drop the tip commit ("add c")
+
+        let out = cmd_range_diff(&dir, &before.to_string(), "HEAD").unwrap();
+        assert!(out.contains("3 commit(s) before → 2 after"), "{out}");
+        assert!(out.contains("(dropped) add c"), "{out}");
+        assert!(
+            out.contains("! ") && out.contains("change a, better — message changed"),
+            "the reworded pair reports message drift: {out}"
+        );
+        assert!(out.contains("= ") && out.contains("add b"), "{out}");
+        assert!(out.contains("final trees DIFFER"), "{out}");
+
+        // A pure message rewrite: trees identical bottom line.
+        let before2 = repo.head().unwrap().target().unwrap();
+        cmd_reword(&dir, "HEAD", Some("add b, renamed\n"), &[], false).unwrap();
+        let out = cmd_range_diff(&dir, &before2.to_string(), "HEAD").unwrap();
+        assert!(
+            out.contains("final trees identical"),
+            "a message-only rewrite re-slices history: {out}"
+        );
     }
 
     #[test]
