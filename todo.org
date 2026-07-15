@@ -48,6 +48,13 @@ anchor {pattern, where} form would have replaced several
 replace_text calls that dragged duplicated context around just to
 re-insert it.
 
+DONE [2026-07-15]: both shapes landed — ~pos: "eob"|"bob"~ sentinels
+(plus the earlier location→pos alias), and ~anchor {pattern, where}~
+anchoring on the UNIQUE line containing a literal text (ambiguity
+errors with the match lines, like expect_unique). Remaining from the
+original entry: only the "surface unsaved+drifted louder" idea (the
+per-tool stale note already covers it).
+
 ** TODO Bytecode-compile hot programs [#C]
 
 ** TODO Dirty-span diffs [#C]

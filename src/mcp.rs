@@ -1070,7 +1070,24 @@ fn tool_insert_text(
     if anchor.is_some() && args.get("pos").is_some() {
         return Err("pass either \"pos\" or \"anchor\", not both".to_string());
     }
-    let program = match (&anchor, args.get("pos").and_then(Value::as_i64)) {
+    // `pos` is a char position, or the "eob"/"bob" sentinels — appending at
+    // the end of the file needs no anchor and no position arithmetic.
+    let pos_form = match args.get("pos") {
+        None => None,
+        Some(v) => Some(match (v.as_i64(), v.as_str()) {
+            (Some(n), _) => n.to_string(),
+            (None, Some("eob" | "end")) => "(point-max)".to_string(),
+            (None, Some("bob" | "start")) => "(point-min)".to_string(),
+            _ => {
+                return Err(
+                    "insert_text: `pos` is a 1-based char position, or \"eob\"/\"bob\" \
+                     (end/beginning of the accessible region)"
+                        .to_string(),
+                );
+            }
+        }),
+    };
+    let program = match (&anchor, pos_form) {
         (Some((_, prelude)), _) => {
             format!("(progn {prelude} (insert \"{escaped}\") (report \"point\" (point)))")
         }
@@ -1086,6 +1103,23 @@ fn tool_insert_text(
             return Err(format!(
                 "anchor: {}",
                 no_defun_error(sessions, &session, &name)
+            ));
+        }
+        Err(e) if e.contains("__no_anchor__") => {
+            let pat = anchor.map(|(n, _)| n).unwrap_or_default();
+            return Err(format!(
+                "anchor: no line matches the pattern {:?}{}",
+                truncate_for_error(&pat),
+                stale_edit_note(sessions, &session)
+            ));
+        }
+        Err(e) if e.contains("__ambiguous_anchor__") => {
+            let pat = anchor.map(|(n, _)| n).unwrap_or_default();
+            let lines = match_lines(sessions, &session, &lisp_literal(&pat), false);
+            return Err(format!(
+                "anchor: the pattern {:?} matches at lines {lines} — an anchor must \
+                 be unique; nothing was inserted (occur shows every match in context)",
+                truncate_for_error(&pat)
             ));
         }
         Err(e) => return Err(e),
@@ -1296,36 +1330,68 @@ fn tool_replace_text(
     })
 }
 
-/// Parse `anchor: {defun: NAME, where?: "after"|"before"}` into the motion
-/// prelude for insert_text — "add this block right after function X" without
-/// hand-writing a program. `after` (the default) lands at the defun's end;
-/// `before` at its start — which includes any Rust `#[attributes]` / Python
-/// decorators, so the insert lands above the whole decorated item.
+/// Parse `anchor: {defun: NAME | pattern: TEXT, where?: "after"|"before"}`
+/// into the motion prelude for insert_text. The defun form is "add this block
+/// right after function X"; the pattern form anchors on the unique LINE
+/// containing a literal text ("insert after the line matching X"). `after`
+/// (the default) lands at the end of the defun or the matched line; `before`
+/// above the whole decorated item, or at the matched line's start. An
+/// ambiguous pattern is an error, never a silent first match.
 fn anchor_prelude(args: &Value) -> Result<Option<(String, String)>, String> {
     let Some(anchor) = args.get("anchor") else {
         return Ok(None);
     };
-    let defun = anchor.get("defun").and_then(Value::as_str).ok_or(
-        "anchor: only {\"defun\": \"name\", \"where\": \"after\"|\"before\"} is supported",
-    )?;
-    let name = lisp_escape(defun);
-    let then = match anchor
+    let defun = anchor.get("defun").and_then(Value::as_str);
+    let pattern = anchor.get("pattern").and_then(Value::as_str);
+    let where_ = anchor
         .get("where")
         .and_then(Value::as_str)
-        .unwrap_or("after")
-    {
-        "after" => "(goto-char (treesit-node-end (treesit-defun-at)))",
-        "before" => "nil",
-        other => {
-            return Err(format!(
-                "anchor.where must be \"after\" or \"before\", got {other:?}"
-            ));
+        .unwrap_or("after");
+    if !matches!(where_, "after" | "before") {
+        return Err(format!(
+            "anchor.where must be \"after\" or \"before\", got {where_:?}"
+        ));
+    }
+    match (defun, pattern) {
+        (Some(_), Some(_)) => Err("anchor: pass `defun` OR `pattern`, not both".to_string()),
+        (None, None) => Err(
+            "anchor: {\"defun\": \"name\"} or {\"pattern\": \"literal line text\"} \
+             (+ optional \"where\": \"after\"|\"before\") is supported"
+                .to_string(),
+        ),
+        (Some(defun), None) => {
+            let name = lisp_escape(defun);
+            let then = match where_ {
+                "after" => "(goto-char (treesit-node-end (treesit-defun-at)))",
+                _ => "nil",
+            };
+            Ok(Some((
+                defun.to_string(),
+                format!("(if (treesit-goto-defun \"{name}\") {then} (error \"__no_defun__\"))"),
+            )))
         }
-    };
-    Ok(Some((
-        defun.to_string(),
-        format!("(if (treesit-goto-defun \"{name}\") {then} (error \"__no_defun__\"))"),
-    )))
+        (None, Some(pattern)) => {
+            if pattern.is_empty() {
+                return Err("anchor: pattern must not be empty".to_string());
+            }
+            let lp = lisp_literal(pattern);
+            let motion = match where_ {
+                "after" => "(end-of-line)",
+                _ => "(goto-char (match-beginning 0)) (beginning-of-line)",
+            };
+            Ok(Some((
+                pattern.to_string(),
+                format!(
+                    "(progn (goto-char (point-min)) \
+                     (if (search-forward \"{lp}\" nil t) \
+                         (if (save-excursion (search-forward \"{lp}\" nil t)) \
+                             (error \"__ambiguous_anchor__\") \
+                           (progn {motion})) \
+                       (error \"__no_anchor__\")))"
+                ),
+            )))
+        }
+    }
 }
 
 /// Parse `scope: {defun: NAME}` into a prelude that narrows to that defun
@@ -3642,13 +3708,13 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "insert_text",
-            "description": "Insert literal text at point (or at `pos`). Pass the text as a plain string — no Lisp escaping needed, the server handles it. Prefer this over run_program with (insert …) for multi-line or quote-heavy content. Edits the warm buffer; call save_buffer to persist.",
+            "description": "Insert literal text at point, at `pos` (a char position, or \"eob\" to append at the end of the file), or relative to an `anchor` (a named defun, or the unique line containing a literal pattern). Pass the text as a plain string — no Lisp escaping needed, the server handles it. Prefer this over run_program with (insert …) for multi-line or quote-heavy content, and over shell appends for end-of-file additions. Edits the warm buffer; call save_buffer to persist.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "text": { "type": "string", "description": "The literal text to insert." },
-                    "pos": { "type": "integer", "description": "1-based position to insert at (default: current point)." },
-                    "anchor": { "type": "object", "description": "Insert relative to a named defun instead of a position: {\"defun\": \"name\", \"where\": \"after\"|\"before\"} (default after — lands at the defun's end; include separating newlines in the text). \"before\" lands above the whole decorated item (Rust #[attributes] / Python decorators included). Not combinable with pos.", "properties": { "defun": { "type": "string" }, "where": { "type": "string", "enum": ["after", "before"] } } },
+                    "pos": { "type": ["integer", "string"], "description": "1-based position to insert at (default: current point) — or \"eob\" / \"bob\" to append at the end / insert at the beginning of the accessible region (no position arithmetic for the common append)." },
+                    "anchor": { "type": "object", "description": "Insert relative to a named defun — {\"defun\": \"name\"} — or to the UNIQUE line containing a literal text — {\"pattern\": \"line text\"} (an ambiguous pattern errors, listing the match lines). \"where\": \"after\" (default) puts the text at the end of the defun or the matched line — include separating newlines in the text. \"before\" puts it above the whole decorated defun (Rust #[attributes] / Python decorators included), or at the start of the matched line. Not combinable with pos.", "properties": { "defun": { "type": "string" }, "pattern": { "type": "string" }, "where": { "type": "string", "enum": ["after", "before"] } } },
                     "view": { "type": ["boolean", "integer"], "description": "Append a rendered viewport around point after the edit (true = 4 context lines, or a line count) — confirm the insert landed right without a follow-up view call." },
                     "session": session,
                     "path": path,

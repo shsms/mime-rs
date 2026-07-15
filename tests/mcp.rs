@@ -464,6 +464,55 @@ fn replace_text_is_literal_counted_and_quote_safe() {
 }
 
 #[test]
+fn insert_text_appends_at_eob_and_anchors_on_a_unique_line() {
+    let mut s = Server::spawn();
+    s.call_ok(1, "open_text", json!({ "text": "alpha\nbeta\ngamma\n" }));
+
+    // Append at the end of the buffer.
+    s.call_ok(2, "insert_text", json!({ "text": "omega\n", "pos": "eob" }));
+    let out = s.call_ok(3, "read_region", json!({ "lines": [1, 4] }));
+    assert_eq!(out, "alpha\nbeta\ngamma\nomega");
+
+    // Anchor on a literal LINE: insert after the line matching "beta".
+    s.call_ok(
+        4,
+        "insert_text",
+        json!({ "text": "\nbeta-note", "anchor": { "pattern": "beta" } }),
+    );
+    let out = s.call_ok(5, "read_region", json!({ "lines": [1, 5] }));
+    assert_eq!(out, "alpha\nbeta\nbeta-note\ngamma\nomega");
+    // ...and before it.
+    s.call_ok(
+        6,
+        "insert_text",
+        json!({ "text": "pre-gamma\n", "anchor": { "pattern": "gamma", "where": "before" } }),
+    );
+    let out = s.call_ok(7, "read_region", json!({ "lines": [1, 6] }));
+    assert_eq!(out, "alpha\nbeta\nbeta-note\npre-gamma\ngamma\nomega");
+
+    // Ambiguity is an error listing the match lines; a miss names the pattern.
+    let err = s.call_err(
+        8,
+        "insert_text",
+        json!({ "text": "x", "anchor": { "pattern": "beta" } }),
+    );
+    assert!(err.contains("unique") && err.contains("lines"), "{err}");
+    let err = s.call_err(
+        9,
+        "insert_text",
+        json!({ "text": "x", "anchor": { "pattern": "absent" } }),
+    );
+    assert!(err.contains("no line matches"), "{err}");
+    // A bad pos shape is loud.
+    let err = s.call_err(
+        10,
+        "insert_text",
+        json!({ "text": "x", "pos": "somewhere" }),
+    );
+    assert!(err.contains("eob"), "{err}");
+}
+
+#[test]
 fn read_region_takes_line_ranges_and_view_rejects_them_loudly() {
     let mut s = Server::spawn();
     s.call_ok(1, "open_text", json!({ "text": "l1\nl2\nl3\nl4\nl5\n" }));

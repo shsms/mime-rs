@@ -62,11 +62,11 @@ Render a viewport around the cursor (or a given position): a few lines of contex
 
 ## insert_text
 
-Insert literal text at point (or at `pos`). Pass the text as a plain string — no Lisp escaping needed, the server handles it. Prefer this over run_program with (insert …) for multi-line or quote-heavy content. Edits the warm buffer; call save_buffer to persist.
+Insert literal text at point, at `pos` (a char position, or "eob" to append at the end of the file), or relative to an `anchor` (a named defun, or the unique line containing a literal pattern). Pass the text as a plain string — no Lisp escaping needed, the server handles it. Prefer this over run_program with (insert …) for multi-line or quote-heavy content, and over shell appends for end-of-file additions. Edits the warm buffer; call save_buffer to persist.
 
-- `anchor` — Insert relative to a named defun instead of a position: {"defun": "name", "where": "after"|"before"} (default after — lands at the defun's end; include separating newlines in the text). "before" lands above the whole decorated item (Rust #[attributes] / Python decorators included). Not combinable with pos.
+- `anchor` — Insert relative to a named defun — {"defun": "name"} — or to the UNIQUE line containing a literal text — {"pattern": "line text"} (an ambiguous pattern errors, listing the match lines). "where": "after" (default) puts the text at the end of the defun or the matched line — include separating newlines in the text. "before" puts it above the whole decorated defun (Rust #[attributes] / Python decorators included), or at the start of the matched line. Not combinable with pos.
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
-- `pos` — 1-based position to insert at (default: current point).
+- `pos` — 1-based position to insert at (default: current point) — or "eob" / "bob" to append at the end / insert at the beginning of the accessible region (no position arithmetic for the common append).
 - `save` — After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.
 - `session` — Warm session id; defaults to "default" when omitted.
 - `text` (required) — The literal text to insert.
