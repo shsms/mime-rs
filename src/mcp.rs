@@ -188,8 +188,14 @@ fn initialize_result(params: &Value) -> Value {
 /// call itself succeeded; the tool-level error rides in `isError` + the text.
 fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let mut args = params.get("arguments").cloned().unwrap_or(json!({}));
 
+    // Absorb common alias spellings (occur {regexp}, replace_text {old, new},
+    // insert_text {location}, …) before validation — a first call should not
+    // die on a borrowed name when the intent is unambiguous.
+    if let Err(message) = normalize_aliases(name, &mut args) {
+        return tool_text(message, true);
+    }
     // Reject arguments the tool doesn't declare, instead of silently dropping
     // them (a `view {offset: N}` typo for `pos` would otherwise render the
     // wrong place with no signal). Driven by the same schemas tools/list
@@ -227,6 +233,74 @@ fn tools_call_result(params: &Value, sessions: &mut HashMap<String, Workspace>) 
         Ok(text) => tool_text(text, false),
         Err(message) => tool_text(message, true),
     }
+}
+
+/// Common alias → canonical argument spellings, accepted per tool. Only
+/// unambiguous aliases are absorbed; anything else still errors. The
+/// vocabulary stays consistent: pattern/replacement for text, pos for
+/// positions, topic for briefs.
+fn alias_table(tool: &str) -> &'static [(&'static str, &'static str)] {
+    match tool {
+        "occur" | "grep" => &[("regexp", "pattern"), ("regex", "pattern")],
+        "help" => &[("topics", "topic")],
+        "replace_text" | "replace_in_files" => &[
+            ("old", "pattern"),
+            ("old_text", "pattern"),
+            ("find", "pattern"),
+            ("new", "replacement"),
+            ("new_text", "replacement"),
+            ("replace", "replacement"),
+        ],
+        "insert_text" => &[("location", "pos"), ("position", "pos"), ("at", "pos")],
+        "read_region" => &[("from", "start"), ("to", "end")],
+        _ => &[],
+    }
+}
+
+/// Rewrite alias keys to their canonical names in `args` (and, for the batch
+/// editors, inside each `edits[]` entry). Passing an alias AND its canonical
+/// key is ambiguous — an error naming both, never a silent pick.
+fn normalize_aliases(tool: &str, args: &mut Value) -> Result<(), String> {
+    let table = alias_table(tool);
+    if table.is_empty() {
+        return Ok(());
+    }
+    // "regexp"/"regex" say more than the key name: the caller wants regex
+    // matching. Remember that before the key is rewritten away, and default
+    // mode to "regex" so the intent is not downgraded to the exact-match
+    // default. An explicit mode still wins.
+    let regex_intent = matches!(tool, "occur" | "grep")
+        && args.as_object().is_some_and(|o| {
+            (o.contains_key("regexp") || o.contains_key("regex")) && !o.contains_key("mode")
+        });
+    let rewrite = |v: &mut Value| -> Result<(), String> {
+        let Some(obj) = v.as_object_mut() else {
+            return Ok(());
+        };
+        for (alias, canonical) in table {
+            if obj.contains_key(*alias) {
+                if obj.contains_key(*canonical) {
+                    return Err(format!(
+                        "{tool}: both \"{alias}\" and \"{canonical}\" given — \
+                         \"{alias}\" is an alias of \"{canonical}\"; pass one"
+                    ));
+                }
+                let val = obj.remove(*alias).expect("checked above");
+                obj.insert((*canonical).to_string(), val);
+            }
+        }
+        Ok(())
+    };
+    rewrite(args)?;
+    if regex_intent && let Some(obj) = args.as_object_mut() {
+        obj.insert("mode".to_string(), Value::String("regex".to_string()));
+    }
+    if let Some(edits) = args.get_mut("edits").and_then(Value::as_array_mut) {
+        for e in edits {
+            rewrite(e)?;
+        }
+    }
+    Ok(())
 }
 
 /// Reject any argument key the named tool does not declare in its
@@ -3604,6 +3678,55 @@ mod git_tool_tests {
     /// `plan_arg` for a plan known to parse: unwrap both layers.
     fn ok_plan_arg(args: &Value) -> Vec<crate::sequencer::PlanItem> {
         plan_arg(args).unwrap().unwrap()
+    }
+
+    #[test]
+    fn aliases_rewrite_borrowed_argument_names() {
+        // The spellings that kept dying in the field are absorbed. "regexp"
+        // also carries regex INTENT, so mode defaults to "regex" with it —
+        // an exact-mode search for the same string would silently miss.
+        let mut args = json!({ "regexp": "foo" });
+        normalize_aliases("occur", &mut args).unwrap();
+        assert_eq!(args, json!({ "pattern": "foo", "mode": "regex" }));
+
+        // An explicit mode wins over the alias's implied one.
+        let mut args = json!({ "regexp": "foo", "mode": "exact" });
+        normalize_aliases("occur", &mut args).unwrap();
+        assert_eq!(args, json!({ "pattern": "foo", "mode": "exact" }));
+
+        let mut args = json!({ "old": "a", "new": "b" });
+        normalize_aliases("replace_text", &mut args).unwrap();
+        assert_eq!(args, json!({ "pattern": "a", "replacement": "b" }));
+
+        // ...inside edits[] batches too.
+        let mut args = json!({ "edits": [{ "find": "a", "replace": "b" }] });
+        normalize_aliases("replace_text", &mut args).unwrap();
+        assert_eq!(
+            args,
+            json!({ "edits": [{ "pattern": "a", "replacement": "b" }] })
+        );
+
+        let mut args = json!({ "location": 7, "text": "x" });
+        normalize_aliases("insert_text", &mut args).unwrap();
+        assert_eq!(args, json!({ "pos": 7, "text": "x" }));
+
+        let mut args = json!({ "topics": "regex" });
+        normalize_aliases("help", &mut args).unwrap();
+        assert_eq!(args, json!({ "topic": "regex" }));
+
+        // Alias + canonical together is ambiguous — an error, not a pick.
+        let mut args = json!({ "pattern": "a", "old": "b" });
+        let err = normalize_aliases("replace_text", &mut args).unwrap_err();
+        assert!(err.contains("alias"), "{err}");
+
+        // The rewritten shape passes validation (aliases can't drift from
+        // the schema: they map onto declared properties).
+        let mut args = json!({ "regex": "x", "path": "f" });
+        normalize_aliases("grep", &mut args).unwrap();
+        validate_args("grep", &args).unwrap_err(); // grep has no `path`
+        let mut args = json!({ "regex": "x" });
+        normalize_aliases("grep", &mut args).unwrap();
+        validate_args("grep", &args).unwrap();
     }
 
     #[test]

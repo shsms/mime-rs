@@ -483,7 +483,16 @@ step's blame window starts at ITS original parent, so per-rehearsal
 would change answers), diffs each commit against the remaining unowned
 paths only, and stops early once every file has its owner.
 
-** TODO [#B] Consistent argument names (or aliases) across tools        :mcp:
+** DONE [#B] Consistent argument names (or aliases) across tools        :mcp:
+CLOSED: [2026-07-15]
+DONE [2026-07-15]: alias normalization before validation
+(~normalize_aliases~, mcp.rs) absorbs every misfire both sessions hit:
+occur/grep {regexp|regex}→pattern, help {topics}→topic, replace_text /
+replace_in_files {old|old_text|find}→pattern and
+{new|new_text|replace}→replacement (also inside edits[]), insert_text
+{location|position|at}→pos, read_region {from,to}→{start,end}. Alias +
+canonical together errors (ambiguous). view's lines/range shape is the
+separate docs item below.
 :LOGBOOK:
 - State "TODO"       from              [2026-07-15 Mi 16:07]
 :END:
