@@ -246,7 +246,25 @@ impl MsgEdit {
 /// typo'd anchor fails loudly rather than silently doing nothing); one that
 /// matches replaces EVERY occurrence — zero-or-all, never a silent partial
 /// application. Replacements never re-match text they inserted.
-fn apply_msg_edits(mut msg: String, edits: &[MsgEdit]) -> Result<String, Error> {
+fn apply_msg_edits(msg: String, edits: &[MsgEdit]) -> Result<String, Error> {
+    let (out, counts) = apply_msg_edits_counted(&msg, edits);
+    for (e, n) in edits.iter().zip(&counts) {
+        if let (MsgEdit::Replace { find, .. }, 0) = (e, *n) {
+            return Err(estr(&format!(
+                "message edit: text not found in the commit message: {find:?}"
+            )));
+        }
+    }
+    Ok(out)
+}
+
+/// The counting core of [`apply_msg_edits`]: per-edit replacement counts
+/// instead of the absent-find error — the range rewrite tolerates zero
+/// matches in ONE commit (the count says so) and checks range-wide totals
+/// itself.
+fn apply_msg_edits_counted(msg: &str, edits: &[MsgEdit]) -> (String, Vec<usize>) {
+    let mut msg = msg.to_string();
+    let mut counts = Vec::with_capacity(edits.len());
     for e in edits {
         match e {
             MsgEdit::Replace { find, with } => {
@@ -258,11 +276,7 @@ fn apply_msg_edits(mut msg: String, edits: &[MsgEdit]) -> Result<String, Error> 
                     at = pos + with.len();
                     n += 1;
                 }
-                if n == 0 {
-                    return Err(estr(&format!(
-                        "message edit: text not found in the commit message: {find:?}"
-                    )));
-                }
+                counts.push(n);
             }
             MsgEdit::Append { text } => {
                 if !msg.is_empty() && !msg.ends_with('\n') {
@@ -272,10 +286,11 @@ fn apply_msg_edits(mut msg: String, edits: &[MsgEdit]) -> Result<String, Error> 
                 if !text.ends_with('\n') {
                     msg.push('\n');
                 }
+                counts.push(1);
             }
         }
     }
-    Ok(msg)
+    (msg, counts)
 }
 
 /// How a step's diff is applied: forward (rebase/cherry-pick) or inverted
@@ -2809,6 +2824,155 @@ fn exec_over(repo: &Repository, range: &str, command: &str) -> Result<String, Er
     }
 }
 
+/// Apply one `message_edits` vocabulary to EVERY commit of `range` — the bulk
+/// trailer strip/add or identifier rename after a symbol rename. A sparse
+/// rewrite touching only messages: each commit is re-created with its own
+/// tree (byte-identical by construction) and re-parented, so nothing can
+/// conflict. Per-commit replacement counts ride in the report; a `find` that
+/// matches NOWHERE in the range is an error and nothing changes.
+pub fn cmd_msg_rewrite(
+    repo_path: &std::path::Path,
+    range: &str,
+    specs: &[MsgEditSpec],
+    rehearse_only: bool,
+) -> Result<String, String> {
+    let repo = open(repo_path)?;
+    if specs.is_empty() {
+        return Err("git_msg_rewrite: message_edits must not be empty".to_string());
+    }
+    let edits: Vec<MsgEdit> = specs
+        .iter()
+        .map(MsgEdit::from_spec)
+        .collect::<Result<_, _>>()?;
+    msg_rewrite(&repo, range, &edits, rehearse_only).map_err(gerr)
+}
+
+fn msg_rewrite(
+    repo: &Repository,
+    range: &str,
+    edits: &[MsgEdit],
+    rehearse_only: bool,
+) -> Result<String, Error> {
+    let head_ref = repo.head()?;
+    if !head_ref.is_branch() {
+        return Err(estr("msg_rewrite: HEAD is detached — check out a branch"));
+    }
+    let branch = head_ref
+        .name()
+        .ok_or_else(|| estr("HEAD has no branch name"))?
+        .to_string();
+    let head = head_ref.peel_to_commit()?.id();
+    drop(head_ref);
+
+    let mut walk = repo.revwalk()?;
+    walk.push_range(range)?;
+    walk.set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE)?;
+    let commits: Vec<Oid> = walk.collect::<Result<_, _>>()?;
+    if commits.is_empty() {
+        return Err(estr(&format!("msg_rewrite: no commits in {range}")));
+    }
+    if *commits.last().expect("non-empty") != head {
+        return Err(estr(
+            "msg_rewrite: the range must end at HEAD (e.g. main..HEAD) — \
+             rewriting below the tip would strand the commits above it",
+        ));
+    }
+
+    // First pass: compute every new message + its per-edit counts, so a
+    // range-wide miss aborts before anything is created.
+    let mut new_msgs: Vec<(Oid, String, Vec<usize>)> = Vec::new();
+    let mut totals = vec![0usize; edits.len()];
+    for oid in &commits {
+        let c = repo.find_commit(*oid)?;
+        if c.parent_count() > 1 {
+            return Err(estr(&format!(
+                "msg_rewrite: {} is a merge — the sparse rewrite handles \
+                 linear history only",
+                short(*oid)
+            )));
+        }
+        let (msg, counts) = apply_msg_edits_counted(c.message().unwrap_or(""), edits);
+        for (t, n) in totals.iter_mut().zip(&counts) {
+            *t += n;
+        }
+        new_msgs.push((*oid, msg, counts));
+    }
+    for (e, t) in edits.iter().zip(&totals) {
+        if let (MsgEdit::Replace { find, .. }, 0) = (e, *t) {
+            return Err(estr(&format!(
+                "msg_rewrite: {find:?} matches no commit message in {range} — \
+                 nothing changed"
+            )));
+        }
+    }
+
+    let counts_line = |counts: &[usize]| {
+        counts
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if rehearse_only {
+        let mut out = format!(
+            "rehearse: would rewrite the messages of {} commit(s) in {range} \
+             (trees byte-identical by construction)\n",
+            commits.len()
+        );
+        for (oid, _, counts) in &new_msgs {
+            out.push_str(&format!(
+                "  {}  replacements per edit: {}\n",
+                short(*oid),
+                counts_line(counts)
+            ));
+        }
+        return Ok(out);
+    }
+
+    // Second pass: re-create each commit with its own tree and the rewritten
+    // message, chaining parents. An untouched prefix reproduces identical
+    // objects (same message, tree, parents ⇒ same oid), so it is a no-op.
+    rotate_backup_ring(repo, &branch, head)?;
+    let mut new_parent: Option<Oid> = None;
+    let mut out = String::new();
+    let mut tip = head;
+    for (oid, msg, counts) in &new_msgs {
+        let c = repo.find_commit(*oid)?;
+        let parents: Vec<git2::Commit> = match new_parent {
+            Some(p) => vec![repo.find_commit(p)?],
+            None => c.parents().collect(),
+        };
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        let new = repo.commit(
+            None,
+            &c.author(),
+            &c.committer(),
+            msg,
+            &c.tree()?,
+            &parent_refs,
+        )?;
+        out.push_str(&if new == *oid {
+            format!("  {}  unchanged\n", short(*oid))
+        } else {
+            format!(
+                "  {} → {}  replacements per edit: {}\n",
+                short(*oid),
+                short(new),
+                counts_line(counts)
+            )
+        });
+        new_parent = Some(new);
+        tip = new;
+    }
+    repo.reference(&branch, tip, true, "mime msg_rewrite")?;
+    Ok(format!(
+        "rewrote the messages of {} commit(s) in {range}; every tree is \
+         byte-identical{}\n{out}",
+        commits.len(),
+        backup_note(repo)
+    ))
+}
+
 fn absorb(repo: &Repository, since: Option<Oid>, rehearse_only: bool) -> Result<String, Error> {
     let head = repo.head()?.peel_to_commit()?;
     let head_tree = head.tree()?;
@@ -4120,6 +4284,78 @@ mod tests {
         std::fs::remove_file(dir.join("gen")).unwrap();
         let out = exec_over(&repo, &format!("{base}..HEAD"), "true").unwrap();
         assert!(out.contains("all passed"), "{out}");
+    }
+
+    #[test]
+    fn msg_rewrite_edits_every_message_and_keeps_trees() {
+        let dir = tmp("msgrange");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let c1 = commit(
+            &repo,
+            &[base],
+            &[("a", "2\n")],
+            "one old_name\n\nCo-Authored-By: Bot <bot@invalid>\n",
+        );
+        let c2 = commit(
+            &repo,
+            &[c1],
+            &[("a", "3\n")],
+            "two\n\nold_name twice: old_name.\n",
+        );
+        on_branch(&repo, "main", c2);
+        let old_trees: Vec<Oid> = [c1, c2]
+            .iter()
+            .map(|o| repo.find_commit(*o).unwrap().tree_id())
+            .collect();
+
+        // Rehearse first: counts visible, nothing moved.
+        let specs = vec![
+            MsgEditSpec {
+                find: Some("old_name".into()),
+                replace: Some("new_name".into()),
+                append: None,
+            },
+            MsgEditSpec {
+                find: Some("Co-Authored-By: Bot <bot@invalid>\n".into()),
+                replace: None,
+                append: None,
+            },
+        ];
+        let out = cmd_msg_rewrite(&dir, "HEAD~2..HEAD", &specs, true).unwrap();
+        assert!(out.contains("rehearse"), "{out}");
+        assert_eq!(repo.head().unwrap().target(), Some(c2), "nothing moved");
+
+        let out = cmd_msg_rewrite(&dir, "HEAD~2..HEAD", &specs, false).unwrap();
+        assert!(out.contains("byte-identical"), "{out}");
+        let branch = commits_since(&repo, base).unwrap();
+        assert_eq!(branch.len(), 2);
+        let m1 = repo.find_commit(branch[0]).unwrap();
+        let m2 = repo.find_commit(branch[1]).unwrap();
+        assert_eq!(m1.message().unwrap(), "one new_name\n\n");
+        assert_eq!(m2.message().unwrap(), "two\n\nnew_name twice: new_name.\n");
+        // Trees byte-identical; the pre-op tip is on the backup ring.
+        assert_eq!(m1.tree_id(), old_trees[0]);
+        assert_eq!(m2.tree_id(), old_trees[1]);
+        assert_eq!(
+            repo.refname_to_id(&backup_slot("main", 0)).unwrap(),
+            c2,
+            "pre-op tip stamped"
+        );
+
+        // A find that matches NOWHERE in the range errors, nothing changes.
+        let miss = vec![MsgEditSpec {
+            find: Some("absent-token".into()),
+            replace: Some("x".into()),
+            append: None,
+        }];
+        let err = cmd_msg_rewrite(&dir, "HEAD~2..HEAD", &miss, false).unwrap_err();
+        assert!(err.contains("matches no commit message"), "{err}");
+        assert_eq!(repo.head().unwrap().target(), Some(branch[1]));
+
+        // The range must end at HEAD.
+        let err = cmd_msg_rewrite(&dir, "HEAD~2..HEAD~1", &specs, false).unwrap_err();
+        assert!(err.contains("end at HEAD"), "{err}");
     }
 
     #[test]

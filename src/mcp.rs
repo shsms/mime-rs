@@ -2756,6 +2756,18 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
         "git_exec_over" => {
             seq::cmd_exec_over(&repo, &str_arg(args, "range")?, &str_arg(args, "command")?)
         }
+        "git_msg_rewrite" => {
+            let edits = args
+                .get("message_edits")
+                .and_then(Value::as_array)
+                .ok_or("git_msg_rewrite: message_edits must be a non-empty array")?;
+            seq::cmd_msg_rewrite(
+                &repo,
+                &str_arg(args, "range")?,
+                &msg_edit_specs(edits)?,
+                bool_arg(args, "rehearse"),
+            )
+        }
         "git_move" => seq::cmd_move(
             &repo,
             &str_arg(args, "from")?,
@@ -3001,6 +3013,32 @@ fn git_tool_schemas() -> Vec<Value> {
                     "rehearse": { "type": "boolean", "description": "Preview the hunk→commit grouping and the resulting history without applying." }
                 },
                 "required": ["repo"],
+            },
+        }),
+        json!({
+            "name": "git_msg_rewrite",
+            "description": "Apply one message_edits vocabulary to EVERY commit of `range` (which must end at HEAD) — the bulk trailer strip/add, or the s/old-symbol/new/ sweep after a rename. A sparse rewrite touching only messages: each commit is re-created with its OWN tree (byte-identical by construction, nothing can conflict) and re-parented; an untouched prefix keeps its identical oids. The report carries per-commit replacement counts, so zero application in one commit is visible; a `find` matching NOWHERE in the range is an error and nothing changes. rehearse:true previews the counts. For one commit's message use git_rebase {action: reword}.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": repo,
+                    "range": { "type": "string", "description": "Revision range whose commit messages to rewrite, e.g. main..HEAD; must end at HEAD." },
+                    "message_edits": {
+                        "type": "array",
+                        "description": "Edits applied in order to EVERY message: {find, replace?} replaces every occurrence (omit replace — or say delete: true — to delete); {append} adds a trailing line.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "find": { "type": "string" },
+                                "replace": { "type": "string" },
+                                "delete": { "type": "boolean" },
+                                "append": { "type": "string" }
+                            }
+                        }
+                    },
+                    "rehearse": { "type": "boolean", "description": "Preview the per-commit replacement counts without applying." }
+                },
+                "required": ["repo", "range", "message_edits"],
             },
         }),
         json!({
@@ -3261,6 +3299,11 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             Git,
             A::destructive(),
             "run a command at every commit of a range (gated: MIME_EXEC=1)",
+        ),
+        "git_msg_rewrite" => (
+            Git,
+            A::destructive(),
+            "apply message edits to every commit of a range (trees untouched)",
         ),
 
         "read_region" => (
@@ -4133,6 +4176,7 @@ mod git_tool_tests {
             "git_fixup",
             "git_absorb",
             "git_exec_over",
+            "git_msg_rewrite",
         ] {
             assert!(names.contains(&expected), "missing schema for {expected}");
         }

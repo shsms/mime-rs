@@ -197,6 +197,10 @@ into git_fixup, or let git_absorb fold them all).
     of onto..HEAD — no need to transcribe untouched commits.
   git_fixup {target, source}  one-call fold of `source` into `target` (keeps
     target's signed message); auto-picks the rest. Commit uncommitted work first.
+  git_msg_rewrite {range, message_edits}  apply one message_edits vocabulary
+    to EVERY commit of the range (must end at HEAD): the bulk trailer
+    strip/add or symbol sweep. Only messages change — every tree stays
+    byte-identical; the report carries per-commit replacement counts.
   git_exec_over {range, command}  run a shell command at every commit of the
     range, oldest-first (the pr-prep "does every commit build?" gate); stops
     on the first failure naming the commit, HEAD restored either way.

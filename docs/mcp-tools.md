@@ -296,6 +296,15 @@ Fold EVERY uncommitted hunk into the commit that owns its lines, automatically �
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 - `since` — Scope owners to `since..HEAD` (oid/ref/revspec, e.g. main — usually the branch base): hunks owned at or beyond the boundary stay in the worktree instead of rewriting history past it. Recommended on shared-history branches.
 
+## git_msg_rewrite
+
+Apply one message_edits vocabulary to EVERY commit of `range` (which must end at HEAD) — the bulk trailer strip/add, or the s/old-symbol/new/ sweep after a rename. A sparse rewrite touching only messages: each commit is re-created with its OWN tree (byte-identical by construction, nothing can conflict) and re-parented; an untouched prefix keeps its identical oids. The report carries per-commit replacement counts, so zero application in one commit is visible; a `find` matching NOWHERE in the range is an error and nothing changes. rehearse:true previews the counts. For one commit's message use git_rebase {action: reword}.
+
+- `message_edits` (required) — Edits applied in order to EVERY message: {find, replace?} replaces every occurrence (omit replace — or say delete: true — to delete); {append} adds a trailing line.
+- `range` (required) — Revision range whose commit messages to rewrite, e.g. main..HEAD; must end at HEAD.
+- `rehearse` — Preview the per-commit replacement counts without applying.
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+
 ## git_exec_over
 
 Run a shell command at EVERY commit of `range`, oldest-first — the pr-prep gate loop (git rebase -x's standalone sibling): each commit is checked out in place (detached), the command runs in the worktree, and the walk stops on the first failure naming the commit and the output tail. HEAD is restored afterwards either way. Refuses on a dirty worktree. DISABLED unless whoever launches the server sets MIME_EXEC=1 (the git tools otherwise promise no hooks, no exec).

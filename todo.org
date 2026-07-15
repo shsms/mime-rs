@@ -638,7 +638,14 @@ wholesale — correct, but off the rails. A blessed verb (conflict-take
 would legitimize the escape hatch and keep the stale-guard/undo story
 intact.
 
-** TODO message_edits over a RANGE: bulk trailer / message rewrite      :git:
+** DONE message_edits over a RANGE: bulk trailer / message rewrite      :git:
+CLOSED: [2026-07-15]
+DONE [2026-07-15]: ~git_msg_rewrite {range, message_edits, rehearse?}~ —
+sparse two-pass rewrite (compute + range-wide miss check first, then
+re-create each commit with its own tree), per-commit replacement
+counts in the report, backup ring stamped, untouched prefix keeps
+identical oids. Linear history only (merges refuse); range must end at
+HEAD.
 :LOGBOOK:
 - State "TODO"       from              [2026-07-15 Mi 16:19]
 :END:
