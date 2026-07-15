@@ -662,7 +662,13 @@ touches only messages, keeps trees byte-identical, and reports
 per-commit replacement counts (ties into the message_edits
 count-reporting item).
 
-** TODO Rewrite results: report tree identity vs the backup             :git:
+** DONE Rewrite results: report tree identity vs the backup             :git:
+CLOSED: [2026-07-15]
+DONE [2026-07-15]: completed rewrites (rebase, committed fixup, move,
+continue/skip) append a ~tree identical to the pre-op tip~ /
+~tree differs ... in: <paths>~ line comparing HEAD's tree to backup
+slot 0. Worktree folds (fixup{hunks}/absorb) and cherry-pick/revert
+change the tree by design, so they stay silent.
 :LOGBOOK:
 - State "TODO"       from              [2026-07-15 Mi 16:19]
 :END:

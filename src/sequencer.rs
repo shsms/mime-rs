@@ -1795,7 +1795,8 @@ fn move_changes(
         onto: newer_prime,
         steps: tail.into_iter().map(pick_step).collect(),
     };
-    Ok(format!("{}{note}", outcome_text(&start(repo, plan)?)))
+    let out = start(repo, plan)?;
+    Ok(format!("{}{note}", outcome_with_tree_note(repo, &out)))
 }
 
 /// Land a `split` step: produce its output commits and move HEAD to the last.
@@ -2298,6 +2299,64 @@ fn blame_worktree(
 
 // ---- text rendering for the tool layer ------------------------------------
 
+/// `outcome_text`, plus — on a COMPLETED rewrite — whether HEAD's tree is
+/// byte-identical to the pre-op tip on the backup ring: the one-line answer
+/// to "did this rewrite change WHAT the branch builds, or only how history
+/// slices it?" that otherwise costs a hand-rolled rev-parse comparison.
+/// Used by the pure-reslice operations (rebase, committed fixup, move) and
+/// by continue/skip, which finish ANY paused op — so a cherry-pick/revert
+/// resumed after a conflict reports too (its tree differing is expected).
+/// Direct cherry-pick/revert results and worktree folds skip the note; they
+/// change the tree by design, so it would be noise there.
+fn outcome_with_tree_note(repo: &Repository, out: &Outcome) -> String {
+    let text = outcome_text(out);
+    match out {
+        Outcome::Done { .. } => format!("{text}{}", tree_identity_note(repo)),
+        _ => text,
+    }
+}
+
+/// One line comparing HEAD's tree with the pre-op tip's (backup ring slot 0).
+/// Empty when there is nothing to compare against.
+fn tree_identity_note(repo: &Repository) -> String {
+    let Some(branch) = repo.head().ok().and_then(|h| h.name().map(str::to_string)) else {
+        return String::new();
+    };
+    if !branch.starts_with("refs/heads/") {
+        return String::new();
+    }
+    let Ok(old) = repo.refname_to_id(&backup_ref(&branch)) else {
+        return String::new();
+    };
+    let old_tree = repo.find_commit(old).and_then(|c| c.tree());
+    let new_tree = repo.head().and_then(|h| h.peel_to_tree());
+    let (Ok(old_tree), Ok(new_tree)) = (old_tree, new_tree) else {
+        return String::new();
+    };
+    if old_tree.id() == new_tree.id() {
+        return "\n  tree identical to the pre-op tip — a pure history re-slice".to_string();
+    }
+    let paths: Vec<String> = repo
+        .diff_tree_to_tree(Some(&old_tree), Some(&new_tree), None)
+        .map(|d| {
+            (0..d.deltas().len())
+                .filter_map(|i| d.get_delta(i))
+                .map(|delta| delta_path(Some(delta)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let shown = if paths.len() > 8 {
+        format!("{} … ({} paths)", paths[..8].join(", "), paths.len())
+    } else {
+        paths.join(", ")
+    };
+    format!(
+        "\n  tree differs from the pre-op tip in: {shown} (expected when the \
+         base moved or the plan drops/edits content; git_show the backup ref \
+         to compare)"
+    )
+}
+
 /// The agent-facing summary of an [`Outcome`].
 pub fn outcome_text(out: &Outcome) -> String {
     match out {
@@ -2529,10 +2588,8 @@ pub fn cmd_fixup(
         ));
     }
     let note = backup_note(&repo);
-    Ok(format!(
-        "{}{note}",
-        outcome_text(&start(&repo, plan).map_err(gerr)?)
-    ))
+    let out = start(&repo, plan).map_err(gerr)?;
+    Ok(format!("{}{note}", outcome_with_tree_note(&repo, &out)))
 }
 
 /// A byte-exact snapshot of the worktree files a diff touches. The worktree
@@ -3437,9 +3494,10 @@ pub fn cmd_rebase(
         ));
     }
     let note = backup_note(&repo);
+    let out = start(&repo, plan).map_err(gerr)?;
     Ok(format!(
         "{}{drop_note}{note}",
-        outcome_text(&start(&repo, plan).map_err(gerr)?)
+        outcome_with_tree_note(&repo, &out)
     ))
 }
 
@@ -3491,13 +3549,15 @@ pub fn cmd_revert(repo_path: &std::path::Path, commits: &[String]) -> Result<Str
 }
 
 pub fn cmd_continue(repo_path: &std::path::Path, force: bool) -> Result<String, String> {
-    Ok(outcome_text(
-        &continue_op(&open(repo_path)?, force).map_err(gerr)?,
-    ))
+    let repo = open(repo_path)?;
+    let out = continue_op(&repo, force).map_err(gerr)?;
+    Ok(outcome_with_tree_note(&repo, &out))
 }
 
 pub fn cmd_skip(repo_path: &std::path::Path) -> Result<String, String> {
-    Ok(outcome_text(&skip(&open(repo_path)?).map_err(gerr)?))
+    let repo = open(repo_path)?;
+    let out = skip(&repo).map_err(gerr)?;
+    Ok(outcome_with_tree_note(&repo, &out))
 }
 
 pub fn cmd_abort(repo_path: &std::path::Path) -> Result<String, String> {
@@ -4654,6 +4714,12 @@ mod tests {
         // One call: fold c3 into c1, inferring the base and picking the rest.
         let out = cmd_fixup(&dir, &c1.to_string(), &c3.to_string(), false).unwrap();
         assert!(out.starts_with("done"), "{out}");
+        // A fold re-slices history without changing what the branch builds —
+        // the result says so instead of leaving a rev-parse comparison to do.
+        assert!(
+            out.contains("tree identical to the pre-op tip"),
+            "tree-identity note rides in the result: {out}"
+        );
         assert_eq!(read(&repo, "a"), "2\n");
         assert_eq!(read(&repo, "b"), "1\n");
         let tip = repo.head().unwrap().peel_to_commit().unwrap();
