@@ -47,6 +47,9 @@ pub enum Lang {
     Toml,
     Yaml,
     Elisp,
+    Typescript,
+    Tsx,
+    Go,
 }
 
 impl Lang {
@@ -71,6 +74,10 @@ impl Lang {
             "yaml" | "yml" => Some(Lang::Yaml),
             // .tl is tulisp — mime-rs's own script dialect parses as elisp.
             "elisp" | "el" | "tl" => Some(Lang::Elisp),
+            // .tsx parses with the TSX-capable grammar variant below.
+            "typescript" | "ts" | "mts" | "cts" => Some(Lang::Typescript),
+            "tsx" => Some(Lang::Tsx),
+            "go" => Some(Lang::Go),
             _ => None,
         }
     }
@@ -87,6 +94,9 @@ impl Lang {
             Lang::Toml => "toml",
             Lang::Yaml => "yaml",
             Lang::Elisp => "elisp",
+            Lang::Typescript => "typescript",
+            Lang::Tsx => "tsx",
+            Lang::Go => "go",
         }
     }
 
@@ -103,6 +113,12 @@ impl Lang {
             Lang::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
             Lang::Yaml => tree_sitter_yaml::LANGUAGE.into(),
             Lang::Elisp => tree_sitter_elisp::LANGUAGE.into(),
+            Lang::Typescript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            // TSX is NOT a superset of TS: an angle-bracket type assertion
+            // (`<Foo>bar`) parses as JSX there. Each extension gets its own
+            // grammar variant.
+            Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Lang::Go => tree_sitter_go::LANGUAGE.into(),
         }
     }
 
@@ -136,6 +152,22 @@ impl Lang {
             // tree.
             Lang::Yaml => &["block_mapping_pair"],
             Lang::Elisp => &["function_definition", "macro_definition"],
+            Lang::Typescript | Lang::Tsx => &[
+                "function_declaration",
+                "generator_function_declaration",
+                "class_declaration",
+                "abstract_class_declaration",
+                "method_definition",
+                "interface_declaration",
+                "enum_declaration",
+                "type_alias_declaration",
+                "module_declaration",
+            ],
+            Lang::Go => &[
+                "function_declaration",
+                "method_declaration",
+                "type_declaration",
+            ],
         }
     }
 }
@@ -463,9 +495,25 @@ impl Syntax {
                     .map(|c| self.text_of(c).trim().to_string())
                     .unwrap_or_default()
             }
-            Lang::Rust | Lang::Python | Lang::Javascript | Lang::Elisp => node
+            Lang::Rust
+            | Lang::Python
+            | Lang::Javascript
+            | Lang::Elisp
+            | Lang::Typescript
+            | Lang::Tsx => node
                 .child_by_field_name("name")
                 .or_else(|| node.child_by_field_name("type"))
+                .map(|n| self.text_of(n).to_string())
+                .unwrap_or_default(),
+            Lang::Go => node
+                .child_by_field_name("name")
+                .or_else(|| {
+                    // `type Foo struct {…}` is a type_declaration wrapping
+                    // type_spec(s); the first spec's name stands in.
+                    let mut c = node.walk();
+                    node.named_children(&mut c)
+                        .find_map(|n| n.child_by_field_name("name"))
+                })
                 .map(|n| self.text_of(n).to_string())
                 .unwrap_or_default(),
             Lang::Html => {
@@ -1014,6 +1062,82 @@ mod tests {
         assert_eq!(names, vec!["top", "server", "port", "hosts"]);
         let p = src.find("80").unwrap() + 1;
         assert_eq!(syn.enclosing_defun_name(p).as_deref(), Some("port"));
+    }
+
+    #[test]
+    fn typescript_outline_names_declarations() {
+        let src = "interface Point { x: number }\n\
+                   type Alias = Point;\n\
+                   class Box {\n  get(): Point { return this.p; }\n}\n\
+                   function make(): Box { return new Box(); }\n\
+                   const arrow = () => 1;\n";
+        let syn = Syntax::parse(src, Lang::Typescript);
+        let names: Vec<(String, String)> =
+            syn.defuns().into_iter().map(|d| (d.kind, d.name)).collect();
+        assert!(
+            names.contains(&("interface_declaration".into(), "Point".into())),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&("type_alias_declaration".into(), "Alias".into())),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&("class_declaration".into(), "Box".into())),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&("method_definition".into(), "get".into())),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&("function_declaration".into(), "make".into())),
+            "{names:?}"
+        );
+        let p = src.find("return this").unwrap() + 1;
+        assert_eq!(syn.enclosing_defun_name(p).as_deref(), Some("get"));
+        // .ts and .tsx resolve to their own grammar variants.
+        assert_eq!(Lang::from_buffer_name("a.ts"), Some(Lang::Typescript));
+        assert_eq!(Lang::from_buffer_name("a.tsx"), Some(Lang::Tsx));
+    }
+
+    #[test]
+    fn typescript_and_tsx_grammars_accept_their_own_dialects() {
+        // An angle-bracket type assertion is valid TS but invalid TSX
+        // (it parses as JSX there) — .ts must not use the TSX grammar.
+        let ts = "const x = <Foo>bar;\n";
+        assert!(!Syntax::parse(ts, Lang::Typescript).has_error());
+        assert!(Syntax::parse(ts, Lang::Tsx).has_error());
+        // JSX is valid TSX but invalid plain TS.
+        let tsx = "const el = <div>hi</div>;\n";
+        assert!(!Syntax::parse(tsx, Lang::Tsx).has_error());
+        assert!(Syntax::parse(tsx, Lang::Typescript).has_error());
+    }
+
+    #[test]
+    fn go_outline_names_funcs_methods_and_types() {
+        let src = "package main\n\n\
+                   type Point struct { X int }\n\n\
+                   func (p Point) Norm() int { return p.X }\n\n\
+                   func main() { _ = Point{1} }\n";
+        let syn = Syntax::parse(src, Lang::Go);
+        let names: Vec<(String, String)> =
+            syn.defuns().into_iter().map(|d| (d.kind, d.name)).collect();
+        assert!(
+            names.contains(&("type_declaration".into(), "Point".into())),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&("method_declaration".into(), "Norm".into())),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&("function_declaration".into(), "main".into())),
+            "{names:?}"
+        );
+        let p = src.find("return p.X").unwrap() + 1;
+        assert_eq!(syn.enclosing_defun_name(p).as_deref(), Some("Norm"));
+        assert_eq!(Lang::from_buffer_name("m.go"), Some(Lang::Go));
     }
 
     #[test]

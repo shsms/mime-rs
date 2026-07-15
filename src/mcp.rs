@@ -492,8 +492,9 @@ fn parse_warning(sessions: &mut HashMap<String, Workspace>, session: &str) -> &'
     // everything else is strict enough that a parse error after a save
     // very likely means the edit broke the file.
     let program = "(if (member (treesit-language)\
-                               '(\"rust\" \"python\" \"javascript\" \"css\"\
-                                 \"toml\" \"yaml\" \"elisp\"))\
+                               '(\"rust\" \"python\" \"javascript\" \"typescript\"\
+                                 \"tsx\" \"go\" \"css\" \"toml\" \"yaml\"\
+                                 \"elisp\"))\
                        (report \"err\" (if (treesit-has-error) 1 0)))";
     match run_in_session(sessions, session, program) {
         Ok(report) if report_value(&report, "err").as_deref() == Some("1") => {
@@ -2313,7 +2314,7 @@ fn tool_outline(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Resu
     if lines.is_empty() {
         return Ok(format!(
             "no defuns found (language: {lang}) — for an extension-less buffer, \
-             treesit-set-language (rust|python|javascript|html|css|toml|yaml|elisp|markdown) \
+             treesit-set-language (rust|python|javascript|typescript|tsx|go|html|css|toml|yaml|elisp|markdown) \
              overrides detection{note}"
         ));
     }

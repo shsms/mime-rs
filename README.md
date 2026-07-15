@@ -45,9 +45,10 @@ front end and the capability tier differ.
   Saves are atomic and **refuse to clobber** a file an external writer changed
   since you opened it — the edit stays warm in the session instead of vanishing.
 
-- **Structural editing, nine languages.** Outline a file, jump to a function
+- **Structural editing, twelve languages.** Outline a file, jump to a function
   *by name*, scope an edit to a single defun, or run a tree-sitter query —
-  across Rust, Python, Markdown, HTML, JavaScript, CSS, TOML, YAML, and Elisp.
+  across Rust, Python, Markdown, HTML, JavaScript, TypeScript, TSX, Go, CSS,
+  TOML, YAML, and Elisp.
   Defun spans include Rust `#[attributes]` and Python decorators, so "delete
   this test" is one motion, and a save-time parse check warns before you commit
   a syntactically broken code buffer.
