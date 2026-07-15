@@ -3,16 +3,6 @@
 
 * Engine
 
-** TODO Shrink upd-epub-to-jp.tl's packed error message
-Failure JSONs now carry the failed run's ~reports~/~log~ across all three
-front-ends, so the script can go back to a plain ~(error ...)~ with the
-diagnostics living in reports/log again.
-
-** TODO ulysses scripts: drop the set-buffer-home workaround
-The closing report now tracks the primary buffer, so add-anno /
-place-diff / upd-epub-to-jp on ulysses-annotated's ~mime-rs~ branch can
-drop their end-of-run ~set-buffer~ dance.
-
 ** TODO Streaming search [#C]
 DONE so far: literal ~search_forward~ streams the range chunk-at-a-time on
 a ~memchr::memmem~ finder (SIMD two-way), stopping at the first hit;
@@ -23,8 +13,7 @@ windowed. Remaining: a resumable streaming DFA (~regex-automata~) to close
 the residual — a regex MISS still grows the window to the bound (the
 engine must see every byte to say "no"); and global-replace a multi-GB
 file across cores.
-/Exit: global-replace a multi-GB file across cores; ulysses bench beats
-legacy ~mime~./
+/Exit: global-replace a multi-GB file across cores./
 
 ** TODO Paged reader holds an open fd per buffer [#C]
 DECIDED (2026-06): a drifted paged buffer must NOT re-open the path
