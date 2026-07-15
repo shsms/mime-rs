@@ -207,9 +207,15 @@ fn op_run(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>, rehearse: b
         }
         Err(e) => {
             // Failure shape: the reports/log the program accumulated before it
-            // died ride along, so diagnostics survive the error.
-            let (reports, log, dirty) = ws.failure_context();
-            crate::result::failure_json(&e, &reports, &log, dirty)
+            // died ride along, so diagnostics survive the error. The engine's
+            // transactional default already rolled pre-error edits back;
+            // surface that like the MCP front-end does.
+            let (reports, log, dirty, rolled_back) = ws.failure_context();
+            let mut json = crate::result::failure_json(&e, &reports, &log, dirty);
+            if rolled_back {
+                json["rolled_back"] = Value::Bool(true);
+            }
+            json
         }
     }
 }

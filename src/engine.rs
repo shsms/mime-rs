@@ -223,9 +223,13 @@ pub struct Workspace {
     capabilities: Capabilities,
     /// Whether the most recent FAILED program left the buffer changed —
     /// surfaced by [`failure_context`](Self::failure_context) so a failure
-    /// JSON can say whether partial edits persist (a warm run does not roll
-    /// back on error; read-only and rehearse sessions do).
+    /// JSON can say whether partial edits persist (only a `keep_partial` run
+    /// leaves them; the transactional default rolls back).
     last_failure_dirty: std::cell::Cell<bool>,
+    /// Whether the most recent FAILED program's pre-error edits were rolled
+    /// back by the transactional default — the front-ends surface it so the
+    /// failure says "nothing happened" explicitly.
+    last_failure_rolled_back: std::cell::Cell<bool>,
     /// Recency stamp the MCP front-end writes on every use — the basis for
     /// least-recently-used eviction when the warm-session cap is hit. The
     /// engine itself never reads it.
@@ -321,6 +325,7 @@ impl Workspace {
             read_only,
             capabilities,
             last_failure_dirty: std::cell::Cell::new(false),
+            last_failure_rolled_back: std::cell::Cell::new(false),
             last_used: std::cell::Cell::new(0),
             undo_ring: Vec::new(),
         }
@@ -400,36 +405,150 @@ impl Workspace {
     /// diff. The buffer effects persist exactly as in [`run`]; only the extra
     /// return value distinguishes the two.
     pub fn run_value(&mut self, program: &str) -> Result<(RunReport, String), String> {
-        // For a read-only session, keep a cheap pre-run snapshot (structural
-        // sharing for Quire) so a mutating program can be rolled back.
-        let guard = self
-            .read_only
-            .then(|| self.session.borrow().buffer.snapshot());
+        self.run_value_with(program, false)
+    }
+
+    /// [`run_value`] with the transactional contract explicit: by default a
+    /// FAILED program's pre-error edits are rolled back to the pre-program
+    /// state, so an error means "nothing happened" on every front-end (MCP,
+    /// CLI, daemon) alike — [`failure_context`](Self::failure_context) then
+    /// reports dirty=false, rolled_back=true. `keep_partial` keeps the
+    /// pre-error edits in the warm buffer instead (dirty=true). A failed
+    /// program that only moved point keeps its motion either way.
+    pub fn run_value_with(
+        &mut self,
+        program: &str,
+        keep_partial: bool,
+    ) -> Result<(RunReport, String), String> {
+        self.last_failure_rolled_back.set(false);
+        // Cheap pre-run snapshots (structural sharing for Quire) so a
+        // mutating program that dies — or mutates a read-only session — can
+        // be rolled back. EVERY buffer is captured: a trusted-tier program
+        // can set-buffer elsewhere, edit there, create or kill buffers, and
+        // "nothing happened" must cover all of it, not just the buffer that
+        // was current at start.
+        let guard = (self.read_only || !keep_partial).then(|| {
+            let s = self.session.borrow();
+            let mut snaps = vec![(
+                s.buffer.name().to_string(),
+                s.buffer.version(),
+                s.buffer.snapshot(),
+            )];
+            for b in &s.inactive {
+                snaps.push((b.name().to_string(), b.version(), b.snapshot()));
+            }
+            (s.buffer.name().to_string(), snaps)
+        });
 
         let (report, value) = match self.eval_and_report(program, false) {
             Ok(rv) => rv,
-            // A program that mutated and THEN died must not leave its edits in
-            // a read-only session either — restore the snapshot before
-            // propagating, and the failure is clean (not dirty).
             Err(e) => {
-                if let Some(snap) = guard {
-                    self.session.borrow_mut().buffer = snap;
-                    self.last_failure_dirty.set(false);
+                if let Some((current_name, snaps)) = guard {
+                    let changed = self.session_changed(&snaps);
+                    if self.read_only {
+                        // A program that mutated and THEN died must not leave
+                        // its edits in a read-only session — restore before
+                        // propagating, and the failure is clean (not dirty).
+                        if changed {
+                            self.rollback_session(&current_name, snaps);
+                        }
+                        self.last_failure_dirty.set(false);
+                    } else if changed {
+                        // Transactional: the pre-error edits roll back to the
+                        // pre-program state — in every buffer.
+                        self.rollback_session(&current_name, snaps);
+                        self.last_failure_dirty.set(false);
+                        self.last_failure_rolled_back.set(true);
+                    }
                 }
                 return Err(e);
             }
         };
 
-        // Enforce read-only after the fact: if the program left the buffer
-        // changed, restore the snapshot and reject it. (Programs that only
+        // Enforce read-only after the fact: if the program left any buffer
+        // changed, restore the snapshots and reject it. (Programs that only
         // navigate/search/report are unaffected.)
-        if let Some(snap) = guard
-            && report.dirty
+        if self.read_only
+            && let Some((current_name, snaps)) = guard
+            && (report.dirty || self.session_changed(&snaps))
         {
-            self.session.borrow_mut().buffer = snap;
+            self.rollback_session(&current_name, snaps);
             return Err("session is read-only: program modified the buffer".to_string());
         }
         Ok((report, value))
+    }
+
+    /// Whether the session no longer matches the pre-run snapshots: a buffer's
+    /// text changed (version moved AND text differs — an edit-then-revert
+    /// program is clean), a buffer was killed, or a new one was created.
+    /// Point-only motion does not count.
+    fn session_changed(&self, snaps: &[(String, u64, Box<dyn TextStore>)]) -> bool {
+        let s = self.session.borrow();
+        let live_count = 1 + s.inactive.len();
+        if live_count != snaps.len() {
+            return true;
+        }
+        for (name, version, snap) in snaps {
+            let live = if s.buffer.name() == name {
+                Some(s.buffer.as_ref())
+            } else {
+                s.inactive
+                    .iter()
+                    .find(|b| b.name() == name)
+                    .map(|b| b.as_ref())
+            };
+            match live {
+                None => return true,
+                Some(b) => {
+                    // Version moved AND text differs — an edit-then-revert
+                    // program is clean. Known limit: a buffer killed and
+                    // re-created under the same name with identical text is
+                    // indistinguishable here (buffers have no identity token
+                    // beyond the name).
+                    if b.version() != *version && b.text() != snap.text() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Roll the whole session back to the pre-run snapshots: a buffer whose
+    /// text changed is restored, a killed buffer comes back, a buffer the
+    /// program created is dropped, and the buffer that was current at start
+    /// is current again. A buffer that only moved point keeps its motion.
+    fn rollback_session(&self, current_name: &str, snaps: Vec<(String, u64, Box<dyn TextStore>)>) {
+        let mut s = self.session.borrow_mut();
+        let placeholder: Box<dyn TextStore> =
+            Box::new(crate::Buffer::from_string("", String::new()));
+        let mut pool: Vec<Box<dyn TextStore>> = Vec::with_capacity(1 + s.inactive.len());
+        pool.push(std::mem::replace(&mut s.buffer, placeholder));
+        pool.append(&mut s.inactive);
+        let mut restored: Vec<Box<dyn TextStore>> = Vec::with_capacity(snaps.len());
+        for (name, version, snap) in snaps {
+            let live = pool.iter().position(|b| b.name() == name);
+            match live {
+                // Killed during the run — the snapshot brings it back.
+                None => restored.push(snap),
+                Some(i) => {
+                    let b = pool.swap_remove(i);
+                    // Same rule as session_changed.
+                    if b.version() != version && b.text() != snap.text() {
+                        restored.push(snap);
+                    } else {
+                        restored.push(b);
+                    }
+                }
+            }
+        }
+        // Whatever is left in the pool was created during the run — dropped.
+        let current = restored
+            .iter()
+            .position(|b| b.name() == current_name)
+            .expect("the pre-run current buffer is always in the snapshot set");
+        s.buffer = restored.swap_remove(current);
+        s.inactive = restored;
     }
 
     /// Dry-run `program` and return the report it *would* produce, then roll the
@@ -561,17 +680,18 @@ impl Workspace {
 
     /// What the most recent FAILED program left behind: the reports and log it
     /// accumulated before dying (cleared at the start of every run, so they
-    /// always belong to the last one; an error does not clear them), plus
-    /// whether its edits persist — `true` only for a warm writable run that
-    /// mutated before erroring (read-only and rehearse sessions roll back).
-    /// The failure JSONs carry all three so diagnostics need not be packed
-    /// into the error string.
-    pub fn failure_context(&self) -> (Vec<(String, String)>, Vec<String>, bool) {
+    /// always belong to the last one; an error does not clear them), whether
+    /// its edits persist — `true` only for a `keep_partial` run that mutated
+    /// before erroring (everything else rolls back) — and whether pre-error
+    /// edits were rolled back by the transactional default. The failure JSONs
+    /// carry these so diagnostics need not be packed into the error string.
+    pub fn failure_context(&self) -> (Vec<(String, String)>, Vec<String>, bool, bool) {
         let s = self.session.borrow();
         (
             s.reports.clone(),
             s.log.clone(),
             self.last_failure_dirty.get(),
+            self.last_failure_rolled_back.get(),
         )
     }
 
@@ -1277,23 +1397,84 @@ mod tests {
         };
         assert!(e.contains("boom"), "got: {e}");
         // The diagnostics the program emitted before dying survive the error;
-        // a navigate-and-report program leaves no edits → not dirty.
-        let (reports, log, dirty) = ws.failure_context();
+        // a navigate-and-report program leaves no edits → not dirty, and
+        // there was nothing to roll back.
+        let (reports, log, dirty, rolled_back) = ws.failure_context();
         assert_eq!(reports, vec![("step".to_string(), "1".to_string())]);
         assert_eq!(log, vec!["got here".to_string()]);
-        assert!(!dirty);
-        // A program that edits and THEN dies reports its lasting partial edit.
+        assert!(!dirty && !rolled_back);
+        // A program that edits and THEN dies is transactional by default: the
+        // pre-error edit is rolled back on every front-end alike.
         assert!(
             ws.run(r#"(insert "partial ") (error "late boom")"#)
                 .is_err()
         );
-        let (_, _, dirty) = ws.failure_context();
-        assert!(dirty, "warm runs keep pre-error edits — flagged");
+        let (_, _, dirty, rolled_back) = ws.failure_context();
+        assert!(!dirty && rolled_back, "pre-error edits rolled back");
+        assert_eq!(ws.text(), "x");
+        // keep_partial opts out: the pre-error edit persists, flagged dirty.
+        assert!(
+            ws.run_value_with(r#"(insert "partial ") (error "late boom")"#, true)
+                .is_err()
+        );
+        let (_, _, dirty, rolled_back) = ws.failure_context();
+        assert!(dirty && !rolled_back, "keep_partial keeps pre-error edits");
         assert!(ws.text().starts_with("partial "));
         // ...and the next run owns the slate again.
         ws.run("(point)").unwrap();
-        let (reports, log, _) = ws.failure_context();
+        let (reports, log, _, _) = ws.failure_context();
         assert!(reports.is_empty() && log.is_empty());
+    }
+
+    #[test]
+    fn failure_rolls_back_edits_in_every_buffer() {
+        // A trusted-tier program can set-buffer elsewhere and edit there —
+        // the transactional rollback must cover that buffer too, and drop
+        // buffers the dying program created.
+        let mut ws = Workspace::new_trusted(Box::new(Buffer::from_string("main", "x")));
+        let program = "(generate-new-buffer \"b\") (set-buffer \"b\") \
+                       (insert \"stray\") (error \"boom\")";
+        assert!(ws.run(program).is_err());
+        let (_, _, dirty, rolled_back) = ws.failure_context();
+        assert!(!dirty && rolled_back, "the cross-buffer edit rolled back");
+        // The created buffer is gone and the original is current, untouched.
+        let names = ws.run_value("(buffer-list)").unwrap().1;
+        assert!(!names.contains("\"b\""), "created buffer dropped: {names}");
+        assert_eq!(ws.text(), "x");
+    }
+
+    #[test]
+    fn failure_restores_a_killed_buffer_without_clobbering_another() {
+        let mut ws = Workspace::new_trusted(Box::new(Buffer::from_string("main", "x")));
+        // A surviving second buffer with content of its own.
+        ws.run(
+            "(generate-new-buffer \"other\") \
+             (with-current-buffer \"other\" (insert \"precious\"))",
+        )
+        .unwrap();
+        // The dying program switches away, kills the primary, edits — the
+        // rollback must resurrect `main` and roll back `other`'s edit, not
+        // overwrite `other` with main's snapshot.
+        let program = "(set-buffer \"other\") (kill-buffer \"main\") \
+                       (insert \" data\") (error \"boom\")";
+        assert!(ws.run(program).is_err());
+        let (_, _, dirty, rolled_back) = ws.failure_context();
+        assert!(!dirty && rolled_back, "reported as a clean rollback");
+        // `main` is back and current; `other` kept its own pre-run content.
+        let names = ws.run_value("(buffer-list)").unwrap().1;
+        assert!(
+            names.contains("\"main\"") && names.contains("\"other\""),
+            "{names}"
+        );
+        assert_eq!(ws.text(), "x", "main is current and untouched");
+        let other = ws
+            .run_value("(with-current-buffer \"other\" (buffer-string))")
+            .unwrap()
+            .1;
+        assert!(
+            other.contains("precious") && !other.contains("data"),
+            "{other}"
+        );
     }
 
     #[test]
@@ -1307,7 +1488,7 @@ mod tests {
         // The pre-error mutation must not survive in a read-only session...
         assert_eq!(ws.text(), "keep me");
         // ...so the failure is reported clean, not dirty.
-        let (_, _, dirty) = ws.failure_context();
+        let (_, _, dirty, _) = ws.failure_context();
         assert!(!dirty);
     }
 

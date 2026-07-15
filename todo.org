@@ -443,7 +443,8 @@ worktree fixup already uses before touching anything, so a discard is
 always recoverable. Reuses snapshot_worktree/apply_subset — the inverse
 selection is kept, the selected hunks reset to HEAD content.
 
-** TODO Move the transactional run_program rollback into the engine     :mcp:
+** DONE Move the transactional run_program rollback into the engine     :mcp:
+CLOSED: [2026-07-15]
 :LOGBOOK:
 - State "TODO"       from              [2026-07-14 Di 14:22]
 :END:
@@ -455,6 +456,15 @@ semantics for the same engine operation. Move the snapshot/rollback into
 Workspace::run (with a keep-partial escape) so all three front-ends share
 one contract. Related smaller item: run_value could return a typed value so
 the MCP layer stops re-parsing the printed string (unprint_string_value).
+
+DONE [2026-07-15]: ~Workspace::run_value_with {keep_partial}~ owns the
+snapshot/rollback (restoring into the buffer the snapshot came from,
+even if the program died in another); ~failure_context~ grew a
+~rolled_back~ flag all three front-ends surface. MCP's undo-ring
+rollback branch is gone; CLI/daemon failure JSONs now carry
+~rolled_back~ too. NOT done (deliberately): the typed run_value
+return — it would churn the public API the CLI repl prints from, for
+marginal gain; unprint_string_value stays.
 
 ** TODO last_toucher: one walk per conflict, not per file               :git:
 :LOGBOOK:

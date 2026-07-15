@@ -452,7 +452,7 @@ fn run_in_session(
     session: &str,
     program: &str,
 ) -> Result<crate::RunReport, String> {
-    run_or_rehearse(sessions, session, program, false).map(|(report, _value)| report)
+    run_or_rehearse(sessions, session, program, false, false).map(|(report, _value)| report)
 }
 
 /// Like [`run_in_session`], but `rehearse` selects a dry-run that rolls the
@@ -462,6 +462,7 @@ fn run_or_rehearse(
     session: &str,
     program: &str,
     rehearse: bool,
+    keep_partial: bool,
 ) -> Result<(crate::RunReport, String), String> {
     if !sessions.contains_key(session) {
         return Err(no_such_session(sessions, session));
@@ -486,7 +487,7 @@ fn run_or_rehearse(
     if rehearse {
         ws.rehearse_value(program)
     } else {
-        ws.run_value(program)
+        ws.run_value_with(program, keep_partial)
     }
 }
 
@@ -654,46 +655,37 @@ fn tool_run_program(
     let program = str_arg(args, "program")?;
     // TODO: resource limits (needs tulisp eval interruption) — a per-program
     // wall-clock/CPU bound can't be enforced until tulisp eval is cancellable.
-    let (report, value) = match run_or_rehearse(sessions, &session, &program, rehearse) {
+    let (report, value) = match run_or_rehearse(
+        sessions,
+        &session,
+        &program,
+        rehearse,
+        bool_arg(args, "keep_partial"),
+    ) {
         Ok(rv) => rv,
         // A failed program still said things before it died: the error
         // content is the failure JSON carrying its reports/log, not just the
         // bare error string.
         Err(e) => {
-            let (reports, log, dirty) = sessions
+            let (reports, log, dirty, rolled_back) = sessions
                 .get(&session)
                 .map(|ws| ws.failure_context())
                 .unwrap_or_default();
             let mut json = crate::result::failure_json(&e, &reports, &log, dirty);
-            // Transactional by default: a failed program's pre-error edits
-            // are rolled back to the pre-program state (the push_undo above)
-            // unless the caller opted out with keep_partial — then the
-            // recovery action rides in the error text instead.
-            if dirty && !rehearse {
-                if bool_arg(args, "keep_partial") {
-                    json["error"] = Value::String(format!(
-                        "{e} (the program's pre-error edits persist in the \
-                         warm buffer — undo_last reverts them)"
-                    ));
-                } else if sessions
-                    .get_mut(&session)
-                    .map(|ws| ws.undo_last().is_ok())
-                    .unwrap_or(false)
-                {
-                    json["dirty"] = Value::Bool(false);
+            // The transactional rollback lives in the ENGINE
+            // (Workspace::run_value_with), shared by every front-end; here
+            // the outcome just rides into the error text.
+            if !rehearse {
+                if rolled_back {
                     json["rolled_back"] = Value::Bool(true);
                     json["error"] = Value::String(format!(
                         "{e} (the program's pre-error edits were rolled back — \
                          pass keep_partial:true to keep them for inspection)"
                     ));
-                } else {
-                    // The rollback itself failed (nothing on the undo ring to
-                    // rewind to) — never pretend it happened: dirty stays
-                    // true and the error says the edits persist.
+                } else if dirty {
                     json["error"] = Value::String(format!(
-                        "{e} (rollback FAILED — the pre-error edits persist \
-                         in the warm buffer; undo_last or (revert-buffer) \
-                         recovers)"
+                        "{e} (the program's pre-error edits persist in the \
+                         warm buffer — undo_last reverts them)"
                     ));
                 }
             }

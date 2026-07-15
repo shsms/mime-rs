@@ -274,11 +274,12 @@ fn run_local(args: &Args, verb: &str) {
         Err(err) => {
             // Carry the reports/log the program accumulated before it died —
             // its own diagnostics — instead of just the bare error string.
-            let (reports, log, dirty) = ws.failure_context();
-            eprintln!(
-                "{}",
-                crate::result::failure_json(&err, &reports, &log, dirty)
-            );
+            let (reports, log, dirty, rolled_back) = ws.failure_context();
+            let mut json = crate::result::failure_json(&err, &reports, &log, dirty);
+            if rolled_back {
+                json["rolled_back"] = serde_json::Value::Bool(true);
+            }
+            eprintln!("{json}");
             exit(1);
         }
     }
@@ -403,7 +404,7 @@ fn eval_and_print<W: Write>(ws: &mut crate::Workspace, form: &str, out: &mut W) 
         Err(e) => {
             // A failed form still said things before it died — print its
             // log/report lines like the success path, then the error.
-            let (reports, log, _) = ws.failure_context();
+            let (reports, log, _, _) = ws.failure_context();
             for line in &log {
                 let _ = writeln!(out, "{line}");
             }
