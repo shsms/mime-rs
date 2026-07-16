@@ -62,7 +62,10 @@ front end and the capability tier differ.
   cherry-pick, and revert as a sequencer (on `git2` / vendored libgit2): the
   plan is *data*, a conflicted step surfaces through the very same
   merge-conflict vocabulary you'd use by hand, and `git_rebase` can `rehearse`
-  a plan before running it. No `git` subprocess, no network, no hooks or exec;
+  a plan before running it. One-call helpers sit on top: `git_fixup` and
+  `git_absorb` fold worktree changes into the commits that own them,
+  `git_reword` / `git_msg_rewrite` edit messages, and `git_range_diff` checks
+  a rewrite after the fact. No `git` subprocess, no network, no hooks or exec;
   every destructive op first stamps a `refs/mime-backup/<branch>` recovery ref.
 
 - **Honest results.** Diffs are token-frugal (clamped with an elision marker
@@ -75,7 +78,9 @@ front end and the capability tier differ.
   MCP/daemon tier is *sandboxed*: the filesystem is confined to `$MIME_ROOTS`,
   every run is audited, and there is **no shell, no process spawn, and no
   network** — the git tools included (they work in-process, so they never
-  breach that boundary).
+  breach that boundary). The one exception is `git_exec_over`, which runs a
+  build command at each commit — it stays disabled unless the host sets
+  `MIME_EXEC=1`.
 
 ## Install
 
@@ -100,6 +105,9 @@ mime repl --file ./in.txt
 
 # Dry-run a program: see the diff it would make, change nothing
 mime rehearse prog.tl --file ./in.txt
+
+# Step a script form by form in a terminal UI (build with `--features tui`)
+mime tui prog.tl --file ./in.txt
 ```
 
 The vocabulary is Emacs Lisp (via [tulisp](https://crates.io/crates/tulisp)):
@@ -138,7 +146,7 @@ insert_text  {path, text, anchor: {defun: "parse_args", where: "after"}}
 outline      {path}            // KIND START END NAME, per defun
 rehearse     {path, program}   // dry-run any lisp program; inspect the diff
 undo_last    {path}            // rewind the last mutating call
-help         {topic}           // regex | treesit | conflicts | sessions | recipes
+help         {topic}           // lisp | regex | treesit | conflicts | git | sessions | recipes
 ```
 
 The design leans on conveniences that matter most for less capable models:
@@ -148,11 +156,18 @@ edit to one function with no narrowing dance; multi-file `files:` batches are
 all-or-nothing; and warm sessions are bounded but never evicted while they hold
 unsaved work.
 
-A `git_*` group adds history editing: `git_rebase` (with a `rehearse` dry-run),
-`git_cherry_pick`, `git_revert`, `git_continue`, `git_skip`, `git_abort`,
-`git_status`, `git_log`, `git_show`. A conflicted step stops with diff3 markers
-in the worktree; resolve them with the conflict tools above, then `git_continue`
-(or `git_skip` / `git_abort`). Repos are confined to `$MIME_ROOTS`, and each op
+A `git_*` group adds history editing. The core is the sequencer: `git_rebase`
+(with a `rehearse` dry-run), `git_cherry_pick`, `git_revert`, and
+`git_continue` / `git_skip` / `git_abort`, plus the read-only `git_status`,
+`git_log`, `git_show`, and `git_blame` (whose worktree mode maps each
+uncommitted hunk to the commit that owns it). On top sit one-call helpers:
+`git_fixup` and `git_absorb` fold uncommitted changes into the commits that
+own them, `git_move` relocates a change between two adjacent commits,
+`git_reword` and `git_msg_rewrite` edit commit messages (one commit / a whole
+range), `git_discard` drops selected uncommitted hunks (recoverably), and
+`git_range_diff` compares a branch before and after a rewrite. A conflicted
+step stops with diff3 markers in the worktree; resolve them with the
+conflict tools above, then `git_continue` (or `git_skip` / `git_abort`). Repos are confined to `$MIME_ROOTS`, and each op
 stamps a `refs/mime-backup/<branch>` ref so the pre-op state is recoverable.
 
 ## How it works
@@ -192,6 +207,8 @@ stamps a `refs/mime-backup/<branch>` ref so the pre-op state is recoverable.
 - **`cli.rs`**, **`mcp.rs`**, **`http.rs`**, and **`daemon.rs`** are the four
   front ends — one-shot/REPL, stdio MCP, MCP over Streamable HTTP, and a
   long-lived unix-socket daemon. The two MCP transports share one dispatch core.
+  An optional fifth front end, `tui.rs` (behind the `tui` feature), steps a
+  script form by form in a terminal UI.
 
 ## Building & testing
 
@@ -201,7 +218,7 @@ make test            # the CI gate: fmt, clippy -D warnings, the full test suite
 make docs            # regenerate docs/mcp-tools.md from the live tool schemas
 ```
 
-`make test` runs 280+ tests, including **differential suites** that pin the
+`make test` runs 440+ tests, including **differential suites** that pin the
 file-backed `Quire` store to the in-memory `Buffer` oracle — every operation is
 run against both and the results compared, so the fast store can't silently
 diverge from the obvious one. Pending work is tracked in [`todo.org`](todo.org).
