@@ -93,6 +93,24 @@ even the interim fuel counter must land in tulisp's eval loop
 (upstream change + release + dependency bump). Fully blocked on the
 tulisp wishlist item.
 
+** TODO Failed-run rollback: buffers have no identity token [#C]
+[2026-07-16 review] The multi-buffer rollback restores by NAME. A program
+that kills a buffer and re-creates one with the same name and the same
+text is invisible to the change check — the impostor (no visited file,
+fresh state) survives a "rolled back" failure. Fixing this needs a real
+buffer id, not version ordering: versions are process-monotonic, so a
+re-created buffer is always NEWER than the snapshot's stamp.
+
+** TODO Search/snapshot allocation nits from the 2026-07 review [#C]
+~meta_twin~ allocates the pattern String even on a cache hit (innermost
+search loop — use a ~get~ before the ~entry~). Quire's adaptive forward
+search runs ~span_captures~ (captures engine + group-text allocations)
+on every unsettled probe where ~span_find~ would do; resolve captures
+only once settled, like ~latest_match_in_span~ already does. And every
+writable run on an ~open_text~ (Buffer-backed) session clones the whole
+text for the transactional snapshot — Quire shares structure; consider
+Quire-backing open_text or snapshotting lazily on first mutation.
+
 * MCP / agent UX
 
 The agent-facing tool surface. Recurring lens: conveniences that
@@ -784,6 +802,48 @@ an unsaved_diff {path} one-call (buffer vs disk unified diff) would
 answer "what exactly have I not saved" without checkpoint gymnastics.
 External tools can't be fixed, but making mime's own read surface
 authoritative removes the reason to shell out.
+
+** TODO Sequencer dedup backlog from the 2026-07 review [#C] :git:
+Three copies of the "materialize tree entries into the worktree" loop
+(~restore_worktree~, ~restore_autostash~, ~discard~) — discard's copy
+aborts on the first error while the others collect failures, and none
+handles symlinks. The signature-or-fallback block is pasted four times;
+the ~summary_of~ closure three times. ~reword~ and ~msg_rewrite~ share a
+rechain skeleton that could be one core with a per-commit message hook.
+~range_diff~ recomputes both sides' patch-ids in the report loop and its
+by-summary fallback is O(old×new) — keep the pairing pids and
+precompute the old summaries.
+
+** TODO begin()'s untracked guard misses files inside untracked directories [#B] :git:
+~statuses~ without ~recurse_untracked_dirs~ reports a fully-untracked
+directory as one ~dir/~ entry, which never matches a tree path — the
+hard reset can then destroy ~dir/file~. ~exec_over~ got the recurse flag
+in the todo-sweep branch; ~begin~ still has the blind spot.
+
+** TODO absorb: refuse merge commits up front [#C] :git:
+A merge inside onto..HEAD dies mid-replay with a raw libgit2 error
+("mainline branch is not specified"). The parked-worktree wrapper aborts
+and restores cleanly, so nothing is lost — but reword/msg_rewrite show
+the pattern: scan the range and refuse with a clear message up front.
+
+** TODO keep_partial only reaches the MCP front-end [#C]
+The engine rollback is shared by MCP, CLI and daemon, but only the
+~run_program~ tool exposes ~keep_partial~ — the REPL and the daemon
+protocol cannot opt out of the transactional rollback to inspect the
+partial state of a failed program.
+
+** TODO MCP consistency nits from the 2026-07 review [#C] :mcp:
+No invariant test walks ~alias_table~ against the declared schemas (only
+grep has a drift test) — a schema rename would leave a stale alias
+rewriting to an unknown key. ~read_region~ hand-parses ~lines: [a, b]~
+though ~lines_arg~ (git_blame's) decodes the same shape. ~replace_text~
+and the batch editor fork into ~6 elisp templates sharing one
+transaction/report skeleton — parameterize ~{search}~/~{replace_step}~
+the way ~match_lines~ already does. Style: grep's unsaved-buffer flag
+uses a ~⚠~ glyph where siblings use "WARNING:" / "(unsaved: …)";
+insert_text accepts undocumented "end"/"start" aliases for eob/bob
+outside the alias table; ~unsaved_diff~ appends ~stale_edit_note~
+(edit-side wording) though it is a read tool.
 
 * Structural editing
 
