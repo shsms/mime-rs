@@ -845,6 +845,67 @@ insert_text accepts undocumented "end"/"start" aliases for eob/bob
 outside the alias table; ~unsaved_diff~ appends ~stale_edit_note~
 (edit-side wording) though it is a read tool.
 
+** TODO [#B] git_rebase: three-arg --onto (separate upstream from new base) :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-17 Fr 09:22]
+:END:
+
+~git_rebase {onto}~ replays ~onto..HEAD~, so the segment start and the
+landing point are the same ref. The stacked-branch case needs them
+apart: ~git rebase --onto fallback-restructure c75a80b explained-formulas~
+transplants only ~c75a80b..HEAD~; with mime the plan would have to ~drop~
+every commit already present in the new base by hand. Add an optional
+~from~ (upstream) field that bounds the replayed range, defaulting to
+~onto~ as today. (Session driver: component-graph-rs stack rebase,
+2026-07-17.)
+
+** TODO [#B] Rewrites carry stacked branch pointers (--update-refs)     :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-17 Fr 09:22]
+:END:
+
+When a rewrite rebuilds commits that other local branches point into,
+those pointers stay on the old commits and each must be moved by hand
+(shell ~git branch -f~). Git's ~rebase --update-refs~ moves every such
+ref along with the rewrite. With this plus three-arg ~--onto~, a
+three-branch stack rebase is ONE call instead of two rebases, a
+cherry-pick and two ~branch -f~. A read-side companion — a stack /
+topology view showing which branches contain which segments — would
+shorten the orientation phase too.
+
+** TODO [#C] git ops on a branch that is not checked out                :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-17 Fr 09:22]
+:END:
+
+Every mime git op works on HEAD, so each rebase in a stack needs a
+shell ~git checkout~ first — and once in the shell, the rest of the
+flow tends to stay there. A ~branch~ parameter on git_rebase /
+git_cherry_pick (operate on that branch, update its ref, leave HEAD
+alone — or check it out, matching git) keeps multi-branch surgery
+inside mime.
+
+** TODO [#C] git_cherry_pick: rehearse preview                          :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-17 Fr 09:22]
+:END:
+
+~rehearse~ exists for git_rebase and git_absorb but not for
+git_cherry_pick / git_revert. A transplant onto a rebuilt base is
+exactly where a conflict preview pays (the RELEASE_NOTES.md conflicts
+in the component-graph stack rebase were predictable up front).
+
+** TODO [#C] branch tool: create / force-move / delete                  :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-17 Fr 09:22]
+:END:
+
+No way to create, force-move or delete a branch ref from mime — after
+a segment rebuild, re-pointing a dependent branch means shell
+~git branch -f~. Small tool: ~git_branch {name, at?, force?, delete?}~.
+Largely subsumed by --update-refs for the stack case, but still useful
+alone. Fetch/push stay out by design (no network).
+
 * Structural editing
 
 ** TODO Incremental re-parse (~InputEdit~s) [#C]
