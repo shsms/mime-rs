@@ -2314,7 +2314,8 @@ fn commit_patch_id(repo: &Repository, commit: Oid) -> Result<Option<Oid>, Error>
     Ok(Some(diff.patchid(None)?))
 }
 
-/// Split `onto..HEAD` into (kept, dropped): commits whose patch-id already
+/// Split `from..HEAD` (`from` = `onto` in the two-arg case) into (kept,
+/// dropped): commits whose patch-id already
 /// appears among the upstream-only commits (`HEAD..onto`) are dropped. This
 /// matches `git rebase`'s default cherry-pick detection
 /// (`--no-reapply-cherry-picks`): when a base rewrite (reorder/amend) leaves the
@@ -2323,7 +2324,11 @@ fn commit_patch_id(repo: &Repository, commit: Oid) -> Result<Option<Oid>, Error>
 /// pick-all would replay them a second time (duplicates). Comparing against only
 /// the onto-only side (not all of `onto`) mirrors git's `onto...HEAD` symmetric
 /// difference, so distinct commits that merely share a base are never dropped.
-fn partition_cherry_picks(repo: &Repository, onto: Oid) -> Result<(Vec<Oid>, Vec<Oid>), Error> {
+fn partition_cherry_picks(
+    repo: &Repository,
+    onto: Oid,
+    from: Oid,
+) -> Result<(Vec<Oid>, Vec<Oid>), Error> {
     // Patch-ids of the commits reachable from `onto` but not HEAD — git's
     // "right side" of the onto...HEAD symmetric difference.
     let mut walk = repo.revwalk()?;
@@ -2337,7 +2342,7 @@ fn partition_cherry_picks(repo: &Repository, onto: Oid) -> Result<(Vec<Oid>, Vec
     }
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
-    for oid in commits_since(repo, onto)? {
+    for oid in commits_since(repo, from)? {
         // Conservative on both None (merge/empty, no patch to match) and Err (a
         // diff/patchid failure): keep the commit rather than risk dropping one we
         // can't positively identify as already-applied.
@@ -4355,6 +4360,7 @@ fn run_plan_over_parked_worktree(
 pub fn cmd_rebase(
     repo_path: &std::path::Path,
     onto: &str,
+    from: Option<&str>,
     plan: Option<Vec<PlanItem>>,
     autosquash: Option<Autosquash>,
     rehearse_only: bool,
@@ -4362,6 +4368,20 @@ pub fn cmd_rebase(
 ) -> Result<String, String> {
     let repo = open(repo_path)?;
     let onto_oid = resolve_s(&repo, onto)?;
+    // Three-arg --onto: `from` (git's <upstream>) bounds the replayed range —
+    // from..HEAD lands on `onto` — so a stacked branch transplants only its own
+    // commits. Defaults to `onto`, the classic two-arg behaviour.
+    if from.is_some() && plan.is_some() {
+        return Err(
+            "from bounds the default (or autosquash) enumeration of onto..HEAD; \
+             an explicit plan already lists its commits — pass one or the other"
+                .to_string(),
+        );
+    }
+    let from_oid = match from {
+        Some(f) => resolve_s(&repo, f)?,
+        None => onto_oid,
+    };
     // Commits omitted from a plan-less pick-all because they are already present
     // in `onto` by patch-id (git's default cherry-pick detection).
     let mut dropped: Vec<Oid> = Vec::new();
@@ -4369,8 +4389,8 @@ pub fn cmd_rebase(
     // points at autosquash:true, which is usually what such a branch wants.
     let plan_less = plan.is_none() && autosquash.is_none();
     let steps = if let Some(Autosquash::Markers) = autosquash {
-        let derived = marker_directives(&repo, onto_oid).map_err(gerr)?;
-        autosquash_steps(&repo, onto_oid, &derived).map_err(gerr)?
+        let derived = marker_directives(&repo, from_oid).map_err(gerr)?;
+        autosquash_steps(&repo, from_oid, &derived).map_err(gerr)?
     } else if let Some(Autosquash::Directives(directives)) = autosquash {
         // An empty list would fall through to a bare pick-all — without even
         // the plan-less path's cherry-pick detection. Error like Markers does.
@@ -4389,7 +4409,7 @@ pub fn cmd_rebase(
                 Ok((resolve_s(&repo, commit)?, resolve_s(&repo, into)?, action))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        autosquash_steps(&repo, onto_oid, &resolved).map_err(gerr)?
+        autosquash_steps(&repo, from_oid, &resolved).map_err(gerr)?
     } else {
         match plan {
             Some(items) => items
@@ -4412,9 +4432,10 @@ pub fn cmd_rebase(
                 .collect::<Result<Vec<_>, String>>()?,
             None => {
                 let commits = if reapply_cherry_picks {
-                    commits_since(&repo, onto_oid).map_err(gerr)?
+                    commits_since(&repo, from_oid).map_err(gerr)?
                 } else {
-                    let (kept, drop) = partition_cherry_picks(&repo, onto_oid).map_err(gerr)?;
+                    let (kept, drop) =
+                        partition_cherry_picks(&repo, onto_oid, from_oid).map_err(gerr)?;
                     dropped = drop;
                     kept
                 };
@@ -4953,7 +4974,7 @@ mod tests {
         on_branch(&repo, "topic", f1);
 
         // Default plan (onto..HEAD) via the path-facing wrapper, onto by oid string.
-        let out = cmd_rebase(&dir, &m1.to_string(), None, None, false, false).unwrap();
+        let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, false, false).unwrap();
         assert!(out.starts_with("done"), "{out}");
         // `add b` and `change a` are distinct patches, so cherry-pick detection
         // drops nothing — a plain rebase onto a diverged base is unaffected.
@@ -4975,6 +4996,108 @@ mod tests {
             show.contains("Diff:") && show.contains("+1"),
             "show carries the unified diff: {show}"
         );
+    }
+
+    #[test]
+    fn three_arg_onto_transplants_only_from_head() {
+        // The stacked-branch driver: `lower` was AMENDED (new patch-id, so
+        // cherry-pick detection cannot drop the stale copy), and topic must
+        // transplant only its own commits — from..HEAD — onto the rewrite.
+        let dir = tmp("rebase-three-arg");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("base", "0\n")], "base");
+        let l1 = commit(
+            &repo,
+            &[base],
+            &[("base", "0\n"), ("lib", "v1\n")],
+            "add lib v1",
+        );
+        let t1 = commit(
+            &repo,
+            &[l1],
+            &[("base", "0\n"), ("lib", "v1\n"), ("t1", "1\n")],
+            "t1",
+        );
+        let t2 = commit(
+            &repo,
+            &[t1],
+            &[
+                ("base", "0\n"),
+                ("lib", "v1\n"),
+                ("t1", "1\n"),
+                ("t2", "1\n"),
+            ],
+            "t2",
+        );
+        on_branch(&repo, "topic", t2);
+        // The rewritten lower branch: same file, different content — a
+        // different patch, so only `from` can keep it out of the replay.
+        let l1p = commit(
+            &repo,
+            &[base],
+            &[("base", "0\n"), ("lib", "v2\n")],
+            "lib v2 (amended)",
+        );
+
+        let pre = cmd_rebase(
+            &dir,
+            &l1p.to_string(),
+            Some(&l1.to_string()),
+            None,
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(pre.contains("t1") && pre.contains("t2"), "{pre}");
+        assert!(
+            !pre.contains("add lib v1"),
+            "old base commit excluded: {pre}"
+        );
+
+        let out = cmd_rebase(
+            &dir,
+            &l1p.to_string(),
+            Some(&l1.to_string()),
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        assert_eq!(read(&repo, "lib"), "v2\n", "the amended base won");
+        assert_eq!(read(&repo, "t1"), "1\n");
+        assert_eq!(read(&repo, "t2"), "1\n");
+        let log = cmd_log(&dir, None).unwrap();
+        assert!(log.contains("lib v2 (amended)"), "{log}");
+        assert!(!log.contains("add lib v1"), "stale base commit gone: {log}");
+    }
+
+    #[test]
+    fn three_arg_onto_refuses_an_explicit_plan() {
+        let dir = tmp("rebase-from-plan");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "2\n")], "f1");
+        on_branch(&repo, "topic", f1);
+        let err = cmd_rebase(
+            &dir,
+            &base.to_string(),
+            Some(&base.to_string()),
+            Some(vec![(
+                f1.to_string(),
+                "pick".to_string(),
+                None,
+                Vec::new(),
+                Vec::new(),
+            )]),
+            None,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("explicit plan"), "{err}");
     }
 
     #[test]
@@ -5013,16 +5136,16 @@ mod tests {
         );
 
         // rehearse, default: the two already-applied commits are reported dropped.
-        let pre = cmd_rebase(&dir, &a1p.to_string(), None, None, true, false).unwrap();
+        let pre = cmd_rebase(&dir, &a1p.to_string(), None, None, None, true, false).unwrap();
         assert!(pre.contains("dropped 2 commit(s)"), "{pre}");
         assert!(pre.contains("add x") && pre.contains("add y"), "{pre}");
 
         // rehearse, reapply_cherry_picks: keeps them — no drop note.
-        let keep = cmd_rebase(&dir, &a1p.to_string(), None, None, true, true).unwrap();
+        let keep = cmd_rebase(&dir, &a1p.to_string(), None, None, None, true, true).unwrap();
         assert!(!keep.contains("dropped"), "{keep}");
 
         // apply, default: topic ends as base→add y→add x→add z — no duplicates.
-        let out = cmd_rebase(&dir, &a1p.to_string(), None, None, false, false).unwrap();
+        let out = cmd_rebase(&dir, &a1p.to_string(), None, None, None, false, false).unwrap();
         assert!(out.starts_with("done"), "{out}");
         assert!(out.contains("dropped 2 commit(s)"), "{out}");
         let tip = repo.head().unwrap().peel_to_commit().unwrap();
@@ -5065,7 +5188,7 @@ mod tests {
         );
         on_branch(&repo, "topic", merge);
 
-        let (kept, dropped) = partition_cherry_picks(&repo, u_empty).unwrap();
+        let (kept, dropped) = partition_cherry_picks(&repo, u_empty, u_empty).unwrap();
         assert!(dropped.is_empty(), "nothing is a cherry-pick: {dropped:?}");
         assert!(kept.contains(&h_empty), "empty branch commit kept");
         assert!(kept.contains(&merge), "ours merge kept");
@@ -5339,7 +5462,7 @@ mod tests {
         std::fs::write(dir.join("notes"), "scratch\n").unwrap();
 
         // m1 adds b; rebase f1 onto m1. `notes` is untouched.
-        let out = cmd_rebase(&dir, &m1.to_string(), None, None, false, false).unwrap();
+        let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, false, false).unwrap();
         assert!(out.starts_with("done"), "{out}");
         assert_eq!(
             read(&repo, "notes"),
@@ -5362,7 +5485,7 @@ mod tests {
         let m1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "m1");
         on_branch(&repo, "topic", f1);
         std::fs::write(dir.join("a"), "uncommitted\n").unwrap();
-        let err = cmd_rebase(&dir, &m1.to_string(), None, None, false, false).unwrap_err();
+        let err = cmd_rebase(&dir, &m1.to_string(), None, None, None, false, false).unwrap_err();
         assert!(err.contains("uncommitted changes"), "{err}");
         assert!(err.contains('a'), "names the clashing path: {err}");
         assert_eq!(read(&repo, "a"), "uncommitted\n", "nothing destroyed");
@@ -5379,7 +5502,7 @@ mod tests {
         std::fs::write(dir.join("notes"), "scratch\n").unwrap();
 
         // f1 conflicts with m1 on `a`; `notes` rides the autostash.
-        let out = cmd_rebase(&dir, &m1.to_string(), None, None, false, false).unwrap();
+        let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, false, false).unwrap();
         assert!(out.contains("conflict"), "{out}");
         assert!(out.contains("autostashed"), "the pause says where: {out}");
         assert_ne!(
@@ -5405,7 +5528,7 @@ mod tests {
         std::fs::write(dir.join("notes"), "scratch\n").unwrap();
 
         // f1 conflicts with m1 on `a`; `notes` rides the autostash.
-        let out = cmd_rebase(&dir, &m1.to_string(), None, None, false, false).unwrap();
+        let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, false, false).unwrap();
         assert!(out.contains("conflict"), "{out}");
         // During the pause the user writes `notes` again — the later edit
         // must win over the parked bytes.
@@ -5446,7 +5569,7 @@ mod tests {
         let mut perm = std::fs::metadata(&abs).unwrap().permissions();
         perm.set_mode(perm.mode() | 0o111);
         std::fs::set_permissions(&abs, perm).unwrap();
-        let out = cmd_rebase(&dir, &m1.to_string(), None, None, false, false).unwrap();
+        let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, false, false).unwrap();
         assert!(out.starts_with("done"), "{out}");
         let mode = std::fs::metadata(&abs).unwrap().permissions().mode();
         assert_ne!(mode & 0o111, 0, "the exec bit came back");
@@ -5508,7 +5631,7 @@ mod tests {
         let mut index = repo.index().unwrap();
         index.add_path(Path::new("notes")).unwrap();
         index.write().unwrap();
-        let err = cmd_rebase(&dir, &m1.to_string(), None, None, false, false).unwrap_err();
+        let err = cmd_rebase(&dir, &m1.to_string(), None, None, None, false, false).unwrap_err();
         assert!(err.contains("staged changes"), "{err}");
         assert!(err.contains("notes"), "{err}");
         // Nothing moved: branch tip and the staged bytes are untouched.
@@ -5997,6 +6120,54 @@ mod tests {
     }
 
     #[test]
+    fn autosquash_markers_respect_the_from_bound() {
+        // Three-arg transplant: from..HEAD replays onto `onto`; the stale
+        // commit below `from` must not come along, and the fold still fires.
+        let dir = tmp("autosq-from");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a.txt", "a\n")], "base");
+        let stale = commit(
+            &repo,
+            &[base],
+            &[("a.txt", "a\n"), ("s.txt", "s\n")],
+            "stale",
+        );
+        let c1 = commit(
+            &repo,
+            &[stale],
+            &[("a.txt", "a\n"), ("s.txt", "s\n"), ("b.txt", "one\n")],
+            "add b",
+        );
+        let c2 = commit(
+            &repo,
+            &[c1],
+            &[("a.txt", "a\n"), ("s.txt", "s\n"), ("b.txt", "one\ntwo\n")],
+            "fixup! add b",
+        );
+        on_branch(&repo, "topic", c2);
+
+        let out = cmd_rebase(
+            &dir,
+            &base.to_string(),
+            Some(&stale.to_string()),
+            None,
+            Some(Autosquash::Markers),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary().unwrap(), "add b");
+        assert_eq!(head.parent(0).unwrap().summary().unwrap(), "base");
+        assert_eq!(read(&repo, "b.txt"), "one\ntwo\n");
+        assert!(
+            !repo.workdir().unwrap().join("s.txt").exists(),
+            "the below-from commit must not be replayed"
+        );
+    }
+
+    #[test]
     fn autosquash_sparse_plan_folds_without_listing_every_commit() {
         let dir = tmp("autosquash");
         let (repo, base, c1, _c2, c3) = fixup_fixture(&dir);
@@ -6005,6 +6176,7 @@ mod tests {
         let out = cmd_rebase(
             &dir,
             &base.to_string(),
+            None,
             None,
             Some(Autosquash::Directives(vec![(
                 c3.to_string(),
@@ -6040,6 +6212,7 @@ mod tests {
         let err = cmd_rebase(
             &dir,
             &base.to_string(),
+            None,
             None,
             Some(Autosquash::Directives(vec![
                 (c3.to_string(), c2.to_string(), "fixup".to_string()),
@@ -6083,6 +6256,7 @@ mod tests {
         let out = cmd_rebase(
             &dir,
             &base.to_string(),
+            None,
             None,
             Some(Autosquash::Markers),
             false,
@@ -6128,6 +6302,7 @@ mod tests {
             &dir,
             &base.to_string(),
             None,
+            None,
             Some(Autosquash::Markers),
             false,
             false,
@@ -6164,6 +6339,7 @@ mod tests {
         let out = cmd_rebase(
             &dir,
             &base.to_string(),
+            None,
             None,
             Some(Autosquash::Markers),
             false,
@@ -6210,6 +6386,7 @@ mod tests {
         let out = cmd_rebase(
             &dir,
             &base.to_string(),
+            None,
             None,
             Some(Autosquash::Markers),
             false,
@@ -6262,6 +6439,7 @@ mod tests {
             &dir,
             &base.to_string(),
             None,
+            None,
             Some(Autosquash::Markers),
             false,
             false,
@@ -6293,18 +6471,19 @@ mod tests {
 
         // A bare replay leaves the marker unfolded — the result must say so
         // and name the argument that folds it (rehearse and real run alike).
-        let pre = cmd_rebase(&dir, &base.to_string(), None, None, true, false).unwrap();
+        let pre = cmd_rebase(&dir, &base.to_string(), None, None, None, true, false).unwrap();
         assert!(
             pre.contains("1 fixup!/squash! commit(s) replayed as-is"),
             "{pre}"
         );
         assert!(pre.contains("autosquash:true"), "{pre}");
-        let out = cmd_rebase(&dir, &base.to_string(), None, None, false, false).unwrap();
+        let out = cmd_rebase(&dir, &base.to_string(), None, None, None, false, false).unwrap();
         assert!(out.contains("autosquash:true"), "{out}");
         // The autosquash run itself must NOT carry the note.
         let out = cmd_rebase(
             &dir,
             &base.to_string(),
+            None,
             None,
             Some(Autosquash::Markers),
             false,
@@ -6325,6 +6504,7 @@ mod tests {
         let err = cmd_rebase(
             &dir,
             &base.to_string(),
+            None,
             None,
             Some(Autosquash::Directives(vec![])),
             false,
@@ -6351,6 +6531,7 @@ mod tests {
         let out = cmd_rebase(
             &dir,
             &base.to_string(),
+            None,
             None,
             Some(Autosquash::Markers),
             false,
@@ -6393,6 +6574,7 @@ mod tests {
             &dir,
             &base.to_string(),
             None,
+            None,
             Some(Autosquash::Markers),
             false,
             false,
@@ -6413,6 +6595,7 @@ mod tests {
             &dir,
             &base.to_string(),
             None,
+            None,
             Some(Autosquash::Markers),
             false,
             false,
@@ -6432,6 +6615,7 @@ mod tests {
         let err = cmd_rebase(
             &dir,
             &base.to_string(),
+            None,
             None,
             Some(Autosquash::Markers),
             false,

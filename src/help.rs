@@ -180,9 +180,11 @@ the find-the-commit half for a fixup/edit plan; `since` scopes to your commits,
 `worktree` maps each UNCOMMITTED hunk to the commit that owns it (omit path to
 sweep the whole tree; group_by: "commit" buckets the hunks per owner — feed
 into git_fixup, or let git_absorb fold them all).
-  git_rebase {onto, plan?}  plan = [{commit, action, message?, message_edits?,
+  git_rebase {onto, from?, plan?}  plan = [{commit, action, message?, message_edits?,
     into?}], action = pick|reword|squash|fixup|edit|split|drop; list order is the
-    new commit order. Omit plan to replay all of onto..HEAD. rehearse:true
+    new commit order. Omit plan to replay all of onto..HEAD; from (git's
+    <upstream> in three-arg --onto) bounds the replay to from..HEAD instead —
+    the stacked-branch transplant. rehearse:true
     previews the result (and whether it is a pure reorder/fold) without applying;
     it lists EVERY step that would conflict — each with the commit that last
     reshaped those lines (usually the right fold target) — not just the first.

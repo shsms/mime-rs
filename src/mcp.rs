@@ -254,6 +254,7 @@ fn alias_table(tool: &str) -> &'static [(&'static str, &'static str)] {
         ],
         "insert_text" => &[("location", "pos"), ("position", "pos"), ("at", "pos")],
         "read_region" => &[("from", "start"), ("to", "end")],
+        "git_rebase" => &[("upstream", "from")],
         _ => &[],
     }
 }
@@ -2886,14 +2887,22 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
     }
     let repo = repo_path(args)?;
     match name {
-        "git_rebase" => seq::cmd_rebase(
-            &repo,
-            &str_arg(args, "onto")?,
-            plan_arg(args)?,
-            autosquash_arg(args)?,
-            bool_arg(args, "rehearse"),
-            bool_arg(args, "reapply_cherry_picks"),
-        ),
+        "git_rebase" => {
+            // A non-string `from` must not silently degrade to the two-arg
+            // onto..HEAD replay — that rewrites a different range.
+            if args.get("from").is_some_and(|v| !v.is_string()) {
+                return Err("git_rebase: `from` must be a string revspec".to_string());
+            }
+            seq::cmd_rebase(
+                &repo,
+                &str_arg(args, "onto")?,
+                args.get("from").and_then(Value::as_str),
+                plan_arg(args)?,
+                autosquash_arg(args)?,
+                bool_arg(args, "rehearse"),
+                bool_arg(args, "reapply_cherry_picks"),
+            )
+        }
         "git_fixup" => {
             let paths = opt_str_list(args, "paths");
             let hunks = hunk_sels_arg(args, "hunks");
@@ -3023,6 +3032,7 @@ fn git_tool_schemas() -> Vec<Value> {
                 "properties": {
                     "repo": repo,
                     "onto": { "type": "string", "description": "The new base — oid/ref/revspec the commits are replayed onto." },
+                    "from": { "type": "string", "description": "Three-arg --onto (git's <upstream>): replay only from..HEAD onto `onto`, so a stacked branch transplants its own commits without hand-dropping the ones already in the new base. Defaults to `onto`. Bounds the plan-less and autosquash enumeration; not combinable with an explicit `plan` (which already lists its commits)." },
                     "autosquash": {
                         "type": ["array", "boolean"],
                         "description": "Sparse autosquash: instead of a full `plan`, list only the relocations. Each {commit, into, action?} moves `commit` to sit right after `into` as a fixup (action: fixup|squash, default fixup); every other commit in onto..HEAD is picked unchanged in order. No need to transcribe untouched commits. OR pass `true` to derive the relocations from commit subjects (git's --autosquash): each fixup!/squash! commit folds into the nearest earlier commit its subject names (subject copy, prefix, or sha; chained fixup-of-fixup markers flatten to the root target, stacking in commit order). A marker whose target can't be found is an ERROR naming it — not a silent no-fold; amend! markers are rejected. rehearse:true previews the derived plan.",

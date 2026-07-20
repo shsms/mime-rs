@@ -1,4 +1,7 @@
 //! mime-rs — a scriptable, transactional editing engine for AI agents.
+// The MCP tool schemas are one large `json!` literal each; git_rebase's
+// outgrew serde_json's default macro recursion depth.
+#![recursion_limit = "192"]
 //!
 //! M0 vertical slice: an in-memory [`Buffer`] (the `TextStore` oracle that
 //! `Quire` — the piece-tree-over-mmap store — will later replace behind the same
