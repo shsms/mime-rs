@@ -109,7 +109,8 @@ mime repl --file ./in.txt
 # Dry-run a program: see the diff it would make, change nothing
 mime rehearse prog.tl --file ./in.txt
 
-# Step a script form by form in a terminal UI (build with `--features tui`)
+# Step a script form by form in a terminal UI (build with `--features tui`).
+# SPACE steps, p auto-plays ([/] speed), b steps back, r restarts.
 mime tui prog.tl --file ./in.txt
 ```
 
@@ -211,7 +212,8 @@ stamps a `refs/mime-backup/<branch>` ref so the pre-op state is recoverable.
   front ends — one-shot/REPL, stdio MCP, MCP over Streamable HTTP, and a
   long-lived unix-socket daemon. The two MCP transports share one dispatch core.
   An optional fifth front end, `tui.rs` (behind the `tui` feature), steps a
-  script form by form in a terminal UI.
+  script form by form in a terminal UI, with playback controls (auto-play,
+  step back, restart).
 
 ## Building & testing
 

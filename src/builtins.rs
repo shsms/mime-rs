@@ -785,7 +785,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             // Keeps the buffer's (possibly uniquified) name, drops the old
             // content's markers/narrowing, and resets the modified baseline —
             // see `engine::revert_in_place`, shared with auto-revert.
-            crate::engine::revert_in_place(&mut s.borrow_mut()).map_err(|e| err(&e))?;
+            let mut sess = s.borrow_mut();
+            crate::engine::revert_in_place(&mut sess).map_err(|e| err(&e))?;
+            sess.disk_io = true;
             Ok(true)
         });
     }
@@ -2664,6 +2666,7 @@ fn find_file_buffer(s: &SharedSession, path: &str, select: bool) -> Result<Strin
     }
     let mut store: Box<dyn crate::store::TextStore> =
         Box::new(crate::Quire::open(p).map_err(|e| err(&format!("find-file {path}: {e}")))?);
+    sess.disk_io = true;
     let unique = sess.unique_buffer_name(store.name());
     if unique != store.name() {
         store.set_name(&unique);
@@ -2976,7 +2979,9 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
                 let text = std::fs::read_to_string(&path)
                     .map_err(|e| err(&format!("insert-file-contents {path}: {e}")))?;
                 let n = text.chars().count() as i64;
-                s.borrow_mut().buffer.insert(&text);
+                let mut sess = s.borrow_mut();
+                sess.disk_io = true;
+                sess.buffer.insert(&text);
                 Ok(n)
             },
         );
@@ -3024,8 +3029,10 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
             // trip against this very write and force a needless re-open. Writing
             // elsewhere left visiting — and the stamp — untouched. Best-effort:
             // a failed re-stamp just leaves the guard conservatively armed.
+            let mut sess = s.borrow_mut();
+            sess.disk_io = true;
             if own_file {
-                let _ = s.borrow_mut().buffer.rebase_to_file(p);
+                let _ = sess.buffer.rebase_to_file(p);
             }
             Ok(written as i64)
         });
@@ -3044,11 +3051,13 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
                 };
                 crate::safety::write_atomic(std::path::Path::new(&path), text.as_bytes())
                     .map_err(|e| err(&format!("write-region {path}: {e}")))?;
+                s.borrow_mut().disk_io = true;
                 Ok(text.len() as i64)
             },
         );
     }
     {
+        let s = session.clone();
         // (directory-files DIR) — the entry names in DIR (names only, not full
         // paths, like Emacs), sorted. IO errors propagate as a tulisp Error.
         ctx.defun(
@@ -3062,6 +3071,7 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
                     names.push(entry.file_name().to_string_lossy().into_owned());
                 }
                 names.sort();
+                s.borrow_mut().disk_io = true;
                 Ok(names)
             },
         );

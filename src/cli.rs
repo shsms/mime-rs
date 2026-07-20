@@ -77,9 +77,10 @@ pub fn run() {
     }
 }
 
-/// `mime tui PROG.tl --file F [--write]` — the script stepper (Phase 0 of the
-/// TUI cockpit): watch the program land form by form. Behind the `tui`
-/// feature so the default build stays lean.
+/// `mime tui PROG.tl --file F [--write]` — the script stepper (Phases 0–1 of
+/// the TUI cockpit): watch the program land form by form, with playback
+/// controls (auto-play, step back, restart, write-on-finish). Behind the
+/// `tui` feature so the default build stays lean.
 fn run_tui(args: &Args) {
     let (Some(prog), Some(file)) = (args.prog_path.as_deref(), args.file.as_deref()) else {
         eprintln!("usage: mime tui PROG.tl --file FILE [--write]");

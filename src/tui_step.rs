@@ -145,6 +145,13 @@ pub struct StepOutcome {
 /// one `mime run` — only the pacing differs.
 pub struct Stepper {
     ws: Workspace,
+    /// The pre-run store, for restart/step-back replays — `TextStore::snapshot`
+    /// is O(log n) for Quire, a full clone for the in-memory Buffer.
+    origin: Box<dyn crate::TextStore>,
+    /// The name of the buffer the stepper was opened over. The `w` write-back
+    /// persists THIS buffer, not whichever buffer the last form left current.
+    primary: String,
+    prog_args: Vec<(String, String)>,
     pub forms: Vec<Form>,
     pub next: usize,
     /// Point after the last step (1 before any step ran).
@@ -164,15 +171,71 @@ impl Stepper {
         if forms.is_empty() {
             return Err("the script has no top-level forms".to_string());
         }
+        let origin = store.snapshot();
         let ws = Workspace::new_trusted(store);
-        ws.set_program_args(prog_args);
+        ws.set_program_args(prog_args.clone());
+        let primary = ws.buffer_name();
         Ok(Stepper {
             ws,
+            origin,
+            primary,
+            prog_args,
             forms,
             next: 0,
             point: 1,
             last: None,
         })
+    }
+
+    /// `Some(reason)` when replay (restart / step-back) is refused: an
+    /// executed form already touched the filesystem, so re-running the
+    /// script would read or write files whose content has moved on — the
+    /// replay would not be faithful.
+    pub fn replay_blocked(&self) -> Option<&'static str> {
+        self.ws.did_disk_io().then_some(
+            "a form did file I/O (find-file / write-file …) — a replay would \
+             re-run it against changed files; quit and rerun instead",
+        )
+    }
+
+    /// Back to before the first form: a fresh workspace over the origin
+    /// snapshot, so interpreter state (defuns, variables) resets along with
+    /// the buffer. Refused after any form touched the filesystem — see
+    /// [`Stepper::replay_blocked`].
+    pub fn restart(&mut self) -> Result<(), &'static str> {
+        if let Some(reason) = self.replay_blocked() {
+            return Err(reason);
+        }
+        self.reset();
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.ws = Workspace::new_trusted(self.origin.snapshot());
+        self.ws.set_program_args(self.prog_args.clone());
+        self.next = 0;
+        self.point = 1;
+        self.last = None;
+    }
+
+    /// Rewind one form by replaying from the origin. Replay — not a buffer
+    /// snapshot — because only re-evaluation rewinds interpreter state too;
+    /// scripts are small, so O(n) per rewind is fine. `Ok(false)` at step 0;
+    /// `Err` after any form touched the filesystem — see
+    /// [`Stepper::replay_blocked`].
+    pub fn step_back(&mut self) -> Result<bool, &'static str> {
+        if self.next == 0 {
+            return Ok(false);
+        }
+        if let Some(reason) = self.replay_blocked() {
+            return Err(reason);
+        }
+        let target = self.next - 1;
+        self.reset();
+        for _ in 0..target {
+            self.step();
+        }
+        Ok(true)
     }
 
     pub fn finished(&self) -> bool {
@@ -182,6 +245,30 @@ impl Stepper {
     /// The buffer's current text (for the viewport pane).
     pub fn text(&self) -> String {
         self.ws.text()
+    }
+
+    /// The PRIMARY buffer's text — what a write-back must persist. Falls
+    /// back to the current buffer if the script killed the primary.
+    pub fn primary_text(&self) -> String {
+        self.ws
+            .text_of(&self.primary)
+            .unwrap_or_else(|| self.ws.text())
+    }
+
+    /// One line of workspace state for the status bar: buffer name, content
+    /// version, and the modified/narrowed/stale flags.
+    pub fn status_line(&self) -> String {
+        let mut s = format!("{} v{}", self.ws.buffer_name(), self.ws.version());
+        if self.ws.is_modified() {
+            s.push_str(" [modified]");
+        }
+        if self.ws.is_narrowed() {
+            s.push_str(" [narrowed]");
+        }
+        if self.ws.is_stale() {
+            s.push_str(" [STALE: file changed on disk]");
+        }
+        s
     }
 
     /// Evaluate the next form; `None` when the script is finished. A failed
@@ -283,6 +370,94 @@ mod tests {
         assert_eq!(out.reports, vec![("len".to_string(), "12".to_string())]);
         assert!(s.finished());
         assert!(s.step().is_none());
+    }
+
+    #[test]
+    fn step_back_replays_and_rewinds_interpreter_state() {
+        let store = Box::new(Buffer::from_string("t", "seed\n"));
+        // Form 2 both edits the buffer AND rebinds `x` — a buffer snapshot
+        // would rewind only the text; the replay must rewind both.
+        let src = "(setq x 1)\n(progn (setq x 2) (insert \"two\\n\"))\n(report \"x\" x)";
+        let mut s = Stepper::new(store, src, Vec::new()).unwrap();
+        s.step();
+        s.step();
+        assert_eq!(s.text(), "two\nseed\n");
+
+        assert!(s.step_back().unwrap(), "rewound to before form 2");
+        assert_eq!(s.next, 1);
+        assert_eq!(s.text(), "seed\n", "the edit is gone");
+        // Stepping forward again re-runs form 2 and form 3 sees x = 2 — not a
+        // stale 2-from-the-first-pass, but the replayed binding.
+        s.step();
+        let out = s.step().unwrap();
+        assert_eq!(out.reports, vec![("x".to_string(), "2".to_string())]);
+        assert!(s.finished());
+    }
+
+    #[test]
+    fn restart_resets_buffer_point_and_bindings() {
+        let store = Box::new(Buffer::from_string("t", "seed\n"));
+        let src = "(defvar y 7)\n(progn (goto-char (point-max)) (insert \"more\\n\"))";
+        let mut s = Stepper::new(store, src, Vec::new()).unwrap();
+        while s.step().is_some() {}
+        assert_eq!(s.text(), "seed\nmore\n");
+
+        s.restart().unwrap();
+        assert_eq!(s.next, 0);
+        assert_eq!(s.point, 1);
+        assert!(s.last.is_none());
+        assert_eq!(s.text(), "seed\n");
+        // The interpreter is fresh too: `y` is unbound until form 1 re-runs.
+        let out = s.step().unwrap();
+        assert!(out.error.is_none(), "{:?}", out.error);
+    }
+
+    #[test]
+    fn step_back_at_the_start_is_a_no_op() {
+        let store = Box::new(Buffer::from_string("t", "x"));
+        let mut s = Stepper::new(store, "(point)", Vec::new()).unwrap();
+        assert!(!s.step_back().unwrap());
+        assert_eq!(s.next, 0);
+    }
+
+    #[test]
+    fn replay_is_refused_after_a_form_does_file_io() {
+        let dir = std::env::temp_dir().join(format!("mime-tui-io-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out.txt");
+        let src = format!(
+            "(insert \"x\")\n(write-file \"{}\")\n(point)",
+            out.display()
+        );
+        let store = Box::new(Buffer::from_string("t", "seed\n"));
+        let mut s = Stepper::new(store, &src, Vec::new()).unwrap();
+
+        s.step();
+        assert!(s.replay_blocked().is_none(), "no I/O yet — replay allowed");
+        assert!(s.step_back().unwrap());
+        s.step();
+        s.step(); // write-file — the point of no replay
+        assert!(std::fs::read_to_string(&out).unwrap().contains('x'));
+        assert!(s.step_back().unwrap_err().contains("file I/O"));
+        assert!(s.restart().unwrap_err().contains("file I/O"));
+        // Stepping forward still works.
+        assert!(s.step().is_some());
+        assert!(s.finished());
+    }
+
+    #[test]
+    fn write_back_uses_the_primary_buffer() {
+        let store = Box::new(Buffer::from_string("main", "primary\n"));
+        let src = "(set-buffer (generate-new-buffer \"scratch\"))\n(insert \"scratch stuff\")";
+        let mut s = Stepper::new(store, src, Vec::new()).unwrap();
+        while s.step().is_some() {}
+        assert_eq!(
+            s.text(),
+            "scratch stuff",
+            "viewport follows the current buffer"
+        );
+        assert_eq!(s.primary_text(), "primary\n", "the write-back must not");
     }
 
     #[test]

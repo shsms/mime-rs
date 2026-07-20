@@ -66,6 +66,12 @@ pub struct Session {
     /// extension detection. A `Vec` + linear scan, like `inactive`: buffer
     /// counts are tiny.
     pub lang_overrides: Vec<(String, crate::syntax::Lang)>,
+    /// Whether any program in this session has touched the filesystem
+    /// (find-file, insert-file-contents, write-file, write-region,
+    /// revert-buffer). Replay-style consumers (the tui stepper) consult it:
+    /// re-running such forms reads or writes files whose content has moved
+    /// on, so a replay would not be faithful.
+    pub disk_io: bool,
     /// The persistent tree-sitter parse: the last `Syntax` the `treesit-*`
     /// builtins built, keyed by (language, store content version). The
     /// version is globally unique per text state (see `TextStore::version`),
@@ -306,6 +312,7 @@ impl Workspace {
             log: Vec::new(),
             args: Vec::new(),
             lang_overrides: Vec::new(),
+            disk_io: false,
             syntax_cache: None,
             synced_version,
         }));
@@ -736,6 +743,12 @@ impl Workspace {
         s.buffer.version() != s.synced_version
     }
 
+    /// The current buffer's content version ("equal versions imply equal
+    /// text") — a cheap change indicator for status displays.
+    pub fn version(&self) -> u64 {
+        self.session.borrow().buffer.version()
+    }
+
     /// Whether any user checkpoint exists — lets `session_status` skip the
     /// label cloning for the common no-checkpoints case.
     pub fn has_checkpoints(&self) -> bool {
@@ -769,6 +782,25 @@ impl Workspace {
     /// The current buffer text — used by the daemon's `save` op.
     pub fn text(&self) -> String {
         self.session.borrow().buffer.text().to_string()
+    }
+
+    /// The text of the buffer named `name` — the current one or an inactive
+    /// one; `None` when no buffer has that name (e.g. it was killed).
+    pub fn text_of(&self, name: &str) -> Option<String> {
+        let s = self.session.borrow();
+        if s.buffer.name() == name {
+            return Some(s.buffer.text().to_string());
+        }
+        s.inactive
+            .iter()
+            .find(|b| b.name() == name)
+            .map(|b| b.text().to_string())
+    }
+
+    /// Whether any program in this workspace has touched the filesystem —
+    /// see [`Session::disk_io`].
+    pub fn did_disk_io(&self) -> bool {
+        self.session.borrow().disk_io
     }
 
     /// Persist the buffer to `path` atomically (temp file + rename), then re-base

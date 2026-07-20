@@ -12,11 +12,12 @@ MIME_ROOTS ?= $(abspath ..)
 build:
 	cargo build --release
 
-# The same gate CI runs.
+# The same gate CI runs. --features tui so the feature-gated front end
+# compiles under the gate too, not only on a manual build.
 test:
 	cargo fmt --check
-	cargo clippy --all-targets -- -D warnings
-	cargo test
+	cargo clippy --all-targets --features tui -- -D warnings
+	cargo test --features tui
 
 install:
 	cargo install --path .

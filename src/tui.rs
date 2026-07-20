@@ -1,11 +1,16 @@
-//! `mime tui SCRIPT.tl --file F` — the Phase-0 script stepper: watch a tulisp
-//! script land form by form. Three panes over a [`crate::tui_step::Stepper`]:
-//! the buffer viewport (around point), the program (top-level forms, next one
-//! highlighted), and the last step's report (diff + reports/log, or the
-//! error). SPACE/n = eval the next form, q = quit — discarding unless
-//! `--write` was given AND the script ran to completion.
+//! `mime tui SCRIPT.tl --file F` — the script stepper: watch a tulisp script
+//! land form by form. Three panes over a [`crate::tui_step::Stepper`] — the
+//! buffer viewport (around point), the program (top-level forms, next one
+//! highlighted), the last step's report (diff + reports/log, or the error) —
+//! plus a status bar. Playback: SPACE/n = one form, p = auto-play (\[/\] =
+//! slower/faster), b = back one form, r = restart, f = run to the end —
+//! b/r are refused once a form has done file I/O (a replay would re-run it
+//! against changed files). Quitting: w = write the finished PRIMARY buffer
+//! (the one the tui opened) and quit; q = quit discarding (unless `--write`
+//! was given AND the script ran to completion).
 
 use std::io::Write as _;
+use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -35,11 +40,13 @@ pub fn run(
         ratatui::try_init().map_err(|e| format!("cannot set up the terminal: {e}"))?;
     let run = ui_loop(&mut terminal, &mut stepper);
     ratatui::restore();
-    run?;
+    let quit = run?;
 
-    if write_back {
+    if write_back || quit == Quit::Write {
         if stepper.finished() {
-            let text = stepper.text();
+            // The PRIMARY buffer — a script ending on another buffer must
+            // not clobber `file` with that buffer's content.
+            let text = stepper.primary_text();
             crate::safety::write_atomic(&path, text.as_bytes())
                 .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
             println!("wrote {} ({} bytes)", path.display(), text.len());
@@ -51,23 +58,89 @@ pub fn run(
             );
         }
     } else {
-        println!("discarded (pass --write to persist a completed run)");
+        println!("discarded (pass --write, or press w after a completed run, to persist)");
     }
     let _ = std::io::stdout().flush();
     Ok(())
 }
 
-fn ui_loop(terminal: &mut ratatui::DefaultTerminal, stepper: &mut Stepper) -> Result<(), String> {
+/// How the user left the UI: `w` asks for the buffer to be written (the
+/// interactive counterpart of `--write`), `q`/Esc discards.
+#[derive(PartialEq)]
+enum Quit {
+    Write,
+    Discard,
+}
+
+/// Auto-play state: whether the script is playing, the delay per form, and
+/// a transient notice (a refused replay) shown in the status bar until the
+/// next action.
+struct Playback {
+    playing: bool,
+    delay: Duration,
+    notice: Option<&'static str>,
+}
+
+const MIN_DELAY: Duration = Duration::from_millis(25);
+const MAX_DELAY: Duration = Duration::from_millis(4000);
+
+fn ui_loop(terminal: &mut ratatui::DefaultTerminal, stepper: &mut Stepper) -> Result<Quit, String> {
+    let mut pb = Playback {
+        playing: false,
+        delay: Duration::from_millis(500),
+        notice: None,
+    };
     loop {
+        if stepper.finished() {
+            pb.playing = false;
+        }
         terminal
-            .draw(|frame| draw(frame, stepper))
+            .draw(|frame| draw(frame, stepper, &pb))
             .map_err(|e| format!("draw failed: {e}"))?;
+        // Playing: wait at most one per-form delay for a key, then step.
+        // Paused: block until a key arrives (poll with a long timeout, so a
+        // resize still redraws).
+        let timeout = if pb.playing {
+            pb.delay
+        } else {
+            Duration::from_secs(3600)
+        };
+        if !event::poll(timeout).map_err(|e| format!("input failed: {e}"))? {
+            if pb.playing {
+                stepper.step();
+            }
+            continue;
+        }
         match event::read().map_err(|e| format!("input failed: {e}"))? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(Quit::Discard),
+                // Write-and-quit — only a COMPLETED run may write (the same
+                // rule as --write); ignored mid-script.
+                KeyCode::Char('w') if stepper.finished() => return Ok(Quit::Write),
                 KeyCode::Char(' ') | KeyCode::Char('n') | KeyCode::Enter => {
+                    pb.playing = false;
+                    pb.notice = None;
                     stepper.step();
                 }
+                KeyCode::Char('p') => {
+                    pb.playing = !pb.playing && !stepper.finished();
+                    pb.notice = None;
+                }
+                KeyCode::Char('b') => {
+                    pb.playing = false;
+                    pb.notice = stepper.step_back().err();
+                }
+                KeyCode::Char('r') => {
+                    pb.playing = false;
+                    pb.notice = stepper.restart().err();
+                }
+                KeyCode::Char('f') => {
+                    pb.playing = false;
+                    pb.notice = None;
+                    while stepper.step().is_some() {}
+                }
+                KeyCode::Char(']') => pb.delay = (pb.delay / 2).max(MIN_DELAY),
+                KeyCode::Char('[') => pb.delay = (pb.delay * 2).min(MAX_DELAY),
                 _ => {}
             },
             _ => {}
@@ -75,11 +148,15 @@ fn ui_loop(terminal: &mut ratatui::DefaultTerminal, stepper: &mut Stepper) -> Re
     }
 }
 
-fn draw(frame: &mut ratatui::Frame, stepper: &Stepper) {
+fn draw(frame: &mut ratatui::Frame, stepper: &Stepper, pb: &Playback) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .split(frame.area());
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(frame.area());
+        .split(rows[0]);
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
@@ -88,6 +165,51 @@ fn draw(frame: &mut ratatui::Frame, stepper: &Stepper) {
     draw_buffer(frame, cols[0], stepper);
     draw_program(frame, right[0], stepper);
     draw_report(frame, right[1], stepper);
+    draw_status(frame, rows[1], stepper, pb);
+}
+
+/// The status bar: workspace state + playback state, and the key map.
+fn draw_status(frame: &mut ratatui::Frame, area: Rect, stepper: &Stepper, pb: &Playback) {
+    let play = if pb.playing {
+        format!("▶ playing {}ms/form", pb.delay.as_millis())
+    } else if stepper.finished() {
+        "■ finished".to_string()
+    } else {
+        format!("‖ paused {}ms/form", pb.delay.as_millis())
+    };
+    let status = format!(
+        " {} — point {} — step {}/{} — {}",
+        stepper.status_line(),
+        stepper.point,
+        stepper.next,
+        stepper.forms.len(),
+        play,
+    );
+    let keys = if stepper.finished() {
+        " w write+quit · b back · r restart · q discard"
+    } else {
+        " SPACE step · p play/pause · [/] speed · b back · r restart · f finish · q quit"
+    };
+    // A refused action replaces the key hints until the next action — the
+    // same line, so the layout never jumps.
+    let second = match pb.notice {
+        Some(n) => Line::from(Span::styled(
+            format!(" ⚠ {n}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        None => Line::from(Span::styled(
+            keys,
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            status,
+            Style::default().add_modifier(Modifier::REVERSED),
+        )),
+        second,
+    ];
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// The buffer viewport: the lines around point, the point line highlighted.
@@ -166,7 +288,7 @@ fn draw_program(frame: &mut ratatui::Frame, area: Rect, stepper: &Stepper) {
         })
         .collect();
     let title = if stepper.finished() {
-        " program — finished (q to quit) "
+        " program — finished (w to write, q to discard) "
     } else {
         " program — SPACE to eval the next form "
     };
