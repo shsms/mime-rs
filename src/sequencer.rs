@@ -799,15 +799,41 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
     // refuses that, so we do too.
     let onto_tree = repo.find_commit(plan.onto)?.tree()?;
     let mut uopts = git2::StatusOptions::new();
-    uopts.include_untracked(true).include_ignored(false);
+    uopts
+        .include_untracked(true)
+        // Recurse so a fully-untracked directory yields per-file entries —
+        // a bare `dir/` entry cannot be resolved against the tree (bypath
+        // needs a full path), so only recursion lets the checks below see
+        // and NAME each colliding file.
+        .recurse_untracked_dirs(true)
+        .include_ignored(false);
     for e in repo.statuses(Some(&mut uopts))?.iter() {
         if e.status().contains(git2::Status::WT_NEW)
             && let Some(p) = e.path()
-            && onto_tree.get_path(Path::new(p)).is_ok()
         {
-            return Err(estr(&format!(
-                "untracked file {p} would be overwritten by the checkout — move or remove it first"
-            )));
+            if onto_tree.get_path(Path::new(p)).is_ok() {
+                return Err(estr(&format!(
+                    "untracked file {p} would be overwritten by the checkout — move or remove it first"
+                )));
+            }
+            // A FILE in onto where the untracked path needs a directory:
+            // the checkout would delete the whole untracked directory to
+            // write the file. get_path cannot descend through a blob, so
+            // check each proper ancestor explicitly.
+            let mut anc = Path::new(p).parent();
+            while let Some(a) = anc {
+                if !a.as_os_str().is_empty()
+                    && let Ok(entry) = onto_tree.get_path(a)
+                    && entry.kind() != Some(git2::ObjectType::Tree)
+                {
+                    return Err(estr(&format!(
+                        "untracked file {p} would be deleted by the checkout ({} is a \
+                         file in the target tree) — move or remove it first",
+                        a.display()
+                    )));
+                }
+                anc = a.parent();
+            }
         }
     }
     let head = repo.head()?;
@@ -6883,6 +6909,97 @@ mod tests {
         );
         assert_eq!(
             read(&repo, "u"),
+            "my untracked work\n",
+            "untracked file untouched"
+        );
+    }
+
+    #[test]
+    fn start_refuses_when_an_untracked_dir_file_would_be_overwritten() {
+        let dir = tmp("untracked-dir");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "2\n")], "f1");
+        // `onto` introduces `d/u`; the worktree has a fully-untracked
+        // directory `d` containing `u`. Statuses without recursion reports
+        // only `d/`, which matches no tree path — the guard must still see
+        // the file inside.
+        let sub = {
+            let blob = repo.blob(b"from onto\n").unwrap();
+            let mut tb = repo.treebuilder(None).unwrap();
+            tb.insert("u", blob, 0o100644).unwrap();
+            tb.write().unwrap()
+        };
+        let m1 = {
+            let a = repo.blob(b"1\n").unwrap();
+            let mut tb = repo.treebuilder(None).unwrap();
+            tb.insert("a", a, 0o100644).unwrap();
+            tb.insert("d", sub, 0o040000).unwrap();
+            let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+            let sig = Signature::now("test", "test@example.invalid").unwrap();
+            let parent = repo.find_commit(base).unwrap();
+            repo.commit(None, &sig, &sig, "adds d/u", &tree, &[&parent])
+                .unwrap()
+        };
+        on_branch(&repo, "topic", f1);
+        std::fs::create_dir(dir.join("d")).unwrap();
+        std::fs::write(dir.join("d").join("u"), "my untracked work\n").unwrap();
+        let err = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Pick, None)],
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.message()
+                .contains("untracked file d/u would be overwritten"),
+            "{}",
+            err.message()
+        );
+        assert_eq!(
+            read(&repo, "d/u"),
+            "my untracked work\n",
+            "untracked file untouched"
+        );
+    }
+
+    #[test]
+    fn start_refuses_when_an_untracked_dir_collides_with_a_file_in_onto() {
+        let dir = tmp("untracked-dirblob");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "2\n")], "f1");
+        // `onto` has a FILE `d`; the worktree has a fully-untracked directory
+        // `d/` with `d/u` inside. bypath cannot descend through the blob, so
+        // only the ancestor check can catch this — the hard reset would
+        // otherwise delete the directory to write the file.
+        let m1 = commit(
+            &repo,
+            &[base],
+            &[("a", "1\n"), ("d", "a file\n")],
+            "adds file d",
+        );
+        on_branch(&repo, "topic", f1);
+        std::fs::create_dir(dir.join("d")).unwrap();
+        std::fs::write(dir.join("d").join("u"), "my untracked work\n").unwrap();
+        let err = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Pick, None)],
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.message()
+                .contains("untracked file d/u would be deleted"),
+            "{}",
+            err.message()
+        );
+        assert_eq!(
+            read(&repo, "d/u"),
             "my untracked work\n",
             "untracked file untouched"
         );
