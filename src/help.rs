@@ -200,7 +200,14 @@ into git_fixup, or let git_absorb fold them all).
     the branch's final tree is unchanged. hunks = [{path, lines:[a,b]}].
   git_rebase autosquash = [{commit, into, action?}]  sparse plan: relocate only
     the named commits (fixup/squash `commit` under `into`), auto-picking the rest
-    of onto..HEAD — no need to transcribe untouched commits.
+    of onto..HEAD — no need to transcribe untouched commits. autosquash = true
+    instead derives the relocations from fixup!/squash! commit subjects (git's
+    --autosquash; markers made by `git commit --fixup` or a teammate's branch):
+    each marker folds into the nearest earlier commit its subject names (copy,
+    prefix, or sha), chained markers flatten to the root target, stacking in
+    commit order. An unmatched marker is an error naming it, amend! is
+    rejected; a squash! meld keeps the marker subject verbatim (reword after
+    if it matters). rehearse:true previews the derived plan.
   git_fixup {target, source}  one-call fold of `source` into `target` (keeps
     target's signed message); auto-picks the rest.
   git_reword {commit, message?|message_edits?}  change ONE commit's message

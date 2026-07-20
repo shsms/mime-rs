@@ -2783,11 +2783,28 @@ fn lines_arg(args: &Value) -> Option<(usize, usize)> {
     Some((lo, hi))
 }
 
-/// Parse the `autosquash` sparse-plan argument: `[{commit, into, action?}]`
-/// (action defaults to fixup). `None` when absent, so `git_rebase` falls back to
-/// `plan`/full replay.
-fn autosquash_arg(args: &Value) -> Option<Vec<(String, String, String)>> {
-    args.get("autosquash").and_then(Value::as_array).map(|arr| {
+/// Parse the `autosquash` argument. `true` derives the plan from
+/// `fixup!`/`squash!` commit subjects (git's `--autosquash`); an array is the
+/// explicit sparse plan `[{commit, into, action?}]` (action defaults to
+/// fixup). `None` when absent or `false`, so `git_rebase` falls back to
+/// `plan`/full replay. Any other value is an ERROR — dropping it would
+/// silently replay the branch with every fixup! commit left unfolded.
+fn autosquash_arg(args: &Value) -> Result<Option<crate::sequencer::Autosquash>, String> {
+    use crate::sequencer::Autosquash;
+    let Some(v) = args.get("autosquash") else {
+        return Ok(None);
+    };
+    if let Some(flag) = v.as_bool() {
+        return Ok(flag.then_some(Autosquash::Markers));
+    }
+    let Some(arr) = v.as_array() else {
+        return Err(
+            "autosquash must be true (derive from fixup!/squash! subjects) or a \
+             [{commit, into, action?}] list"
+                .to_string(),
+        );
+    };
+    Ok(Some(Autosquash::Directives(
         arr.iter()
             .map(|d| {
                 (
@@ -2805,8 +2822,8 @@ fn autosquash_arg(args: &Value) -> Option<Vec<(String, String, String)>> {
                         .to_string(),
                 )
             })
-            .collect()
-    })
+            .collect(),
+    )))
 }
 
 /// An optional list-of-strings argument — empty when absent or not an array.
@@ -2873,7 +2890,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
             &repo,
             &str_arg(args, "onto")?,
             plan_arg(args)?,
-            autosquash_arg(args),
+            autosquash_arg(args)?,
             bool_arg(args, "rehearse"),
             bool_arg(args, "reapply_cherry_picks"),
         ),
@@ -3000,15 +3017,15 @@ fn git_tool_schemas() -> Vec<Value> {
     vec![
         json!({
             "name": "git_rebase",
-            "description": "Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`. Each step picks/rewords/squashes/fixups/edits/splits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. A `split` step partitions one commit's changes — by whole file (`paths`) or by hunk (`hunks`, a post-commit line span) — into the commits listed in `into`. The plan-less pick-all drops commits already present in `onto` by patch-id (like `git rebase`, so a stacked branch onto a rewritten base doesn't duplicate them; reported, and overridable with `reapply_cherry_picks`). Stops on a conflict for the conflict tools + git_continue. Unstaged changes to paths the plan does NOT rewrite are autostashed (parked on a backup ref, restored when the operation finishes or aborts; a file you edit again during a pause keeps your later edit, and the parked bytes stay on the ref); staged changes and changes to rewritten paths refuse, naming them. No network, hooks, or exec.",
+            "description": "Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`, or an `autosquash` fold (a sparse {commit, into} list, or `true` to fold the branch's fixup!/squash! commits into the commits their subjects name). Each plan step picks/rewords/squashes/fixups/edits/splits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. A `split` step partitions one commit's changes — by whole file (`paths`) or by hunk (`hunks`, a post-commit line span) — into the commits listed in `into`. The plan-less pick-all drops commits already present in `onto` by patch-id (like `git rebase`, so a stacked branch onto a rewritten base doesn't duplicate them; reported, and overridable with `reapply_cherry_picks`). Stops on a conflict for the conflict tools + git_continue. Unstaged changes to paths the plan does NOT rewrite are autostashed (parked on a backup ref, restored when the operation finishes or aborts; a file you edit again during a pause keeps your later edit, and the parked bytes stay on the ref); staged changes and changes to rewritten paths refuse, naming them. No network, hooks, or exec.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "repo": repo,
                     "onto": { "type": "string", "description": "The new base — oid/ref/revspec the commits are replayed onto." },
                     "autosquash": {
-                        "type": "array",
-                        "description": "Sparse autosquash: instead of a full `plan`, list only the relocations. Each {commit, into, action?} moves `commit` to sit right after `into` as a fixup (action: fixup|squash, default fixup); every other commit in onto..HEAD is picked unchanged in order. No need to transcribe untouched commits.",
+                        "type": ["array", "boolean"],
+                        "description": "Sparse autosquash: instead of a full `plan`, list only the relocations. Each {commit, into, action?} moves `commit` to sit right after `into` as a fixup (action: fixup|squash, default fixup); every other commit in onto..HEAD is picked unchanged in order. No need to transcribe untouched commits. OR pass `true` to derive the relocations from commit subjects (git's --autosquash): each fixup!/squash! commit folds into the nearest earlier commit its subject names (subject copy, prefix, or sha; chained fixup-of-fixup markers flatten to the root target, stacking in commit order). A marker whose target can't be found is an ERROR naming it — not a silent no-fold; amend! markers are rejected. rehearse:true previews the derived plan.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -3530,7 +3547,7 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
         "git_rebase" => (
             Git,
             A::destructive(),
-            "rebase the branch (or an explicit plan) onto a base",
+            "rebase the branch onto a base — full plan, sparse autosquash, or autosquash:true (fold fixup!/squash! commits)",
         ),
         "git_cherry_pick" => (Git, A::append(), "apply commits on top of the branch tip"),
         "git_revert" => (
@@ -4505,5 +4522,31 @@ mod git_tool_tests {
             .collect();
         assert!(names.contains(&"git_rebase"));
         assert!(names.contains(&"git_status"));
+    }
+
+    #[test]
+    fn autosquash_arg_accepts_bool_and_array_rejects_junk() {
+        use crate::sequencer::Autosquash;
+        assert!(matches!(autosquash_arg(&json!({})), Ok(None)));
+        assert!(matches!(
+            autosquash_arg(&json!({"autosquash": false})),
+            Ok(None)
+        ));
+        assert!(matches!(
+            autosquash_arg(&json!({"autosquash": true})),
+            Ok(Some(Autosquash::Markers))
+        ));
+        match autosquash_arg(&json!({"autosquash": [{"commit": "c", "into": "t"}]})) {
+            Ok(Some(Autosquash::Directives(d))) => {
+                assert_eq!(d, vec![("c".into(), "t".into(), "fixup".into())]);
+            }
+            other => panic!("expected directives, got {other:?}"),
+        }
+        // A mistyped value must ERROR: dropping it would silently replay the
+        // branch with every fixup! commit left unfolded.
+        for junk in [json!("true"), json!(1), json!({"commit": "c"})] {
+            let err = autosquash_arg(&json!({ "autosquash": junk })).unwrap_err();
+            assert!(err.contains("autosquash must be"), "{err}");
+        }
     }
 }

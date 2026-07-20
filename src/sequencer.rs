@@ -263,6 +263,17 @@ pub type PlanItem = (
     Vec<SplitPart>,
 );
 
+/// The `autosquash` argument to `cmd_rebase`: an explicit sparse directive
+/// list, or marker-driven derivation — git's `--autosquash` proper — from
+/// `fixup!`/`squash!` commit subjects in onto..HEAD.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Autosquash {
+    /// Explicit `[{commit, into, action}]` directives (revspecs, unresolved).
+    Directives(Vec<(String, String, String)>),
+    /// Derive the directives from `fixup!`/`squash!` subject markers.
+    Markers,
+}
+
 impl MsgEdit {
     pub fn from_spec(spec: &MsgEditSpec) -> Result<MsgEdit, String> {
         match (&spec.find, &spec.append) {
@@ -2901,6 +2912,111 @@ fn autosquash_steps(
     Ok(steps)
 }
 
+/// Split a subject into its marker action and remainder: `fixup! X` →
+/// (Fixup, "X"). ONE prefix only: a chained marker's remainder
+/// (`fixup! fixup! X` → "fixup! X") names the intermediate marker's full
+/// subject, and target resolution follows it. (git instead strips ALL
+/// prefixes and rematches — same root target when the intermediate marker
+/// exists; when it was already folded away, git guesses the base subject
+/// while this errors the marker as an orphan.) `None` for a plain subject.
+fn marker_split(subject: &str) -> Option<(Action, &str)> {
+    if let Some(rest) = subject.strip_prefix("fixup! ") {
+        Some((Action::Fixup, rest))
+    } else {
+        subject
+            .strip_prefix("squash! ")
+            .map(|rest| (Action::Squash, rest))
+    }
+}
+
+/// Derive sparse autosquash directives from `fixup!`/`squash!` subject markers
+/// in onto..HEAD — git's `--autosquash` as a plan derivation. Scans oldest-
+/// first; each marker resolves its target among the PRECEDING non-marker
+/// commits: nearest exact subject match, then nearest subject-prefix match
+/// (a hand-written marker may truncate the subject), then the remainder as a
+/// revspec (`fixup! 1a2b3c`). The exact tier matches EVERY preceding commit,
+/// markers included — a chained `fixup! fixup! X` resolves to the earlier
+/// `fixup! X` marker by full subject, never to an unrelated commit that
+/// happens to share X's subject — and a marker hit flattens to that marker's
+/// own target, so `autosquash_steps`' no-chain invariant holds. The prefix
+/// tier matches plain subjects only.
+/// Unmatched markers are an ERROR naming each orphan — git leaves them in
+/// place silently, but a silent no-fold here would read as folded. `amend!`
+/// (message-replacing fixup) is rejected rather than half-supported.
+///
+/// Directives come back newest-first: `autosquash_steps` inserts each directly
+/// after its target, so processing newest-first lands the oldest marker first
+/// and commit order — hence patch application order — survives.
+fn marker_directives(repo: &Repository, onto: Oid) -> Result<Vec<(Oid, Oid, Action)>, Error> {
+    // (oid, subject) pairs in range order — markers included — the match pool.
+    let mut pool: Vec<(Oid, String)> = Vec::new();
+    // marker oid → its resolved (non-marker) target, for chain flattening.
+    let mut target_of: std::collections::HashMap<Oid, Oid> = std::collections::HashMap::new();
+    let mut directives: Vec<(Oid, Oid, Action)> = Vec::new();
+    let mut orphans: Vec<String> = Vec::new();
+    for oid in commits_since(repo, onto)? {
+        let c = repo.find_commit(oid)?;
+        let subject = c.summary().unwrap_or("").to_string();
+        if subject.starts_with("amend! ") {
+            return Err(estr(&format!(
+                "autosquash: {} is an amend! commit — message-replacing folds \
+                 are not supported; git_reword the target and fold with an \
+                 explicit directive instead",
+                short(oid)
+            )));
+        }
+        let Some((action, rest)) = marker_split(&subject) else {
+            pool.push((oid, subject));
+            continue;
+        };
+        // Exact tier: markers included, so a chain remainder finds its
+        // intermediate marker. Prefix tier: PLAIN subjects only — every marker
+        // subject starts with "fixup!"/"squash!", so a truncated remainder
+        // ("fixup! fix") would hit the nearest marker instead of the commit it
+        // means.
+        let matched = pool
+            .iter()
+            .rev()
+            .find(|(_, s)| s == rest)
+            .or_else(|| {
+                pool.iter()
+                    .rev()
+                    .find(|(_, s)| marker_split(s).is_none() && s.starts_with(rest))
+            })
+            .map(|&(t, _)| t)
+            .or_else(|| {
+                repo.revparse_single(rest)
+                    .ok()
+                    .and_then(|o| o.peel_to_commit().ok())
+                    .map(|c| c.id())
+            });
+        let Some(mut target) = matched else {
+            orphans.push(format!("{} \"{subject}\"", short(oid)));
+            continue;
+        };
+        if let Some(&t) = target_of.get(&target) {
+            target = t;
+        }
+        target_of.insert(oid, target);
+        pool.push((oid, subject));
+        directives.push((oid, target, action));
+    }
+    if !orphans.is_empty() {
+        return Err(estr(&format!(
+            "autosquash: no target found for {} — fold with an explicit \
+             {{commit, into}} directive, or reword the marker subject",
+            orphans.join(", ")
+        )));
+    }
+    if directives.is_empty() {
+        return Err(estr(
+            "autosquash: no fixup!/squash! commits in onto..HEAD — nothing to fold",
+        ));
+    }
+    directives.reverse();
+    Ok(directives)
+}
+
 /// The rebase base for folding `source` into `target`: the parent of whichever is
 /// the ancestor. Errors if they aren't on one line of history, or the ancestor is
 /// a root commit.
@@ -4214,7 +4330,7 @@ pub fn cmd_rebase(
     repo_path: &std::path::Path,
     onto: &str,
     plan: Option<Vec<PlanItem>>,
-    autosquash: Option<Vec<(String, String, String)>>,
+    autosquash: Option<Autosquash>,
     rehearse_only: bool,
     reapply_cherry_picks: bool,
 ) -> Result<String, String> {
@@ -4223,7 +4339,18 @@ pub fn cmd_rebase(
     // Commits omitted from a plan-less pick-all because they are already present
     // in `onto` by patch-id (git's default cherry-pick detection).
     let mut dropped: Vec<Oid> = Vec::new();
-    let steps = if let Some(directives) = autosquash {
+    // A bare replay leaves fixup!/squash! commits as they are — the note below
+    // points at autosquash:true, which is usually what such a branch wants.
+    let plan_less = plan.is_none() && autosquash.is_none();
+    let steps = if let Some(Autosquash::Markers) = autosquash {
+        let derived = marker_directives(&repo, onto_oid).map_err(gerr)?;
+        autosquash_steps(&repo, onto_oid, &derived).map_err(gerr)?
+    } else if let Some(Autosquash::Directives(directives)) = autosquash {
+        // An empty list would fall through to a bare pick-all — without even
+        // the plan-less path's cherry-pick detection. Error like Markers does.
+        if directives.is_empty() {
+            return Err("autosquash: empty directive list — nothing to fold".to_string());
+        }
         let resolved = directives
             .iter()
             .map(|(commit, into, action)| {
@@ -4269,6 +4396,11 @@ pub fn cmd_rebase(
             }
         }
     };
+    let mark_note = if plan_less {
+        marker_note(&repo, &steps)
+    } else {
+        String::new()
+    };
     let plan = Plan {
         onto: onto_oid,
         steps,
@@ -4276,20 +4408,41 @@ pub fn cmd_rebase(
     let drop_note = dropped_note(&repo, onto_oid, &dropped);
     if rehearse_only {
         return Ok(format!(
-            "{}{drop_note}",
+            "{}{drop_note}{mark_note}",
             preview_text(&repo, &rehearse(&repo, &plan, Mode::Pick).map_err(gerr)?),
         ));
     }
     let note = backup_note(&repo);
     let out = start(&repo, plan).map_err(gerr)?;
     Ok(format!(
-        "{}{drop_note}{note}",
+        "{}{drop_note}{mark_note}{note}",
         outcome_with_tree_note(&repo, &out)
     ))
 }
 
 /// A report of the commits a plan-less rebase skipped as already-applied, so the
 /// drop is never silent. Empty when nothing was dropped.
+/// A note appended to a plan-less replay whose range carries fixup!/squash!
+/// marker commits: they are picked unchanged, so name the one argument that
+/// would fold them instead — the point where an agent learns it exists.
+fn marker_note(repo: &Repository, steps: &[Step]) -> String {
+    let n = steps
+        .iter()
+        .filter(|s| {
+            repo.find_commit(s.commit)
+                .ok()
+                .is_some_and(|c| marker_split(c.summary().unwrap_or("")).is_some())
+        })
+        .count();
+    if n == 0 {
+        return String::new();
+    }
+    format!(
+        "\nnote: {n} fixup!/squash! commit(s) replayed as-is — \
+         autosquash:true folds them into their targets"
+    )
+}
+
 fn dropped_note(repo: &Repository, onto: Oid, dropped: &[Oid]) -> String {
     if dropped.is_empty() {
         return String::new();
@@ -5827,7 +5980,11 @@ mod tests {
             &dir,
             &base.to_string(),
             None,
-            Some(vec![(c3.to_string(), c1.to_string(), "fixup".to_string())]),
+            Some(Autosquash::Directives(vec![(
+                c3.to_string(),
+                c1.to_string(),
+                "fixup".to_string(),
+            )])),
             false,
             false,
         )
@@ -5858,16 +6015,407 @@ mod tests {
             &dir,
             &base.to_string(),
             None,
-            Some(vec![
+            Some(Autosquash::Directives(vec![
                 (c3.to_string(), c2.to_string(), "fixup".to_string()),
                 (c2.to_string(), c1.to_string(), "fixup".to_string()),
-            ]),
+            ])),
             false,
             false,
         )
         .unwrap_err();
         assert!(err.contains("itself being folded"), "{err}");
         assert!(!state_path(&repo).exists());
+    }
+
+    /// A branch base←c1(add a)←c2(add b) ready for marker commits on top.
+    fn marker_fixture(dir: &std::path::Path) -> (Repository, Oid, Oid, Oid) {
+        let repo = Repository::init(dir).unwrap();
+        let base = commit(&repo, &[], &[("x", "0\n")], "base");
+        let c1 = commit(&repo, &[base], &[("x", "0\n"), ("a", "1\n")], "add a");
+        let c2 = commit(
+            &repo,
+            &[c1],
+            &[("x", "0\n"), ("a", "1\n"), ("b", "1\n")],
+            "add b",
+        );
+        (repo, base, c1, c2)
+    }
+
+    #[test]
+    fn autosquash_markers_derive_the_plan_from_subjects() {
+        let dir = tmp("asq-markers");
+        let (repo, base, _c1, c2) = marker_fixture(&dir);
+        let f = commit(
+            &repo,
+            &[c2],
+            &[("x", "0\n"), ("a", "2\n"), ("b", "1\n")],
+            "fixup! add a",
+        );
+        on_branch(&repo, "main", f);
+
+        // No directives: the plan derives from the fixup! subject.
+        let out = cmd_rebase(
+            &dir,
+            &base.to_string(),
+            None,
+            Some(Autosquash::Markers),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        assert_eq!(read(&repo, "a"), "2\n");
+        let tip = repo.head().unwrap().peel_to_commit().unwrap(); // c2'
+        assert_eq!(tip.message().unwrap(), "add b");
+        let c1p = tip.parent(0).unwrap();
+        // The marker message is gone (fixup keeps the target's message)...
+        assert_eq!(c1p.message().unwrap(), "add a");
+        // ...and its change landed inside the target commit.
+        let e = c1p.tree().unwrap().get_path(Path::new("a")).unwrap();
+        assert_eq!(repo.find_blob(e.id()).unwrap().content(), b"2\n");
+        assert_eq!(c1p.parent(0).unwrap().id(), base);
+        assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn autosquash_markers_stack_in_commit_order() {
+        let dir = tmp("asq-marker-order");
+        let (repo, base, _c1, c2) = marker_fixture(&dir);
+        // Two fixups of one target: f2's diff (a: 2→3) only applies AFTER
+        // f1's (a: 1→2) — a reversed stacking would conflict, not just
+        // mis-order messages.
+        let f1 = commit(
+            &repo,
+            &[c2],
+            &[("x", "0\n"), ("a", "2\n"), ("b", "1\n")],
+            "fixup! add a",
+        );
+        let f2 = commit(
+            &repo,
+            &[f1],
+            &[("x", "0\n"), ("a", "3\n"), ("b", "1\n")],
+            "fixup! add a",
+        );
+        on_branch(&repo, "main", f2);
+
+        let out = cmd_rebase(
+            &dir,
+            &base.to_string(),
+            None,
+            Some(Autosquash::Markers),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        assert_eq!(read(&repo, "a"), "3\n");
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(tip.message().unwrap(), "add b");
+        assert_eq!(tip.parent(0).unwrap().message().unwrap(), "add a");
+        assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn autosquash_markers_flatten_a_chained_fixup() {
+        let dir = tmp("asq-marker-chain");
+        let (repo, base, _c1, c2) = marker_fixture(&dir);
+        let f1 = commit(
+            &repo,
+            &[c2],
+            &[("x", "0\n"), ("a", "2\n"), ("b", "1\n")],
+            "fixup! add a",
+        );
+        // A fixup OF the fixup (git commit --fixup=<f1>): both prefixes in the
+        // subject. It flattens to c1, sitting after f1 — no chain rejection.
+        let f2 = commit(
+            &repo,
+            &[f1],
+            &[("x", "0\n"), ("a", "3\n"), ("b", "1\n")],
+            "fixup! fixup! add a",
+        );
+        on_branch(&repo, "main", f2);
+
+        let out = cmd_rebase(
+            &dir,
+            &base.to_string(),
+            None,
+            Some(Autosquash::Markers),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        assert_eq!(read(&repo, "a"), "3\n");
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(tip.message().unwrap(), "add b");
+        assert_eq!(tip.parent(0).unwrap().message().unwrap(), "add a");
+        assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn autosquash_markers_chain_beats_a_duplicate_subject() {
+        let dir = tmp("asq-marker-dup");
+        let (repo, base, _c1, c2) = marker_fixture(&dir);
+        let f1 = commit(
+            &repo,
+            &[c2],
+            &[("x", "0\n"), ("a", "2\n"), ("b", "1\n")],
+            "fixup! add a",
+        );
+        // A LATER plain commit reusing the target's subject, sitting between
+        // the chain and its root.
+        let dup = commit(
+            &repo,
+            &[f1],
+            &[("x", "0\n"), ("a", "2\n"), ("b", "1\n"), ("c", "1\n")],
+            "add a",
+        );
+        // The chained marker's remainder ("fixup! add a") names f1's FULL
+        // subject — it must fold through f1 into c1, not into the nearer
+        // duplicate. (If it folded into `dup`, c1' would keep a=2.)
+        let f2 = commit(
+            &repo,
+            &[dup],
+            &[("x", "0\n"), ("a", "3\n"), ("b", "1\n"), ("c", "1\n")],
+            "fixup! fixup! add a",
+        );
+        on_branch(&repo, "main", f2);
+
+        let out = cmd_rebase(
+            &dir,
+            &base.to_string(),
+            None,
+            Some(Autosquash::Markers),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        assert_eq!(read(&repo, "a"), "3\n");
+        let tip = repo.head().unwrap().peel_to_commit().unwrap(); // dup'
+        assert_eq!(tip.message().unwrap(), "add a");
+        let c2p = tip.parent(0).unwrap();
+        assert_eq!(c2p.message().unwrap(), "add b");
+        // Both fixes landed in c1, upstream of the duplicate.
+        let c1p = c2p.parent(0).unwrap();
+        assert_eq!(c1p.message().unwrap(), "add a");
+        let e = c1p.tree().unwrap().get_path(Path::new("a")).unwrap();
+        assert_eq!(repo.find_blob(e.id()).unwrap().content(), b"3\n");
+        assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn autosquash_marker_prefix_tier_skips_marker_subjects() {
+        let dir = tmp("asq-marker-prefix");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("x", "0\n")], "base");
+        let ca = commit(&repo, &[base], &[("x", "0\n"), ("t", "1\n")], "fix typo");
+        let cb = commit(
+            &repo,
+            &[ca],
+            &[("x", "0\n"), ("t", "1\n"), ("b", "1\n")],
+            "add b",
+        );
+        let fb = commit(
+            &repo,
+            &[cb],
+            &[("x", "0\n"), ("t", "1\n"), ("b", "2\n")],
+            "fixup! add b",
+        );
+        // Truncated remainder "fix": must prefix-match the PLAIN "fix typo",
+        // not the nearer marker subject "fixup! add b".
+        let ft = commit(
+            &repo,
+            &[fb],
+            &[("x", "0\n"), ("t", "2\n"), ("b", "2\n")],
+            "fixup! fix",
+        );
+        on_branch(&repo, "main", ft);
+
+        let out = cmd_rebase(
+            &dir,
+            &base.to_string(),
+            None,
+            Some(Autosquash::Markers),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        let tip = repo.head().unwrap().peel_to_commit().unwrap(); // cb'
+        assert_eq!(tip.message().unwrap(), "add b");
+        let cap = tip.parent(0).unwrap(); // ca'
+        assert_eq!(cap.message().unwrap(), "fix typo");
+        // The typo fix landed in "fix typo", not inside "add b"'s fold.
+        let e = cap.tree().unwrap().get_path(Path::new("t")).unwrap();
+        assert_eq!(repo.find_blob(e.id()).unwrap().content(), b"2\n");
+        assert!(tip.tree().unwrap().get_path(Path::new("b")).is_ok());
+        assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn planless_replay_notes_unfolded_marker_commits() {
+        let dir = tmp("asq-note");
+        let (repo, base, _c1, c2) = marker_fixture(&dir);
+        let f = commit(
+            &repo,
+            &[c2],
+            &[("x", "0\n"), ("a", "2\n"), ("b", "1\n")],
+            "fixup! add a",
+        );
+        on_branch(&repo, "main", f);
+
+        // A bare replay leaves the marker unfolded — the result must say so
+        // and name the argument that folds it (rehearse and real run alike).
+        let pre = cmd_rebase(&dir, &base.to_string(), None, None, true, false).unwrap();
+        assert!(
+            pre.contains("1 fixup!/squash! commit(s) replayed as-is"),
+            "{pre}"
+        );
+        assert!(pre.contains("autosquash:true"), "{pre}");
+        let out = cmd_rebase(&dir, &base.to_string(), None, None, false, false).unwrap();
+        assert!(out.contains("autosquash:true"), "{out}");
+        // The autosquash run itself must NOT carry the note.
+        let out = cmd_rebase(
+            &dir,
+            &base.to_string(),
+            None,
+            Some(Autosquash::Markers),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        assert!(!out.contains("replayed as-is"), "{out}");
+    }
+
+    #[test]
+    fn autosquash_rejects_an_empty_directive_list() {
+        let dir = tmp("asq-empty");
+        let (repo, base, _c1, c2) = marker_fixture(&dir);
+        on_branch(&repo, "main", c2);
+
+        // An empty list must not degrade to a bare pick-all.
+        let err = cmd_rebase(
+            &dir,
+            &base.to_string(),
+            None,
+            Some(Autosquash::Directives(vec![])),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("nothing to fold"), "{err}");
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), c2);
+    }
+
+    #[test]
+    fn autosquash_markers_squash_melds_and_sha_form_resolves() {
+        let dir = tmp("asq-marker-sha");
+        let (repo, base, c1, c2) = marker_fixture(&dir);
+        // squash! with a revspec remainder instead of a subject copy.
+        let s = commit(
+            &repo,
+            &[c2],
+            &[("x", "0\n"), ("a", "2\n"), ("b", "1\n")],
+            &format!("squash! {}", &c1.to_string()[..10]),
+        );
+        on_branch(&repo, "main", s);
+
+        let out = cmd_rebase(
+            &dir,
+            &base.to_string(),
+            None,
+            Some(Autosquash::Markers),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        assert_eq!(read(&repo, "a"), "2\n");
+        let c1p = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .parent(0)
+            .unwrap();
+        // squash melds the messages (marker subject kept verbatim — reword
+        // after if it matters).
+        let msg = c1p.message().unwrap().to_string();
+        assert!(msg.starts_with("add a"), "{msg}");
+        assert!(msg.contains("squash!"), "{msg}");
+        assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn autosquash_markers_reject_orphans_amend_and_empty() {
+        let dir = tmp("asq-marker-err");
+        let (repo, base, _c1, c2) = marker_fixture(&dir);
+        on_branch(&repo, "main", c2);
+        // Move the already-checked-out branch to `tip` (on_branch can't force-
+        // update the current HEAD's branch).
+        let advance = |tip: Oid| {
+            repo.reference("refs/heads/main", tip, true, "test")
+                .unwrap();
+            repo.reset(&repo.find_object(tip, None).unwrap(), ResetType::Hard, None)
+                .unwrap();
+        };
+
+        // No markers at all: an error, not a silent full replay.
+        let err = cmd_rebase(
+            &dir,
+            &base.to_string(),
+            None,
+            Some(Autosquash::Markers),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("no fixup!/squash! commits"), "{err}");
+
+        // A marker with no matching target names the orphan instead of leaving
+        // it in place silently (git's behavior would read as "folded" here).
+        let o = commit(
+            &repo,
+            &[c2],
+            &[("x", "1\n"), ("a", "1\n"), ("b", "1\n")],
+            "fixup! no such subject",
+        );
+        advance(o);
+        let err = cmd_rebase(
+            &dir,
+            &base.to_string(),
+            None,
+            Some(Autosquash::Markers),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("no target found"), "{err}");
+        assert!(err.contains("no such subject"), "{err}");
+
+        // amend! (message-replacing fold) is rejected, not half-applied.
+        let a = commit(
+            &repo,
+            &[c2],
+            &[("x", "2\n"), ("a", "1\n"), ("b", "1\n")],
+            "amend! add a",
+        );
+        advance(a);
+        let err = cmd_rebase(
+            &dir,
+            &base.to_string(),
+            None,
+            Some(Autosquash::Markers),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("amend!"), "{err}");
+        // Nothing was applied by any of the failures.
+        assert!(!state_path(&repo).exists());
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), a);
     }
 
     #[test]

@@ -62,7 +62,10 @@ front end and the capability tier differ.
   cherry-pick, and revert as a sequencer (on `git2` / vendored libgit2): the
   plan is *data*, a conflicted step surfaces through the very same
   merge-conflict vocabulary you'd use by hand, and `git_rebase` can `rehearse`
-  a plan before running it. One-call helpers sit on top: `git_fixup` and
+  a plan before running it. `autosquash` folds commits without a full plan:
+  a sparse `{commit, into}` list, or `true` to fold the branch's
+  `fixup!`/`squash!` commits into the commits their subjects name (git's
+  `--autosquash`). One-call helpers sit on top: `git_fixup` and
   `git_absorb` fold worktree changes into the commits that own them,
   `git_reword` / `git_msg_rewrite` edit messages, and `git_range_diff` checks
   a rewrite after the fact. No `git` subprocess, no network, no hooks or exec;
