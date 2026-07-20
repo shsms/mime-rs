@@ -906,6 +906,51 @@ a segment rebuild, re-pointing a dependent branch means shell
 Largely subsumed by --update-refs for the stack case, but still useful
 alone. Fetch/push stay out by design (no network).
 
+** TODO [#C] git_status: report branch and worktree state when idle     :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-17 Fr 12:10]
+:END:
+
+Dogfooding (2026-07-17, switchyard rebase): before starting a rebase the
+agent wants "am I on the right branch, is the tree clean" — but
+~git_status~ only reports an in-progress operation, so the pre-flight
+check falls back to shell ~git status --short --branch~. Suggestion:
+when nothing is in progress, report HEAD's branch, a short ahead/behind
+against its upstream, and whether the worktree/index are dirty (count +
+paths, capped). That would make ~git_status~ the one-call pre-flight for
+every git tool.
+
+** TODO [#C] git_log: oldest-first order and a follow-up past the 50 cap :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-17 Fr 12:10]
+:END:
+
+Dogfooding (2026-07-17, switchyard rebase): building an explicit rebase
+plan needs the full onto..HEAD list in replay order (oldest first).
+~git_log~ is newest-first and hard-capped at 50, so a 54-commit range
+truncated and the agent fell back to shell
+~git log --reverse --format='%H %s'~. Suggestions: a ~reverse:true~ (or
+~order:"oldest-first"~) flag, and a way to continue past the cap — either
+a cursor ("pass range <oid>..X for the rest") or an explicit
+~limit~/offset. The cap itself is fine; dead-ending at it is the
+friction.
+
+** TODO [#C] git_diff: tree-diff between two arbitrary refs             :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-07-17 Fr 12:10]
+:END:
+
+Dogfooding (2026-07-17, switchyard rebase): after a rebase the natural
+check is "what does the new tip's TREE change vs the backup ref" —
+file-level stat with line counts. ~git_show~ is one commit's patch;
+~git_range_diff~ pairs commits and only says whether the final trees are
+identical, not where they differ. The agent fell back to shell
+~git diff --stat backup..HEAD~. Suggestion: a read-only ~git_diff~
+{repo, old, new, paths?, stat_only?} for two revspecs — stat by default,
+with per-file patches on request (capped like other outputs). Would also
+pair well with the "tree differs in: <files>" line ~git_rebase~ already
+prints.
+
 * Structural editing
 
 ** TODO Incremental re-parse (~InputEdit~s) [#C]
