@@ -814,11 +814,25 @@ rechain skeleton that could be one core with a per-commit message hook.
 by-summary fallback is O(old×new) — keep the pairing pids and
 precompute the old summaries.
 
-** TODO begin()'s untracked guard misses files inside untracked directories [#B] :git:
+** DONE begin()'s untracked guard misses files inside untracked directories [#B] :git:
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-20 Mo 17:19]
+:END:
+
 ~statuses~ without ~recurse_untracked_dirs~ reports a fully-untracked
 directory as one ~dir/~ entry, which never matches a tree path — the
 hard reset can then destroy ~dir/file~. ~exec_over~ got the recurse flag
 in the todo-sweep branch; ~begin~ still has the blind spot.
+
+DONE [2026-07-20]: fixed in =01bf44d=. The data loss was real — a coarse
+=dir/= status entry never matches =bypath= (a trailing-slash lookup needs
+a tree), so =begin()= never refused and the hard reset destroyed the
+files. Recursing (like =exec_over=) makes each file inside checkable and
+namable. The 2026-07-21 review found the sibling hole: an untracked
+directory colliding with a FILE in onto — =bypath= cannot descend through
+a blob — now caught by checking each proper ancestor. Tests lock both
+refusal messages. =exec_over='s guard still lacks the ancestor check
+(follow-up).
 
 ** TODO absorb: refuse merge commits up front [#C] :git:
 A merge inside onto..HEAD dies mid-replay with a raw libgit2 error
@@ -845,8 +859,9 @@ insert_text accepts undocumented "end"/"start" aliases for eob/bob
 outside the alias table; ~unsaved_diff~ appends ~stale_edit_note~
 (edit-side wording) though it is a read tool.
 
-** TODO [#B] git_rebase: three-arg --onto (separate upstream from new base) :git:
+** DONE [#B] git_rebase: three-arg --onto (separate upstream from new base) :git:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-20 Mo 17:25]
 - State "TODO"       from              [2026-07-17 Fr 09:22]
 :END:
 
@@ -858,6 +873,11 @@ every commit already present in the new base by hand. Add an optional
 ~from~ (upstream) field that bounds the replayed range, defaulting to
 ~onto~ as today. (Session driver: component-graph-rs stack rebase,
 2026-07-17.)
+
+DONE [2026-07-20]: =434f8c8=. Optional =from= (alias =upstream=)
+bounds the plan-less and autosquash enumeration to from..HEAD;
+explicit =plan= + =from= is an error. Cherry-pick detection still
+compares against onto's side.
 
 ** TODO [#B] Rewrites carry stacked branch pointers (--update-refs)     :git:
 :LOGBOOK:
@@ -1008,12 +1028,24 @@ continue. --write persists only a COMPLETED run. Remaining: a manual
 pass in a real terminal (the spike is only smoke-tested headless);
 the exit criterion (watch a conflict-resolution script) awaits that.
 
-** TODO Phase 1 — playback controls
+** DONE Phase 1 — playback controls
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-07-20 Mo 17:29]
+:END:
+
 Auto-play with a speed setting (delay per form), pause/resume, restart
 (snapshot at program start; rollback + replay — rehearse semantics make
 this free), step-backward via the same snapshots (keep the last N),
 finish-and-save vs finish-and-discard. Status bar: point, narrowing,
 stale flag, step n/m, buffer name/version.
+
+DONE [2026-07-20]: =3216c6e=. Auto-play (=p=, =[/]= speed, 25ms–4s),
+=b= back, =r= restart, =f= run-to-end, =w= write-on-finish, two-line
+status bar (name/version, modified/narrowed/stale, point, step n/m,
+play state). Back/restart REPLAY from an origin snapshot through a
+fresh workspace instead of restoring buffer snapshots — replay also
+rewinds defuns/variables, so there is no interpreter-state caveat and
+no last-N ring to manage.
 
 ** TODO Phase 2 — daemon cockpit (--attach)
 Watch an AGENT edit live: poll the daemon (the accept loop is
