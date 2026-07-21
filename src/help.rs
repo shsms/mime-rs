@@ -304,6 +304,9 @@ Replace inside one function (no program needed):
   replace_text {path, pattern, replacement, scope: {defun: "name"}}
 Add a function after another:
   insert_text {path, text: "\n\nfn new() {…}", anchor: {defun: "prev"}}
+Insert above/below the unique line containing a literal text:
+  insert_text {path, text: "…\n", anchor: {before: "LINE"}}  ; before|after,
+  shorthand for {pattern: "LINE", where: "before"}
 Bulk regex sweep with count:
   run_program: (goto-char (point-min)) (report "n" (replace-regexp "PAT" "REP"))
 Per-match logic:

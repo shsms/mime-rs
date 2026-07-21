@@ -263,6 +263,9 @@ fn alias_table(tool: &str) -> &'static [(&'static str, &'static str)] {
 /// editors, inside each `edits[]` entry). Passing an alias AND its canonical
 /// key is ambiguous — an error naming both, never a silent pick.
 fn normalize_aliases(tool: &str, args: &mut Value) -> Result<(), String> {
+    if tool == "insert_text" {
+        normalize_insert_sugar(args)?;
+    }
     let table = alias_table(tool);
     if table.is_empty() {
         return Ok(());
@@ -302,6 +305,69 @@ fn normalize_aliases(tool: &str, args: &mut Value) -> Result<(), String> {
             rewrite(e)?;
         }
     }
+    Ok(())
+}
+
+/// insert_text sugar: `before: "line"` / `after: "line"` — at top level or
+/// inside `anchor` — are shorthand for the canonical
+/// `anchor: {"pattern": "line", "where": "before"|"after"}`. That is the
+/// spelling first-time callers reach for, so absorb it before validation.
+/// Combining the shorthand with the keys it expands to (or both sides at
+/// once) is ambiguous — an error naming the conflict, never a silent pick.
+fn normalize_insert_sugar(args: &mut Value) -> Result<(), String> {
+    let Some(obj) = args.as_object_mut() else {
+        return Ok(());
+    };
+    // Top level first: lift `before`/`after` into an `anchor` object; the
+    // anchor-level pass below then rewrites it to the canonical form.
+    let top: Vec<&str> = ["before", "after"]
+        .into_iter()
+        .filter(|k| obj.contains_key(*k))
+        .collect();
+    if let Some(&side) = top.first() {
+        if top.len() == 2 {
+            return Err("insert_text: pass \"before\" or \"after\", not both".to_string());
+        }
+        for clash in ["anchor", "pos"] {
+            if obj.contains_key(clash) {
+                return Err(format!(
+                    "insert_text: \"{side}\" is shorthand for an anchor — \
+                     pass it or \"{clash}\", not both"
+                ));
+            }
+        }
+        let val = obj.remove(side).expect("checked above");
+        obj.insert("anchor".to_string(), json!({ side: val }));
+    }
+    let Some(anchor) = obj.get_mut("anchor").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    let sides: Vec<&str> = ["before", "after"]
+        .into_iter()
+        .filter(|k| anchor.contains_key(*k))
+        .collect();
+    let Some(&side) = sides.first() else {
+        return Ok(());
+    };
+    if sides.len() == 2 {
+        return Err("anchor: pass \"before\" or \"after\", not both".to_string());
+    }
+    for clash in ["pattern", "defun", "where"] {
+        if anchor.contains_key(clash) {
+            return Err(format!(
+                "anchor: \"{side}\" is shorthand for \
+                 {{\"pattern\": …, \"where\": \"{side}\"}} — pass it or \"{clash}\", not both"
+            ));
+        }
+    }
+    let val = anchor.remove(side).expect("checked above");
+    if !val.is_string() {
+        return Err(format!(
+            "anchor: \"{side}\" takes the literal line text to anchor on, got {val}"
+        ));
+    }
+    anchor.insert("pattern".to_string(), val);
+    anchor.insert("where".to_string(), json!(side));
     Ok(())
 }
 
@@ -3844,7 +3910,7 @@ fn build_tool_schemas() -> Vec<Value> {
                 "properties": {
                     "text": { "type": "string", "description": "The literal text to insert." },
                     "pos": { "type": ["integer", "string"], "description": "1-based position to insert at (default: current point) — or \"eob\" / \"bob\" to append at the end / insert at the beginning of the accessible region (no position arithmetic for the common append)." },
-                    "anchor": { "type": "object", "description": "Insert relative to a named defun — {\"defun\": \"name\"} — or to the UNIQUE line containing a literal text — {\"pattern\": \"line text\"} (an ambiguous pattern errors, listing the match lines). \"where\": \"after\" (default) puts the text at the end of the defun or the matched line — include separating newlines in the text. \"before\" puts it above the whole decorated defun (Rust #[attributes] / Python decorators included), or at the start of the matched line. Not combinable with pos.", "properties": { "defun": { "type": "string" }, "pattern": { "type": "string" }, "where": { "type": "string", "enum": ["after", "before"] } } },
+                    "anchor": { "type": "object", "description": "E.g. {\"pattern\": \"fn main() {\", \"where\": \"before\"} — insert relative to the UNIQUE line containing a literal text ({\"before\": \"line text\"} / {\"after\": \"line text\"} are accepted shorthand for the same) — or {\"defun\": \"name\"} to target a named defun. An ambiguous pattern errors, listing the match lines. \"where\": \"after\" (default) puts the text at the end of the defun or the matched line — include separating newlines in the text. \"before\" puts it above the whole decorated defun (Rust #[attributes] / Python decorators included), or at the start of the matched line. Not combinable with pos.", "properties": { "defun": { "type": "string" }, "pattern": { "type": "string" }, "where": { "type": "string", "enum": ["after", "before"] }, "before": { "type": "string", "description": "Shorthand for {\"pattern\": <this text>, \"where\": \"before\"}." }, "after": { "type": "string", "description": "Shorthand for {\"pattern\": <this text>, \"where\": \"after\"}." } } },
                     "view": { "type": ["boolean", "integer"], "description": "Append a rendered viewport around point after the edit (true = 4 context lines, or a line count) — confirm the insert landed right without a follow-up view call." },
                     "session": session,
                     "path": path,
@@ -4245,6 +4311,48 @@ mod git_tool_tests {
         let mut args = json!({ "regex": "x" });
         normalize_aliases("grep", &mut args).unwrap();
         validate_args("grep", &args).unwrap();
+    }
+
+    #[test]
+    fn insert_text_before_after_sugar_normalizes() {
+        // `before`/`after` name both the anchor line and the side to insert
+        // on — the spelling first calls reach for. Top level lifts into an
+        // anchor; anchor level rewrites to the canonical {pattern, where}.
+        let mut args = json!({ "text": "x", "before": "fn main() {" });
+        normalize_aliases("insert_text", &mut args).unwrap();
+        assert_eq!(
+            args,
+            json!({ "text": "x",
+                    "anchor": { "pattern": "fn main() {", "where": "before" } })
+        );
+        validate_args("insert_text", &args).unwrap();
+
+        let mut args = json!({ "text": "x", "anchor": { "after": "use std;" } });
+        normalize_aliases("insert_text", &mut args).unwrap();
+        assert_eq!(
+            args,
+            json!({ "text": "x",
+                    "anchor": { "pattern": "use std;", "where": "after" } })
+        );
+
+        // Ambiguous combinations error instead of silently picking a side.
+        for bad in [
+            json!({ "text": "x", "before": "a", "after": "b" }),
+            json!({ "text": "x", "before": "a", "pos": 7 }),
+            json!({ "text": "x", "before": "a", "anchor": { "pattern": "b" } }),
+            json!({ "text": "x", "anchor": { "before": "a", "after": "b" } }),
+            json!({ "text": "x", "anchor": { "before": "a", "pattern": "b" } }),
+            json!({ "text": "x", "anchor": { "before": "a", "where": "after" } }),
+            json!({ "text": "x", "anchor": { "after": "a", "defun": "f" } }),
+        ] {
+            let mut args = bad.clone();
+            normalize_aliases("insert_text", &mut args).unwrap_err();
+        }
+
+        // The shorthand value is the anchor line's text — a string.
+        let mut args = json!({ "text": "x", "anchor": { "before": 3 } });
+        let err = normalize_aliases("insert_text", &mut args).unwrap_err();
+        assert!(err.contains("literal line text"), "{err}");
     }
 
     #[test]
