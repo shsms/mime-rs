@@ -3207,7 +3207,7 @@ fn git_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "git_status",
-            "description": "Report the in-progress operation: which step, of how many, the current tip, and any unresolved conflict files (or that nothing is in progress).",
+            "description": "Porcelain status: branch, upstream and ahead/behind counts, every dirty path with its two-char mark (staged/unstaged/untracked/conflicted; capped), and the in-progress sequencer operation if any (which step of how many, the current tip, unresolved conflict files).",
             "inputSchema": { "type": "object", "properties": { "repo": repo }, "required": ["repo"] },
         }),
         json!({
@@ -3638,7 +3638,11 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             A::destructive(),
             "abort the operation, restoring the pre-op state",
         ),
-        "git_status" => (Git, A::read(), "report the in-progress operation"),
+        "git_status" => (
+            Git,
+            A::read(),
+            "branch, upstream ahead/behind, dirty paths, in-progress operation",
+        ),
         "git_log" => (Git, A::read(), "one line per commit for a range"),
         "git_show" => (
             Git,

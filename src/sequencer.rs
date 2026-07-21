@@ -4556,8 +4556,137 @@ pub fn cmd_abort(repo_path: &std::path::Path) -> Result<String, String> {
     ))
 }
 
+/// Two-char porcelain marks for one dirty entry (`git status --short`):
+/// index column then worktree column; conflicts are UU, untracked ??.
+fn status_marks(s: git2::Status) -> (char, char) {
+    if s.is_conflicted() {
+        return ('U', 'U');
+    }
+    let x = if s.is_index_new() {
+        'A'
+    } else if s.is_index_modified() {
+        'M'
+    } else if s.is_index_deleted() {
+        'D'
+    } else if s.is_index_renamed() {
+        'R'
+    } else if s.is_index_typechange() {
+        'T'
+    } else {
+        ' '
+    };
+    let y = if s.is_wt_new() {
+        '?'
+    } else if s.is_wt_modified() {
+        'M'
+    } else if s.is_wt_deleted() {
+        'D'
+    } else if s.is_wt_renamed() {
+        'R'
+    } else if s.is_wt_typechange() {
+        'T'
+    } else {
+        ' '
+    };
+    // Untracked proper: nothing staged AND new in the worktree. A staged
+    // entry whose file is also new in the worktree (e.g. git rm --cached)
+    // keeps its index column: `D?`, not `??`.
+    if x == ' ' && y == '?' {
+        return ('?', '?');
+    }
+    (x, y)
+}
+
+/// The `## branch...upstream [ahead N, behind M]` header, with detached and
+/// unborn HEADs spelled out rather than errored.
+fn branch_line(repo: &Repository) -> String {
+    match repo.head() {
+        Ok(head) if head.is_branch() => {
+            let name = head.shorthand().unwrap_or("HEAD").to_string();
+            let mut line = format!("## {name}");
+            if let Ok(branch) = repo.find_branch(&name, git2::BranchType::Local)
+                && let Ok(up) = branch.upstream()
+            {
+                line.push_str(&format!("...{}", up.get().shorthand().unwrap_or("?")));
+                if let (Some(local), Some(remote)) = (head.target(), up.get().target())
+                    && let Ok((ahead, behind)) = repo.graph_ahead_behind(local, remote)
+                {
+                    match (ahead, behind) {
+                        (0, 0) => {}
+                        (a, 0) => line.push_str(&format!(" [ahead {a}]")),
+                        (0, b) => line.push_str(&format!(" [behind {b}]")),
+                        (a, b) => line.push_str(&format!(" [ahead {a}, behind {b}]")),
+                    }
+                }
+            }
+            line
+        }
+        Ok(head) => format!(
+            "## HEAD detached at {}",
+            head.target().map(short).unwrap_or_else(|| "?".into())
+        ),
+        // head() errors on an unborn branch — a repo with no commits yet
+        // still names its target branch on the HEAD symref.
+        Err(_) => match repo
+            .find_reference("HEAD")
+            .ok()
+            .and_then(|r| r.symbolic_target().map(str::to_string))
+        {
+            Some(t) => format!(
+                "## {} (no commits yet)",
+                t.strip_prefix("refs/heads/").unwrap_or(&t)
+            ),
+            None => "## (no HEAD)".to_string(),
+        },
+    }
+}
+
+/// Every dirty path with its two-char mark, capped so a huge tree cannot
+/// flood the reply; "worktree clean" when there is nothing to report.
+fn worktree_summary(repo: &Repository) -> Result<String, Error> {
+    const CAP: usize = 30;
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .exclude_submodules(true);
+    let statuses = repo.statuses(Some(&mut opts))?;
+    let mut lines: Vec<String> = Vec::new();
+    for e in statuses.iter() {
+        let s = e.status();
+        if s.is_ignored() || s == git2::Status::CURRENT {
+            continue;
+        }
+        let (x, y) = status_marks(s);
+        lines.push(format!(" {x}{y} {}", e.path().unwrap_or("?")));
+    }
+    if lines.is_empty() {
+        return Ok("worktree clean".to_string());
+    }
+    let n = lines.len();
+    let mut out = format!("{n} dirty path(s):");
+    for l in lines.iter().take(CAP) {
+        out.push('\n');
+        out.push_str(l);
+    }
+    if n > CAP {
+        out.push_str(&format!("\n … and {} more", n - CAP));
+    }
+    Ok(out)
+}
+
 pub fn cmd_status(repo_path: &std::path::Path) -> Result<String, String> {
-    Ok(status_text(status(&open(repo_path)?).map_err(gerr)?))
+    let repo = open(repo_path)?;
+    // statuses() itself errors on a bare repo; the rest still applies.
+    let worktree = if repo.is_bare() {
+        "bare repository (no worktree)".to_string()
+    } else {
+        worktree_summary(&repo).map_err(gerr)?
+    };
+    Ok(format!(
+        "{}\n{worktree}\n{}",
+        branch_line(&repo),
+        status_text(status(&repo).map_err(gerr)?)
+    ))
 }
 
 pub fn cmd_log(repo_path: &std::path::Path, range: Option<&str>) -> Result<String, String> {
@@ -4981,7 +5110,7 @@ mod tests {
         assert!(!out.contains("dropped"), "{out}");
         assert_eq!(
             cmd_status(&dir).unwrap(),
-            "no sequencer operation in progress"
+            "## topic\nworktree clean\nno sequencer operation in progress"
         );
 
         let log = cmd_log(&dir, None).unwrap();
@@ -8208,5 +8337,92 @@ mod tests {
         assert!(preview.conflicts.is_empty());
         assert!(!repo.head_detached().unwrap(), "no mutation");
         assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn cmd_status_reports_branch_upstream_dirty_paths_and_sequencer() {
+        let dir = tmp("status");
+        let repo = Repository::init(&dir).unwrap();
+        let a = commit(&repo, &[], &[("f.txt", "one\n")], "base");
+        let b = commit(&repo, &[a], &[("f.txt", "one\ntwo\n")], "more");
+        on_branch(&repo, "base", a);
+        on_branch(&repo, "main", b);
+        repo.find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .set_upstream(Some("base"))
+            .unwrap();
+        std::fs::write(repo.workdir().unwrap().join("f.txt"), "changed\n").unwrap();
+        std::fs::write(repo.workdir().unwrap().join("new.txt"), "n\n").unwrap();
+
+        let out = cmd_status(&dir).unwrap();
+        assert!(out.starts_with("## main...base [ahead 1]"), "{out}");
+        assert!(out.contains(" M f.txt"), "{out}");
+        assert!(out.contains("?? new.txt"), "{out}");
+        assert!(out.contains("2 dirty path(s)"), "{out}");
+        assert!(out.contains("no sequencer operation in progress"), "{out}");
+    }
+
+    #[test]
+    fn cmd_status_detached_behind_cap_and_staged_marks() {
+        let dir = tmp("status-edge");
+        let repo = Repository::init(&dir).unwrap();
+        let a = commit(&repo, &[], &[("f.txt", "one\n")], "base");
+        let b = commit(&repo, &[a], &[("f.txt", "one\ntwo\n")], "more");
+        on_branch(&repo, "base", b);
+        on_branch(&repo, "main", a);
+        repo.find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .set_upstream(Some("base"))
+            .unwrap();
+        let out = cmd_status(&dir).unwrap();
+        assert!(out.starts_with("## main...base [behind 1]"), "{out}");
+
+        // git rm --cached: index D survives next to the worktree ?, not ??.
+        let mut idx = repo.index().unwrap();
+        idx.remove_path(Path::new("f.txt")).unwrap();
+        idx.write().unwrap();
+        let out = cmd_status(&dir).unwrap();
+        assert!(out.contains(" D? f.txt"), "{out}");
+        idx.add_path(Path::new("f.txt")).unwrap();
+        idx.write().unwrap();
+
+        // 31 untracked files: the cap lists 30 and counts the rest.
+        for i in 0..31 {
+            std::fs::write(repo.workdir().unwrap().join(format!("u{i:02}.txt")), "u\n").unwrap();
+        }
+        let out = cmd_status(&dir).unwrap();
+        assert!(out.contains("31 dirty path(s)"), "{out}");
+        assert!(out.contains("… and 1 more"), "{out}");
+
+        // Detached HEAD names the commit.
+        repo.set_head_detached(a).unwrap();
+        let out = cmd_status(&dir).unwrap();
+        assert!(
+            out.starts_with(&format!("## HEAD detached at {}", short(a))),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn cmd_status_on_a_bare_repo() {
+        let dir = tmp("status-bare");
+        Repository::init_bare(&dir).unwrap();
+        let out = cmd_status(&dir).unwrap();
+        assert!(out.contains("bare repository (no worktree)"), "{out}");
+    }
+
+    #[test]
+    fn cmd_status_clean_tree_and_unborn_branch() {
+        let dir = tmp("status-clean");
+        let repo = Repository::init(&dir).unwrap();
+        let out = cmd_status(&dir).unwrap();
+        assert!(out.contains("(no commits yet)"), "{out}");
+        assert!(out.contains("worktree clean"), "{out}");
+
+        let a = commit(&repo, &[], &[("f.txt", "one\n")], "base");
+        on_branch(&repo, "main", a);
+        let out = cmd_status(&dir).unwrap();
+        assert!(out.starts_with("## main\n"), "{out}");
+        assert!(out.contains("worktree clean"), "{out}");
     }
 }

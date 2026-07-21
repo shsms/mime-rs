@@ -239,7 +239,8 @@ Rewrites autostash unstaged changes to paths the plan does not touch
 during a pause keeps your later edit, the parked bytes stay on the ref);
 staged changes and dirty REWRITTEN paths refuse, naming them.
 Each STOPS on the first conflict. Then, per stop:
-  git_status     which step of how many + the unresolved files
+  git_status     branch + upstream ahead/behind + dirty paths, and — mid-op —
+                 which step of how many + the unresolved files
   resolve each file with the conflicts vocabulary (help conflicts), SAVE
   git_continue   commit the resolution + resume (errors while marker lines
                  remain; force:true overrides); at an edit pause, amends the

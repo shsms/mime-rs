@@ -246,7 +246,7 @@ Abort the in-progress operation, restoring HEAD/branch/worktree to the pre-opera
 
 ## git_status
 
-Report the in-progress operation: which step, of how many, the current tip, and any unresolved conflict files (or that nothing is in progress).
+Porcelain status: branch, upstream and ahead/behind counts, every dirty path with its two-char mark (staged/unstaged/untracked/conflicted; capped), and the in-progress sequencer operation if any (which step of how many, the current tip, unresolved conflict files).
 
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 
