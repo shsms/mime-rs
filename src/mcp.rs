@@ -255,9 +255,11 @@ fn alias_table(tool: &str) -> &'static [(&'static str, &'static str)] {
         "insert_text" => &[("location", "pos"), ("position", "pos"), ("at", "pos")],
         "read_region" => &[("from", "start"), ("to", "end")],
         "git_rebase" => &[("upstream", "from"), ("path", "repo")],
-        // `path` names a FILE in git_blame — there it stays an error (whose
-        // message lists the valid keys) instead of silently meaning the repo.
-        "git_blame" => &[],
+        // `path` names a FILE in git_blame, and git_commit's explicit `paths`
+        // makes a stray singular `path` too ambiguous to absorb — in both it
+        // stays an error (whose message lists the valid keys) instead of
+        // silently meaning the repo.
+        "git_blame" | "git_commit" => &[],
         git if git.starts_with("git_") => &[("path", "repo")],
         _ => &[],
     }
@@ -3002,6 +3004,20 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
                 )
             }
         }
+        "git_commit" => {
+            // A non-string `after` must not silently skip the requested
+            // relocation — the commit would land at the tip with a success
+            // reply.
+            if args.get("after").is_some_and(|v| !v.is_string()) {
+                return Err("git_commit: `after` must be a string revspec".to_string());
+            }
+            seq::cmd_commit(
+                &repo,
+                &str_list_arg(args, "paths")?,
+                &str_arg(args, "message")?,
+                args.get("after").and_then(Value::as_str),
+            )
+        }
         "git_cherry_pick" => seq::cmd_cherry_pick(&repo, &str_list_arg(args, "commits")?),
         "git_revert" => seq::cmd_revert(&repo, &str_list_arg(args, "commits")?),
         "git_continue" => seq::cmd_continue(&repo, bool_arg(args, "force")),
@@ -3174,6 +3190,20 @@ fn git_tool_schemas() -> Vec<Value> {
                     "reapply_cherry_picks": { "type": "boolean", "description": "Plan-less pick-all only: keep commits already present in `onto` by patch-id instead of dropping them. Default false — like `git rebase`, a commit whose change already sits in the new base (e.g. after the base was reordered/amended below the merge-base) is skipped so a stacked branch isn't duplicated; the skipped commits are reported. Set true to replay them anyway. Ignored when an explicit `plan` or `autosquash` is given." }
                 },
                 "required": ["repo", "onto"],
+            },
+        }),
+        json!({
+            "name": "git_commit",
+            "description": "Commit exactly `paths` with `message` on the current branch: each listed file is staged from its worktree content (a listed file missing on disk becomes a deletion). There is deliberately no stage-everything mode — no -A, no \".\", no directories — so stray files can't be swept into history; unlisted worktree changes just stay dirty, and pre-staged index changes outside `paths` refuse, naming them. `after` places the new commit directly after that ancestor instead of at the tip (in-series insertion via the rebase machinery: backup ring, pauses on conflict for the conflict tools + git_continue).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": repo,
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "The files to commit, each named explicitly — absolute or repo-relative. Required and non-empty; directories are refused." },
+                    "message": { "type": "string", "description": "The commit message." },
+                    "after": { "type": "string", "description": "Optional placement: an ancestor commit (oid/ref/revspec) the new commit should sit directly after, instead of at the branch tip." }
+                },
+                "required": ["repo", "paths", "message"],
             },
         }),
         json!({
@@ -3636,6 +3666,11 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             Git,
             A::destructive(),
             "rebase the branch onto a base — full plan, sparse autosquash, or autosquash:true (fold fixup!/squash! commits)",
+        ),
+        "git_commit" => (
+            Git,
+            A::append(),
+            "commit exactly the listed files (optionally placed mid-series)",
         ),
         "git_cherry_pick" => (Git, A::append(), "apply commits on top of the branch tip"),
         "git_revert" => (

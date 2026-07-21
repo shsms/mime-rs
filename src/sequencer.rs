@@ -4762,6 +4762,209 @@ pub fn cmd_status(repo_path: &std::path::Path) -> Result<String, String> {
     ))
 }
 
+/// `git_commit`: commit exactly `paths` — each file staged from its worktree
+/// content, a listed-but-missing file becoming a deletion — with `message`,
+/// on the current branch. There is deliberately no pathspec-less mode: the
+/// sweep (`git add -A`/`.`) that bakes stray files into history cannot be
+/// expressed. Pre-staged index changes OUTSIDE `paths` refuse, naming them;
+/// unlisted worktree changes simply stay dirty. With `after`, the new commit
+/// is then relocated to sit directly after that ancestor via the rebase
+/// machinery (backup ring; a conflict pauses for the conflict tools +
+/// git_continue).
+pub fn cmd_commit(
+    repo_path: &std::path::Path,
+    paths: &[String],
+    message: &str,
+    after: Option<&str>,
+) -> Result<String, String> {
+    let repo = open(repo_path)?;
+    if paths.is_empty() {
+        return Err(
+            "git_commit: `paths` must name each file to commit explicitly \
+             (there is no stage-everything mode)"
+                .to_string(),
+        );
+    }
+    let workdir = repo
+        .workdir()
+        .ok_or("git_commit: bare repository")?
+        .to_path_buf();
+    // Absolute (the form grep/occur return) or workdir-relative; a directory
+    // is refused — a directory pathspec is a sweep, not an explicit list.
+    let mut rels: Vec<String> = Vec::new();
+    for p in paths {
+        let path = Path::new(p);
+        let rel = if path.is_absolute() {
+            path.strip_prefix(&workdir)
+                .map_err(|_| format!("git_commit: path is outside the repo: {p}"))?
+                .to_path_buf()
+        } else {
+            path.to_path_buf()
+        };
+        // Component-normalize (drop `./`) so the same file spelled two ways
+        // compares equal to index delta paths and to other list entries.
+        let mut norm = std::path::PathBuf::new();
+        for comp in rel.components() {
+            match comp {
+                std::path::Component::CurDir => {}
+                std::path::Component::Normal(c) => norm.push(c),
+                _ => {
+                    return Err(format!(
+                        "git_commit: unsupported path component in {p} — pass a \
+                         plain repo-relative or absolute file path"
+                    ));
+                }
+            }
+        }
+        // symlink_metadata: a tracked symlink whose target is a directory is
+        // a committable blob, not a directory sweep.
+        if workdir
+            .join(&norm)
+            .symlink_metadata()
+            .is_ok_and(|m| m.is_dir())
+        {
+            return Err(format!(
+                "git_commit: {p} is a directory — list the files explicitly"
+            ));
+        }
+        rels.push(norm.to_string_lossy().into_owned());
+    }
+    rels.sort();
+    rels.dedup();
+
+    let head_commit = match repo.head() {
+        Ok(h) => {
+            if !h.is_branch() {
+                return Err("git_commit: HEAD is detached — check out a branch".to_string());
+            }
+            Some(h.peel_to_commit().map_err(gerr)?)
+        }
+        // An unborn branch: this becomes the root commit.
+        Err(_) => None,
+    };
+    let head_tree = head_commit
+        .as_ref()
+        .map(|c| c.tree())
+        .transpose()
+        .map_err(gerr)?;
+
+    // Validate the placement target BEFORE anything is created, so a bad
+    // `after` leaves no half-done state behind.
+    let after_oid = after
+        .map(|a| -> Result<Oid, String> {
+            let oid = resolve_s(&repo, a)?;
+            let head = head_commit
+                .as_ref()
+                .ok_or("git_commit: after has no meaning for the root commit")?
+                .id();
+            if oid != head && !repo.graph_descendant_of(head, oid).unwrap_or(false) {
+                return Err(format!(
+                    "git_commit: after ({}) is not HEAD or an ancestor of it",
+                    short(oid)
+                ));
+            }
+            Ok(oid)
+        })
+        .transpose()?;
+
+    let mut index = repo.index().map_err(gerr)?;
+    let staged = repo
+        .diff_tree_to_index(head_tree.as_ref(), Some(&index), None)
+        .map_err(gerr)?;
+    let outside: Vec<String> = staged
+        .deltas()
+        .map(|d| delta_path(Some(d)))
+        .filter(|p| !rels.iter().any(|r| r == p))
+        .collect();
+    if !outside.is_empty() {
+        return Err(format!(
+            "git_commit: the index already holds staged changes outside `paths` \
+             ({}) — commit or unstage them first",
+            outside.join(", ")
+        ));
+    }
+
+    for rel in &rels {
+        let rp = Path::new(rel);
+        if workdir.join(rp).symlink_metadata().is_ok() {
+            index.add_path(rp).map_err(gerr)?;
+        } else if index.get_path(rp, 0).is_some()
+            || head_tree.as_ref().is_some_and(|t| t.get_path(rp).is_ok())
+        {
+            // Listed but absent on disk: stage the deletion of a tracked file.
+            index.remove_path(rp).map_err(gerr)?;
+        } else {
+            return Err(format!("git_commit: no such file: {rel}"));
+        }
+    }
+    let tree_oid = index.write_tree().map_err(gerr)?;
+    if head_tree.as_ref().is_some_and(|t| t.id() == tree_oid) {
+        return Err("git_commit: nothing to commit — the given paths match HEAD".to_string());
+    }
+    let tree = repo.find_tree(tree_oid).map_err(gerr)?;
+    if head_tree.is_none() && tree.is_empty() {
+        return Err("git_commit: nothing to commit — the given paths match HEAD".to_string());
+    }
+    let sig = repo
+        .signature()
+        .map_err(|e| format!("git_commit: no committer identity — {}", e.message()))?;
+    let msg = if message.ends_with('\n') {
+        message.to_string()
+    } else {
+        format!("{message}\n")
+    };
+    let parents: Vec<&git2::Commit> = head_commit.iter().collect();
+    let new = repo
+        .commit(Some("HEAD"), &sig, &sig, &msg, &tree, &parents)
+        .map_err(gerr)?;
+    // Persist the staged entries only once the commit exists — a failure
+    // above must not leave staged state the caller never asked to keep.
+    index.write().map_err(gerr)?;
+    let out = format!(
+        "committed {} {}",
+        short(new),
+        msg.lines().next().unwrap_or("")
+    );
+
+    let Some(after_oid) = after_oid else {
+        return Ok(out);
+    };
+    // In-series placement: replay after..HEAD onto `after` with the new
+    // commit first — a pure reorder unless the moved hunks collide.
+    let range = commits_since(&repo, after_oid).map_err(gerr)?;
+    if range.len() == 1 {
+        return Ok(format!(
+            "{out}\n  already sits directly after {} — no relocation needed",
+            short(after_oid)
+        ));
+    }
+    let mut steps = vec![pick_step(new)];
+    steps.extend(range.into_iter().filter(|o| *o != new).map(pick_step));
+    let note = backup_note(&repo);
+    // The sequencer can still refuse here (an in-progress op, a dirty path
+    // some replayed commit rewrites) — by then the commit exists, so the
+    // error must say so instead of hiding it.
+    let res = start(
+        &repo,
+        Plan {
+            onto: after_oid,
+            steps,
+        },
+    )
+    .map_err(|e| {
+        format!(
+            "{out}\nrelocation refused: {} — the new commit stays at the tip; \
+             resolve the refusal, then relocate with git_rebase",
+            gerr(e)
+        )
+    })?;
+    Ok(format!(
+        "{out}\nrelocated after {}: {}{note}",
+        short(after_oid),
+        outcome_text(&res)
+    ))
+}
+
 pub fn cmd_log(
     repo_path: &std::path::Path,
     range: Option<&str>,
@@ -8545,6 +8748,130 @@ mod tests {
         assert!(
             out.contains("base\n   A f.txt +1 -0\n   1 file(s), +1 -0\n"),
             "{out}"
+        );
+    }
+
+    #[test]
+    fn cmd_commit_stages_only_the_listed_paths() {
+        let dir = tmp("commit");
+        let repo = Repository::init(&dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "test").unwrap();
+        cfg.set_str("user.email", "test@example.invalid").unwrap();
+        let a = commit(&repo, &[], &[("f.txt", "one\n"), ("g.txt", "g\n")], "base");
+        on_branch(&repo, "main", a);
+        let wd = repo.workdir().unwrap().to_path_buf();
+        std::fs::write(wd.join("f.txt"), "changed\n").unwrap();
+        std::fs::write(wd.join("stray.txt"), "stray\n").unwrap();
+
+        let out = cmd_commit(&dir, &["f.txt".to_string()], "tweak f", None).unwrap();
+        assert!(out.contains("tweak f"), "{out}");
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary().unwrap(), "tweak f");
+        assert!(
+            head.tree()
+                .unwrap()
+                .get_path(Path::new("stray.txt"))
+                .is_err(),
+            "the unlisted file must NOT be committed"
+        );
+        assert!(
+            wd.join("stray.txt").exists(),
+            "unlisted file stays in the worktree"
+        );
+
+        // A listed-but-missing file stages its deletion.
+        std::fs::remove_file(wd.join("g.txt")).unwrap();
+        cmd_commit(&dir, &["g.txt".to_string()], "drop g", None).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert!(head.tree().unwrap().get_path(Path::new("g.txt")).is_err());
+
+        // Refusals: no paths, a typo'd path, nothing to commit, a directory.
+        cmd_commit(&dir, &[], "x", None).unwrap_err();
+        cmd_commit(&dir, &["nope.txt".to_string()], "x", None).unwrap_err();
+        cmd_commit(&dir, &["f.txt".to_string()], "x", None).unwrap_err();
+        std::fs::create_dir(wd.join("sub")).unwrap();
+        let err = cmd_commit(&dir, &["sub".to_string()], "x", None).unwrap_err();
+        assert!(err.contains("directory"), "{err}");
+
+        // "./f.txt" is the same file as "f.txt" — normalized, not refused.
+        std::fs::write(wd.join("f.txt"), "again\n").unwrap();
+        cmd_commit(&dir, &["./f.txt".to_string()], "dot spelled", None).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary().unwrap(), "dot spelled");
+
+        // Pre-staged changes OUTSIDE `paths` refuse, naming them.
+        std::fs::write(wd.join("f.txt"), "third\n").unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(Path::new("stray.txt")).unwrap();
+        idx.write().unwrap();
+        let err = cmd_commit(&dir, &["f.txt".to_string()], "x", None).unwrap_err();
+        assert!(err.contains("stray.txt"), "{err}");
+    }
+
+    #[test]
+    fn cmd_commit_detached_unborn_and_already_placed() {
+        let dir = tmp("commit-edge");
+        let repo = Repository::init(&dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "test").unwrap();
+        cfg.set_str("user.email", "test@example.invalid").unwrap();
+
+        // Unborn branch: the commit becomes the root.
+        std::fs::write(repo.workdir().unwrap().join("f.txt"), "one\n").unwrap();
+        cmd_commit(&dir, &["f.txt".to_string()], "root", None).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.parent_count(), 0);
+        assert_eq!(head.summary().unwrap(), "root");
+
+        // after = HEAD: the new commit already sits directly after it.
+        std::fs::write(repo.workdir().unwrap().join("g.txt"), "g\n").unwrap();
+        let out = cmd_commit(&dir, &["g.txt".to_string()], "add g", Some("HEAD")).unwrap();
+        assert!(out.contains("already sits directly after"), "{out}");
+
+        // Detached HEAD refuses before touching anything.
+        let tip = repo.head().unwrap().peel_to_commit().unwrap().id();
+        repo.set_head_detached(tip).unwrap();
+        std::fs::write(repo.workdir().unwrap().join("h.txt"), "h\n").unwrap();
+        let err = cmd_commit(&dir, &["h.txt".to_string()], "x", None).unwrap_err();
+        assert!(err.contains("detached"), "{err}");
+    }
+
+    #[test]
+    fn cmd_commit_after_places_the_commit_mid_series() {
+        let dir = tmp("commit-after");
+        let repo = Repository::init(&dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "test").unwrap();
+        cfg.set_str("user.email", "test@example.invalid").unwrap();
+        let a = commit(&repo, &[], &[("f.txt", "one\n")], "base");
+        let b = commit(
+            &repo,
+            &[a],
+            &[("f.txt", "one\n"), ("g.txt", "g\n")],
+            "add g",
+        );
+        on_branch(&repo, "main", b);
+        std::fs::write(repo.workdir().unwrap().join("h.txt"), "h\n").unwrap();
+
+        let out = cmd_commit(&dir, &["h.txt".to_string()], "add h", Some("HEAD~1")).unwrap();
+        assert!(out.contains("relocated after"), "{out}");
+        let log = cmd_log(&dir, None, false).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert!(lines[0].contains("add g"), "{log}");
+        assert!(lines[1].contains("add h"), "{log}");
+        assert!(lines[2].contains("base"), "{log}");
+
+        // A bad `after` is caught BEFORE the commit is created.
+        std::fs::write(repo.workdir().unwrap().join("i.txt"), "i\n").unwrap();
+        let other = commit(&repo, &[], &[("z.txt", "z\n")], "unrelated");
+        let err =
+            cmd_commit(&dir, &["i.txt".to_string()], "x", Some(&other.to_string())).unwrap_err();
+        assert!(err.contains("not HEAD or an ancestor"), "{err}");
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert!(
+            head.summary().unwrap().contains("add g"),
+            "no commit created"
         );
     }
 }

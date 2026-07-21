@@ -211,6 +211,15 @@ Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `
 - `rehearse` — Dry-run: preview the resulting commits and whether the tree is unchanged (a pure reorder/fold), applying nothing. Unlike a real run, the rehearsal does NOT stop at the first conflict: it lists EVERY step that would conflict, each with the commit that last reshaped the conflicted lines (usually the right fold target) — repair the whole plan in one pass. Default false.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 
+## git_commit
+
+Commit exactly `paths` with `message` on the current branch: each listed file is staged from its worktree content (a listed file missing on disk becomes a deletion). There is deliberately no stage-everything mode — no -A, no ".", no directories — so stray files can't be swept into history; unlisted worktree changes just stay dirty, and pre-staged index changes outside `paths` refuse, naming them. `after` places the new commit directly after that ancestor instead of at the tip (in-series insertion via the rebase machinery: backup ring, pauses on conflict for the conflict tools + git_continue).
+
+- `after` — Optional placement: an ancestor commit (oid/ref/revspec) the new commit should sit directly after, instead of at the branch tip.
+- `message` (required) — The commit message.
+- `paths` (required) — The files to commit, each named explicitly — absolute or repo-relative. Required and non-empty; directories are refused.
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+
 ## git_cherry_pick
 
 Apply `commits` (in order) on top of the current branch tip. Stops on conflict for the conflict tools + git_continue.

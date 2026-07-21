@@ -198,6 +198,10 @@ into git_fixup, or let git_absorb fold them all).
     into the commits in into = [{message, paths?, hunks?}] — paths takes whole
     files, hunks = [{path, lines:[a,b]}] takes hunks by post-commit line span;
     one part may omit both as the catch-all for everything else.
+  git_commit {paths, message, after?}  commit exactly the listed files (a
+    listed-but-missing file stages its deletion). No -A/"."/directory sweep
+    exists; staged changes outside `paths` refuse. after: an ancestor the
+    new commit should sit directly after — commit + relocate in one call.
   git_cherry_pick {commits} / git_revert {commits}  on top of the tip.
   git_move {from, to, paths?, hunks?}  relocate a change between two ADJACENT
     commits (the moved change must be in `from`, not `to`), then replay the rest;
