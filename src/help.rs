@@ -174,7 +174,9 @@ Run (treesit-has-error) after resolving code, then save."#;
 const GIT: &str = r#"— git history workflow —
 In-process rebase/cherry-pick/revert: no network, no hooks, no exec; the
 worktree is the warm buffer set. Plan with git_log (oid + summary over a
-range like main..HEAD) and git_show (a commit's diff + metadata). git_blame
+range like main..HEAD; stat:true adds each commit's files + line counts —
+review a series without a git_show per commit) and git_show (a commit's
+diff + metadata). git_blame
 {path?, lines?, since?, worktree?} reports which commit last touched each line —
 the find-the-commit half for a fixup/edit plan; `since` scopes to your commits,
 `worktree` maps each UNCOMMITTED hunk to the commit that owns it (omit path to

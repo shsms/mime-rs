@@ -2359,8 +2359,15 @@ fn short(oid: Oid) -> String {
     s[..s.len().min(10)].to_string()
 }
 
-/// A one-line-per-commit log of `range` (default: from HEAD), capped at `limit`.
-pub fn log(repo: &Repository, range: Option<&str>, limit: usize) -> Result<String, Error> {
+/// A one-line-per-commit log of `range` (default: from HEAD), capped at
+/// `limit`. With `stat`, each line is followed by the commit's changed files
+/// (mark, path, +/- line counts) and a totals line — the series-review view.
+pub fn log(
+    repo: &Repository,
+    range: Option<&str>,
+    limit: usize,
+    stat: bool,
+) -> Result<String, Error> {
     let mut walk = repo.revwalk()?;
     match range {
         Some(r) => walk.push_range(r)?,
@@ -2378,10 +2385,83 @@ pub fn log(repo: &Repository, range: Option<&str>, limit: usize) -> Result<Strin
             short(c.id()),
             c.summary().unwrap_or("")
         ));
+        if stat {
+            out.push_str(&commit_stat(repo, &c)?);
+        }
     }
     if out.is_empty() {
         out.push_str("(no commits)\n");
     }
+    Ok(out)
+}
+
+/// One-char change mark for a delta status (the `git status --short` letters).
+fn delta_mark(s: Delta) -> char {
+    match s {
+        Delta::Added => 'A',
+        Delta::Deleted => 'D',
+        Delta::Modified => 'M',
+        Delta::Renamed => 'R',
+        Delta::Copied => 'C',
+        _ => '?',
+    }
+}
+
+/// The `--stat` block for one commit: per-file mark/path/+N -M lines (capped,
+/// binary files marked `bin`) and an exact totals line, diffed against the
+/// first parent (the empty tree for a root).
+fn commit_stat(repo: &Repository, c: &git2::Commit) -> Result<String, Error> {
+    const CAP: usize = 50;
+    let new_tree = c.tree()?;
+    let old_tree = if c.parent_count() > 0 {
+        Some(c.parent(0)?.tree()?)
+    } else {
+        None
+    };
+    let diff = repo.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)?;
+    let files: Vec<(char, String)> = diff
+        .deltas()
+        .map(|d| (delta_mark(d.status()), delta_path(Some(d))))
+        .collect();
+    let mut counts: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new();
+    let mut binaries: std::collections::HashSet<String> = std::collections::HashSet::new();
+    diff.foreach(
+        &mut |_, _| true,
+        Some(&mut |d, _b| {
+            binaries.insert(delta_path(Some(d)));
+            true
+        }),
+        None,
+        Some(&mut |d, _h, line| {
+            let e = counts.entry(delta_path(Some(d))).or_default();
+            match line.origin() {
+                '+' => e.0 += 1,
+                '-' => e.1 += 1,
+                _ => {}
+            }
+            true
+        }),
+    )?;
+    let mut out = String::new();
+    let (mut add, mut del) = (0, 0);
+    for (n, (mark, path)) in files.iter().enumerate() {
+        let (a, d) = counts.get(path).copied().unwrap_or((0, 0));
+        add += a;
+        del += d;
+        if n >= CAP {
+            continue;
+        }
+        if binaries.contains(path) {
+            out.push_str(&format!("   {mark} {path} bin\n"));
+        } else {
+            out.push_str(&format!("   {mark} {path} +{a} -{d}\n"));
+        }
+    }
+    if files.len() > CAP {
+        out.push_str(&format!("   … and {} more file(s)\n", files.len() - CAP));
+    }
+    out.push_str(&format!("   {} file(s), +{add} -{del}\n", files.len()));
     Ok(out)
 }
 
@@ -2404,14 +2484,7 @@ pub fn show(repo: &Repository, oid: Oid) -> Result<String, Error> {
     };
     let diff = repo.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)?;
     for d in diff.deltas() {
-        let mark = match d.status() {
-            Delta::Added => "A",
-            Delta::Deleted => "D",
-            Delta::Modified => "M",
-            Delta::Renamed => "R",
-            Delta::Copied => "C",
-            _ => "?",
-        };
+        let mark = delta_mark(d.status());
         let p = delta_path(Some(d));
         let p = if p.is_empty() { "?" } else { &p };
         out.push_str(&format!("  {mark} {p}\n"));
@@ -4689,8 +4762,12 @@ pub fn cmd_status(repo_path: &std::path::Path) -> Result<String, String> {
     ))
 }
 
-pub fn cmd_log(repo_path: &std::path::Path, range: Option<&str>) -> Result<String, String> {
-    log(&open(repo_path)?, range, 50).map_err(gerr)
+pub fn cmd_log(
+    repo_path: &std::path::Path,
+    range: Option<&str>,
+    stat: bool,
+) -> Result<String, String> {
+    log(&open(repo_path)?, range, 50, stat).map_err(gerr)
 }
 
 pub fn cmd_show(repo_path: &std::path::Path, commit: &str) -> Result<String, String> {
@@ -5113,7 +5190,7 @@ mod tests {
             "## topic\nworktree clean\nno sequencer operation in progress"
         );
 
-        let log = cmd_log(&dir, None).unwrap();
+        let log = cmd_log(&dir, None, false).unwrap();
         assert!(log.contains("add b") && log.contains("change a"), "{log}");
         let show = cmd_show(&dir, "HEAD").unwrap();
         assert!(
@@ -5198,7 +5275,7 @@ mod tests {
         assert_eq!(read(&repo, "lib"), "v2\n", "the amended base won");
         assert_eq!(read(&repo, "t1"), "1\n");
         assert_eq!(read(&repo, "t2"), "1\n");
-        let log = cmd_log(&dir, None).unwrap();
+        let log = cmd_log(&dir, None, false).unwrap();
         assert!(log.contains("lib v2 (amended)"), "{log}");
         assert!(!log.contains("add lib v1"), "stale base commit gone: {log}");
     }
@@ -8424,5 +8501,50 @@ mod tests {
         let out = cmd_status(&dir).unwrap();
         assert!(out.starts_with("## main\n"), "{out}");
         assert!(out.contains("worktree clean"), "{out}");
+    }
+
+    #[test]
+    fn cmd_log_stat_marks_binaries_and_caps_the_file_list() {
+        let dir = tmp("logstat-edge");
+        let repo = Repository::init(&dir).unwrap();
+        // 51 text files plus one binary (a NUL byte marks it as such).
+        let names: Vec<String> = (0..51).map(|i| format!("f{i:02}.txt")).collect();
+        let mut files: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "x\n")).collect();
+        files.push(("a_img.bin", "\u{0}binary\u{0}\n"));
+        let a = commit(&repo, &[], &files, "big");
+        on_branch(&repo, "main", a);
+
+        let out = cmd_log(&dir, None, true).unwrap();
+        assert!(out.contains(" A a_img.bin bin\n"), "{out}");
+        assert!(
+            !out.contains("a_img.bin +"),
+            "binary must not count lines: {out}"
+        );
+        assert!(out.contains("… and 2 more file(s)\n"), "{out}");
+        assert!(out.contains("52 file(s), +51 -0\n"), "{out}");
+    }
+
+    #[test]
+    fn cmd_log_stat_reports_files_and_line_counts() {
+        let dir = tmp("logstat");
+        let repo = Repository::init(&dir).unwrap();
+        let a = commit(&repo, &[], &[("f.txt", "one\n")], "base");
+        let b = commit(
+            &repo,
+            &[a],
+            &[("f.txt", "one\ntwo\n"), ("g.txt", "g\n")],
+            "more",
+        );
+        on_branch(&repo, "main", b);
+
+        let out = cmd_log(&dir, None, true).unwrap();
+        assert!(
+            out.contains("more\n   M f.txt +1 -0\n   A g.txt +1 -0\n   2 file(s), +2 -0\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("base\n   A f.txt +1 -0\n   1 file(s), +1 -0\n"),
+            "{out}"
+        );
     }
 }

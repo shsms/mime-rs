@@ -3008,7 +3008,11 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
         "git_skip" => seq::cmd_skip(&repo),
         "git_abort" => seq::cmd_abort(&repo),
         "git_status" => seq::cmd_status(&repo),
-        "git_log" => seq::cmd_log(&repo, args.get("range").and_then(Value::as_str)),
+        "git_log" => seq::cmd_log(
+            &repo,
+            args.get("range").and_then(Value::as_str),
+            bool_arg(args, "stat"),
+        ),
         "git_show" => seq::cmd_show(&repo, &str_arg(args, "commit")?),
         "git_blame" => {
             let group_by = match args.get("group_by").and_then(Value::as_str) {
@@ -3216,10 +3220,14 @@ fn git_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "git_log",
-            "description": "One line per commit (oid + summary), for `range` (e.g. main..HEAD) or from HEAD; capped at 50. Use to build a rebase plan.",
+            "description": "One line per commit (oid + summary), for `range` (e.g. main..HEAD) or from HEAD; capped at 50. Use to build a rebase plan. stat: true adds each commit's changed files with +/- line counts — the review-a-series view (git log --stat) without a git_show per commit.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "repo": repo, "range": { "type": "string", "description": "A revision range like main..HEAD; omit for HEAD's history." } },
+                "properties": {
+                    "repo": repo,
+                    "range": { "type": "string", "description": "A revision range like main..HEAD; omit for HEAD's history." },
+                    "stat": { "type": "boolean", "description": "Follow each commit with its changed files (mark, path, +/- line counts, vs first parent) and a totals line. Default false." }
+                },
                 "required": ["repo"],
             },
         }),
@@ -3647,7 +3655,11 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             A::read(),
             "branch, upstream ahead/behind, dirty paths, in-progress operation",
         ),
-        "git_log" => (Git, A::read(), "one line per commit for a range"),
+        "git_log" => (
+            Git,
+            A::read(),
+            "one line per commit for a range (stat: files + line counts)",
+        ),
         "git_show" => (
             Git,
             A::read(),
