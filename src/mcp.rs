@@ -254,7 +254,11 @@ fn alias_table(tool: &str) -> &'static [(&'static str, &'static str)] {
         ],
         "insert_text" => &[("location", "pos"), ("position", "pos"), ("at", "pos")],
         "read_region" => &[("from", "start"), ("to", "end")],
-        "git_rebase" => &[("upstream", "from")],
+        "git_rebase" => &[("upstream", "from"), ("path", "repo")],
+        // `path` names a FILE in git_blame — there it stays an error (whose
+        // message lists the valid keys) instead of silently meaning the repo.
+        "git_blame" => &[],
+        git if git.starts_with("git_") => &[("path", "repo")],
         _ => &[],
     }
 }
@@ -4357,6 +4361,30 @@ mod git_tool_tests {
         let mut args = json!({ "text": "x", "anchor": { "before": 3 } });
         let err = normalize_aliases("insert_text", &mut args).unwrap_err();
         assert!(err.contains("literal line text"), "{err}");
+    }
+
+    #[test]
+    fn git_tools_accept_path_as_a_repo_alias_except_blame() {
+        let mut args = json!({ "path": "/r", "range": "main..HEAD" });
+        normalize_aliases("git_log", &mut args).unwrap();
+        assert_eq!(args, json!({ "repo": "/r", "range": "main..HEAD" }));
+
+        // git_rebase keeps its upstream→from alias alongside.
+        let mut args = json!({ "path": "/r", "upstream": "main", "onto": "base" });
+        normalize_aliases("git_rebase", &mut args).unwrap();
+        assert_eq!(
+            args,
+            json!({ "repo": "/r", "from": "main", "onto": "base" })
+        );
+
+        // Both spellings at once is ambiguous, not a silent pick.
+        let mut args = json!({ "path": "/r", "repo": "/s" });
+        normalize_aliases("git_status", &mut args).unwrap_err();
+
+        // git_blame's `path` is the file to blame — untouched.
+        let mut args = json!({ "repo": "/r", "path": "src/a.rs" });
+        normalize_aliases("git_blame", &mut args).unwrap();
+        assert_eq!(args, json!({ "repo": "/r", "path": "src/a.rs" }));
     }
 
     #[test]
