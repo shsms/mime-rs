@@ -2734,9 +2734,9 @@ fn repo_path(args: &Value) -> Result<std::path::PathBuf, String> {
     crate::safety::check_path(Path::new(&str_arg(args, "repo")?))
 }
 
-/// The `git_rebase` plan array → (commit, action, message, message_edits, split
-/// parts) tuples. A split part with no `paths` key is the catch-all. `Err`
-/// when a message edit contradicts itself (see [`msg_edit_specs`]).
+/// The `git_rebase` plan array → (commit, action, message, message_edits)
+/// tuples. `Err` when a message edit contradicts itself (see
+/// [`msg_edit_specs`]).
 fn plan_arg(args: &Value) -> Result<Option<Vec<crate::sequencer::PlanItem>>, String> {
     let Some(arr) = args.get("plan").and_then(Value::as_array) else {
         return Ok(None);
@@ -2748,57 +2748,6 @@ fn plan_arg(args: &Value) -> Result<Option<Vec<crate::sequencer::PlanItem>>, Str
                 Some(a) => msg_edit_specs(a)?,
                 None => Vec::new(),
             };
-            let into = s
-                .get("into")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .map(|p| {
-                            let paths_key = p.get("paths");
-                            let hunks_key = p.get("hunks");
-                            crate::sequencer::SplitPart {
-                                message: p
-                                    .get("message")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string(),
-                                paths: paths_key
-                                    .and_then(Value::as_array)
-                                    .map(|ps| {
-                                        ps.iter()
-                                            .filter_map(|x| x.as_str().map(str::to_string))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default(),
-                                hunks: hunks_key
-                                    .and_then(Value::as_array)
-                                    .map(|hs| {
-                                        hs.iter()
-                                            .filter_map(|h| {
-                                                let path = h
-                                                    .get("path")
-                                                    .and_then(Value::as_str)?
-                                                    .to_string();
-                                                let lines =
-                                                    h.get("lines").and_then(Value::as_array)?;
-                                                let lo =
-                                                    lines.first().and_then(Value::as_u64)? as u32;
-                                                let hi =
-                                                    lines.get(1).and_then(Value::as_u64)? as u32;
-                                                Some(crate::sequencer::HunkSel { path, lo, hi })
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_default(),
-                                // The catch-all is the part with NEITHER a `paths` nor a
-                                // `hunks` key; a present-but-non-array key stays a
-                                // non-catch-all (rejected later, no silent promotion).
-                                rest: paths_key.is_none() && hunks_key.is_none(),
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
             Ok((
                 s.get("commit")
                     .and_then(Value::as_str)
@@ -2810,11 +2759,53 @@ fn plan_arg(args: &Value) -> Result<Option<Vec<crate::sequencer::PlanItem>>, Str
                     .to_string(),
                 s.get("message").and_then(Value::as_str).map(str::to_string),
                 edits,
-                into,
             ))
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(Some(items))
+}
+
+/// The `git_split` `into` array → the output-commit parts.
+fn split_parts(arr: &[Value]) -> Vec<crate::sequencer::SplitPart> {
+    arr.iter()
+        .map(|p| {
+            let paths_key = p.get("paths");
+            let hunks_key = p.get("hunks");
+            crate::sequencer::SplitPart {
+                message: p
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                paths: paths_key
+                    .and_then(Value::as_array)
+                    .map(|ps| {
+                        ps.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                hunks: hunks_key
+                    .and_then(Value::as_array)
+                    .map(|hs| {
+                        hs.iter()
+                            .filter_map(|h| {
+                                let path = h.get("path").and_then(Value::as_str)?.to_string();
+                                let lines = h.get("lines").and_then(Value::as_array)?;
+                                let lo = lines.first().and_then(Value::as_u64)? as u32;
+                                let hi = lines.get(1).and_then(Value::as_u64)? as u32;
+                                Some(crate::sequencer::HunkSel { path, lo, hi })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                // The catch-all is the part with NEITHER a `paths` nor a
+                // `hunks` key; a present-but-non-array key stays a
+                // non-catch-all (rejected later, no silent promotion).
+                rest: paths_key.is_none() && hunks_key.is_none(),
+            }
+        })
+        .collect()
 }
 
 /// Parse `message_edits` items. `delete: true` is the explicit spelling of
@@ -3004,6 +2995,17 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
                 )
             }
         }
+        "git_split" => seq::cmd_split(
+            &repo,
+            &str_arg(args, "commit")?,
+            split_parts(
+                args.get("into")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            ),
+            bool_arg(args, "rehearse"),
+        ),
         "git_commit" => {
             // A non-string `after` must not silently skip the requested
             // relocation — the commit would land at the tip with a success
@@ -3116,7 +3118,7 @@ fn git_tool_schemas() -> Vec<Value> {
     vec![
         json!({
             "name": "git_rebase",
-            "description": "Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`, or an `autosquash` fold (a sparse {commit, into} list, or `true` to fold the branch's fixup!/squash! commits into the commits their subjects name). Each plan step picks/rewords/squashes/fixups/edits/splits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. A `split` step partitions one commit's changes — by whole file (`paths`) or by hunk (`hunks`, a post-commit line span) — into the commits listed in `into`. The plan-less pick-all drops commits already present in `onto` by patch-id (like `git rebase`, so a stacked branch onto a rewritten base doesn't duplicate them; reported, and overridable with `reapply_cherry_picks`). Stops on a conflict for the conflict tools + git_continue. Unstaged changes to paths the plan does NOT rewrite are autostashed (parked on a backup ref, restored when the operation finishes or aborts; a file you edit again during a pause keeps your later edit, and the parked bytes stay on the ref); staged changes and changes to rewritten paths refuse, naming them. No network, hooks, or exec.",
+            "description": "Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`, or an `autosquash` fold (a sparse {commit, into} list, or `true` to fold the branch's fixup!/squash! commits into the commits their subjects name). Each plan step picks/rewords/squashes/fixups/edits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. (Partitioning one commit into several is its own tool: git_split.) The plan-less pick-all drops commits already present in `onto` by patch-id (like `git rebase`, so a stacked branch onto a rewritten base doesn't duplicate them; reported, and overridable with `reapply_cherry_picks`). Stops on a conflict for the conflict tools + git_continue. Unstaged changes to paths the plan does NOT rewrite are autostashed (parked on a backup ref, restored when the operation finishes or aborts; a file you edit again during a pause keeps your later edit, and the parked bytes stay on the ref); staged changes and changes to rewritten paths refuse, naming them. No network, hooks, or exec.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3143,7 +3145,7 @@ fn git_tool_schemas() -> Vec<Value> {
                             "type": "object",
                             "properties": {
                                 "commit": { "type": "string", "description": "oid/ref/revspec of the commit." },
-                                "action": { "type": "string", "enum": ["pick", "reword", "squash", "fixup", "edit", "split", "drop"] },
+                                "action": { "type": "string", "enum": ["pick", "reword", "squash", "fixup", "edit", "drop"] },
                                 "message": { "type": "string", "description": "New message (reword/edit) or melded message (squash); ignored otherwise." },
                                 "message_edits": {
                                     "type": "array",
@@ -3157,30 +3159,6 @@ fn git_tool_schemas() -> Vec<Value> {
                                             "append": { "type": "string", "description": "Text to append as a trailing line." }
                                         }
                                     }
-                                },
-                                "into": {
-                                    "type": "array",
-                                    "description": "For a `split` step: the output commits, in order. Each is {message, paths?, hunks?}: `paths` takes whole files, `hunks` takes specific hunks of a file by post-commit line range. One part may omit both to be the catch-all collecting every change no other part claims. Every change the commit makes must be covered exactly once; tracked files can be split across parts by hunk.",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "message": { "type": "string", "description": "Commit message for this output commit." },
-                                            "paths": { "type": "array", "items": { "type": "string" }, "description": "Whole files whose changes go into this commit." },
-                                            "hunks": {
-                                                "type": "array",
-                                                "description": "Specific hunks of a file: each {path, lines: [start, end]} takes every diff-hunk of `path` whose post-commit line range overlaps [start, end] (1-based inclusive). Lets one part take part of a file and another the rest.",
-                                                "items": {
-                                                    "type": "object",
-                                                    "properties": {
-                                                        "path": { "type": "string", "description": "File whose hunks to select." },
-                                                        "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based inclusive line span in the POST-commit file." }
-                                                    },
-                                                    "required": ["path", "lines"]
-                                                }
-                                            }
-                                        },
-                                        "required": ["message"]
-                                    }
                                 }
                             },
                             "required": ["commit", "action"]
@@ -3190,6 +3168,43 @@ fn git_tool_schemas() -> Vec<Value> {
                     "reapply_cherry_picks": { "type": "boolean", "description": "Plan-less pick-all only: keep commits already present in `onto` by patch-id instead of dropping them. Default false — like `git rebase`, a commit whose change already sits in the new base (e.g. after the base was reordered/amended below the merge-base) is skipped so a stacked branch isn't duplicated; the skipped commits are reported. Set true to replay them anyway. Ignored when an explicit `plan` or `autosquash` is given." }
                 },
                 "required": ["repo", "onto"],
+            },
+        }),
+        json!({
+            "name": "git_split",
+            "description": "Split ONE commit into several: partition its changes into the commits listed in `into` (in order); every descendant is replayed on top unchanged, so the branch's final tree is untouched — a pure history re-slice with git_rebase's backup ring, autostash, and conflict handling. rehearse:true previews the resulting commits without applying.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": repo,
+                    "commit": { "type": "string", "description": "oid/ref/revspec of the commit to split — any non-merge, non-root commit on the current branch." },
+                    "into": {
+                        "type": "array",
+                        "description": "The output commits, in order. Each is {message, paths?, hunks?}: `paths` takes whole files, `hunks` takes specific hunks of a file by post-commit line range. One part may omit both to be the catch-all collecting every change no other part claims. Every change the commit makes must be covered exactly once; tracked files can be split across parts by hunk.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "message": { "type": "string", "description": "Commit message for this output commit." },
+                                "paths": { "type": "array", "items": { "type": "string" }, "description": "Whole files whose changes go into this commit." },
+                                "hunks": {
+                                    "type": "array",
+                                    "description": "Specific hunks of a file: each {path, lines: [start, end]} takes every diff-hunk of `path` whose post-commit line range overlaps [start, end] (1-based inclusive). Lets one part take part of a file and another the rest.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "path": { "type": "string", "description": "File whose hunks to select." },
+                                            "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based inclusive line span in the POST-commit file." }
+                                        },
+                                        "required": ["path", "lines"]
+                                    }
+                                }
+                            },
+                            "required": ["message"]
+                        }
+                    },
+                    "rehearse": { "type": "boolean", "description": "Preview the resulting commits without applying. Default false." }
+                },
+                "required": ["repo", "commit", "into"],
             },
         }),
         json!({
@@ -3666,6 +3681,11 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             Git,
             A::destructive(),
             "rebase the branch onto a base — full plan, sparse autosquash, or autosquash:true (fold fixup!/squash! commits)",
+        ),
+        "git_split" => (
+            Git,
+            A::destructive(),
+            "split one commit into several; descendants replay unchanged",
         ),
         "git_commit" => (
             Git,
@@ -4293,30 +4313,19 @@ mod git_tool_tests {
     }
 
     #[test]
-    fn plan_arg_treats_only_an_absent_paths_key_as_the_split_catch_all() {
-        let plan = ok_plan_arg(&json!({
-            "plan": [{
-                "commit": "abc",
-                "action": "split",
-                "into": [
-                    {"message": "m1", "paths": ["x"]},
-                    {"message": "m2", "paths": "not-an-array"},
-                    {"message": "m3"}
-                ]
-            }]
-        }));
-        let parts = &plan[0].4;
+    fn split_parts_treats_only_an_absent_paths_key_as_the_catch_all() {
+        let into = json!([
+            {"message": "m1", "paths": ["x"]},
+            {"message": "m2", "paths": "not-an-array"},
+            {"message": "m3"}
+        ]);
+        let parts = split_parts(into.as_array().unwrap());
         assert!(!parts[0].rest && parts[0].paths == ["x"], "explicit paths");
         assert!(
             !parts[1].rest && parts[1].paths.is_empty(),
             "malformed paths is NOT silently promoted to the catch-all"
         );
         assert!(parts[2].rest, "an absent paths key IS the catch-all");
-    }
-
-    /// `plan_arg` for a plan known to parse: unwrap both layers.
-    fn ok_plan_arg(args: &Value) -> Vec<crate::sequencer::PlanItem> {
-        plan_arg(args).unwrap().unwrap()
     }
 
     #[test]
@@ -4466,10 +4475,12 @@ mod git_tool_tests {
     #[test]
     fn message_edit_delete_is_explicit_and_contradiction_checked() {
         // delete: true parses to the same spec as omitting replace.
-        let plan = ok_plan_arg(&json!({
+        let plan = plan_arg(&json!({
             "plan": [{ "commit": "c", "action": "reword",
                        "message_edits": [{ "find": "x", "delete": true }] }]
-        }));
+        }))
+        .unwrap()
+        .unwrap();
         assert_eq!(plan[0].3[0].replace, None);
         // A half-typo'd edit errors instead of silently deleting.
         for bad in [

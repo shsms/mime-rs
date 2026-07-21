@@ -254,14 +254,8 @@ pub struct HunkSel {
 }
 
 /// A raw plan step as the MCP layer extracts it: (commit, action, message,
-/// message_edits, split parts). `cmd_rebase` resolves/validates each into a `Step`.
-pub type PlanItem = (
-    String,
-    String,
-    Option<String>,
-    Vec<MsgEditSpec>,
-    Vec<SplitPart>,
-);
+/// message_edits). `cmd_rebase` resolves/validates each into a `Step`.
+pub type PlanItem = (String, String, Option<String>, Vec<MsgEditSpec>);
 
 /// The `autosquash` argument to `cmd_rebase`: an explicit sparse directive
 /// list, or marker-driven derivation — git's `--autosquash` proper — from
@@ -4487,19 +4481,27 @@ pub fn cmd_rebase(
         match plan {
             Some(items) => items
                 .iter()
-                .map(|(commit, action, message, edits, into)| {
+                .map(|(commit, action, message, edits)| {
                     let message_edits = edits.iter().map(MsgEdit::from_spec).collect::<Result<
                         Vec<_>,
                         String,
                     >>(
                     )?;
+                    let action = Action::parse(action)
+                        .ok_or_else(|| format!("unknown action \"{action}\""))?;
+                    if action == Action::Split {
+                        return Err(
+                            "split is its own tool now — git_split {repo, commit, into} \
+                             partitions one commit and replays the descendants"
+                                .to_string(),
+                        );
+                    }
                     Ok(Step {
                         commit: resolve_s(&repo, commit)?,
-                        action: Action::parse(action)
-                            .ok_or_else(|| format!("unknown action \"{action}\""))?,
+                        action,
                         message: message.clone(),
                         message_edits,
-                        split_into: into.clone(),
+                        split_into: Vec::new(),
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?,
@@ -4963,6 +4965,72 @@ pub fn cmd_commit(
         short(after_oid),
         outcome_text(&res)
     ))
+}
+
+/// `git_split`: partition `commit`'s changes into the commits described by
+/// `parts` (in order), replaying every descendant on top unchanged — a
+/// single-purpose front-end over the rebase machinery (same backup ring,
+/// autostash, conflict pause, rehearse).
+pub fn cmd_split(
+    repo_path: &std::path::Path,
+    commit: &str,
+    parts: Vec<SplitPart>,
+    rehearse_only: bool,
+) -> Result<String, String> {
+    let repo = open(repo_path)?;
+    if parts.len() < 2 {
+        return Err(
+            "git_split: `into` needs at least two parts — one part is a reword, not a split"
+                .to_string(),
+        );
+    }
+    let target = resolve_s(&repo, commit)?;
+    let head = repo
+        .head()
+        .map_err(gerr)?
+        .peel_to_commit()
+        .map_err(gerr)?
+        .id();
+    if target != head && !repo.graph_descendant_of(head, target).map_err(gerr)? {
+        return Err("git_split: the commit is not on the current branch".to_string());
+    }
+    let tc = repo.find_commit(target).map_err(gerr)?;
+    if tc.parent_count() > 1 {
+        return Err(format!(
+            "git_split: {} is a merge — split applies to linear commits",
+            short(target)
+        ));
+    }
+    if tc.parent_count() == 0 {
+        return Err(format!(
+            "git_split: {} is the root commit — not supported",
+            short(target)
+        ));
+    }
+    let onto = tc.parent_id(0).map_err(gerr)?;
+    let mut steps = vec![Step {
+        commit: target,
+        action: Action::Split,
+        message: None,
+        message_edits: Vec::new(),
+        split_into: parts,
+    }];
+    steps.extend(
+        commits_since(&repo, target)
+            .map_err(gerr)?
+            .into_iter()
+            .map(pick_step),
+    );
+    let plan = Plan { onto, steps };
+    if rehearse_only {
+        return Ok(preview_text(
+            &repo,
+            &rehearse(&repo, &plan, Mode::Pick).map_err(gerr)?,
+        ));
+    }
+    let note = backup_note(&repo);
+    let out = start(&repo, plan).map_err(gerr)?;
+    Ok(format!("{}{note}", outcome_with_tree_note(&repo, &out)))
 }
 
 pub fn cmd_log(
@@ -5494,13 +5562,7 @@ mod tests {
             &dir,
             &base.to_string(),
             Some(&base.to_string()),
-            Some(vec![(
-                f1.to_string(),
-                "pick".to_string(),
-                None,
-                Vec::new(),
-                Vec::new(),
-            )]),
+            Some(vec![(f1.to_string(), "pick".to_string(), None, Vec::new())]),
             None,
             false,
             false,
@@ -8873,5 +8935,101 @@ mod tests {
             head.summary().unwrap().contains("add g"),
             "no commit created"
         );
+    }
+
+    #[test]
+    fn cmd_split_partitions_one_commit_and_replays_the_tail() {
+        let dir = tmp("cmdsplit");
+        let repo = Repository::init(&dir).unwrap();
+        let a = commit(&repo, &[], &[("f.txt", "one\n")], "base");
+        let b = commit(
+            &repo,
+            &[a],
+            &[("f.txt", "one\n"), ("g.txt", "g\n"), ("h.txt", "h\n")],
+            "add g and h",
+        );
+        let c = commit(
+            &repo,
+            &[b],
+            &[("f.txt", "one\nmore\n"), ("g.txt", "g\n"), ("h.txt", "h\n")],
+            "tail",
+        );
+        on_branch(&repo, "main", c);
+        let parts = || {
+            vec![
+                SplitPart {
+                    message: "add g".to_string(),
+                    paths: vec!["g.txt".to_string()],
+                    hunks: Vec::new(),
+                    rest: false,
+                },
+                SplitPart {
+                    message: "add h".to_string(),
+                    paths: Vec::new(),
+                    hunks: Vec::new(),
+                    rest: true,
+                },
+            ]
+        };
+
+        // Rehearse first: previews the parts, mutates nothing.
+        let preview = cmd_split(&dir, &b.to_string(), parts(), true).unwrap();
+        assert!(preview.contains("rehearsal"), "{preview}");
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), c);
+
+        let out = cmd_split(&dir, &b.to_string(), parts(), false).unwrap();
+        assert!(out.contains("tree identical"), "{out}");
+        let log = cmd_log(&dir, None, false).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert!(lines[0].contains("tail"), "{log}");
+        assert!(lines[1].contains("add h"), "{log}");
+        assert!(lines[2].contains("add g"), "{log}");
+        assert!(lines[3].contains("base"), "{log}");
+
+        // Fewer than two parts is a reword, not a split.
+        let err = cmd_split(&dir, "HEAD", Vec::new(), false).unwrap_err();
+        assert!(err.contains("at least two"), "{err}");
+
+        // Root commit, off-branch commit, and merge commit all refuse.
+        let err = cmd_split(&dir, &a.to_string(), parts(), false).unwrap_err();
+        assert!(err.contains("root commit"), "{err}");
+        let stray = commit(&repo, &[], &[("z.txt", "z\n")], "unrelated");
+        let err = cmd_split(&dir, &stray.to_string(), parts(), false).unwrap_err();
+        assert!(err.contains("not on the current branch"), "{err}");
+        let tip = repo.head().unwrap().peel_to_commit().unwrap().id();
+        let merge = commit(
+            &repo,
+            &[tip, stray],
+            &[("f.txt", "one\nmore\n"), ("z.txt", "z\n")],
+            "merge",
+        );
+        repo.reset(
+            &repo.find_object(merge, None).unwrap(),
+            ResetType::Hard,
+            None,
+        )
+        .unwrap();
+        let err = cmd_split(&dir, &merge.to_string(), parts(), false).unwrap_err();
+        assert!(err.contains("is a merge"), "{err}");
+    }
+
+    #[test]
+    fn cmd_rebase_plan_rejects_the_removed_split_action() {
+        let dir = tmp("nosplit");
+        let repo = Repository::init(&dir).unwrap();
+        let a = commit(&repo, &[], &[("f.txt", "one\n")], "base");
+        let b = commit(&repo, &[a], &[("f.txt", "one\ntwo\n")], "more");
+        on_branch(&repo, "main", b);
+        let err = cmd_rebase(
+            &dir,
+            &a.to_string(),
+            None,
+            Some(vec![(b.to_string(), "split".to_string(), None, Vec::new())]),
+            None,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("git_split"), "{err}");
     }
 }

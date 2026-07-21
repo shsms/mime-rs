@@ -182,9 +182,9 @@ the find-the-commit half for a fixup/edit plan; `since` scopes to your commits,
 `worktree` maps each UNCOMMITTED hunk to the commit that owns it (omit path to
 sweep the whole tree; group_by: "commit" buckets the hunks per owner — feed
 into git_fixup, or let git_absorb fold them all).
-  git_rebase {onto, from?, plan?}  plan = [{commit, action, message?, message_edits?,
-    into?}], action = pick|reword|squash|fixup|edit|split|drop; list order is the
-    new commit order. Omit plan to replay all of onto..HEAD; from (git's
+  git_rebase {onto, from?, plan?}  plan = [{commit, action, message?,
+    message_edits?}], action = pick|reword|squash|fixup|edit|drop; list order
+    is the new commit order. Omit plan to replay all of onto..HEAD; from (git's
     <upstream> in three-arg --onto) bounds the replay to from..HEAD instead —
     the stacked-branch transplant. rehearse:true
     previews the result (and whether it is a pure reorder/fold) without applying;
@@ -194,10 +194,12 @@ into git_fixup, or let git_absorb fold them all).
     worktree, then git_continue folds the changes into that commit. message_edits
     ([{find, replace?}] to replace/delete EVERY occurrence, [{append}] to add a
     trailing line) tweak a reword/squash/fixup/edit message without retyping it,
-    so the sign-off and the rest survive. A `split` step partitions one commit
-    into the commits in into = [{message, paths?, hunks?}] — paths takes whole
-    files, hunks = [{path, lines:[a,b]}] takes hunks by post-commit line span;
-    one part may omit both as the catch-all for everything else.
+    so the sign-off and the rest survive.
+  git_split {commit, into, rehearse?}  partition ONE commit into the commits
+    in into = [{message, paths?, hunks?}] — paths takes whole files, hunks =
+    [{path, lines:[a,b]}] takes hunks by post-commit line span; one part may
+    omit both as the catch-all. Descendants replay unchanged on top, so the
+    branch's final tree is untouched.
   git_commit {paths, message, after?}  commit exactly the listed files (a
     listed-but-missing file stages its deletion). No -A/"."/directory sweep
     exists; staged changes outside `paths` refuse. after: an ancestor the
