@@ -15,7 +15,7 @@ exclude = ["*.org"]
 # Git sequencer (rebase / cherry-pick / revert) — see todo.org. `vendored-libgit2`
 # builds libgit2 from source via `cc` so there is no system-libgit2 dependency;
 # we never expose remote/transport ops, so the network surface is unused.
-git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 # Streamable HTTP transport for the MCP server (`mime --http`) — a sync, minimal
 # HTTP/1.1 server (no async runtime). The agent never reaches the network; this
 # is a localhost front end, like the daemon's unix socket.
@@ -55,8 +55,8 @@ memchr = "2.8.1"
 # TUI cockpit (`mime tui`, behind the `tui` feature): an observer/stepper over
 # the engine — ratatui + crossterm stay out of the default build so the core
 # (and the MCP/daemon deployments) remain lean.
-ratatui = { version = "0.29", optional = true }
-crossterm = { version = "0.28", optional = true }
+ratatui = { version = "0.30", optional = true }
+crossterm = { version = "0.29", optional = true }
 
 [features]
 tui = ["dep:ratatui", "dep:crossterm"]
