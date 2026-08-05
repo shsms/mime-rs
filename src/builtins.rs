@@ -87,6 +87,12 @@ fn err(msg: &str) -> Error {
     Error::lisp_error(msg.to_string())
 }
 
+/// Accept conflict sides as either strings (`"ours"`) or quoted symbols
+/// (`'ours`), matching how Lisp callers naturally spell enum-like values.
+fn conflict_side_arg(side: &TulispObject) -> Result<String, Error> {
+    side.as_string().or_else(|_| side.as_symbol())
+}
+
 /// A buffer marker: a durable position handle. The `id` indexes the store's
 /// marker registry (`TextStore::marker_*`), where the live position lives and
 /// auto-adjusts across edits. A first-class tulisp value (via `TulispConvertible`)
@@ -1939,7 +1945,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         ctx.defun(
             "conflict-text",
-            move |side: String, n: Option<i64>| -> Result<String, Error> {
+            move |side: TulispObject, n: Option<i64>| -> Result<String, Error> {
+                let side = conflict_side_arg(&side)?;
                 let mut sess = s.borrow_mut();
                 let b = sess.buffer.as_mut();
                 let hunks = crate::conflict::scan(b);
@@ -2033,7 +2040,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         ctx.defun(
             "conflict-keep",
-            move |side: String, n: Option<i64>| -> Result<i64, Error> {
+            move |side: TulispObject, n: Option<i64>| -> Result<i64, Error> {
+                let side = conflict_side_arg(&side)?;
                 conflict_splice(&s, n, |b, h| {
                     crate::conflict::side_text_with_warning(b, h, &side).map_err(|e| err(&e))
                 })
@@ -2050,7 +2058,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         ctx.defun(
             "conflict-keep-all",
-            move |side: String| -> Result<i64, Error> {
+            move |side: TulispObject| -> Result<i64, Error> {
+                let side = conflict_side_arg(&side)?;
                 let mut sess = s.borrow_mut();
                 let (remaining, warnings) = {
                     let b = sess.buffer.as_mut();
@@ -4140,6 +4149,29 @@ mod tests {
         assert_eq!(report(&r, "g"), "5"); // start of "<<<<<<< A"
         assert_eq!(report(&r, "p"), "5");
         assert_eq!(report(&r, "ours"), "\"o\\n\"");
+    }
+
+    #[test]
+    fn conflict_sides_accept_quoted_symbols() {
+        let text = "<<<<<<< A\no\n=======\nt\n>>>>>>> B\n";
+        let mut ws = trusted(text);
+        let r = ws
+            .run(
+                r#"(report "ours" (conflict-text 'ours 1))
+                   (report "left" (conflict-keep 'theirs 1))
+                   (report "text" (buffer-string))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "ours"), "\"o\\n\"");
+        assert_eq!(report(&r, "left"), "0");
+        assert_eq!(report(&r, "text"), "\"t\\n\"");
+
+        let mut ws = trusted(text);
+        let r = ws
+            .run(r#"(report "left" (conflict-keep-all 'ours)) (report "text" (buffer-string))"#)
+            .unwrap();
+        assert_eq!(report(&r, "left"), "0");
+        assert_eq!(report(&r, "text"), "\"o\\n\"");
     }
 
     #[test]
