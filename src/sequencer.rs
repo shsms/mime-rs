@@ -22,9 +22,10 @@
 //! racing a single call — an agent driving its own repo, the intended use, is
 //! single-writer.
 //!
-//! Network and arbitrary-code channels are unused by construction: no
-//! remotes/transports, no hooks or filters; repos are confined to `MIME_ROOTS`
-//! at the tool boundary (see todo.org for the security checklist).
+//! Network and arbitrary-code channels are unused by default: no
+//! remotes/transports, hooks or filters. `MIME_EXEC=1` allows the explicit
+//! exec tool and the configured commit signer; repos are confined to
+//! `MIME_ROOTS` at the tool boundary (see todo.org for the security checklist).
 
 use crate::buffer::Buffer;
 use git2::{
@@ -32,7 +33,7 @@ use git2::{
     RevertOptions, Sort, build::CheckoutBuilder,
 };
 use serde_json::json;
-use std::path::Path;
+use std::{io::Write, path::Path};
 
 type Error = git2::Error;
 
@@ -40,17 +41,146 @@ fn estr(msg: &str) -> Error {
     Error::from_str(msg)
 }
 
+fn exec_allowed() -> bool {
+    std::env::var("MIME_EXEC")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn optional_config_string(repo: &Repository, key: &str) -> Result<Option<String>, Error> {
+    match repo.config()?.get_string(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn signing_required(repo: &Repository) -> Result<bool, Error> {
+    match repo.config()?.get_bool("commit.gpgsign") {
+        Ok(value) => Ok(value),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn require_signing_ready(repo: &Repository) -> Result<(), Error> {
+    if !signing_required(repo)? {
+        return Ok(());
+    }
+    if !exec_allowed() {
+        return Err(estr(
+            "commit.gpgsign=true, but commit signing needs to execute the configured signer and MIME_EXEC is disabled — launch mime with MIME_EXEC=1 or disable commit.gpgsign for this repo",
+        ));
+    }
+    let format =
+        optional_config_string(repo, "gpg.format")?.unwrap_or_else(|| "openpgp".to_string());
+    if !format.eq_ignore_ascii_case("openpgp") {
+        return Err(estr(&format!(
+            "commit.gpgsign=true with gpg.format={format}, but mime currently supports openpgp signing only"
+        )));
+    }
+    Ok(())
+}
+
+fn signing_rehearsal_note(repo: &Repository) -> String {
+    match signing_required(repo) {
+        Ok(false) => String::new(),
+        Ok(true) if exec_allowed() => {
+            "  signing note: the real run will execute the configured OpenPGP signer because commit.gpgsign=true\n".to_string()
+        }
+        Ok(true) => {
+            "  signing note: commit.gpgsign=true; the real run will refuse until mime is launched with MIME_EXEC=1\n".to_string()
+        }
+        Err(e) => format!("  signing note: cannot read commit.gpgsign: {}\n", e.message()),
+    }
+}
+
+/// Create a history commit, signing it when repository config requires it.
+/// Internal autostash/backup commits deliberately keep using `repo.commit`
+/// directly: they are implementation objects, never branch history.
+#[allow(clippy::too_many_arguments)] // Mirrors Repository::commit plus signing policy.
+fn create_commit(
+    repo: &Repository,
+    update_ref: Option<&str>,
+    author: &git2::Signature,
+    committer: &git2::Signature,
+    message: &str,
+    tree: &git2::Tree,
+    parents: &[&git2::Commit],
+    sign: bool,
+) -> Result<Oid, Error> {
+    if !sign || !signing_required(repo)? {
+        return repo.commit(update_ref, author, committer, message, tree, parents);
+    }
+    require_signing_ready(repo)?;
+
+    let content = repo.commit_create_buffer(author, committer, message, tree, parents)?;
+    let content = std::str::from_utf8(&content)
+        .map_err(|e| estr(&format!("cannot encode commit for signing: {e}")))?;
+    let program = optional_config_string(repo, "gpg.openpgp.program")?
+        .or(optional_config_string(repo, "gpg.program")?)
+        .unwrap_or_else(|| "gpg".into());
+    let key = optional_config_string(repo, "user.signingkey")?;
+    let mut command = std::process::Command::new(&program);
+    command
+        .arg("--status-fd=2")
+        .arg("-bsa")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(key) = key {
+        command.arg("--local-user").arg(key);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|e| estr(&format!("cannot execute commit signer {program:?}: {e}")))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| estr("commit signer stdin is unavailable"))?
+        .write_all(content.as_bytes())
+        .map_err(|e| estr(&format!("cannot send commit to signer: {e}")))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| estr(&format!("cannot wait for commit signer: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(estr(&format!(
+            "commit signer {program:?} failed with {}: {}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+    let signature = std::str::from_utf8(&output.stdout)
+        .map_err(|e| estr(&format!("commit signer returned non-UTF-8 output: {e}")))?;
+    if signature.trim().is_empty() {
+        return Err(estr("commit signer returned an empty signature"));
+    }
+    let oid = repo.commit_signed(content, signature, None)?;
+    if let Some(reference) = update_ref {
+        let target = if reference == "HEAD" {
+            repo.find_reference("HEAD")?
+                .symbolic_target()
+                .map(str::to_string)
+                .unwrap_or_else(|| "HEAD".to_string())
+        } else {
+            reference.to_string()
+        };
+        repo.reference(&target, oid, true, "commit (mime)")?;
+    }
+    Ok(oid)
+}
+
 /// Hard-reset HEAD/index/worktree to `oid` — the recurring teardown idiom.
 fn hard_reset(repo: &Repository, oid: Oid) -> Result<(), Error> {
     repo.reset(&repo.find_object(oid, None)?, ResetType::Hard, None)
 }
 
-/// [`hard_reset`], but carry the autostashed paths' CURRENT worktree bytes
-/// across the reset. The plan never rewrites these paths, so an edit the user
-/// made there during the operation is theirs — the teardown reset must not
-/// silently revert it.
-fn hard_reset_keeping_autostash(repo: &Repository, oid: Oid, st: &State) -> Result<(), Error> {
-    if st.autostash.is_empty() {
+/// [`hard_reset`], but carry `paths`' CURRENT worktree bytes across the reset.
+/// Used for autostashed paths and, on abort, explicitly folded untracked files
+/// that the reset would otherwise delete.
+fn hard_reset_keeping_paths(repo: &Repository, oid: Oid, paths: &[String]) -> Result<(), Error> {
+    if paths.is_empty() {
         return hard_reset(repo, oid);
     }
     let workdir = repo.workdir().ok_or_else(|| estr("bare repository"))?;
@@ -64,8 +194,7 @@ fn hard_reset_keeping_autostash(repo: &Repository, oid: Oid, st: &State) -> Resu
             Err(_) => None,
         }
     };
-    let kept: Vec<(String, Option<Vec<u8>>)> = st
-        .autostash
+    let kept: Vec<(String, Option<Vec<u8>>)> = paths
         .iter()
         .filter_map(|p| read_opt(p).map(|bytes| (p.clone(), bytes)))
         .collect();
@@ -88,6 +217,10 @@ fn hard_reset_keeping_autostash(repo: &Repository, oid: Oid, st: &State) -> Resu
         }
     }
     Ok(())
+}
+
+fn hard_reset_keeping_autostash(repo: &Repository, oid: Oid, st: &State) -> Result<(), Error> {
+    hard_reset_keeping_paths(repo, oid, &st.autostash)
 }
 
 /// The recovery ref a `begin` stamps with the pre-op tip of `branch` (a full
@@ -376,6 +509,10 @@ pub enum Outcome {
         /// edited them during the operation — the parked bytes stay on the
         /// `-autostash` ref. Empty on a clean restore (or no autostash).
         kept: Vec<String>,
+        /// Paths explicitly selected by `include_untracked` while editing.
+        /// Kept separate so the result cannot explain their addition away as
+        /// an ordinary tree difference.
+        committed_untracked: Vec<String>,
     },
     Conflict {
         step: usize,
@@ -440,6 +577,9 @@ struct State {
     /// Paths of uncommitted changes autostashed at begin (their bytes live on
     /// the `-autostash` backup ref); restored by finish/abort. Empty = none.
     autostash: Vec<String>,
+    /// Untracked paths explicitly folded at an edit pause. Persisted so abort
+    /// can restore their bytes after resetting them out of history.
+    committed_untracked: Vec<String>,
 }
 
 fn state_path(repo: &Repository) -> std::path::PathBuf {
@@ -486,6 +626,7 @@ fn save_state(repo: &Repository, st: &State) -> Result<(), Error> {
         "mode": st.mode.as_str(),
         "editing": st.editing,
         "autostash": st.autostash,
+        "committed_untracked": st.committed_untracked,
     });
     std::fs::write(state_path(repo), serde_json::to_vec_pretty(&v).unwrap())
         .map_err(|e| estr(&format!("cannot write sequencer state: {e}")))
@@ -584,6 +725,14 @@ fn load_state(repo: &Repository) -> Result<State, Error> {
         mode: Mode::parse(v["mode"].as_str().unwrap_or("pick")),
         editing: v["editing"].as_bool().unwrap_or(false),
         autostash: v["autostash"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        committed_untracked: v["committed_untracked"]
             .as_array()
             .map(|a| {
                 a.iter()
@@ -741,6 +890,9 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
     if repo.head_detached()? {
         return Err(estr("HEAD is detached — check out a branch first"));
     }
+    // Refuse before stamping refs or touching the worktree when the repository
+    // requires signatures but the launcher did not grant signer execution.
+    require_signing_ready(repo)?;
     // Uncommitted work the hard reset below would silently destroy: changes to
     // paths this operation REWRITES refuse (like `git rebase`; restoring their
     // bytes over the rewrite would silently mix old and new content). Unstaged
@@ -889,6 +1041,7 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
         mode,
         editing: false,
         autostash,
+        committed_untracked: Vec::new(),
     };
     save_state(repo, &st)?;
     drive(repo, st)
@@ -1111,13 +1264,13 @@ fn rehearse(repo: &Repository, plan: &Plan, mode: Mode) -> Result<Preview, Error
         if step.action == Action::Split {
             // Preview the split's output commits (real objects, left dangling).
             let pick = repo.find_commit(step.commit)?;
-            for c in build_split(repo, &pick, current, &tree, &step.split_into)? {
+            for c in build_split(repo, &pick, current, &tree, &step.split_into, false)? {
                 let summary = repo.find_commit(c)?.summary().unwrap_or("").to_string();
                 commits.push((c, summary));
                 current = c;
             }
         } else {
-            let new = make_commit(repo, mode, plan.onto, current, step, &tree)?;
+            let new = make_commit(repo, mode, plan.onto, current, step, &tree, false)?;
             let summary = repo.find_commit(new)?.summary().unwrap_or("").to_string();
             // A squash/fixup re-parents onto the PREVIOUS commit's parent, so the
             // new commit supersedes it rather than adding one — mirror that in the
@@ -1198,15 +1351,74 @@ fn last_touchers(
 /// marker-like lines, e.g. a diff fixture).
 /// Resume from an `edit` pause: fold the agent's worktree changes into the
 /// paused commit (an amend), then drive the remaining steps.
-fn amend_step(repo: &Repository, mut st: State) -> Result<Outcome, Error> {
+fn amend_step(
+    repo: &Repository,
+    mut st: State,
+    include_untracked: &[String],
+) -> Result<Outcome, Error> {
     let current = repo.find_commit(st.current)?;
     let parent = current.parent(0)?;
-    // Sync the index to the worktree: update_all stages modifications and
-    // deletions of tracked files; add_all stages new files (honouring .gitignore).
+    // Sync TRACKED modifications and deletions to the worktree. Brand-new files
+    // are never swept in; exact untracked paths need an explicit opt-in below.
     let mut index = repo.index()?;
     index.update_all(["*"], None)?;
-    index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)?;
+    let workdir = repo.workdir().ok_or_else(|| estr("bare repository"))?;
+    for path in include_untracked {
+        let rel = Path::new(path);
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+        {
+            return Err(estr(&format!(
+                "include_untracked path {path} must be repository-relative and contain no .."
+            )));
+        }
+        let metadata = std::fs::symlink_metadata(workdir.join(rel)).map_err(|e| {
+            estr(&format!(
+                "include_untracked path {path} cannot be read: {e}"
+            ))
+        })?;
+        if metadata.file_type().is_dir() {
+            return Err(estr(&format!(
+                "include_untracked path {path} is a directory — name files explicitly"
+            )));
+        }
+        let status = repo.status_file(rel)?;
+        let already_selected = st.committed_untracked.iter().any(|p| p == path);
+        if status.is_ignored() {
+            return Err(estr(&format!(
+                "include_untracked path {path} is ignored — mime will not force-add it"
+            )));
+        }
+        if !(status.is_wt_new() || already_selected && status.is_index_new()) {
+            return Err(estr(&format!(
+                "include_untracked path {path} is not untracked — tracked changes are folded automatically"
+            )));
+        }
+        index.add_path(rel)?;
+        if !already_selected {
+            st.committed_untracked.push(path.clone());
+        }
+    }
+    // Native git users may have staged a new file themselves at the pause.
+    // Record every index entry absent from the paused commit's tree, not only
+    // include_untracked selections, so abort and the result classify both paths.
+    let current_tree = current.tree()?;
+    for entry in index.iter() {
+        let Ok(path) = std::str::from_utf8(&entry.path) else {
+            continue;
+        };
+        if current_tree.get_path(Path::new(path)).is_err()
+            && !st.committed_untracked.iter().any(|p| p == path)
+        {
+            st.committed_untracked.push(path.to_string());
+        }
+    }
     index.write()?;
+    // Persist the opt-in before committing. If commit creation fails, abort
+    // still knows which newly staged paths a hard reset must carry across.
+    save_state(repo, &st)?;
     // Autostashed paths never belong to the plan — a pause-time edit there
     // is the user's live change and must not be folded into this commit
     // (the restore logic keeps it in the worktree instead).
@@ -1233,13 +1445,15 @@ fn amend_step(repo: &Repository, mut st: State) -> Result<Outcome, Error> {
     let tree = repo.find_tree(index.write_tree()?)?;
     // Amend in place: same author/committer/message, the worktree's tree, the
     // same parent. An unedited worktree reproduces the identical commit (no-op).
-    let amended = repo.commit(
+    let amended = create_commit(
+        repo,
         None,
         &current.author(),
         &current.committer(),
         current.message().unwrap_or(""),
         &tree,
         &[&parent],
+        true,
     )?;
     repo.set_head_detached(amended)?;
     st.current = amended;
@@ -1248,12 +1462,21 @@ fn amend_step(repo: &Repository, mut st: State) -> Result<Outcome, Error> {
     drive(repo, st)
 }
 
-pub fn continue_op(repo: &Repository, force: bool) -> Result<Outcome, Error> {
+pub fn continue_op(
+    repo: &Repository,
+    force: bool,
+    include_untracked: &[String],
+) -> Result<Outcome, Error> {
     let mut st = load_state(repo)?;
     if st.editing {
         // Resuming from an `edit` pause: the commit is already landed; amend it
         // with the agent's worktree changes, then continue.
-        return amend_step(repo, st);
+        return amend_step(repo, st, include_untracked);
+    }
+    if !include_untracked.is_empty() {
+        return Err(estr(
+            "include_untracked applies only at an edit pause; conflict continuation stages exactly the conflicted paths",
+        ));
     }
     let step = st
         .steps
@@ -1358,7 +1581,13 @@ pub fn abort(repo: &Repository) -> Result<Vec<String>, Error> {
         .unwrap_or(st.orig);
     repo.reference(&st.branch, tip, true, "mime sequencer: abort")?;
     repo.set_head(&st.branch)?;
-    hard_reset_keeping_autostash(repo, tip, &st)?;
+    let mut keep = st.autostash.clone();
+    for path in &st.committed_untracked {
+        if !keep.contains(path) {
+            keep.push(path.clone());
+        }
+    }
+    hard_reset_keeping_paths(repo, tip, &keep)?;
     let _ = repo.cleanup_state();
     let _ = std::fs::remove_file(state_path(repo));
     // An aborted op hands the autostashed uncommitted changes back too. The
@@ -1403,6 +1632,7 @@ fn make_commit(
     current_oid: Oid,
     step: &Step,
     tree: &git2::Tree,
+    sign: bool,
 ) -> Result<Oid, Error> {
     let current = repo.find_commit(current_oid)?;
     let pick = repo.find_commit(step.commit)?;
@@ -1415,36 +1645,45 @@ fn make_commit(
             "Revert \"{summary}\"\n\nThis reverts commit {}.\n",
             pick.id()
         );
-        return repo.commit(
+        return create_commit(
+            repo,
             None,
             &pick.committer(),
             &pick.committer(),
             &msg,
             tree,
             &[&current],
+            sign,
         );
     }
     match step.action {
-        Action::Pick => repo.commit(
-            None,
-            &pick.author(),
-            &pick.committer(),
-            &pick_msg(),
-            tree,
-            &[&current],
-        ),
-        // `edit` lands like a pick (optionally reworded); the amend happens on
-        // continue, once the agent has changed the worktree.
-        Action::Reword | Action::Edit => {
-            let msg = step.message.clone().unwrap_or_else(pick_msg);
-            let msg = apply_msg_edits(msg, &step.message_edits)?;
-            repo.commit(
+        Action::Pick => {
+            let msg = pick_msg();
+            create_commit(
+                repo,
                 None,
                 &pick.author(),
                 &pick.committer(),
                 &msg,
                 tree,
                 &[&current],
+                sign,
+            )
+        }
+        // `edit` lands like a pick (optionally reworded); the amend happens on
+        // continue, once the agent has changed the worktree.
+        Action::Reword | Action::Edit => {
+            let msg = step.message.clone().unwrap_or_else(pick_msg);
+            let msg = apply_msg_edits(msg, &step.message_edits)?;
+            create_commit(
+                repo,
+                None,
+                &pick.author(),
+                &pick.committer(),
+                &msg,
+                tree,
+                &[&current],
+                sign,
             )
         }
         Action::Squash | Action::Fixup => {
@@ -1460,13 +1699,15 @@ fn make_commit(
                 }),
             };
             let msg = apply_msg_edits(msg, &step.message_edits)?;
-            repo.commit(
+            create_commit(
+                repo,
                 None,
                 &current.author(),
                 &current.committer(),
                 &msg,
                 tree,
                 &[&parent],
+                sign,
             )
         }
         Action::Drop => unreachable!("drop is handled before make_commit"),
@@ -1479,7 +1720,7 @@ fn make_commit(
 /// on `current`'s parent (the "HEAD" path rejects first-parent != HEAD); the
 /// worktree already matches the merged tree.
 fn land_step(repo: &Repository, st: &State, step: &Step, tree: &git2::Tree) -> Result<Oid, Error> {
-    let new = make_commit(repo, st.mode, st.onto, st.current, step, tree)?;
+    let new = make_commit(repo, st.mode, st.onto, st.current, step, tree, true)?;
     repo.set_head_detached(new)?;
     Ok(new)
 }
@@ -1579,6 +1820,7 @@ fn split_commits(
     base: Oid,
     target: &git2::Tree,
     parts: &[SplitPart],
+    sign: bool,
 ) -> Result<Vec<Oid>, Error> {
     let base_tree = repo.find_commit(base)?.tree()?;
     let touched = changed_paths(repo, &base_tree, target)?;
@@ -1620,13 +1862,15 @@ fn split_commits(
             }
         }
         let tree = repo.find_tree(index.write_tree_to(repo)?)?;
-        let new = repo.commit(
+        let new = create_commit(
+            repo,
             None,
             &pick.author(),
             &pick.committer(),
             &part.message,
             &tree,
             &[&cur],
+            sign,
         )?;
         made.push(new);
         current = new;
@@ -1642,11 +1886,12 @@ fn build_split(
     base: Oid,
     target: &git2::Tree,
     parts: &[SplitPart],
+    sign: bool,
 ) -> Result<Vec<Oid>, Error> {
     if parts.iter().any(|p| !p.hunks.is_empty()) {
-        split_commits_hunked(repo, pick, base, target, parts)
+        split_commits_hunked(repo, pick, base, target, parts, sign)
     } else {
-        split_commits(repo, pick, base, target, parts)
+        split_commits(repo, pick, base, target, parts, sign)
     }
 }
 
@@ -1846,6 +2091,7 @@ fn split_commits_hunked(
     base: Oid,
     target: &git2::Tree,
     parts: &[SplitPart],
+    sign: bool,
 ) -> Result<Vec<Oid>, Error> {
     let base_tree = repo.find_commit(base)?.tree()?;
     let plan = hunk_assignment(repo, &base_tree, target, parts)?;
@@ -1876,13 +2122,15 @@ fn split_commits_hunked(
         )?;
         let tree = repo.find_tree(tree_oid)?;
         let parent = repo.find_commit(current)?;
-        let new = repo.commit(
+        let new = create_commit(
+            repo,
             None,
             &pick.author(),
             &pick.committer(),
             &part.message,
             &tree,
             &[&parent],
+            sign,
         )?;
         made.push(new);
         current = new;
@@ -2116,21 +2364,26 @@ fn move_changes(
         )?
     };
 
-    let older_prime = repo.commit(
+    require_signing_ready(repo)?;
+    let older_prime = create_commit(
+        repo,
         None,
         &older.author(),
         &older.committer(),
         older.message().unwrap_or(""),
         &repo.find_tree(older_new_tree)?,
         &[&base_commit],
+        true,
     )?;
-    let newer_prime = repo.commit(
+    let newer_prime = create_commit(
+        repo,
         None,
         &newer.author(),
         &newer.committer(),
         newer.message().unwrap_or(""),
         &newer_tree,
         &[&repo.find_commit(older_prime)?],
+        true,
     )?;
 
     // Replay the commits after `newer` onto the rebuilt pair via the sequencer,
@@ -2153,7 +2406,7 @@ fn land_split(
     target: &git2::Tree,
 ) -> Result<Oid, Error> {
     let pick = repo.find_commit(step.commit)?;
-    let made = build_split(repo, &pick, st.current, target, &step.split_into)?;
+    let made = build_split(repo, &pick, st.current, target, &step.split_into, true)?;
     let last = *made.last().expect("split produced at least one commit");
     repo.set_head_detached(last)?;
     Ok(last)
@@ -2217,6 +2470,7 @@ fn drive(repo: &Repository, mut st: State) -> Result<Outcome, Error> {
     Ok(Outcome::Done {
         head: st.current,
         kept,
+        committed_untracked: st.committed_untracked,
     })
 }
 
@@ -2751,8 +3005,16 @@ fn blame_worktree(
 fn outcome_with_tree_note(repo: &Repository, out: &Outcome) -> String {
     let text = outcome_text(out);
     match out {
-        Outcome::Done { kept, .. } => {
-            format!("{text}{}{}", tree_identity_note(repo), kept_note(kept))
+        Outcome::Done {
+            kept,
+            committed_untracked,
+            ..
+        } => {
+            format!(
+                "{text}{}{}",
+                tree_identity_note(repo, committed_untracked),
+                kept_note(kept)
+            )
         }
         // A pause with an autostash in flight: say where the uncommitted
         // changes went and when they come back.
@@ -2785,7 +3047,7 @@ fn kept_note(kept: &[String]) -> String {
 
 /// One line comparing HEAD's tree with the pre-op tip's (backup ring slot 0).
 /// Empty when there is nothing to compare against.
-fn tree_identity_note(repo: &Repository) -> String {
+fn tree_identity_note(repo: &Repository, committed_untracked: &[String]) -> String {
     let Some(branch) = repo.head().ok().and_then(|h| h.name().map(str::to_string)) else {
         return String::new();
     };
@@ -2817,8 +3079,39 @@ fn tree_identity_note(repo: &Repository) -> String {
     } else {
         paths.join(", ")
     };
+    let committed_untracked: Vec<&String> = committed_untracked
+        .iter()
+        .filter(|path| {
+            old_tree.get_path(Path::new(path)).is_err()
+                && new_tree.get_path(Path::new(path)).is_ok()
+        })
+        .collect();
+    let untracked = if committed_untracked.is_empty() {
+        String::new()
+    } else {
+        let shown = if committed_untracked.len() > 8 {
+            format!(
+                "{} … ({} paths)",
+                committed_untracked[..8]
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                committed_untracked.len()
+            )
+        } else {
+            committed_untracked
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "\n  WARNING: previously untracked paths are now committed (staged or selected via include_untracked): {shown}"
+        )
+    };
     format!(
-        "\n  tree differs from the pre-op tip in: {shown} (expected when the \
+        "{untracked}\n  tree differs from the pre-op tip in: {shown} (expected when the \
          base moved or the plan drops/edits content; git_show the backup ref \
          to compare)"
     )
@@ -2916,6 +3209,38 @@ pub fn preview_text(repo: &Repository, preview: &Preview) -> String {
         ));
     }
     out
+}
+
+/// Rehearsal-side visibility for edit pauses: untracked files are deterministic
+/// worktree state even though the commit replay itself stays in-memory.
+fn edit_untracked_note(repo: &Repository, plan: &Plan) -> String {
+    if !plan.steps.iter().any(|s| s.action == Action::Edit) {
+        return String::new();
+    }
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false);
+    let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
+        return String::new();
+    };
+    let mut paths: Vec<String> = statuses
+        .iter()
+        .filter(|s| s.status().is_wt_new())
+        .filter_map(|s| s.path().map(str::to_string))
+        .collect();
+    if paths.is_empty() {
+        return String::new();
+    }
+    paths.sort();
+    let shown = if paths.len() > 8 {
+        format!("{} … ({} paths)", paths[..8].join(", "), paths.len())
+    } else {
+        paths.join(", ")
+    };
+    format!(
+        "  edit-pause note: untracked files stay untracked unless named in git_continue's include_untracked: {shown}\n"
+    )
 }
 
 // ---- path-facing command wrappers (the MCP tool layer calls these) --------
@@ -3154,11 +3479,13 @@ pub fn cmd_fixup(
     let steps = autosquash_steps(&repo, onto, &[(source, target, Action::Fixup)]).map_err(gerr)?;
     let plan = Plan { onto, steps };
     if rehearse_only {
-        return Ok(preview_text(
-            &repo,
-            &rehearse(&repo, &plan, Mode::Pick).map_err(gerr)?,
+        return Ok(format!(
+            "{}{}",
+            preview_text(&repo, &rehearse(&repo, &plan, Mode::Pick).map_err(gerr)?),
+            signing_rehearsal_note(&repo)
         ));
     }
+    require_signing_ready(&repo).map_err(gerr)?;
     let note = backup_note(&repo);
     let out = start(&repo, plan).map_err(gerr)?;
     Ok(format!("{}{note}", outcome_with_tree_note(&repo, &out)))
@@ -3621,20 +3948,17 @@ pub fn cmd_absorb(
 /// afterwards either way. Refuses on a dirty worktree.
 ///
 /// GATED: running an arbitrary command breaks the git tools' default
-/// "no hooks, no exec" posture, so it must be enabled explicitly by whoever
+/// "no hooks, no exec" default posture, so it must be enabled explicitly by whoever
 /// LAUNCHES the server (not the agent): set MIME_EXEC=1 in the environment.
 pub fn cmd_exec_over(
     repo_path: &std::path::Path,
     range: &str,
     command: &str,
 ) -> Result<String, String> {
-    let allowed = std::env::var("MIME_EXEC")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if !allowed {
+    if !exec_allowed() {
         return Err(
-            "git_exec_over: command execution is disabled by default (the git tools \
-             promise no hooks, no exec). Whoever launches the server can allow it by \
+            "git_exec_over: command execution is disabled by default. Whoever launches \
+             the server can grant the shared exec/signing capability by \
              setting MIME_EXEC=1 in mime's environment."
                 .to_string(),
         );
@@ -3864,36 +4188,42 @@ fn reword(
     if rehearse_only {
         return Ok(format!(
             "rehearse: would reword {} to:\n{}\n(the tree and every descendant's \
-             tree stay byte-identical)",
+             tree stay byte-identical)\n{}",
             short(target),
-            new_msg.trim_end()
+            new_msg.trim_end(),
+            signing_rehearsal_note(repo).trim_end()
         ));
     }
+    require_signing_ready(repo)?;
 
     // Re-create the target with its own tree + the new message, then chain
     // its descendants (same trees and messages, re-parented).
     rotate_backup_ring(repo, &branch, head)?;
     let parents: Vec<git2::Commit> = tc.parents().collect();
     let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-    let mut tip = repo.commit(
+    let mut tip = create_commit(
+        repo,
         None,
         &tc.author(),
         &tc.committer(),
         &new_msg,
         &tc.tree()?,
         &parent_refs,
+        true,
     )?;
     let reworded = tip;
     for oid in tail {
         let c = repo.find_commit(oid)?;
         let parent = repo.find_commit(tip)?;
-        tip = repo.commit(
+        tip = create_commit(
+            repo,
             None,
             &c.author(),
             &c.committer(),
             c.message().unwrap_or(""),
             &c.tree()?,
             &[&parent],
+            true,
         )?;
     }
     repo.reference(&branch, tip, true, "mime reword")?;
@@ -3984,8 +4314,10 @@ fn msg_rewrite(
                 counts_line(counts)
             ));
         }
+        out.push_str(&signing_rehearsal_note(repo));
         return Ok(out);
     }
+    require_signing_ready(repo)?;
 
     // Second pass: re-create each commit with its own tree and the rewritten
     // message, chaining parents. An untouched prefix reproduces identical
@@ -4001,13 +4333,15 @@ fn msg_rewrite(
             None => c.parents().collect(),
         };
         let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-        let new = repo.commit(
+        let new = create_commit(
+            repo,
             None,
             &c.author(),
             &c.committer(),
             msg,
             &c.tree()?,
             &parent_refs,
+            true,
         )?;
         out.push_str(&if new == *oid {
             format!("  {}  unchanged\n", short(*oid))
@@ -4032,6 +4366,9 @@ fn msg_rewrite(
 }
 
 fn absorb(repo: &Repository, since: Option<Oid>, rehearse_only: bool) -> Result<String, Error> {
+    if !rehearse_only {
+        require_signing_ready(repo)?;
+    }
     let head = repo.head()?.peel_to_commit()?;
     let head_tree = head.tree()?;
     let diff = worktree_diff(repo, None)?;
@@ -4202,8 +4539,9 @@ fn absorb(repo: &Repository, since: Option<Oid>, rehearse_only: bool) -> Result<
 
     if rehearse_only {
         return Ok(format!(
-            "{}\n{report}\n(the hunks left in the worktree stay uncommitted)",
-            preview_text(repo, &rehearse(repo, &plan, Mode::Pick)?)
+            "{}{}\n{report}\n(the hunks left in the worktree stay uncommitted)",
+            preview_text(repo, &rehearse(repo, &plan, Mode::Pick)?),
+            signing_rehearsal_note(repo)
         ));
     }
     let snap = snapshot_worktree(repo, &diff)?;
@@ -4228,6 +4566,9 @@ fn fixup_worktree(
     hunks: &[HunkSel],
     rehearse_only: bool,
 ) -> Result<String, Error> {
+    if !rehearse_only {
+        require_signing_ready(repo)?;
+    }
     let head = repo.head()?.peel_to_commit()?;
     let head_tree = head.tree()?;
     if head.id() != target && !repo.graph_descendant_of(head.id(), target)? {
@@ -4303,8 +4644,9 @@ fn fixup_worktree(
     let plan = Plan { onto, steps };
     if rehearse_only {
         return Ok(format!(
-            "{}\n(the unfolded uncommitted changes stay in the worktree)",
-            preview_text(repo, &rehearse(repo, &plan, Mode::Pick)?)
+            "{}{}\n(the unfolded uncommitted changes stay in the worktree)",
+            preview_text(repo, &rehearse(repo, &plan, Mode::Pick)?),
+            signing_rehearsal_note(repo)
         ));
     }
 
@@ -4530,8 +4872,10 @@ pub fn cmd_rebase(
     let drop_note = dropped_note(&repo, onto_oid, &dropped);
     if rehearse_only {
         return Ok(format!(
-            "{}{drop_note}{mark_note}",
+            "{}{}{}{drop_note}{mark_note}",
             preview_text(&repo, &rehearse(&repo, &plan, Mode::Pick).map_err(gerr)?),
+            edit_untracked_note(&repo, &plan),
+            signing_rehearsal_note(&repo),
         ));
     }
     let note = backup_note(&repo);
@@ -4610,9 +4954,13 @@ pub fn cmd_revert(repo_path: &std::path::Path, commits: &[String]) -> Result<Str
     ))
 }
 
-pub fn cmd_continue(repo_path: &std::path::Path, force: bool) -> Result<String, String> {
+pub fn cmd_continue(
+    repo_path: &std::path::Path,
+    force: bool,
+    include_untracked: &[String],
+) -> Result<String, String> {
     let repo = open(repo_path)?;
-    let out = continue_op(&repo, force).map_err(gerr)?;
+    let out = continue_op(&repo, force, include_untracked).map_err(gerr)?;
     Ok(outcome_with_tree_note(&repo, &out))
 }
 
@@ -4780,6 +5128,7 @@ pub fn cmd_commit(
     after: Option<&str>,
 ) -> Result<String, String> {
     let repo = open(repo_path)?;
+    require_signing_ready(&repo).map_err(gerr)?;
     if paths.is_empty() {
         return Err(
             "git_commit: `paths` must name each file to commit explicitly \
@@ -4916,8 +5265,7 @@ pub fn cmd_commit(
         format!("{message}\n")
     };
     let parents: Vec<&git2::Commit> = head_commit.iter().collect();
-    let new = repo
-        .commit(Some("HEAD"), &sig, &sig, &msg, &tree, &parents)
+    let new = create_commit(&repo, Some("HEAD"), &sig, &sig, &msg, &tree, &parents, true)
         .map_err(gerr)?;
     // Persist the staged entries only once the commit exists — a failure
     // above must not leave staged state the caller never asked to keep.
@@ -5023,9 +5371,10 @@ pub fn cmd_split(
     );
     let plan = Plan { onto, steps };
     if rehearse_only {
-        return Ok(preview_text(
-            &repo,
-            &rehearse(&repo, &plan, Mode::Pick).map_err(gerr)?,
+        return Ok(format!(
+            "{}{}",
+            preview_text(&repo, &rehearse(&repo, &plan, Mode::Pick).map_err(gerr)?),
+            signing_rehearsal_note(&repo)
         ));
     }
     let note = backup_note(&repo);
@@ -5109,6 +5458,36 @@ mod tests {
     use git2::Signature;
     use std::path::Path;
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct MimeExecGuard(Option<std::ffi::OsString>);
+
+    impl MimeExecGuard {
+        fn set(value: Option<&str>) -> Self {
+            let old = std::env::var_os("MIME_EXEC");
+            // Tests serialize this process-global mutation with ENV_LOCK.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var("MIME_EXEC", value),
+                    None => std::env::remove_var("MIME_EXEC"),
+                }
+            }
+            Self(old)
+        }
+    }
+
+    impl Drop for MimeExecGuard {
+        fn drop(&mut self) {
+            // The same lock remains held until after this guard drops.
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("MIME_EXEC", value),
+                    None => std::env::remove_var("MIME_EXEC"),
+                }
+            }
+        }
+    }
+
     fn tmp(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("mime-seq-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -5117,6 +5496,12 @@ mod tests {
 
     /// Commit a tree built from `files`, with explicit parents, updating no ref.
     fn commit(repo: &Repository, parents: &[Oid], files: &[(&str, &str)], msg: &str) -> Oid {
+        // Test repositories must not inherit the developer's global signing
+        // policy; signing-specific tests opt back in explicitly.
+        repo.config()
+            .unwrap()
+            .set_bool("commit.gpgsign", false)
+            .unwrap();
         let mut tb = repo.treebuilder(None).unwrap();
         for (name, content) in files {
             let blob = repo.blob(content.as_bytes()).unwrap();
@@ -5286,7 +5671,7 @@ mod tests {
 
         // Resolve and resume.
         std::fs::write(repo.workdir().unwrap().join("a"), "resolved\n").unwrap();
-        let out = continue_op(&repo, false).unwrap();
+        let out = continue_op(&repo, false, &[]).unwrap();
         assert!(matches!(out, Outcome::Done { .. }));
         assert_eq!(read(&repo, "a"), "resolved\n");
         assert!(!state_path(&repo).exists());
@@ -6005,7 +6390,7 @@ mod tests {
         // must win over the parked bytes.
         std::fs::write(dir.join("notes"), "newer\n").unwrap();
         std::fs::write(dir.join("a"), "3\n").unwrap();
-        let out = cmd_continue(&dir, false).unwrap();
+        let out = cmd_continue(&dir, false, &[]).unwrap();
         assert!(out.contains("done"), "{out}");
         assert_eq!(read(&repo, "notes"), "newer\n", "pause-time edit kept");
         assert!(
@@ -6070,7 +6455,7 @@ mod tests {
         // During the edit pause the user edits a plan file AND the parked path.
         std::fs::write(dir.join("a"), "3\n").unwrap();
         std::fs::write(dir.join("notes"), "newer\n").unwrap();
-        let out = continue_op(&repo, false).unwrap();
+        let out = continue_op(&repo, false, &[]).unwrap();
         assert!(matches!(out, Outcome::Done { .. }));
         // The amended commit carries `a` but NOT the parked path's edit...
         let tip = repo.head().unwrap().peel_to_commit().unwrap();
@@ -6357,10 +6742,97 @@ mod tests {
 
     #[test]
     fn exec_over_is_gated_behind_an_env_opt_in() {
-        // No test sets MIME_EXEC, so the gate must hold here.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = MimeExecGuard::set(None);
         let (dir, _repo, _base, _c1, _c2) = absorb_fixture("exec-gate");
         let err = cmd_exec_over(&dir, "HEAD~1..HEAD", "true").unwrap_err();
         assert!(err.contains("MIME_EXEC"), "{err}");
+    }
+
+    #[test]
+    fn required_commit_signing_refuses_without_exec_before_mutating() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = MimeExecGuard::set(None);
+        let dir = tmp("signing-refusal");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+        repo.config()
+            .unwrap()
+            .set_bool("commit.gpgsign", true)
+            .unwrap();
+        let plan = Plan {
+            onto: m1,
+            steps: vec![step(f1, Action::Pick, None)],
+        };
+
+        let note = signing_rehearsal_note(&repo);
+        assert!(note.contains("real run will refuse"), "{note}");
+        let err = start(&repo, plan).unwrap_err();
+        assert!(err.message().contains("commit.gpgsign=true"), "{err}");
+        assert!(err.message().contains("MIME_EXEC"), "{err}");
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), f1);
+        assert!(!state_path(&repo).exists());
+        assert!(repo.refname_to_id(&backup_ref("refs/heads/topic")).is_err());
+    }
+
+    #[test]
+    fn required_commit_signing_uses_the_configured_signer() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = MimeExecGuard::set(Some("1"));
+        let dir = tmp("signing-success");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+        let signer = dir.join("fake-gpg");
+        std::fs::write(
+            &signer,
+            b"#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '-----BEGIN PGP SIGNATURE-----' '' 'ZmFrZQ==' '-----END PGP SIGNATURE-----'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&signer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_bool("commit.gpgsign", true).unwrap();
+        config
+            .set_str("gpg.program", signer.to_str().unwrap())
+            .unwrap();
+        config.set_str("user.signingkey", "test-key").unwrap();
+        drop(config);
+
+        let out = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Edit, None)],
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, Outcome::Paused { .. }));
+        let landed = repo.head().unwrap().peel_to_commit().unwrap();
+        assert!(
+            landed
+                .raw_header()
+                .unwrap()
+                .contains("gpgsig -----BEGIN PGP SIGNATURE-----")
+        );
+        drop(landed);
+
+        std::fs::write(repo.workdir().unwrap().join("b"), b"EDITED\n").unwrap();
+        let out = continue_op(&repo, false, &[]).unwrap();
+        assert!(matches!(out, Outcome::Done { .. }));
+        let amended = repo.head().unwrap().peel_to_commit().unwrap();
+        assert!(
+            amended
+                .raw_header()
+                .unwrap()
+                .contains("gpgsig -----BEGIN PGP SIGNATURE-----")
+        );
     }
 
     #[test]
@@ -7277,6 +7749,7 @@ mod tests {
             onto: base,
             current: base,
             autostash: vec!["parked.txt".to_string()],
+            committed_untracked: vec!["new.txt".to_string()],
             next: 1,
             steps: vec![
                 Step {
@@ -7324,6 +7797,7 @@ mod tests {
         };
         save_state(&repo, &st).unwrap();
         let back = load_state(&repo).unwrap();
+        assert_eq!(back.committed_untracked, vec!["new.txt"]);
 
         match &back.steps[0].message_edits[0] {
             MsgEdit::Replace { find, with } => {
@@ -7387,7 +7861,7 @@ mod tests {
         let (repo, _) = conflict_repo(&dir);
         // The worktree still carries the diff3 markers; continue must refuse to
         // bake them into history rather than silently committing them.
-        let err = continue_op(&repo, false).unwrap_err();
+        let err = continue_op(&repo, false, &[]).unwrap_err();
         assert!(
             err.message().contains("unresolved conflict markers"),
             "{}",
@@ -7404,11 +7878,11 @@ mod tests {
         let (repo, _) = conflict_repo(&dir);
         std::fs::write(dir.join("a"), "resolved\n<<<<<<< leftover opener\n").unwrap();
         assert!(
-            continue_op(&repo, false).is_err(),
+            continue_op(&repo, false, &[]).is_err(),
             "stray opener must block"
         );
         // The failed continue committed/advanced nothing, so a forced retry works.
-        let out = continue_op(&repo, true).unwrap();
+        let out = continue_op(&repo, true, &[]).unwrap();
         assert!(matches!(out, Outcome::Done { .. }));
         assert_eq!(read(&repo, "a"), "resolved\n<<<<<<< leftover opener\n");
     }
@@ -7438,7 +7912,7 @@ mod tests {
         std::fs::write(dir.join("a"), "resolved\n").unwrap();
         std::fs::write(dir.join("b"), "also changed\n").unwrap();
         assert!(matches!(
-            continue_op(&repo, false).unwrap(),
+            continue_op(&repo, false, &[]).unwrap(),
             Outcome::Done { .. }
         ));
         // Only the conflicted path is committed; the unrelated edit is NOT folded
@@ -7474,7 +7948,7 @@ mod tests {
         // Resolve by keeping the deletion — add_path on a missing file would error.
         let _ = std::fs::remove_file(dir.join("f"));
         assert!(matches!(
-            continue_op(&repo, false).unwrap(),
+            continue_op(&repo, false, &[]).unwrap(),
             Outcome::Done { .. }
         ));
         assert!(!dir.join("f").exists(), "deletion landed");
@@ -7906,8 +8380,17 @@ mod tests {
         // The agent edits the worktree, then continues.
         std::fs::write(repo.workdir().unwrap().join("b"), b"EDITED\n").unwrap();
         std::fs::write(repo.workdir().unwrap().join("c"), b"new\n").unwrap();
-        let out = continue_op(&repo, false).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("c")).unwrap();
+        index.write().unwrap();
+        let out = continue_op(&repo, false, &[]).unwrap();
         assert!(matches!(out, Outcome::Done { .. }));
+        assert!(
+            outcome_with_tree_note(&repo, &out)
+                .contains("WARNING: previously untracked paths are now committed"),
+            "{}",
+            outcome_with_tree_note(&repo, &out)
+        );
 
         assert_eq!(read(&repo, "b"), "EDITED\n", "edit folded into the commit");
         assert_eq!(read(&repo, "c"), "new\n", "new file folded in");
@@ -7915,6 +8398,89 @@ mod tests {
         assert_eq!(tip.message().unwrap(), "add b", "message preserved");
         assert_eq!(tip.parent(0).unwrap().id(), m1, "still rebased onto m1");
         assert!(!state_path(&repo).exists(), "state cleared on finish");
+    }
+
+    #[test]
+    fn edit_pause_leaves_unselected_untracked_files_untracked() {
+        let dir = tmp("edit-untracked-stays-out");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+
+        let out = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Edit, None)],
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, Outcome::Paused { .. }));
+
+        std::fs::write(repo.workdir().unwrap().join("b"), b"EDITED\n").unwrap();
+        std::fs::write(repo.workdir().unwrap().join("scratch"), b"keep me\n").unwrap();
+        let out = continue_op(&repo, false, &[]).unwrap();
+        assert!(matches!(out, Outcome::Done { .. }));
+
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        assert!(tip.tree().unwrap().get_path(Path::new("scratch")).is_err());
+        assert_eq!(read(&repo, "scratch"), "keep me\n");
+        assert!(repo.status_file(Path::new("scratch")).unwrap().is_wt_new());
+    }
+
+    #[test]
+    fn abort_restores_explicitly_folded_untracked_file_as_untracked() {
+        let dir = tmp("edit-untracked-abort");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        let f2 = commit(
+            &repo,
+            &[f1],
+            &[("a", "1\n"), ("b", "1\n"), ("c", "1\n")],
+            "add c",
+        );
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f2);
+
+        let out = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Edit, None), step(f2, Action::Edit, None)],
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, Outcome::Paused { step: 0, .. }));
+
+        std::fs::write(repo.workdir().unwrap().join("scratch"), b"keep me\n").unwrap();
+        let out = continue_op(&repo, false, &["scratch".to_string()]).unwrap();
+        assert!(matches!(out, Outcome::Paused { step: 1, .. }));
+
+        abort(&repo).unwrap();
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), f2);
+        assert_eq!(read(&repo, "scratch"), "keep me\n");
+        assert!(repo.status_file(Path::new("scratch")).unwrap().is_wt_new());
+    }
+
+    #[test]
+    fn rehearsal_reports_untracked_files_near_edit_pauses() {
+        let dir = tmp("edit-untracked-rehearse");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        on_branch(&repo, "topic", f1);
+        std::fs::write(repo.workdir().unwrap().join("scratch"), b"keep me\n").unwrap();
+        let plan = Plan {
+            onto: base,
+            steps: vec![step(f1, Action::Edit, None)],
+        };
+
+        let note = edit_untracked_note(&repo, &plan);
+        assert!(note.contains("scratch"), "{note}");
+        assert!(note.contains("include_untracked"), "{note}");
     }
 
     #[test]
@@ -7968,7 +8534,7 @@ mod tests {
 
         // Resolve the conflict, continue → lands the commit, then PAUSES for the edit.
         std::fs::write(repo.workdir().unwrap().join("a"), b"resolved\n").unwrap();
-        let out = continue_op(&repo, false).unwrap();
+        let out = continue_op(&repo, false, &[]).unwrap();
         assert!(
             matches!(out, Outcome::Paused { .. }),
             "paused after resolving the conflict"
@@ -7977,7 +8543,7 @@ mod tests {
 
         // Now amend the resolved commit and finish.
         std::fs::write(repo.workdir().unwrap().join("a"), b"final\n").unwrap();
-        let out = continue_op(&repo, false).unwrap();
+        let out = continue_op(&repo, false, &[]).unwrap();
         assert!(matches!(out, Outcome::Done { .. }));
         assert_eq!(
             read(&repo, "a"),
@@ -8820,6 +9386,7 @@ mod tests {
         let mut cfg = repo.config().unwrap();
         cfg.set_str("user.name", "test").unwrap();
         cfg.set_str("user.email", "test@example.invalid").unwrap();
+        cfg.set_bool("commit.gpgsign", false).unwrap();
         let a = commit(&repo, &[], &[("f.txt", "one\n"), ("g.txt", "g\n")], "base");
         on_branch(&repo, "main", a);
         let wd = repo.workdir().unwrap().to_path_buf();
@@ -8878,6 +9445,7 @@ mod tests {
         let mut cfg = repo.config().unwrap();
         cfg.set_str("user.name", "test").unwrap();
         cfg.set_str("user.email", "test@example.invalid").unwrap();
+        cfg.set_bool("commit.gpgsign", false).unwrap();
 
         // Unborn branch: the commit becomes the root.
         std::fs::write(repo.workdir().unwrap().join("f.txt"), "one\n").unwrap();
