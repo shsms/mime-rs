@@ -8738,6 +8738,62 @@ mod tests {
     }
 
     #[test]
+    fn include_untracked_retry_after_a_failed_continue_succeeds() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set("MIME_EXEC", None);
+        let dir = tmp("edit-untracked-retry");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        on_branch(&repo, "topic", f1);
+        let out = start(
+            &repo,
+            Plan {
+                onto: base,
+                steps: vec![step(f1, Action::Edit, None)],
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, Outcome::Paused { .. }));
+
+        std::fs::write(repo.workdir().unwrap().join("scratch"), b"keep\n").unwrap();
+        // First attempt stages the opt-in, then fails at commit creation:
+        // the repo starts requiring signatures mid-pause with MIME_EXEC off.
+        repo.config()
+            .unwrap()
+            .set_bool("commit.gpgsign", true)
+            .unwrap();
+        let err = continue_op(&repo, false, &["scratch".to_string()]).unwrap_err();
+        assert!(err.message().contains("MIME_EXEC"), "{err}");
+        assert!(
+            repo.status_file(Path::new("scratch"))
+                .unwrap()
+                .is_index_new(),
+            "first attempt left the opt-in staged"
+        );
+
+        // The retry must accept the same selection even though the path is
+        // no longer worktree-new (already_selected && is_index_new).
+        repo.config()
+            .unwrap()
+            .set_bool("commit.gpgsign", false)
+            .unwrap();
+        let out = continue_op(&repo, false, &["scratch".to_string()]).unwrap();
+        assert!(matches!(out, Outcome::Done { .. }));
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        assert!(tip.tree().unwrap().get_path(Path::new("scratch")).is_ok());
+    }
+
+    #[test]
+    fn include_untracked_refuses_at_a_conflict_continuation() {
+        let dir = tmp("untracked-at-conflict");
+        let (repo, _) = conflict_repo(&dir);
+        std::fs::write(dir.join("a"), "resolved\n").unwrap();
+        let err = continue_op(&repo, false, &["x".to_string()]).unwrap_err();
+        assert!(err.message().contains("edit pause"), "{err}");
+    }
+
+    #[test]
     fn edit_skip_leaves_the_commit_unchanged() {
         let dir = tmp("edit-skip");
         let repo = Repository::init(&dir).unwrap();
