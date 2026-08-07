@@ -198,7 +198,20 @@ fn create_commit(
         } else {
             reference.to_string()
         };
-        repo.reference(&target, oid, true, "commit (mime)")?;
+        // The reflog line repo.commit would have written for this update:
+        // infix from the parent count, summary via git_commit_summary (which
+        // folds a wrapped subject into one line — not the same as the first
+        // physical line of `message`).
+        let commit = repo.find_commit(oid)?;
+        let infix = match commit.parent_count() {
+            0 => " (initial)",
+            1 => "",
+            _ => " (merge)",
+        };
+        let reflog_msg = format!("commit{infix}: {}", commit.summary().unwrap_or(""));
+        // Updating the branch HEAD points at also appends to HEAD's log
+        // (libgit2 mirrors git there), so one update covers both logs.
+        repo.reference(&target, oid, true, &reflog_msg)?;
     }
     Ok(oid)
 }
@@ -7006,6 +7019,74 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message().contains("SIG_CREATED"), "{err}");
+    }
+
+    #[test]
+    fn signed_commits_write_the_same_reflog_as_unsigned_ones() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set("MIME_EXEC", Some("1"));
+
+        let mk = |tag: &str, sign: bool| {
+            let dir = tmp(tag);
+            let repo = Repository::init(&dir).unwrap();
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "test").unwrap();
+            cfg.set_str("user.email", "test@example.invalid").unwrap();
+            cfg.set_bool("commit.gpgsign", sign).unwrap();
+            if sign {
+                let signer = fake_signer(&dir);
+                cfg.set_str("gpg.openpgp.program", signer.to_str().unwrap())
+                    .unwrap();
+            }
+            drop(cfg);
+            std::fs::write(repo.workdir().unwrap().join("f.txt"), "one\n").unwrap();
+            cmd_commit(&dir, &["f.txt".to_string()], "root", None).unwrap();
+            std::fs::write(repo.workdir().unwrap().join("f.txt"), "two\n").unwrap();
+            cmd_commit(&dir, &["f.txt".to_string()], "more", None).unwrap();
+            // Subjects that diverge from the first physical line: a wrapped
+            // subject (folded into one line) and a leading blank line
+            // (skipped) — git_commit_summary handles both.
+            std::fs::write(repo.workdir().unwrap().join("f.txt"), "three\n").unwrap();
+            cmd_commit(
+                &dir,
+                &["f.txt".to_string()],
+                "wrapped subject\ncontinued here\n\nbody",
+                None,
+            )
+            .unwrap();
+            std::fs::write(repo.workdir().unwrap().join("f.txt"), "four\n").unwrap();
+            cmd_commit(&dir, &["f.txt".to_string()], "\nleading blank", None).unwrap();
+            repo
+        };
+        let signed = mk("reflog-signed", true);
+        let unsigned = mk("reflog-unsigned", false);
+
+        // Compare the raw log files — what `git reflog` on a real checkout reads.
+        let msgs = |repo: &Repository, rel: &str| -> Vec<String> {
+            std::fs::read_to_string(repo.path().join(rel))
+                .unwrap_or_default()
+                .lines()
+                .map(|l| l.split_once('\t').map(|x| x.1).unwrap_or("").to_string())
+                .collect()
+        };
+        let branch = signed.head().unwrap().name().unwrap().to_string();
+        let branch_log = format!("logs/{branch}");
+        let signed_branch = msgs(&signed, &branch_log);
+        assert!(!signed_branch.is_empty(), "{branch_log} missing or empty");
+        assert_eq!(signed_branch, msgs(&unsigned, &branch_log));
+        assert_eq!(msgs(&signed, "logs/HEAD"), msgs(&unsigned, "logs/HEAD"));
+        let head_log = msgs(&signed, "logs/HEAD");
+        assert!(head_log.iter().any(|m| m == "commit: more"), "{head_log:?}");
+        assert!(
+            head_log
+                .iter()
+                .any(|m| m == "commit: wrapped subject continued here"),
+            "{head_log:?}"
+        );
+        assert!(
+            head_log.iter().any(|m| m == "commit: leading blank"),
+            "{head_log:?}"
+        );
     }
 
     #[test]
