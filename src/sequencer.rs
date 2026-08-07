@@ -3993,7 +3993,7 @@ pub fn cmd_absorb(
 /// afterwards either way. Refuses on a dirty worktree.
 ///
 /// GATED: running an arbitrary command breaks the git tools' default
-/// "no hooks, no exec" default posture, so it must be enabled explicitly by whoever
+/// "no hooks, no exec" posture, so it must be enabled explicitly by whoever
 /// LAUNCHES the server (not the agent): set MIME_EXEC=1 in the environment.
 pub fn cmd_exec_over(
     repo_path: &std::path::Path,
