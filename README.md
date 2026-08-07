@@ -69,8 +69,8 @@ front end and the capability tier differ.
   `git_absorb` fold worktree changes into the commits that own them,
   `git_reword` / `git_msg_rewrite` edit messages, and `git_range_diff` checks
   a rewrite after the fact. There is no `git` subprocess, network access or
-  hook execution. Repositories with `commit.gpgsign=true` are honoured via the
-  configured OpenPGP signer when the launcher grants `MIME_EXEC=1`; otherwise
+  hook execution. `commit.gpgsign=true` is honoured via the configured
+  OpenPGP signer when the launcher grants `MIME_EXEC=1`; otherwise
   write operations refuse instead of silently creating unsigned history.
   `MIME_EXEC=1` also enables the explicit `git_exec_over` tool. Every
   destructive op first stamps a `refs/mime-backup/<branch>` recovery ref.
