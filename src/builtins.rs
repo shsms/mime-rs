@@ -90,7 +90,11 @@ fn err(msg: &str) -> Error {
 /// Accept conflict sides as either strings (`"ours"`) or quoted symbols
 /// (`'ours`), matching how Lisp callers naturally spell enum-like values.
 fn conflict_side_arg(side: &TulispObject) -> Result<String, Error> {
-    side.as_string().or_else(|_| side.as_symbol())
+    side.as_string().or_else(|_| side.as_symbol()).map_err(|_| {
+        err(&format!(
+            "conflict side must be a string or symbol (\"ours\", 'theirs, …), got: {side}"
+        ))
+    })
 }
 
 /// A buffer marker: a durable position handle. The `id` indexes the store's
@@ -4172,6 +4176,15 @@ mod tests {
             .unwrap();
         assert_eq!(report(&r, "left"), "0");
         assert_eq!(report(&r, "text"), "\"o\\n\"");
+
+        // A wrong-typed side names BOTH accepted spellings, not just one.
+        let mut ws = trusted(text);
+        let e = match ws.run("(conflict-keep 5)") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("wrong-typed side must error"),
+        };
+        assert!(e.contains("string or symbol"), "{e}");
+        assert!(e.contains("got: 5"), "{e}");
     }
 
     #[test]
