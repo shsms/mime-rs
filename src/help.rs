@@ -172,7 +172,9 @@ to address the hunk at point. Nested conflicts surface innermost-first.
 Run (treesit-has-error) after resolving code, then save."#;
 
 const GIT: &str = r#"— git history workflow —
-In-process rebase/cherry-pick/revert: no network, no hooks, no exec; the
+In-process rebase/cherry-pick/revert: no network or hooks. With
+commit.gpgsign=true, MIME_EXEC=1 permits the configured OpenPGP signer;
+without it write operations refuse rather than create unsigned commits. The
 worktree is the warm buffer set. Plan with git_log (oid + summary over a
 range like main..HEAD; stat:true adds each commit's files + line counts —
 review a series without a git_show per commit) and git_show (a commit's

@@ -3022,7 +3022,15 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
         }
         "git_cherry_pick" => seq::cmd_cherry_pick(&repo, &str_list_arg(args, "commits")?),
         "git_revert" => seq::cmd_revert(&repo, &str_list_arg(args, "commits")?),
-        "git_continue" => seq::cmd_continue(&repo, bool_arg(args, "force")),
+        "git_continue" => seq::cmd_continue(
+            &repo,
+            bool_arg(args, "force"),
+            &args
+                .get("include_untracked")
+                .map(|_| str_list_arg(args, "include_untracked"))
+                .transpose()?
+                .unwrap_or_default(),
+        ),
         "git_skip" => seq::cmd_skip(&repo),
         "git_abort" => seq::cmd_abort(&repo),
         "git_status" => seq::cmd_status(&repo),
@@ -3118,7 +3126,7 @@ fn git_tool_schemas() -> Vec<Value> {
     vec![
         json!({
             "name": "git_rebase",
-            "description": "Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`, or an `autosquash` fold (a sparse {commit, into} list, or `true` to fold the branch's fixup!/squash! commits into the commits their subjects name). Each plan step picks/rewords/squashes/fixups/edits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. (Partitioning one commit into several is its own tool: git_split.) The plan-less pick-all drops commits already present in `onto` by patch-id (like `git rebase`, so a stacked branch onto a rewritten base doesn't duplicate them; reported, and overridable with `reapply_cherry_picks`). Stops on a conflict for the conflict tools + git_continue. Unstaged changes to paths the plan does NOT rewrite are autostashed (parked on a backup ref, restored when the operation finishes or aborts; a file you edit again during a pause keeps your later edit, and the parked bytes stay on the ref); staged changes and changes to rewritten paths refuse, naming them. No network, hooks, or exec.",
+            "description": "Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`, or an `autosquash` fold (a sparse {commit, into} list, or `true` to fold the branch's fixup!/squash! commits into the commits their subjects name). Each plan step picks/rewords/squashes/fixups/edits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. (Partitioning one commit into several is its own tool: git_split.) The plan-less pick-all drops commits already present in `onto` by patch-id (like `git rebase`, so a stacked branch onto a rewritten base doesn't duplicate them; reported, and overridable with `reapply_cherry_picks`). Stops on a conflict for the conflict tools + git_continue. Unstaged changes to paths the plan does NOT rewrite are autostashed (parked on a backup ref, restored when the operation finishes or aborts; a file you edit again during a pause keeps your later edit, and the parked bytes stay on the ref); staged changes and changes to rewritten paths refuse, naming them. No network or hooks. With commit.gpgsign=true, the configured OpenPGP signer runs only when MIME_EXEC=1; otherwise the operation refuses before mutation.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3241,10 +3249,14 @@ fn git_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "git_continue",
-            "description": "After resolving the stopped step's conflicts in the worktree (and saving), commit the resolution and continue the operation. At an `edit` pause, instead amends the paused commit to match the worktree, then continues. Errors if a resolved file still contains conflict-marker lines; pass force: true to override (e.g. the resolution legitimately contains marker-like text).",
+            "description": "After resolving the stopped step's conflicts in the worktree (and saving), commit the resolution and continue the operation. At an `edit` pause, instead amends the paused commit with tracked worktree modifications and deletions, then continues; untracked files are never swept in. Pass exact repo-relative files via `include_untracked` to fold selected untracked, non-ignored files. Errors if a resolved file still contains conflict-marker lines; pass force: true to override (e.g. the resolution legitimately contains marker-like text).",
             "inputSchema": {
                 "type": "object",
-                "properties": { "repo": repo, "force": { "type": "boolean", "description": "Commit even if a resolved file still has conflict-marker lines. Default false." } },
+                "properties": {
+                    "repo": repo,
+                    "force": { "type": "boolean", "description": "Commit even if a resolved file still has conflict-marker lines. Default false." },
+                    "include_untracked": { "type": "array", "items": { "type": "string" }, "description": "Edit-pause only: exact repo-relative untracked files to fold. Ignored files and directories refuse; omitted untracked files stay untracked." }
+                },
                 "required": ["repo"],
             },
         }),
@@ -3465,7 +3477,7 @@ fn git_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "git_exec_over",
-            "description": "Run a shell command at EVERY commit of `range`, oldest-first — the pr-prep gate loop (git rebase -x's standalone sibling): each commit is checked out in place (detached), the command runs in the worktree, and the walk stops on the first failure naming the commit and the output tail. HEAD is restored afterwards either way. Refuses on a dirty worktree. DISABLED unless whoever launches the server sets MIME_EXEC=1 (the git tools otherwise promise no hooks, no exec).",
+            "description": "Run a shell command at EVERY commit of `range`, oldest-first — the pr-prep gate loop (git rebase -x's standalone sibling): each commit is checked out in place (detached), the command runs in the worktree, and the walk stops on the first failure naming the commit and the output tail. HEAD is restored afterwards either way. Refuses on a dirty worktree. DISABLED unless whoever launches the server sets MIME_EXEC=1 (the same launcher gate used for configured commit signing).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4091,7 +4103,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "conflicts",
-            "description": "Overview of the merge-conflict hunks in the buffer: number, position + line, branch labels, side sizes; warns about marker lines it could not parse (malformed/nested). Read-only, but the resolution entry point — don't hand-edit markers with replace_text/insert_text; resolve via run_program: (conflict-keep SIDE &optional N) with ours|theirs|both, or base|all on diff3 hunks only; (conflict-keep-all SIDE) to take one side over every remaining hunk at once; (conflict-replace TEXT &optional N) for a hand-crafted merge; (conflict-resolve-trivial) to sweep the safe ones; (conflict-diff &optional N) to see what differs; (conflict-text SIDE &optional N) to read one side; (conflict-context &optional N LINES) to see one hunk WITH its surrounding code — the decision view; (conflict-goto &optional N) to jump to a hunk; (conflict-count) the remaining count ((conflict-hunks) renders this same overview). Mutating calls return the remaining count — wrap them in (report \"left\" …) to see it in run_program's JSON. N is 1-based and refreshes after each edit; nil N = the hunk at point. @positions are absolute, L labels narrowing-relative; a narrowing that cuts through a hunk hides it entirely — widen before resolving.",
+            "description": "Overview of the merge-conflict hunks in the buffer: number, position + line, branch labels, side sizes; warns about marker lines it could not parse (malformed/nested). Read-only, but the resolution entry point — don't hand-edit markers with replace_text/insert_text; resolve via run_program: (conflict-keep SIDE &optional N) with \"ours\"|\"theirs\"|\"both\" (quoted symbols 'ours|'theirs|'both also work), or \"base\"|\"all\" on diff3 hunks only; (conflict-keep-all SIDE) to take one side over every remaining hunk at once; (conflict-replace TEXT &optional N) for a hand-crafted merge; (conflict-resolve-trivial) to sweep the safe ones; (conflict-diff &optional N) to see what differs; (conflict-text SIDE &optional N) to read one side; (conflict-context &optional N LINES) to see one hunk WITH its surrounding code — the decision view; (conflict-goto &optional N) to jump to a hunk; (conflict-count) the remaining count ((conflict-hunks) renders this same overview). Mutating calls return the remaining count — wrap them in (report \"left\" …) to see it in run_program's JSON. N is 1-based and refreshes after each edit; nil N = the hunk at point. @positions are absolute, L labels narrowing-relative; a narrowing that cuts through a hunk hides it entirely — widen before resolving.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
