@@ -87,14 +87,27 @@ fn err(msg: &str) -> Error {
     Error::lisp_error(msg.to_string())
 }
 
-/// Accept conflict sides as either strings (`"ours"`) or quoted symbols
-/// (`'ours`), matching how Lisp callers naturally spell enum-like values.
-fn conflict_side_arg(side: &TulispObject) -> Result<String, Error> {
-    side.as_string().or_else(|_| side.as_symbol()).map_err(|_| {
-        err(&format!(
-            "conflict side must be a string or symbol (\"ours\", 'theirs, …), got: {side}"
-        ))
-    })
+/// Accept a name-like argument — a conflict side, language token, coding
+/// system, checkpoint label, report key — as either a string (`"rust"`) or a
+/// quoted symbol (`'rust`), matching how Lisp callers naturally spell token
+/// values. Free text, paths and regexes stay strings only.
+fn name_arg(what: &str, v: &TulispObject) -> Result<String, Error> {
+    // Any string passes verbatim — the MCP layer generates string spellings
+    // from free-form JSON values, colons and all.
+    if let Ok(s) = v.as_string() {
+        return Ok(s);
+    }
+    let name = v
+        .as_symbol()
+        .map_err(|_| err(&format!("{what} must be a string or symbol, got: {v}")))?;
+    // A keyword is a symbol whose name keeps the colon; accepting it would
+    // silently mint labels/keys spelled ":x" that 'x can never address.
+    if let Some(bare) = name.strip_prefix(':') {
+        return Err(err(&format!(
+            "{what} must be a string or symbol, got keyword {name} — spell it '{bare} or \"{bare}\""
+        )));
+    }
+    Ok(name)
 }
 
 /// A buffer marker: a durable position handle. The `id` indexes the store's
@@ -559,7 +572,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         ctx.defun(
             "report",
-            move |key: String, value: TulispObject| -> Result<TulispObject, Error> {
+            move |key: TulispObject, value: TulispObject| -> Result<TulispObject, Error> {
+                let key = name_arg("report key", &key)?;
                 s.borrow_mut().reports.push((key, value.to_string()));
                 Ok(value)
             },
@@ -1480,7 +1494,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         ctx.defun(
             "set-buffer-file-coding-system",
-            move |name: String| -> Result<String, Error> {
+            move |name: TulispObject| -> Result<String, Error> {
+                let name = name_arg("coding system", &name)?;
                 let mut sess = s.borrow_mut();
                 // A coding only round-trips through a visited file; an in-memory
                 // buffer (open_text) has none, so reject rather than report a
@@ -1799,9 +1814,13 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         ctx.defun(
             "checkpoint",
-            move |label: Option<String>| -> Result<TulispObject, Error> {
+            move |label: Option<TulispObject>| -> Result<TulispObject, Error> {
+                // tulisp binds an explicit nil as None, same as an omitted arg.
                 let mut sess = s.borrow_mut();
-                let label = label.unwrap_or_else(|| format!("auto-{}", sess.checkpoints.len()));
+                let label = match label {
+                    Some(l) => name_arg("checkpoint label", &l)?,
+                    None => format!("auto-{}", sess.checkpoints.len()),
+                };
                 let cp = Checkpoint::capture(label.clone(), &*sess.buffer);
                 sess.checkpoints.push(cp);
                 Ok(TulispValue::from(label).into_ref(None))
@@ -1812,7 +1831,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         ctx.defun(
             "restore-checkpoint",
-            move |label: String| -> Result<TulispObject, Error> {
+            move |label: TulispObject| -> Result<TulispObject, Error> {
+                let label = name_arg("checkpoint label", &label)?;
                 let mut sess = s.borrow_mut();
                 let restored = sess
                     .checkpoints
@@ -1844,7 +1864,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         ctx.defun(
             "checkpoint-diff",
-            move |a: String, b: String| -> Result<String, Error> {
+            move |a: TulispObject, b: TulispObject| -> Result<String, Error> {
+                let a = name_arg("checkpoint label", &a)?;
+                let b = name_arg("checkpoint label", &b)?;
                 let sess = s.borrow();
                 let text = |label: &str| {
                     sess.checkpoints
@@ -1950,7 +1972,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun(
             "conflict-text",
             move |side: TulispObject, n: Option<i64>| -> Result<String, Error> {
-                let side = conflict_side_arg(&side)?;
+                let side = name_arg("conflict side (\"ours\", 'theirs, …)", &side)?;
                 let mut sess = s.borrow_mut();
                 let b = sess.buffer.as_mut();
                 let hunks = crate::conflict::scan(b);
@@ -2045,7 +2067,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun(
             "conflict-keep",
             move |side: TulispObject, n: Option<i64>| -> Result<i64, Error> {
-                let side = conflict_side_arg(&side)?;
+                let side = name_arg("conflict side (\"ours\", 'theirs, …)", &side)?;
                 conflict_splice(&s, n, |b, h| {
                     crate::conflict::side_text_with_warning(b, h, &side).map_err(|e| err(&e))
                 })
@@ -2063,7 +2085,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun(
             "conflict-keep-all",
             move |side: TulispObject| -> Result<i64, Error> {
-                let side = conflict_side_arg(&side)?;
+                let side = name_arg("conflict side (\"ours\", 'theirs, …)", &side)?;
                 let mut sess = s.borrow_mut();
                 let (remaining, warnings) = {
                     let b = sess.buffer.as_mut();
@@ -2168,7 +2190,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // buffers. Returns the canonical name; errors on an unknown language.
         ctx.defun(
             "treesit-set-language",
-            move |token: String| -> Result<String, Error> {
+            move |token: TulispObject| -> Result<String, Error> {
+                let token = name_arg("treesit language", &token)?;
                 let lang = Lang::from_token(&token)
                     .ok_or_else(|| err(&format!("Unknown treesit language: {token}")))?;
                 let mut sess = s.borrow_mut();
@@ -3096,12 +3119,16 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
         // (arg "KEY") — the value the trusted CLI passed for KEY, or nil if it
         // wasn't given. A bare `--flag` reads back as the string "t", so a flag
         // and a string option are queried the same way.
-        ctx.defun("arg", move |key: String| -> Result<TulispObject, Error> {
-            Ok(match s.borrow().args.iter().find(|(k, _)| *k == key) {
-                Some((_, v)) => TulispValue::from(v.clone()).into_ref(None),
-                None => TulispObject::nil(),
-            })
-        });
+        ctx.defun(
+            "arg",
+            move |key: TulispObject| -> Result<TulispObject, Error> {
+                let key = name_arg("arg key", &key)?;
+                Ok(match s.borrow().args.iter().find(|(k, _)| *k == key) {
+                    Some((_, v)) => TulispValue::from(v.clone()).into_ref(None),
+                    None => TulispObject::nil(),
+                })
+            },
+        );
     }
     {
         let s = session.clone();
@@ -4184,7 +4211,56 @@ mod tests {
             Ok(_) => panic!("wrong-typed side must error"),
         };
         assert!(e.contains("string or symbol"), "{e}");
+        assert!(e.contains("'theirs"), "names valid spellings: {e}");
         assert!(e.contains("got: 5"), "{e}");
+    }
+
+    #[test]
+    fn name_like_args_accept_quoted_symbols() {
+        let mut ws = trusted("one\n");
+        let r = ws
+            .run(
+                r#"(checkpoint 'start)
+                   (insert "two\n")
+                   (checkpoint 'grown)
+                   (report 'diff (checkpoint-diff 'start 'grown))
+                   (restore-checkpoint 'start)
+                   (report "lang" (treesit-set-language 'rust))
+                   (report "text" (buffer-string))"#,
+            )
+            .unwrap();
+        assert!(
+            report(&r, "diff").contains("+two"),
+            "{}",
+            report(&r, "diff")
+        );
+        assert_eq!(report(&r, "lang"), "\"rust\"");
+        assert_eq!(report(&r, "text"), "\"one\\n\"");
+
+        // Auto-labelling still works with the label omitted or explicitly nil
+        // (tulisp binds both as an absent optional).
+        let mut ws = trusted("x\n");
+        let r = ws
+            .run(r#"(report "a" (checkpoint)) (report "b" (checkpoint nil))"#)
+            .unwrap();
+        assert_eq!(report(&r, "a"), "\"auto-0\"");
+        assert_eq!(report(&r, "b"), "\"auto-1\"");
+
+        // A keyword is refused with the correct spellings, not accepted as a
+        // colon-prefixed name that 'x could never address.
+        let e = match ws.run("(checkpoint :start)") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("keyword label must error"),
+        };
+        assert!(e.contains("keyword :start"), "{e}");
+        assert!(e.contains("'start"), "{e}");
+
+        // Only the SYMBOL spelling is a keyword; a string ":wip" is an
+        // ordinary label (the MCP checkpoint tool sends exactly this shape).
+        let r = ws
+            .run(r#"(checkpoint ":wip") (report "back" (restore-checkpoint ":wip"))"#)
+            .unwrap();
+        assert_eq!(report(&r, "back"), "t");
     }
 
     #[test]
@@ -4636,7 +4712,7 @@ mod tests {
         // A string option, a flag (reads back as "t"), and an absent key (nil).
         let r = ws
             .run(
-                r#"(report "date" (arg "date"))
+                r#"(report "date" (arg 'date))
                    (report "badges" (arg "with_badges"))
                    (report "missing" (arg "missing"))"#,
             )

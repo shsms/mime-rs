@@ -1243,7 +1243,11 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("mime-conv-{}.txt", std::process::id()));
         std::fs::write(&tmp, b"\xEF\xBB\xBFone\r\ntwo\r\n").unwrap();
         let mut ws = Workspace::new(Box::new(Quire::open(&tmp).unwrap()));
-        ws.run(r#"(set-buffer-file-coding-system "utf-8-unix")"#)
+        // Both spellings: the documented string form, then the quoted-symbol
+        // form — Emacs's own — which must work the same. The last call wins.
+        ws.run(r#"(set-buffer-file-coding-system "utf-8-dos")"#)
+            .unwrap();
+        ws.run(r#"(set-buffer-file-coding-system 'utf-8-unix)"#)
             .unwrap();
         ws.save_to(&tmp).unwrap();
         assert_eq!(std::fs::read(&tmp).unwrap(), b"one\ntwo\n");

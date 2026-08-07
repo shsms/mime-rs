@@ -75,8 +75,12 @@ Strings: replace-regexp-in-string split-string string-trim string-replace
 
 Gotchas: only the FINAL form's value is returned — wrap earlier results in
 (report "label" …). @N/point are absolute (goto-char); line numbers are
-narrowing-relative (goto-line). A defun node EXCLUDES its leading attribute /
-decorator / doc-comment — extend the region upward to delete the whole item."#;
+narrowing-relative (goto-line). Name-like arguments — conflict sides, treesit
+languages, coding systems, checkpoint labels, report/arg keys — accept a
+string or a quoted symbol: (treesit-set-language 'rust). Everything else
+(buffer names, defun/field names, free text, paths, regexes) is a string.
+A defun node EXCLUDES its leading attribute / decorator / doc-comment —
+extend the region upward to delete the whole item."#;
 
 const REGEX: &str = r#"— regex dialect —
 PATTERNS are Emacs regexp syntax, translated onto the RE2 engine (Rust regex
