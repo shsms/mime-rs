@@ -79,18 +79,39 @@ fn require_signing_ready(repo: &Repository) -> Result<(), Error> {
             "commit.gpgsign=true with gpg.format={format}, but mime currently supports openpgp signing only"
         )));
     }
+    // An unresolvable identity must refuse here — at the start of an
+    // operation, before any ref is stamped — not at commit N of a replay.
+    signing_key(repo)?;
     Ok(())
+}
+
+/// The signer's `--local-user` value: `user.signingkey`, else the configured
+/// user identity ("Name <email>"), like git's `get_signing_key()`. mime signs
+/// as the CURRENT user even where a replay preserves a foreign committer (git
+/// instead resets the committer to the current user) — that committer's key
+/// may not be in the keyring at all.
+fn signing_key(repo: &Repository) -> Result<String, Error> {
+    if let Some(key) =
+        optional_config_string(repo, "user.signingkey")?.filter(|k| !k.trim().is_empty())
+    {
+        return Ok(key);
+    }
+    repo.signature().map(|me| me.to_string()).map_err(|e| {
+        estr(&format!(
+            "commit.gpgsign=true needs a signing identity: set user.signingkey, \
+             or user.name and user.email ({})",
+            e.message()
+        ))
+    })
 }
 
 fn signing_rehearsal_note(repo: &Repository) -> String {
     match signing_required(repo) {
         Ok(false) => String::new(),
-        Ok(true) if exec_allowed() => {
-            "  signing note: the real run will execute the configured OpenPGP signer because commit.gpgsign=true\n".to_string()
-        }
-        Ok(true) => {
-            "  signing note: commit.gpgsign=true; the real run will refuse until mime is launched with MIME_EXEC=1\n".to_string()
-        }
+        Ok(true) => match require_signing_ready(repo) {
+            Ok(()) => "  signing note: the real run will execute the configured OpenPGP signer because commit.gpgsign=true\n".to_string(),
+            Err(e) => format!("  signing note: the real run will refuse — {}\n", e.message()),
+        },
         Err(e) => format!("  signing note: cannot read commit.gpgsign: {}\n", e.message()),
     }
 }
@@ -120,17 +141,16 @@ fn create_commit(
     let program = optional_config_string(repo, "gpg.openpgp.program")?
         .or(optional_config_string(repo, "gpg.program")?)
         .unwrap_or_else(|| "gpg".into());
-    let key = optional_config_string(repo, "user.signingkey")?;
+    let key = signing_key(repo)?;
     let mut command = std::process::Command::new(&program);
     command
         .arg("--status-fd=2")
         .arg("-bsa")
+        .arg("--local-user")
+        .arg(key)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    if let Some(key) = key {
-        command.arg("--local-user").arg(key);
-    }
     let mut child = command
         .spawn()
         .map_err(|e| estr(&format!("cannot execute commit signer {program:?}: {e}")))?;
@@ -143,11 +163,23 @@ fn create_commit(
     let output = child
         .wait_with_output()
         .map_err(|e| estr(&format!("cannot wait for commit signer: {e}")))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(estr(&format!(
             "commit signer {program:?} failed with {}: {}",
             output.status,
+            stderr.trim()
+        )));
+    }
+    // Exit status alone doesn't prove a signature was made (git efee9553):
+    // require the SIG_CREATED status line, like git does.
+    if !stderr
+        .lines()
+        .any(|l| l.starts_with("[GNUPG:] SIG_CREATED"))
+    {
+        return Err(estr(&format!(
+            "commit signer {program:?} exited successfully but reported no \
+             SIG_CREATED status: {}",
             stderr.trim()
         )));
     }
@@ -5460,32 +5492,59 @@ mod tests {
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    struct MimeExecGuard(Option<std::ffi::OsString>);
+    struct EnvGuard(&'static str, Option<std::ffi::OsString>);
 
-    impl MimeExecGuard {
-        fn set(value: Option<&str>) -> Self {
-            let old = std::env::var_os("MIME_EXEC");
+    impl EnvGuard {
+        fn set(name: &'static str, value: Option<&str>) -> Self {
+            let old = std::env::var_os(name);
             // Tests serialize this process-global mutation with ENV_LOCK.
             unsafe {
                 match value {
-                    Some(value) => std::env::set_var("MIME_EXEC", value),
-                    None => std::env::remove_var("MIME_EXEC"),
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
                 }
             }
-            Self(old)
+            Self(name, old)
         }
     }
 
-    impl Drop for MimeExecGuard {
+    impl Drop for EnvGuard {
         fn drop(&mut self) {
             // The same lock remains held until after this guard drops.
             unsafe {
-                match self.0.take() {
-                    Some(value) => std::env::set_var("MIME_EXEC", value),
-                    None => std::env::remove_var("MIME_EXEC"),
+                match self.1.take() {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
                 }
             }
         }
+    }
+
+    /// A stand-in gpg: logs its argv to `<script>.args`, reports SIG_CREATED
+    /// on the status fd, and prints a well-formed armored signature. Callers
+    /// configure it as `gpg.openpgp.program` — the highest-precedence program
+    /// key — so a developer's global signer config cannot shadow the stub.
+    fn fake_signer(dir: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let signer = dir.join("fake-gpg");
+        std::fs::write(
+            &signer,
+            b"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\ncat >/dev/null\nprintf '%s\\n' '[GNUPG:] SIG_CREATED D 22 10 00 0 FAKE' >&2\nprintf '%s\\n' '-----BEGIN PGP SIGNATURE-----' '' 'ZmFrZQ==' '-----END PGP SIGNATURE-----'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&signer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        signer
+    }
+
+    /// The `--local-user` value the last `fake_signer` invocation was given.
+    fn signer_key_arg(signer: &Path) -> String {
+        let logged = std::fs::read_to_string(signer.with_extension("args")).unwrap();
+        let args: Vec<&str> = logged.lines().collect();
+        let at = args
+            .iter()
+            .position(|a| *a == "--local-user")
+            .expect("signer was invoked with --local-user");
+        args[at + 1].to_string()
     }
 
     fn tmp(tag: &str) -> std::path::PathBuf {
@@ -6743,7 +6802,7 @@ mod tests {
     #[test]
     fn exec_over_is_gated_behind_an_env_opt_in() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _env = MimeExecGuard::set(None);
+        let _env = EnvGuard::set("MIME_EXEC", None);
         let (dir, _repo, _base, _c1, _c2) = absorb_fixture("exec-gate");
         let err = cmd_exec_over(&dir, "HEAD~1..HEAD", "true").unwrap_err();
         assert!(err.contains("MIME_EXEC"), "{err}");
@@ -6752,7 +6811,7 @@ mod tests {
     #[test]
     fn required_commit_signing_refuses_without_exec_before_mutating() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _env = MimeExecGuard::set(None);
+        let _env = EnvGuard::set("MIME_EXEC", None);
         let dir = tmp("signing-refusal");
         let repo = Repository::init(&dir).unwrap();
         let base = commit(&repo, &[], &[("a", "1\n")], "base");
@@ -6780,27 +6839,19 @@ mod tests {
 
     #[test]
     fn required_commit_signing_uses_the_configured_signer() {
-        use std::os::unix::fs::PermissionsExt;
-
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _env = MimeExecGuard::set(Some("1"));
+        let _env = EnvGuard::set("MIME_EXEC", Some("1"));
         let dir = tmp("signing-success");
         let repo = Repository::init(&dir).unwrap();
         let base = commit(&repo, &[], &[("a", "1\n")], "base");
         let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
         let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
         on_branch(&repo, "topic", f1);
-        let signer = dir.join("fake-gpg");
-        std::fs::write(
-            &signer,
-            b"#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '-----BEGIN PGP SIGNATURE-----' '' 'ZmFrZQ==' '-----END PGP SIGNATURE-----'\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&signer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let signer = fake_signer(&dir);
         let mut config = repo.config().unwrap();
         config.set_bool("commit.gpgsign", true).unwrap();
         config
-            .set_str("gpg.program", signer.to_str().unwrap())
+            .set_str("gpg.openpgp.program", signer.to_str().unwrap())
             .unwrap();
         config.set_str("user.signingkey", "test-key").unwrap();
         drop(config);
@@ -6833,6 +6884,128 @@ mod tests {
                 .unwrap()
                 .contains("gpgsig -----BEGIN PGP SIGNATURE-----")
         );
+        assert_eq!(signer_key_arg(&signer), "test-key");
+    }
+
+    #[test]
+    fn signing_without_signingkey_signs_as_the_configured_user() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set("MIME_EXEC", Some("1"));
+        let dir = tmp("signing-default-key");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+        let signer = fake_signer(&dir);
+        let mut config = repo.config().unwrap();
+        config.set_bool("commit.gpgsign", true).unwrap();
+        config
+            .set_str("gpg.openpgp.program", signer.to_str().unwrap())
+            .unwrap();
+        config.set_str("user.name", "Test User").unwrap();
+        config
+            .set_str("user.email", "test@example.invalid")
+            .unwrap();
+        // A configured-but-blank signingkey must fall through to the
+        // identity, not reach the signer as --local-user "".
+        config.set_str("user.signingkey", " ").unwrap();
+        drop(config);
+
+        let out = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Pick, None)],
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, Outcome::Done { .. }));
+        // git's fallback: the configured identity picks the key, not gpg's
+        // keyring default (and not the replayed commit's committer, "test").
+        assert_eq!(signer_key_arg(&signer), "Test User <test@example.invalid>");
+    }
+
+    #[test]
+    fn required_signing_without_identity_refuses_before_mutating() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set("MIME_EXEC", Some("1"));
+        let dir = tmp("signing-no-identity");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+        // Signing is on and a signer is available, but there is no
+        // user.signingkey and no usable user.name/email to derive a key from:
+        // blank LOCAL values shadow any developer-global identity, and libgit2
+        // rejects empty signature fields, so the refusal is deterministic.
+        let signer = fake_signer(&dir);
+        let mut config = repo.config().unwrap();
+        config.set_bool("commit.gpgsign", true).unwrap();
+        config
+            .set_str("gpg.openpgp.program", signer.to_str().unwrap())
+            .unwrap();
+        config.set_str("user.name", "").unwrap();
+        config.set_str("user.email", "").unwrap();
+        drop(config);
+
+        let err = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Pick, None)],
+            },
+        )
+        .unwrap_err();
+        assert!(err.message().contains("needs a signing identity"), "{err}");
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), f1);
+        assert!(!state_path(&repo).exists());
+        assert!(repo.refname_to_id(&backup_ref("refs/heads/topic")).is_err());
+        assert!(
+            !signer.with_extension("args").exists(),
+            "the signer must never have run"
+        );
+    }
+
+    #[test]
+    fn signer_success_without_sig_created_status_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set("MIME_EXEC", Some("1"));
+        let dir = tmp("signing-no-status");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "add b");
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+        // Exits 0 and prints signature-shaped output, but never reports
+        // SIG_CREATED — a misbehaving wrapper, not a signature.
+        let signer = dir.join("silent-gpg");
+        std::fs::write(
+            &signer,
+            b"#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '-----BEGIN PGP SIGNATURE-----' '' 'ZmFrZQ==' '-----END PGP SIGNATURE-----'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&signer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_bool("commit.gpgsign", true).unwrap();
+        config
+            .set_str("gpg.openpgp.program", signer.to_str().unwrap())
+            .unwrap();
+        config.set_str("user.signingkey", "test-key").unwrap();
+        drop(config);
+
+        let err = start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![step(f1, Action::Pick, None)],
+            },
+        )
+        .unwrap_err();
+        assert!(err.message().contains("SIG_CREATED"), "{err}");
     }
 
     #[test]
