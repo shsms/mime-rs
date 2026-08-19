@@ -2652,6 +2652,28 @@ fn short(oid: Oid) -> String {
     s[..s.len().min(10)].to_string()
 }
 
+/// Feed `range` to a revwalk: `A..B` goes to libgit2's push_range; a bare
+/// rev (`HEAD`, a branch) means everything reachable from it, which is how
+/// a walk reaches the root commit (`A..B` hides A and its ancestors).
+/// `A...B` is refused with a message naming both accepted forms.
+fn push_range_or_rev(
+    repo: &Repository,
+    walk: &mut git2::Revwalk,
+    range: &str,
+) -> Result<(), Error> {
+    if range.contains("...") {
+        return Err(estr(&format!(
+            "range {range}: A...B (symmetric difference) is not supported — use \
+             A..B, or a bare rev for everything reachable from it"
+        )));
+    }
+    if range.contains("..") {
+        walk.push_range(range)
+    } else {
+        walk.push(resolve(repo, range)?)
+    }
+}
+
 /// A one-line-per-commit log of `range` (default: from HEAD), capped at
 /// `limit`. With `stat`, each line is followed by the commit's changed files
 /// (mark, path, +/- line counts) and a totals line — the series-review view.
@@ -2663,7 +2685,7 @@ pub fn log(
 ) -> Result<String, Error> {
     let mut walk = repo.revwalk()?;
     match range {
-        Some(r) => walk.push_range(r)?,
+        Some(r) => push_range_or_rev(repo, &mut walk, r)?,
         None => walk.push_head()?,
     }
     let mut out = String::new();
@@ -4024,11 +4046,24 @@ fn exec_over(repo: &Repository, range: &str, command: &str) -> Result<String, Er
         .ok_or_else(|| estr("bare repository"))?
         .to_path_buf();
     let mut walk = repo.revwalk()?;
-    walk.push_range(range)?;
+    push_range_or_rev(repo, &mut walk, range)?;
     walk.set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE)?;
     let commits: Vec<Oid> = walk.collect::<Result<_, _>>()?;
     if commits.is_empty() {
         return Err(estr(&format!("exec_over: no commits in {range}")));
+    }
+    // A bare rev means "the whole history up to that commit" — for a tool
+    // that checks out and runs a command at every commit, accept it only
+    // for HEAD itself, so `HEAD~5` cannot mean "everything except the
+    // last 5" by surprise.
+    if !range.contains("..")
+        && *commits.last().expect("non-empty") != repo.head()?.peel_to_commit()?.id()
+    {
+        return Err(estr(&format!(
+            "exec_over: bare rev {range} does not resolve to HEAD — a bare rev \
+             means the whole history and must equal HEAD; use an A..B range for \
+             part of it"
+        )));
     }
     // is_dirty ignores untracked files, but the force checkouts would still
     // clobber an untracked file colliding with a path in any visited tree —
@@ -4298,7 +4333,7 @@ fn msg_rewrite(
     drop(head_ref);
 
     let mut walk = repo.revwalk()?;
-    walk.push_range(range)?;
+    push_range_or_rev(repo, &mut walk, range)?;
     walk.set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE)?;
     let commits: Vec<Oid> = walk.collect::<Result<_, _>>()?;
     if commits.is_empty() {
@@ -4402,6 +4437,7 @@ fn msg_rewrite(
         tip = new;
     }
     repo.reference(&branch, tip, true, "mime msg_rewrite")?;
+
     Ok(format!(
         "rewrote the messages of {} commit(s) in {range}; every tree is \
          byte-identical{}\n{out}",
@@ -6810,6 +6846,86 @@ mod tests {
         // The range must end at HEAD.
         let err = cmd_msg_rewrite(&dir, "HEAD~2..HEAD~1", &specs, false).unwrap_err();
         assert!(err.contains("end at HEAD"), "{err}");
+    }
+
+    #[test]
+    fn bare_rev_range_covers_history_from_the_root() {
+        let dir = tmp("bare-rev-range");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base old_name\n");
+        let c1 = commit(&repo, &[base], &[("a", "2\n")], "one old_name\n");
+        let c2 = commit(&repo, &[c1], &[("a", "3\n")], "two old_name\n");
+        on_branch(&repo, "main", c2);
+        let root_tree = repo.find_commit(base).unwrap().tree_id();
+        let specs = vec![MsgEditSpec {
+            find: Some("old_name".into()),
+            replace: Some("new_name".into()),
+            append: None,
+        }];
+
+        // The bare form does not bypass the end-at-HEAD guard.
+        let err = cmd_msg_rewrite(&dir, "HEAD~1", &specs, false).unwrap_err();
+        assert!(err.contains("end at HEAD"), "{err}");
+
+        // A bare HEAD reaches every commit, the root included.
+        let out = cmd_msg_rewrite(&dir, "HEAD", &specs, false).unwrap();
+        assert!(out.contains("3 commit(s)"), "{out}");
+        let mut walk = repo.revwalk().unwrap();
+        walk.push_head().unwrap();
+        walk.set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE).unwrap();
+        let root = repo.find_commit(walk.next().unwrap().unwrap()).unwrap();
+        assert_eq!(root.parent_count(), 0, "the root stays parentless");
+        assert_eq!(root.message().unwrap(), "base new_name\n");
+        assert_eq!(root.tree_id(), root_tree);
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.message().unwrap(), "two new_name\n");
+
+        // log and exec_over take the same bare-rev form. A rev below HEAD
+        // pins that the range argument is honored, not silently ignored.
+        let out = log(&repo, Some("HEAD"), 10, false).unwrap();
+        assert_eq!(out.lines().count(), 3, "{out}");
+        let out = log(&repo, Some(&root.id().to_string()), 10, false).unwrap();
+        assert_eq!(out.lines().count(), 1, "{out}");
+        let err = log(&repo, Some("nosuchrev"), 10, false).unwrap_err();
+        assert!(err.message().contains("nosuchrev"), "{err}");
+        let err = log(&repo, Some("main...HEAD"), 10, false).unwrap_err();
+        assert!(err.message().contains("use A..B"), "{err}");
+        let out = exec_over(&repo, "HEAD", "true").unwrap();
+        assert!(out.contains("3 commit(s)"), "{out}");
+    }
+
+    #[test]
+    fn bare_rev_over_a_merge_is_refused_by_msg_rewrite() {
+        let dir = tmp("bare-rev-merge");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base old_name\n");
+        let l = commit(&repo, &[base], &[("a", "2\n")], "left\n");
+        let r = commit(&repo, &[base], &[("b", "1\n")], "right\n");
+        let m = commit(&repo, &[l, r], &[("a", "2\n"), ("b", "1\n")], "merge\n");
+        let tip = commit(&repo, &[m], &[("a", "3\n")], "tip old_name\n");
+        on_branch(&repo, "main", tip);
+        let specs = vec![MsgEditSpec {
+            find: Some("old_name".into()),
+            replace: Some("new_name".into()),
+            append: None,
+        }];
+        let err = cmd_msg_rewrite(&dir, "HEAD", &specs, false).unwrap_err();
+        assert!(err.contains("is a merge"), "{err}");
+        assert_eq!(repo.head().unwrap().target(), Some(tip), "nothing moved");
+        // Below the merge, an A..B range still works.
+        let out = cmd_msg_rewrite(&dir, "HEAD~1..HEAD", &specs, false).unwrap();
+        assert!(out.contains("1 commit(s)"), "{out}");
+    }
+
+    #[test]
+    fn exec_over_bare_rev_must_resolve_to_head() {
+        let dir = tmp("exec-over-bare");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("f", "1\n")], "base");
+        let c1 = commit(&repo, &[base], &[("f", "2\n")], "tip");
+        on_branch(&repo, "main", c1);
+        let err = exec_over(&repo, "HEAD~1", "true").unwrap_err();
+        assert!(err.message().contains("resolve to HEAD"), "{err}");
     }
 
     #[test]
