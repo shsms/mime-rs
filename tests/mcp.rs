@@ -1940,6 +1940,196 @@ fn close_session_releases_and_guards_unsaved_edits() {
 }
 
 #[test]
+fn close_session_closes_several_targets_at_once() {
+    let dir = temp_dir("close-multi");
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    std::fs::write(&a, "alpha\n").unwrap();
+    std::fs::write(&b, "beta\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let pa = a.to_string_lossy().into_owned();
+    let pb = b.to_string_lossy().into_owned();
+
+    // Two warm files plus a named in-memory buffer; paths and sessions mix.
+    s.call_ok(1, "occur", json!({ "path": pa, "pattern": "alpha" }));
+    s.call_ok(2, "occur", json!({ "path": pb, "pattern": "beta" }));
+    s.call_ok(
+        3,
+        "open_text",
+        json!({ "text": "x", "name": "scratch", "session": "mem" }),
+    );
+    let closed = s.call_ok(
+        4,
+        "close_session",
+        json!({ "paths": [pa, pb], "sessions": ["mem"] }),
+    );
+    assert!(closed.contains("closed 3 sessions"), "got: {closed}");
+    assert!(
+        closed.contains(&pa) && closed.contains(&pb) && closed.contains("mem"),
+        "got: {closed}"
+    );
+    let status: Value = serde_json::from_str(&s.call_ok(5, "session_status", json!({}))).unwrap();
+    assert_eq!(status["sessions"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn close_session_multi_is_all_or_nothing_without_force() {
+    let dir = temp_dir("close-atomic");
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    std::fs::write(&a, "alpha\n").unwrap();
+    std::fs::write(&b, "beta\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let pa = a.to_string_lossy().into_owned();
+    let pb = b.to_string_lossy().into_owned();
+
+    s.call_ok(1, "occur", json!({ "path": pa, "pattern": "alpha" }));
+    s.call_ok(
+        2,
+        "replace_text",
+        json!({ "path": pb, "pattern": "beta", "replacement": "gamma" }),
+    );
+    // b is unsaved: nothing closes, and the error names the offender only.
+    let err = s.call_err(3, "close_session", json!({ "paths": [pa, pb] }));
+    assert!(err.contains("unsaved") && err.contains(&pb), "got: {err}");
+    assert!(!err.contains(&pa), "clean session named as unsaved: {err}");
+    let status: Value = serde_json::from_str(&s.call_ok(4, "session_status", json!({}))).unwrap();
+    assert_eq!(
+        status["sessions"].as_array().unwrap().len(),
+        2,
+        "partial close"
+    );
+
+    // A miss anywhere in the list is also a whole-call error.
+    let err = s.call_err(
+        5,
+        "close_session",
+        json!({ "paths": [pa, dir.join("nope.txt")] }),
+    );
+    assert!(err.contains("no warm session"), "got: {err}");
+    let status: Value = serde_json::from_str(&s.call_ok(6, "session_status", json!({}))).unwrap();
+    assert_eq!(
+        status["sessions"].as_array().unwrap().len(),
+        2,
+        "partial close"
+    );
+
+    // force discards and reports which one lost edits.
+    let closed = s.call_ok(
+        7,
+        "close_session",
+        json!({ "paths": [pa, pb], "force": true }),
+    );
+    assert_eq!(
+        closed,
+        format!("closed 2 sessions:\n  \"{pa}\"\n  \"{pb}\" (unsaved edits discarded)")
+    );
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "beta\n");
+}
+
+#[test]
+fn close_session_plural_forms_never_touch_the_default_session() {
+    let dir = temp_dir("close-plural");
+    let a = dir.join("a.txt");
+    std::fs::write(&a, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let pa = a.to_string_lossy().into_owned();
+
+    // A warm "default" is what a stray fallback would close.
+    s.call_ok(1, "open_text", json!({ "text": "x" }));
+    s.call_ok(3, "occur", json!({ "path": pa, "pattern": "alpha" }));
+
+    // Empty lists close nothing — and do not fall back to "default".
+    let closed = s.call_ok(4, "close_session", json!({ "paths": [] }));
+    assert!(closed.contains("closed 0 sessions"), "got: {closed}");
+    let closed = s.call_ok(5, "close_session", json!({ "sessions": [] }));
+    assert!(closed.contains("closed 0 sessions"), "got: {closed}");
+
+    // A mistyped `all` or a malformed list is an error, not a fallback;
+    // `all` refuses even an empty explicit list.
+    let err = s.call_err(6, "close_session", json!({ "all": "true" }));
+    assert!(err.contains("\"all\" must be a boolean"), "got: {err}");
+    let err = s.call_err(7, "close_session", json!({ "paths": [1] }));
+    assert!(err.contains("list of strings"), "got: {err}");
+    let err = s.call_err(8, "close_session", json!({ "paths": "not-a-list" }));
+    assert!(err.contains("non-array"), "got: {err}");
+    let err = s.call_err(13, "close_session", json!({ "all": true, "paths": [] }));
+    assert!(err.contains("all"), "got: {err}");
+
+    // The same session via path and paths is closed once; the singular form
+    // mixes with the plural one.
+    let closed = s.call_ok(9, "close_session", json!({ "path": pa, "paths": [pa] }));
+    assert!(closed.starts_with("closed session "), "got: {closed}");
+    s.call_ok(10, "occur", json!({ "path": pa, "pattern": "alpha" }));
+    let closed = s.call_ok(
+        11,
+        "close_session",
+        json!({ "session": "default", "paths": [pa], "force": true }),
+    );
+    // Exact: one line per target, in the order given (not sorted).
+    assert_eq!(
+        closed,
+        format!("closed 2 sessions:\n  \"default\"\n  \"{pa}\"")
+    );
+    let status: Value = serde_json::from_str(&s.call_ok(12, "session_status", json!({}))).unwrap();
+    assert_eq!(status["sessions"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn close_session_all_drops_every_warm_session() {
+    let dir = temp_dir("close-all");
+    let a = dir.join("a.txt");
+    std::fs::write(&a, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let pa = a.to_string_lossy().into_owned();
+
+    // Nothing warm: a clean no-op, not an error.
+    let closed = s.call_ok(1, "close_session", json!({ "all": true }));
+    assert!(closed.contains("closed 0 sessions"), "got: {closed}");
+
+    // Exactly one warm session reads as a single close, not "1 sessions".
+    s.call_ok(11, "occur", json!({ "path": pa, "pattern": "alpha" }));
+    let closed = s.call_ok(12, "close_session", json!({ "all": true }));
+    assert_eq!(closed, format!("closed session \"{pa}\""));
+
+    s.call_ok(2, "occur", json!({ "path": pa, "pattern": "alpha" }));
+    s.call_ok(
+        3,
+        "open_text",
+        json!({ "text": "x", "name": "scratch", "session": "mem" }),
+    );
+    let b = dir.join("b.txt");
+    std::fs::write(&b, "beta\n").unwrap();
+    let pb = b.to_string_lossy().into_owned();
+    s.call_ok(
+        4,
+        "replace_text",
+        json!({ "path": pb, "pattern": "beta", "replacement": "gamma" }),
+    );
+    let err = s.call_err(6, "close_session", json!({ "all": true }));
+    assert!(err.contains("unsaved") && err.contains(&pb), "got: {err}");
+    let status: Value = serde_json::from_str(&s.call_ok(7, "session_status", json!({}))).unwrap();
+    assert_eq!(
+        status["sessions"].as_array().unwrap().len(),
+        3,
+        "partial close"
+    );
+
+    let closed = s.call_ok(8, "close_session", json!({ "all": true, "force": true }));
+    assert!(closed.contains("closed 3 sessions"), "got: {closed}");
+    let status: Value = serde_json::from_str(&s.call_ok(9, "session_status", json!({}))).unwrap();
+    assert_eq!(status["sessions"].as_array().unwrap().len(), 0);
+
+    // all combined with an explicit target is ambiguous.
+    let err = s.call_err(
+        10,
+        "close_session",
+        json!({ "all": true, "session": "mem" }),
+    );
+    assert!(err.contains("all"), "got: {err}");
+}
+
+#[test]
 fn outline_scope_and_anchor_drive_structural_edits() {
     let mut s = Server::spawn();
     let src = "fn alpha() -> i64 {\n    let x = 1;\n    x\n}\n\nfn beta() -> i64 {\n    let x = 1;\n    x\n}\n";

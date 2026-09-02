@@ -282,8 +282,10 @@ its canonical path; relative paths resolve against the server's cwd) OR
 `session` (an explicit id) — never both. Warm sessions persist buffers,
 point, checkpoints, kill-ring, and defuns across calls; session_status
 lists them with narrowed/stale/unsaved flags and each session's checkpoint
-labels, plus the writable roots. close_session drops one (force: true
-discards unsaved edits).
+labels, plus the writable roots. close_session drops one ({path} or
+{session}), several ({paths: [...]} and/or {sessions: [...]}), or every
+warm session ({all: true}); an unsaved target refuses the whole call
+unless force: true discards its edits.
 
 Workspaces: a workspace is one isolated set of sessions behind an
 unguessable handle. On stdio there is exactly one and you normally omit it.

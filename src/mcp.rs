@@ -746,56 +746,123 @@ fn resolve_existing_session(
     match (path, session) {
         (Some(_), Some(_)) => Err("pass either \"path\" or \"session\", not both".to_string()),
         (None, s) => Ok(s.unwrap_or(DEFAULT_SESSION).to_string()),
-        (Some(p), None) => {
-            let checked = crate::safety::check_path(Path::new(p))?;
-            let id = checked.to_string_lossy().into_owned();
-            if sessions.contains_key(&id) {
-                return Ok(id);
-            }
-            let mut visiting: Vec<String> = sessions
-                .iter()
-                .filter(|(_, ws)| ws.visited_path().as_deref() == Some(checked.as_path()))
-                .map(|(k, _)| k.clone())
-                .collect();
-            match visiting.len() {
-                1 => Ok(visiting.remove(0)),
-                0 => Err(format!("no warm session visits {}", checked.display())),
-                _ => {
-                    visiting.sort();
-                    Err(format!(
-                        "ambiguous: sessions {} all visit {} — pass \"session\" explicitly",
-                        visiting.join(", "),
-                        checked.display()
-                    ))
-                }
-            }
+        (Some(p), None) => session_of_path(p, sessions),
+    }
+}
+
+/// The warm session visiting `p` — an error when none or several do.
+fn session_of_path(p: &str, sessions: &HashMap<String, Workspace>) -> Result<String, String> {
+    let checked = crate::safety::check_path(Path::new(p))?;
+    let id = checked.to_string_lossy().into_owned();
+    if sessions.contains_key(&id) {
+        return Ok(id);
+    }
+    let mut visiting: Vec<String> = sessions
+        .iter()
+        .filter(|(_, ws)| ws.visited_path().as_deref() == Some(checked.as_path()))
+        .map(|(k, _)| k.clone())
+        .collect();
+    match visiting.len() {
+        1 => Ok(visiting.remove(0)),
+        0 => Err(format!("no warm session visits {}", checked.display())),
+        _ => {
+            visiting.sort();
+            Err(format!(
+                "ambiguous: sessions {} all visit {} — pass \"session\" explicitly",
+                visiting.join(", "),
+                checked.display()
+            ))
         }
     }
 }
 
-/// `close_session {session?|path?, force?}` — drop a warm session, releasing
-/// its buffer (and the open fd a file-backed one holds). Refuses while the
-/// buffer has unsaved edits unless `force: true` discards them.
+/// `close_session {session?|path?, sessions?, paths?, all?, force?}` — drop
+/// warm sessions, releasing their buffers (and the open fd a file-backed one
+/// holds). Targets may mix the singular and plural forms; `all: true` takes
+/// every warm session instead. All-or-nothing: every target is resolved and
+/// checked before any is dropped. A target that is not warm closes nothing
+/// (the error names the first miss); unsaved targets close nothing unless
+/// `force: true` discards their edits (the error names all of them).
 fn tool_close_session(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
-    let session = resolve_existing_session(args, sessions)?;
-    if !sessions.contains_key(&session) {
-        return Err(no_such_session(sessions, &session));
+    // Strict, unlike `bool_arg`: a non-boolean `all` is an error, not false
+    // (which would close "default").
+    let all = match args.get("all") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(v) => return Err(format!("\"all\" must be a boolean, got {v}")),
+    };
+    let singular = args.get("path").is_some() || args.get("session").is_some();
+    let plural = args.get("paths").is_some() || args.get("sessions").is_some();
+    let mut targets: Vec<String> = if all {
+        if singular || plural {
+            return Err(
+                "all: true closes every warm session — do not combine it with \
+                 path/session/paths/sessions"
+                    .to_string(),
+            );
+        }
+        let mut ids: Vec<String> = sessions.keys().cloned().collect();
+        ids.sort();
+        ids
+    } else {
+        let mut v = Vec::new();
+        // The singular form (and its "default" fallback) applies only when no
+        // plural form is given — `{paths: [...]}` must not also close
+        // "default" on the side, even when the list is empty.
+        if singular || !plural {
+            v.push(resolve_existing_session(args, sessions)?);
+        }
+        for p in present_str_list(args, "paths")? {
+            v.push(session_of_path(&p, sessions)?);
+        }
+        v.extend(present_str_list(args, "sessions")?);
+        v
+    };
+    let mut seen = std::collections::HashSet::new();
+    targets.retain(|t| seen.insert(t.clone()));
+    for t in &targets {
+        if !sessions.contains_key(t) {
+            return Err(no_such_session(sessions, t));
+        }
     }
-    let unsaved = is_unsaved(sessions, &session);
-    if unsaved && !bool_arg(args, "force") {
+    let unsaved: Vec<&String> = targets.iter().filter(|t| is_unsaved(sessions, t)).collect();
+    if !unsaved.is_empty() && !bool_arg(args, "force") {
+        let list: Vec<String> = unsaved.iter().map(|t| format!("\"{t}\"")).collect();
         return Err(format!(
-            "session \"{session}\" has unsaved edits — save_buffer (or save: true) \
-             first, or pass force: true to discard them"
+            "nothing closed: {} unsaved edits — save_buffer (or save: true) \
+             first, or pass force: true to discard them",
+            if list.len() == 1 {
+                format!("session {} has", list[0])
+            } else {
+                format!("sessions {} have", list.join(", "))
+            }
         ));
     }
-    sessions.remove(&session);
-    Ok(if unsaved {
-        format!("closed session \"{session}\" (unsaved edits discarded)")
-    } else {
-        format!("closed session \"{session}\"")
+    let lines: Vec<String> = targets
+        .iter()
+        .map(|t| {
+            sessions.remove(t);
+            if unsaved.contains(&t) {
+                format!("\"{t}\" (unsaved edits discarded)")
+            } else {
+                format!("\"{t}\"")
+            }
+        })
+        .collect();
+    Ok(match lines.len() {
+        0 => "closed 0 sessions (nothing to close)".to_string(),
+        1 => format!("closed session {}", lines[0]),
+        n => format!(
+            "closed {n} sessions:\n{}",
+            lines
+                .iter()
+                .map(|l| format!("  {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
     })
 }
 
@@ -3411,6 +3478,17 @@ fn hunk_sels_arg(args: &Value, key: &str) -> Vec<crate::sequencer::HunkSel> {
         .unwrap_or_default()
 }
 
+/// A string-list argument that is optional but, when present, must be a list
+/// of strings — unlike `opt_str_list`, a malformed list is an error rather
+/// than silently empty.
+fn present_str_list(args: &Value, key: &str) -> Result<Vec<String>, String> {
+    if args.get(key).is_some() {
+        str_list_arg(args, key)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
 /// A required list-of-strings argument (e.g. `commits`).
 fn str_list_arg(args: &Value, key: &str) -> Result<Vec<String>, String> {
     args.get(key)
@@ -3515,11 +3593,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
         "git_continue" => seq::cmd_continue(
             &repo,
             bool_arg(args, "force"),
-            &args
-                .get("include_untracked")
-                .map(|_| str_list_arg(args, "include_untracked"))
-                .transpose()?
-                .unwrap_or_default(),
+            &present_str_list(args, "include_untracked")?,
         ),
         "git_skip" => seq::cmd_skip(&repo),
         "git_abort" => seq::cmd_abort(&repo),
@@ -4133,7 +4207,7 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
         "close_session" => (
             Session,
             A::append(),
-            "drop a warm session (force discards unsaved edits)",
+            "drop warm sessions — one, several, or all (force discards unsaved edits)",
         ),
         "unsaved_diff" => (
             Inspection,
@@ -4745,13 +4819,16 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "close_session",
-            "description": "Drop a warm session: releases its buffer and the open file handle a file-backed session holds. Refuses while the session has unsaved edits unless force:true discards them. Use it when done with a file, or to force a clean re-open from disk.",
+            "description": "Drop warm sessions: releases each buffer and the open file handle a file-backed session holds. Name one target (path or session), several (paths and/or sessions), or all:true for every warm session. All-or-nothing: an unsaved target refuses the whole call (naming the unsaved sessions) unless force:true discards their edits, and a target that is not warm closes nothing. Use it when done with a file, or to force a clean re-open from disk.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "force": { "type": "boolean", "description": "Discard unsaved edits. Default false: closing an unsaved session is an error." },
-                    "session": session,
-                    "path": path,
+                    "all": { "type": "boolean", "description": "Close every warm session. Not combinable with path/session/paths/sessions." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Files whose warm sessions to close (never auto-opens). Combinable with sessions; an empty list closes nothing." },
+                    "sessions": { "type": "array", "items": { "type": "string" }, "description": "Warm session ids to close. Combinable with paths; an empty list closes nothing." },
+                    "session": { "type": "string", "description": "One warm session id to close; defaults to \"default\" when neither it nor path/paths/sessions is given. Pass path OR session, not both." },
+                    "path": { "type": "string", "description": "One file whose warm session to close (never auto-opens; a file that is not warm is an error). Pass path OR session, not both." },
                 },
                 "required": [],
             },

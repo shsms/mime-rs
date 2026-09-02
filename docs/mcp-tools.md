@@ -195,11 +195,14 @@ Write the session buffer's text to disk. Without `to`, save back to the session'
 
 ## close_session
 
-Drop a warm session: releases its buffer and the open file handle a file-backed session holds. Refuses while the session has unsaved edits unless force:true discards them. Use it when done with a file, or to force a clean re-open from disk.
+Drop warm sessions: releases each buffer and the open file handle a file-backed session holds. Name one target (path or session), several (paths and/or sessions), or all:true for every warm session. All-or-nothing: an unsaved target refuses the whole call (naming the unsaved sessions) unless force:true discards their edits, and a target that is not warm closes nothing. Use it when done with a file, or to force a clean re-open from disk.
 
+- `all` — Close every warm session. Not combinable with path/session/paths/sessions.
 - `force` — Discard unsaved edits. Default false: closing an unsaved session is an error.
-- `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
-- `session` — Warm session id; defaults to "default" when omitted.
+- `path` — One file whose warm session to close (never auto-opens; a file that is not warm is an error). Pass path OR session, not both.
+- `paths` — Files whose warm sessions to close (never auto-opens). Combinable with sessions; an empty list closes nothing.
+- `session` — One warm session id to close; defaults to "default" when neither it nor path/paths/sessions is given. Pass path OR session, not both.
+- `sessions` — Warm session ids to close. Combinable with paths; an empty list closes nothing.
 - `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## help
