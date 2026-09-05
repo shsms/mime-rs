@@ -1354,4 +1354,82 @@ mod tests {
         );
         assert_eq!(Kind::Str.name(), "string");
     }
+
+    /// Every node span in a parse, anonymous nodes included.
+    fn all_node_spans(syn: &crate::syntax::Syntax) -> std::collections::HashSet<(usize, usize)> {
+        let mut root = syn.node_at(1).expect("a node at position 1");
+        while let Some(p) = syn.parent_of(root) {
+            root = p;
+        }
+        let mut out = std::collections::HashSet::new();
+        let mut stack = vec![root];
+        while let Some(h) = stack.pop() {
+            let s = syn.describe(h).expect("a live handle");
+            out.insert((s.start, s.end));
+            for i in 0..syn.child_count_of(h, false).unwrap_or(0) {
+                if let Some(c) = syn.child_of(h, i, false) {
+                    stack.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    fn collect_groups(sc: &Scanner, from: usize, bound: usize, out: &mut Vec<(usize, usize)>) {
+        let mut p = from;
+        while let Some(x) = sc.sexp_forward(p, bound).unwrap() {
+            if x.kind == SexpKind::Group {
+                out.push((x.start, x.end));
+                collect_groups(sc, x.start + 1, x.end - 1, out);
+            }
+            p = x.end;
+        }
+    }
+
+    #[test]
+    fn every_group_the_scanner_finds_is_a_tree_sitter_node_on_clean_code() {
+        let fixtures: &[(Lang, &str)] = &[
+            (
+                Lang::Rust,
+                "fn main() {\n    let v = vec![1, (2 + 3), \"x)\"]; // ) in a comment\n    foo(v, [4, 5]);\n}\n",
+            ),
+            (
+                Lang::Python,
+                "def f(a, b):\n    x = [a, (b, 1), \"s)\"]  # )\n    return g(x, {1: 2})\n",
+            ),
+            (
+                Lang::Javascript,
+                "function f(a) {\n  const x = [a, (1 + 2), \"s)\"]; // )\n  return g(x, {k: 1});\n}\n",
+            ),
+            (
+                Lang::Go,
+                "package p\n\nfunc f(a int) int {\n\tp := `C:\\`\n\tx := g(a, (1 + 2)) // )\n\treturn h(x, p, \"s)\")\n}\n",
+            ),
+            (
+                Lang::Elisp,
+                "(defun f (a b)\n  \"doc )\"\n  ;; )\n  (let ((x (+ a b)))\n    (list x [1 2])))\n",
+            ),
+            (
+                Lang::Css,
+                "a { color: rgb(1, calc((2 + 3) * 4)); /* ) */ }\n",
+            ),
+        ];
+        for (lang, text) in fixtures {
+            let store = Buffer::from_string("f", *text);
+            let syn = crate::syntax::Syntax::parse(text, *lang);
+            assert!(!syn.has_error(), "{lang:?}: the fixture must parse cleanly");
+            let nodes = all_node_spans(&syn);
+            let sc = Scanner::new(&store, *lang);
+            let mut groups = Vec::new();
+            collect_groups(&sc, 1, store.point_max(), &mut groups);
+            assert!(groups.len() >= 3, "{lang:?}: the fixture has nested groups");
+            for (a, b) in groups {
+                assert!(
+                    nodes.contains(&(a, b)),
+                    "{lang:?}: the group {a}..{b} {:?} matches no tree-sitter node",
+                    store.substring(a, b)
+                );
+            }
+        }
+    }
 }
