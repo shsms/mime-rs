@@ -205,6 +205,77 @@ pub fn unit_backward(
     skip_backward(store, p, bound, is_constituent)
 }
 
+/// Start of the line containing `p`, not below `min`.
+fn bol(store: &dyn TextStore, p: usize, min: usize) -> usize {
+    skip_backward(store, p, min, &|c| c != '\n')
+}
+
+/// Start of the line before the one starting at `line`, or `min`.
+fn prev_bol(store: &dyn TextStore, line: usize, min: usize) -> usize {
+    if line <= min {
+        return min;
+    }
+    // `line - 1` is the newline ending the previous line; scan past it.
+    bol(store, line - 1, min)
+}
+
+/// One pass over the line starting at `line`: whether it holds only spaces
+/// and tabs (an empty line, and the empty line at `bound`, count as blank),
+/// and the start of the line after it, or `bound`.
+///
+/// The blank run and the run to the newline are one walk — the second skip
+/// starts where the first stopped — so a paragraph walk reads each line once.
+fn scan_line(store: &dyn TextStore, line: usize, bound: usize) -> (bool, usize) {
+    let p = skip_forward(store, line, bound, &|c| c == ' ' || c == '\t');
+    let blank = p >= bound || store.char_after(p) == Some('\n');
+    let eol = skip_forward(store, p, bound, &|c| c != '\n');
+    (blank, if eol < bound { eol + 1 } else { bound })
+}
+
+/// Forward paragraph hop: skip any blank lines point is on, then run to the
+/// start of the next blank line, or `bound`. Never mutates the store.
+pub fn paragraph_forward(store: &dyn TextStore, from: usize, bound: usize) -> usize {
+    let mut l = bol(store, from, store.point_min());
+    while l < bound {
+        let (blank, next) = scan_line(store, l, bound);
+        if !blank {
+            break;
+        }
+        l = next;
+    }
+    while l < bound {
+        let (blank, next) = scan_line(store, l, bound);
+        if blank {
+            break;
+        }
+        l = next;
+    }
+    l
+}
+
+/// Backward paragraph hop: from a blank line, step up into the paragraph
+/// above; then run to the paragraph's first line and land on the blank line
+/// before it, or `bound`. Never mutates the store.
+pub fn paragraph_backward(store: &dyn TextStore, from: usize, bound: usize) -> usize {
+    let max = store.point_max();
+    let mut l = bol(store, from, bound);
+    while l > bound && scan_line(store, l, max).0 {
+        l = prev_bol(store, l, bound);
+    }
+    // One `prev_bol` per line: the line above is both the landing place, when
+    // it is blank, and the next line to step to when it is not.
+    loop {
+        if l <= bound {
+            return bound;
+        }
+        let prev = prev_bol(store, l, bound);
+        if scan_line(store, prev, max).0 {
+            return prev;
+        }
+        l = prev;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,5 +411,51 @@ mod tests {
         assert_eq!(unit_backward(&b, 11, min, &is_word_char), 7);
         assert_eq!(unit_backward(&b, 7, min, &is_word_char), 3);
         assert_eq!(unit_backward(&b, 3, min, &is_word_char), 1);
+    }
+
+    #[test]
+    fn paragraph_forward_lands_on_the_next_blank_line_or_the_bound() {
+        // "one\n" = 1-4, "two\n" = 5-8, "\n" = 9, "three\n" = 10-15,
+        // "  \n" = 16-18, "four" = 19-22, point_max = 23.
+        let b = buf("one\ntwo\n\nthree\n  \nfour");
+        let max = b.point_max();
+        assert_eq!(paragraph_forward(&b, 1, max), 9);
+        // From mid-paragraph, same answer.
+        assert_eq!(paragraph_forward(&b, 6, max), 9);
+        // Starting ON the blank line: skip it, then run to the next one.
+        // The whitespace-only line starts at 16.
+        assert_eq!(paragraph_forward(&b, 9, max), 16);
+        // The last paragraph has no separator after it: the bound.
+        assert_eq!(paragraph_forward(&b, 19, max), max);
+        // A bound inside the text caps the walk.
+        assert_eq!(paragraph_forward(&b, 1, 7), 7);
+    }
+
+    #[test]
+    fn paragraph_backward_lands_on_the_previous_blank_line_or_the_bound() {
+        let b = buf("one\ntwo\n\nthree\n  \nfour");
+        let min = b.point_min();
+        let max = b.point_max();
+        // From inside `four`: the whitespace-only separator at 16.
+        assert_eq!(paragraph_backward(&b, max, min), 16);
+        assert_eq!(paragraph_backward(&b, 21, min), 16);
+        // From ON that separator: into `three`, whose separator is at 9.
+        assert_eq!(paragraph_backward(&b, 16, min), 9);
+        // From the start of `three` (line start, not a blank line): 9.
+        assert_eq!(paragraph_backward(&b, 10, min), 9);
+        // The first paragraph has no separator before it: the bound.
+        assert_eq!(paragraph_backward(&b, 6, min), min);
+        // A bound inside the text caps the walk.
+        assert_eq!(paragraph_backward(&b, 6, 3), 3);
+    }
+
+    #[test]
+    fn paragraph_walks_respect_a_narrowing() {
+        let mut b = buf("one\ntwo\n\nthree\n  \nfour");
+        b.narrow_to_region(5, 15); // "two\n\nthree\n"
+        assert_eq!(paragraph_forward(&b, 5, b.point_max()), 9);
+        assert_eq!(paragraph_forward(&b, 10, b.point_max()), b.point_max());
+        assert_eq!(paragraph_backward(&b, 12, b.point_min()), 9);
+        assert_eq!(paragraph_backward(&b, 7, b.point_min()), b.point_min());
     }
 }
