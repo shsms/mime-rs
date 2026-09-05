@@ -23,6 +23,8 @@
 //! stray text. Files that hit these have a tree-sitter grammar; the node
 //! tools are the fallback.
 
+use std::cell::RefCell;
+
 use crate::motion::{FIRST_WINDOW, WINDOW};
 use crate::store::TextStore;
 use crate::syntax::{Lang, SexpRule};
@@ -149,12 +151,24 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// The backward lexer's memo: the tokens of `[bound, upto)` in order,
+/// comments included, plus at most one token that starts before `upto` and
+/// may run past it, as the last element: a string or block comment cut by
+/// the position is lexed to its real end; a symbol or line comment cut by it
+/// is cut off at `upto`.
+struct Lexed {
+    bound: usize,
+    upto: usize,
+    tokens: Vec<Token>,
+}
+
 /// The scanner for one store and language. Cheap to build: build one per
 /// builtin call or tool call.
 pub struct Scanner<'a> {
     store: &'a dyn TextStore,
     lang: Lang,
     rule: &'static SexpRule,
+    memo: RefCell<Option<Lexed>>,
 }
 
 impl<'a> Scanner<'a> {
@@ -163,6 +177,7 @@ impl<'a> Scanner<'a> {
             store,
             lang,
             rule: lang.sexp_rule(),
+            memo: RefCell::new(None),
         }
     }
 
@@ -412,6 +427,200 @@ impl<'a> Scanner<'a> {
             }
         }
     }
+
+    /// Lex `[bound, upto)` into the memo unless it already covers that
+    /// range. A string or comment cut by `upto` is lexed to its real end (a
+    /// string that never closes is `UnterminatedString`) and kept as the
+    /// last token, so a caller can tell "inside a string" from "at a token
+    /// boundary". A symbol cut by `upto` is simply cut.
+    fn lex_upto(&self, upto: usize, bound: usize) -> Result<(), ScanError> {
+        if self
+            .memo
+            .borrow()
+            .as_ref()
+            .is_some_and(|m| m.bound == bound && m.upto >= upto)
+        {
+            return Ok(());
+        }
+        let mut tokens = Vec::new();
+        let mut r = Reader::new(self.store, bound, upto);
+        loop {
+            match self.raw_token(&mut r) {
+                Ok(Some(t)) => tokens.push(t),
+                Ok(None) => break,
+                Err(ScanError::UnterminatedString { at })
+                | Err(ScanError::UnterminatedComment { at }) => {
+                    let mut whole = Reader::new(self.store, at, self.store.point_max());
+                    tokens.push(self.raw_token(&mut whole)?.expect("a token starts at `at`"));
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        *self.memo.borrow_mut() = Some(Lexed {
+            bound,
+            upto,
+            tokens,
+        });
+        Ok(())
+    }
+
+    /// Run `f` over the tokens (comments included) that end at or before
+    /// `from`, and the token cut by `from` if one starts before it and ends
+    /// after it.
+    fn with_tokens<R>(
+        &self,
+        from: usize,
+        bound: usize,
+        f: impl FnOnce(&[Token], Option<Token>) -> R,
+    ) -> Result<R, ScanError> {
+        self.lex_upto(from, bound)?;
+        let memo = self.memo.borrow();
+        let all = &memo.as_ref().expect("lexed above").tokens;
+        let n = all.partition_point(|t| t.end <= from);
+        let cut = all.get(n).filter(|t| t.start < from).copied();
+        Ok(f(&all[..n], cut))
+    }
+
+    /// The sexp that ends at or before `from`, matching a closer back to its
+    /// opener and absorbing the prefixes before it. `Ok(None)` at the
+    /// bound. An opener met first is `Unbalanced` (backward over `(` would
+    /// leave the group), as is a closer with no opener.
+    pub fn sexp_backward(&self, from: usize, bound: usize) -> Result<Option<Sexp>, ScanError> {
+        self.with_tokens(from, bound, |before, cut| {
+            match cut {
+                Some(t) if t.kind == TokenKind::Str => {
+                    return Ok(Some(self.with_prefixes(
+                        before,
+                        Sexp {
+                            start: t.start,
+                            end: t.end,
+                            kind: SexpKind::Str,
+                        },
+                    )));
+                }
+                Some(t) if t.kind == TokenKind::Symbol => {
+                    return Ok(Some(self.with_prefixes(
+                        before,
+                        Sexp {
+                            start: t.start,
+                            end: from,
+                            kind: SexpKind::Symbol,
+                        },
+                    )));
+                }
+                _ => {} // inside a comment, or at a boundary: the sexp before
+            }
+            let Some((i, last)) = before
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, t)| t.kind != TokenKind::Comment)
+            else {
+                return Ok(None);
+            };
+            let sexp = match last.kind {
+                TokenKind::Close(_) => Self::group_back(before, i)?,
+                TokenKind::Open(_) => return Err(ScanError::Unbalanced { at: last.start }),
+                TokenKind::Str => Sexp {
+                    start: last.start,
+                    end: last.end,
+                    kind: SexpKind::Str,
+                },
+                TokenKind::Symbol => Sexp {
+                    start: last.start,
+                    end: last.end,
+                    kind: SexpKind::Symbol,
+                },
+                _ => Sexp {
+                    start: last.start,
+                    end: last.end,
+                    kind: SexpKind::Punct,
+                },
+            };
+            Ok(Some(self.with_prefixes(before, sexp)))
+        })?
+    }
+
+    /// `sexp` extended back over the expression-prefix characters directly
+    /// before it (no whitespace between), as `backward-prefix-chars` does.
+    fn with_prefixes(&self, before: &[Token], mut sexp: Sexp) -> Sexp {
+        // Token ends are increasing, so the tokens before the sexp (its own
+        // interior skipped) are a prefix of `before`.
+        let outside = before.partition_point(|t| t.end <= sexp.start);
+        for t in before[..outside].iter().rev() {
+            if t.end == sexp.start && t.kind == TokenKind::Punct && self.is_prefix(t.start) {
+                sexp.start = t.start;
+            } else {
+                break;
+            }
+        }
+        sexp
+    }
+
+    /// The group whose closer is `tokens[close]`, walking back to its opener.
+    fn group_back(tokens: &[Token], close: usize) -> Result<Sexp, ScanError> {
+        let TokenKind::Close(c) = tokens[close].kind else {
+            unreachable!("group_back is called on a closer");
+        };
+        let mut depth = 0usize;
+        for t in tokens[..=close].iter().rev() {
+            match t.kind {
+                TokenKind::Close(_) => depth += 1,
+                TokenKind::Open(o) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if closer_of(o) != c {
+                            return Err(ScanError::Unbalanced {
+                                at: tokens[close].start,
+                            });
+                        }
+                        return Ok(Sexp {
+                            start: t.start,
+                            end: tokens[close].end,
+                            kind: SexpKind::Group,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err(ScanError::Unbalanced {
+            at: tokens[close].start,
+        })
+    }
+
+    /// The bracket group that ends at or before `from`, skipping atoms;
+    /// `Unbalanced` at an opener met first, `Ok(None)` at the bound.
+    pub fn list_backward(&self, from: usize, bound: usize) -> Result<Option<Sexp>, ScanError> {
+        self.with_tokens(from, bound, |before, _cut| {
+            for (i, t) in before.iter().enumerate().rev() {
+                match t.kind {
+                    TokenKind::Close(_) => return Self::group_back(before, i).map(Some),
+                    TokenKind::Open(_) => return Err(ScanError::Unbalanced { at: t.start }),
+                    _ => {}
+                }
+            }
+            Ok(None)
+        })?
+    }
+
+    /// The opener of the innermost group containing `from`, or `Ok(None)`
+    /// at depth zero.
+    pub fn up_backward(&self, from: usize, bound: usize) -> Result<Option<usize>, ScanError> {
+        self.with_tokens(from, bound, |before, _cut| {
+            let mut depth = 0usize;
+            for t in before.iter().rev() {
+                match t.kind {
+                    TokenKind::Close(_) => depth += 1,
+                    TokenKind::Open(_) if depth == 0 => return Some(t.start),
+                    TokenKind::Open(_) => depth -= 1,
+                    _ => {}
+                }
+            }
+            None
+        })
+    }
 }
 
 #[cfg(test)]
@@ -645,5 +854,119 @@ mod tests {
             (3, 4, SexpKind::Punct),
             "a trailing prefix is just punctuation"
         );
+    }
+
+    #[test]
+    fn sexp_backward_spans_the_previous_sexp_and_matches_groups_backward() {
+        //             123456789012345678901
+        let (b, l) = sc("foo(a, \"x)\") [b] ; 'q");
+        let s = Scanner::new(&b, l);
+        let x = s.sexp_backward(b.point_max(), 1).unwrap().unwrap();
+        assert_eq!((x.start, x.end, x.kind), (21, 22, SexpKind::Symbol));
+        let x = s.sexp_backward(21, 1).unwrap().unwrap();
+        assert_eq!((x.start, x.end, x.kind), (20, 21, SexpKind::Punct));
+        let x = s.sexp_backward(20, 1).unwrap().unwrap();
+        assert_eq!(
+            (x.start, x.end, x.kind),
+            (18, 19, SexpKind::Punct),
+            "`;` is punctuation in Rust"
+        );
+        let x = s.sexp_backward(18, 1).unwrap().unwrap();
+        assert_eq!((x.start, x.end, x.kind), (14, 17, SexpKind::Group));
+        let x = s.sexp_backward(14, 1).unwrap().unwrap();
+        assert_eq!(
+            (x.start, x.end, x.kind),
+            (4, 13, SexpKind::Group),
+            "the `)` inside the string is text"
+        );
+        let x = s.sexp_backward(4, 1).unwrap().unwrap();
+        assert_eq!((x.start, x.end), (1, 4));
+        assert_eq!(s.sexp_backward(1, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn backward_from_inside_a_string_comment_or_symbol() {
+        //             1234567890123456789
+        let (b, l) = sc("a \"b c\" // x (\nfoo");
+        let s = Scanner::new(&b, l);
+        let x = s.sexp_backward(5, 1).unwrap().unwrap();
+        assert_eq!(
+            (x.start, x.end, x.kind),
+            (3, 8, SexpKind::Str),
+            "inside the string: the string"
+        );
+        let x = s.sexp_backward(12, 1).unwrap().unwrap();
+        assert_eq!(
+            (x.start, x.end),
+            (3, 8),
+            "inside the comment: the sexp before it"
+        );
+        let x = s.sexp_backward(18, 1).unwrap().unwrap();
+        assert_eq!((x.start, x.end), (16, 18), "mid-symbol: the symbol so far");
+        // A multi-line string: the closing quote on line 2 is a closer.
+        //             123456789012 3
+        let (b, l) = sc("x \"one\ntwo\" y");
+        let s = Scanner::new(&b, l);
+        let x = s.sexp_backward(12, 1).unwrap().unwrap();
+        assert_eq!((x.start, x.end, x.kind), (3, 12, SexpKind::Str));
+    }
+
+    #[test]
+    fn backward_list_and_up_scans() {
+        //             12345678901234567
+        let (b, l) = sc("a (b c) d [e] ) f");
+        let s = Scanner::new(&b, l);
+        let g = s.list_backward(15, 1).unwrap().unwrap();
+        assert_eq!((g.start, g.end), (11, 14));
+        let g = s.list_backward(11, 1).unwrap().unwrap();
+        assert_eq!((g.start, g.end), (3, 8));
+        assert_eq!(s.list_backward(3, 1).unwrap(), None);
+        assert_eq!(
+            s.up_backward(5, 1).unwrap(),
+            Some(3),
+            "inside (b c): its opener"
+        );
+        assert_eq!(s.up_backward(9, 1).unwrap(), None, "at depth zero");
+        assert_eq!(
+            s.sexp_backward(4, 1),
+            Err(ScanError::Unbalanced { at: 3 }),
+            "backward over an opener"
+        );
+        let (b, l) = sc("(a (b) c");
+        let s = Scanner::new(&b, l);
+        assert_eq!(s.up_backward(8, 1).unwrap(), Some(1));
+        let (b, l) = sc("a ) b");
+        let s = Scanner::new(&b, l);
+        assert_eq!(
+            s.sexp_backward(4, 1),
+            Err(ScanError::Unbalanced { at: 3 }),
+            "a closer with no opener"
+        );
+    }
+
+    #[test]
+    fn backward_sexp_absorbs_adjacent_prefix_characters() {
+        //                                    123456789
+        let b = Buffer::from_string("t.el", "a '(b) `c");
+        let s = Scanner::new(&b, Lang::Elisp);
+        let x = s.sexp_backward(b.point_max(), 1).unwrap().unwrap();
+        assert_eq!((x.start, x.end), (8, 10));
+        let x = s.sexp_backward(8, 1).unwrap().unwrap();
+        assert_eq!((x.start, x.end), (3, 7));
+    }
+
+    #[test]
+    fn the_backward_lexer_is_memoised_per_scanner() {
+        // Twelve thousand tokens, a hundred backward hops: linear, not quadratic.
+        let text = "(a b) ".repeat(2000);
+        let b = Buffer::from_string("t.rs", &text);
+        let s = Scanner::new(&b, Lang::Rust);
+        let started = std::time::Instant::now();
+        let mut p = b.point_max();
+        for _ in 0..100 {
+            p = s.sexp_backward(p, 1).unwrap().unwrap().start;
+        }
+        assert_eq!(p, text.chars().count() - 100 * 6 + 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }
