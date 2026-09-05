@@ -8,7 +8,7 @@ recipes (`help {topic: "recipes"}`).
 
 | Group | Primitives |
 |---|---|
-| Motion | `point` `point-min` `point-max` `goto-char` `goto-line` `forward-char` `backward-char` `forward-line` `forward-word` `backward-word` `forward-symbol` `backward-symbol` `skip-chars-forward` `skip-chars-backward` `forward-paragraph` `backward-paragraph` `beginning-of-defun` `end-of-defun` `beginning-of-buffer` `end-of-buffer` `beginning-of-line` `end-of-line` `back-to-indentation` `line-beginning-position` `line-end-position` `line-number-at-pos` `current-column` `current-indentation` |
+| Motion | `point` `point-min` `point-max` `goto-char` `goto-line` `forward-char` `backward-char` `forward-line` `forward-word` `backward-word` `forward-symbol` `backward-symbol` `skip-chars-forward` `skip-chars-backward` `forward-paragraph` `backward-paragraph` `forward-sexp` `backward-sexp` `forward-list` `backward-list` `up-list` `backward-up-list` `down-list` `beginning-of-defun` `end-of-defun` `beginning-of-buffer` `end-of-buffer` `beginning-of-line` `end-of-line` `back-to-indentation` `line-beginning-position` `line-end-position` `line-number-at-pos` `current-column` `current-indentation` |
 | Predicates / chars | `bolp` `eolp` `bobp` `eobp` `char-after` `char-before` `looking-at` `looking-back` |
 | Mark & region | `set-mark` `mark` `region-beginning` `region-end` `exchange-point-and-mark` `mark-word` `mark-symbol` `mark-paragraph` `mark-defun` |
 | Markers | `make-marker` `point-marker` `copy-marker` `set-marker` `marker-position` `markerp` (durable positions; `goto-char` accepts a marker) |

@@ -59,6 +59,8 @@ Motion/inspect: point point-min point-max goto-char goto-line forward-line
   backward-symbol forward-paragraph backward-paragraph skip-chars-forward
   skip-chars-backward beginning-of-defun end-of-defun line-number-at-pos
   current-column looking-at char-after buffer-substring buffer-string
+  forward-sexp backward-sexp forward-list backward-list up-list
+  backward-up-list down-list
 Mark: set-mark mark region-beginning region-end exchange-point-and-mark
   mark-word mark-symbol mark-paragraph mark-defun
 Search/replace: re-search-forward re-search-backward search-forward

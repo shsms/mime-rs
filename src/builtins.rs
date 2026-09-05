@@ -4,6 +4,7 @@
 //! Subagents extend this with region/mark, kill-ring, markers, and narrowing.
 use crate::engine::{Checkpoint, SharedSession};
 use crate::motion::{is_word_char, move_paragraphs, move_units};
+use crate::sexp::{ScanError, Scanner};
 use crate::syntax::{Lang, NodeRef, Syntax};
 use tulisp::{Error, Shared, TulispContext, TulispConvertible, TulispObject, TulispValue};
 
@@ -1329,6 +1330,108 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             let to = move_units(&*sess.buffer, from, n.unwrap_or(1).saturating_neg(), &pred);
             sess.buffer.goto_char(to);
             to as i64
+        });
+    }
+    {
+        let s = session.clone();
+        // (forward-sexp &optional N) — over N balanced expressions: a bracket
+        // group, a string, a symbol or a punctuation character. A negative N
+        // moves back. Errors on unbalanced text, point unmoved. Returns the
+        // new point.
+        ctx.defun(
+            "forward-sexp",
+            move |n: Option<i64>| -> Result<i64, Error> {
+                let mut sess = s.borrow_mut();
+                let to = move_sexps(&sess, n.unwrap_or(1)).map_err(scan_err)?;
+                sess.buffer.goto_char(to);
+                Ok(to as i64)
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (backward-sexp &optional N) — the mirror of forward-sexp: N sexps
+        // back, a negative N forward. Errors on unbalanced text, point
+        // unmoved. Returns the new point.
+        ctx.defun(
+            "backward-sexp",
+            move |n: Option<i64>| -> Result<i64, Error> {
+                let mut sess = s.borrow_mut();
+                let to = move_sexps(&sess, n.unwrap_or(1).saturating_neg()).map_err(scan_err)?;
+                sess.buffer.goto_char(to);
+                Ok(to as i64)
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (forward-list &optional N) — over N bracket groups, skipping atoms
+        // in between. A negative N moves back. Errors on unbalanced text,
+        // point unmoved. Returns the new point.
+        ctx.defun(
+            "forward-list",
+            move |n: Option<i64>| -> Result<i64, Error> {
+                let mut sess = s.borrow_mut();
+                let to = move_lists(&sess, n.unwrap_or(1)).map_err(scan_err)?;
+                sess.buffer.goto_char(to);
+                Ok(to as i64)
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (backward-list &optional N) — the mirror of forward-list: N groups
+        // back, a negative N forward. Errors on unbalanced text, point
+        // unmoved. Returns the new point.
+        ctx.defun(
+            "backward-list",
+            move |n: Option<i64>| -> Result<i64, Error> {
+                let mut sess = s.borrow_mut();
+                let to = move_lists(&sess, n.unwrap_or(1).saturating_neg()).map_err(scan_err)?;
+                sess.buffer.goto_char(to);
+                Ok(to as i64)
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (up-list &optional N) — out of N enclosing groups, forward past
+        // the closer. A negative N moves out backward, before the opener.
+        // No enclosing group is an error, point unmoved. Returns the new
+        // point.
+        ctx.defun("up-list", move |n: Option<i64>| -> Result<i64, Error> {
+            let mut sess = s.borrow_mut();
+            let to = move_up(&sess, n.unwrap_or(1)).map_err(scan_err)?;
+            sess.buffer.goto_char(to);
+            Ok(to as i64)
+        });
+    }
+    {
+        let s = session.clone();
+        // (backward-up-list &optional N) — the mirror of up-list: out of N
+        // enclosing groups backward, before the opener. A negative N moves
+        // out forward, past the closer. No enclosing group is an error,
+        // point unmoved. Returns the new point.
+        ctx.defun(
+            "backward-up-list",
+            move |n: Option<i64>| -> Result<i64, Error> {
+                let mut sess = s.borrow_mut();
+                let to = move_up(&sess, n.unwrap_or(1).saturating_neg()).map_err(scan_err)?;
+                sess.buffer.goto_char(to);
+                Ok(to as i64)
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (down-list &optional N) — into the next N groups, just past each
+        // opener. A closer met first is an error, point unmoved; negative
+        // counts are not supported. Returns the new point.
+        ctx.defun("down-list", move |n: Option<i64>| -> Result<i64, Error> {
+            let mut sess = s.borrow_mut();
+            let to = move_down(&sess, n.unwrap_or(1))?;
+            sess.buffer.goto_char(to);
+            Ok(to as i64)
         });
     }
     {
@@ -2903,6 +3006,115 @@ fn skip_chars(
 fn symbol_pred(sess: &crate::engine::Session) -> impl Fn(char) -> bool + 'static {
     let lang = lang_of(sess);
     move |c: char| lang.is_symbol_char(c)
+}
+
+/// A scanner error as a Lisp error; the builtin that got it has not moved
+/// point.
+fn scan_err(e: ScanError) -> Error {
+    err(&e.to_string())
+}
+
+/// Where N sexp hops from point land: forward for a positive N, backward
+/// for a negative one. A hop that finds nothing before the region edge
+/// stops the run at that edge, as Emacs's `forward-sexp` does.
+fn move_sexps(sess: &crate::engine::Session, n: i64) -> Result<usize, ScanError> {
+    let store = &*sess.buffer;
+    let sc = Scanner::new(store, lang_of(sess));
+    hop_n(
+        store,
+        n,
+        |p| Ok(sc.sexp_forward(p, store.point_max())?.map(|x| x.end)),
+        |p| Ok(sc.sexp_backward(p, store.point_min())?.map(|x| x.start)),
+    )
+}
+
+/// N hops from point: `fwd` for a positive N, `back` for a negative one, each
+/// answering the landing position or `None` at the region edge, where the run
+/// stops and lands (Emacs's `forward-sexp` buffer-end fallback).
+fn hop_n(
+    store: &dyn crate::store::TextStore,
+    n: i64,
+    fwd: impl Fn(usize) -> Result<Option<usize>, ScanError>,
+    back: impl Fn(usize) -> Result<Option<usize>, ScanError>,
+) -> Result<usize, ScanError> {
+    let mut p = store.point();
+    for _ in 0..n.unsigned_abs() {
+        let next = if n >= 0 { fwd(p)? } else { back(p)? };
+        match next {
+            Some(q) => p = q,
+            None if n >= 0 => return Ok(store.point_max()),
+            None => return Ok(store.point_min()),
+        }
+    }
+    Ok(p)
+}
+
+/// Kill from point over N sexps (back for a negative N) onto the kill
+/// ring; point lands at the start of the killed text. A zero count kills
+/// nothing and pushes nothing.
+fn kill_sexps(sess: &mut crate::engine::Session, n: i64) -> Result<(), Error> {
+    let here = sess.buffer.point();
+    let to = move_sexps(sess, n).map_err(scan_err)?;
+    let (a, b) = (here.min(to), here.max(to));
+    if a == b {
+        return Ok(());
+    }
+    kill_span(sess, a, b);
+    Ok(())
+}
+
+/// Kill `[a, b)` onto the kill ring; point lands at `a` (or the region end,
+/// when the kill took the last newline).
+fn kill_span(sess: &mut crate::engine::Session, a: usize, b: usize) {
+    let text = sess.buffer.substring(a, b);
+    sess.kill_ring.push(text);
+    sess.buffer.delete_region(a, b);
+    let landing = a.min(sess.buffer.point_max());
+    sess.buffer.goto_char(landing);
+}
+
+/// The `forward-list` twin of [`move_sexps`]: N bracket groups, atoms skipped.
+fn move_lists(sess: &crate::engine::Session, n: i64) -> Result<usize, ScanError> {
+    let store = &*sess.buffer;
+    let sc = Scanner::new(store, lang_of(sess));
+    hop_n(
+        store,
+        n,
+        |p| Ok(sc.list_forward(p, store.point_max(), false)?.map(|x| x.end)),
+        |p| Ok(sc.list_backward(p, store.point_min())?.map(|x| x.start)),
+    )
+}
+
+/// `up-list`: out of N enclosing groups, forward past the closer for a
+/// positive N, back before the opener for a negative one. No enclosing
+/// group is `Unbalanced` at point.
+fn move_up(sess: &crate::engine::Session, n: i64) -> Result<usize, ScanError> {
+    let store = &*sess.buffer;
+    let sc = Scanner::new(store, lang_of(sess));
+    let out = |p: usize, next: Option<usize>| next.ok_or(ScanError::Unbalanced { at: p }).map(Some);
+    hop_n(
+        store,
+        n,
+        |p| out(p, sc.up_forward(p, store.point_max())?),
+        |p| out(p, sc.up_backward(p, store.point_min())?),
+    )
+}
+
+/// `down-list`: into the next N groups. Only forward.
+fn move_down(sess: &crate::engine::Session, n: i64) -> Result<usize, Error> {
+    if n < 0 {
+        return Err(err("down-list: a negative count is not supported"));
+    }
+    let store = &*sess.buffer;
+    let sc = Scanner::new(store, lang_of(sess));
+    let mut p = store.point();
+    for _ in 0..n {
+        p = sc
+            .down_forward(p, store.point_max())
+            .map_err(scan_err)?
+            .ok_or_else(|| scan_err(ScanError::Unbalanced { at: p }))?;
+    }
+    Ok(p)
 }
 
 /// `beginning-of-defun` / `end-of-defun`: point to the `edge` of the
@@ -5500,6 +5712,119 @@ mod tests {
     }
 
     #[test]
+    fn sexp_and_list_motions_walk_groups_strings_and_atoms() {
+        // 1 `(`, 2 a, 4 `(`, 5 b, 7-10 "c)", 11 `)`, 13 d, 14 `)`, 16 `[`, 17 e,
+        // 18 `]`, 20 f, point-max 21.
+        let mut ws = Workspace::new_trusted(Box::new(Buffer::from_string(
+            "t.rs",
+            "(a (b \"c)\") d) [e] f",
+        )));
+        let r = ws
+            .run(
+                r#"(goto-char 1)
+                   (report "fs1" (forward-sexp))
+                   (report "fs2" (forward-sexp))
+                   (report "fs3" (forward-sexp))
+                   (report "fs4" (forward-sexp))
+                   (report "bs1" (backward-sexp 2))
+                   (report "bs2" (backward-sexp))
+                   (report "neg" (progn (goto-char 21) (forward-sexp -2)))
+                   (goto-char 5) (report "ul" (up-list))
+                   (goto-char 5) (report "bul" (backward-up-list))
+                   (goto-char 5) (report "ul2" (up-list 2))
+                   (goto-char 12) (report "bul-neg" (up-list -1))
+                   (goto-char 1) (report "dl" (down-list))
+                   (report "dl2" (down-list))
+                   (goto-char 2) (report "fl" (forward-list))
+                   (goto-char 13) (report "bl" (backward-list))
+                   (goto-char 1) (report "fl2" (forward-list 2))
+                   (report "fl-edge" (forward-list))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "fs1"), "15");
+        assert_eq!(report(&r, "fs2"), "19");
+        assert_eq!(report(&r, "fs3"), "21");
+        assert_eq!(
+            report(&r, "fs4"),
+            "21",
+            "nothing left: point stays at the edge"
+        );
+        assert_eq!(report(&r, "bs1"), "16");
+        assert_eq!(report(&r, "bs2"), "1");
+        assert_eq!(report(&r, "neg"), "16");
+        assert_eq!(report(&r, "ul"), "12");
+        assert_eq!(report(&r, "bul"), "4");
+        assert_eq!(report(&r, "ul2"), "15");
+        assert_eq!(report(&r, "bul-neg"), "1");
+        assert_eq!(report(&r, "dl"), "2");
+        assert_eq!(report(&r, "dl2"), "5");
+        assert_eq!(report(&r, "fl"), "12");
+        assert_eq!(report(&r, "bl"), "4");
+        assert_eq!(report(&r, "fl2"), "19");
+        assert_eq!(report(&r, "fl-edge"), "21");
+    }
+
+    #[test]
+    fn sexp_motions_error_on_unbalanced_text_and_leave_point_alone() {
+        let mut ws = Workspace::new_trusted(Box::new(Buffer::from_string(
+            "t.rs",
+            "(a (b \"c)\") d) [e] f",
+        )));
+        let e = match ws.run("(goto-char 20) (up-list)") {
+            Err(e) => e,
+            Ok(_) => panic!("up-list at depth zero must fail"),
+        };
+        assert!(e.contains("Unbalanced parentheses at 20"), "{e}");
+        let e = match ws.run("(goto-char 13) (forward-sexp 2)") {
+            Err(e) => e,
+            Ok(_) => panic!("forward-sexp over the closer must fail"),
+        };
+        assert!(e.contains("Unbalanced parentheses at 14"), "{e}");
+        let r = ws.run(r#"(report "p" (point))"#).unwrap();
+        assert_eq!(
+            report(&r, "p"),
+            "13",
+            "the failed motion did not move point"
+        );
+        let e = match ws.run("(goto-char 1) (down-list -1)") {
+            Err(e) => e,
+            Ok(_) => panic!("a negative down-list count is unsupported"),
+        };
+        assert!(e.contains("negative count"), "{e}");
+        // A different buffer with an unterminated string.
+        let mut ws = Workspace::new_trusted(Box::new(Buffer::from_string("t.rs", "a \"bc")));
+        let e = match ws.run("(goto-char 3) (forward-sexp)") {
+            Err(e) => e,
+            Ok(_) => panic!("an unterminated string must fail"),
+        };
+        assert!(e.contains("Unterminated string at 3"), "{e}");
+    }
+
+    #[test]
+    fn elisp_buffers_treat_operator_symbols_and_quotes_as_emacs_does() {
+        let mut ws = Workspace::new_trusted(Box::new(Buffer::from_string(
+            "x.el",
+            "(setq foo-bar 'baz) ; (\n#'f",
+        )));
+        let r = ws
+            .run(
+                r#"(goto-char 7) (report "sym" (forward-sexp))
+                   (report "quoted" (forward-sexp))
+                   (goto-char (point-max)) (report "back" (backward-sexp))
+                   (report "back2" (backward-sexp))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "sym"), "14", "`foo-bar` is one symbol");
+        assert_eq!(report(&r, "quoted"), "19", "`'baz` is one sexp");
+        assert_eq!(
+            report(&r, "back"),
+            "25",
+            "`#'f` is one sexp; the comment is skipped"
+        );
+        assert_eq!(report(&r, "back2"), "1");
+    }
+
+    #[test]
     fn a_zero_count_leaves_point_alone_on_every_counted_motion() {
         // "one two" = 1-7, the newline ending it = 8, the blank line = 9,
         // "three four" = 10-19, point-max = 20. Point starts inside "three".
@@ -5513,6 +5838,13 @@ mod tests {
             "backward-paragraph",
             "mark-word",
             "mark-symbol",
+            "forward-sexp",
+            "backward-sexp",
+            "forward-list",
+            "backward-list",
+            "up-list",
+            "backward-up-list",
+            "down-list",
         ] {
             let r = ws
                 .run(&format!(
