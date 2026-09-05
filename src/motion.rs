@@ -210,7 +210,7 @@ fn unit_backward(
 /// accessible region. The run stops early when a hop returns the position it
 /// was handed — the edge, or nothing left to cross — so an over-long count
 /// costs one wasted hop, not `n` of them. `n == 0` returns `from`.
-pub fn repeat_hop(
+fn repeat_hop(
     store: &dyn TextStore,
     from: usize,
     n: i64,
@@ -280,7 +280,7 @@ fn scan_line(store: &dyn TextStore, line: usize, bound: usize) -> (bool, usize) 
 
 /// Forward paragraph hop: skip any blank lines point is on, then run to the
 /// start of the next blank line, or `bound`. Never mutates the store.
-pub fn paragraph_forward(store: &dyn TextStore, from: usize, bound: usize) -> usize {
+fn paragraph_forward(store: &dyn TextStore, from: usize, bound: usize) -> usize {
     let mut l = bol(store, from, store.point_min());
     while l < bound {
         let (blank, next) = scan_line(store, l, bound);
@@ -302,7 +302,7 @@ pub fn paragraph_forward(store: &dyn TextStore, from: usize, bound: usize) -> us
 /// Backward paragraph hop: from a blank line, step up into the paragraph
 /// above; then run to the paragraph's first line and land on the blank line
 /// before it, or `bound`. Never mutates the store.
-pub fn paragraph_backward(store: &dyn TextStore, from: usize, bound: usize) -> usize {
+fn paragraph_backward(store: &dyn TextStore, from: usize, bound: usize) -> usize {
     let max = store.point_max();
     let mut l = bol(store, from, bound);
     while l > bound && scan_line(store, l, max).0 {
@@ -320,6 +320,13 @@ pub fn paragraph_backward(store: &dyn TextStore, from: usize, bound: usize) -> u
         }
         l = prev;
     }
+}
+
+/// Where `n` paragraph hops from `from` land — forward for positive `n`,
+/// backward for negative — bounded by the accessible region. Never mutates
+/// the store.
+pub fn move_paragraphs(store: &dyn TextStore, from: usize, n: i64) -> usize {
+    repeat_hop(store, from, n, &paragraph_forward, &paragraph_backward)
 }
 
 #[cfg(test)]

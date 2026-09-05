@@ -3,7 +3,7 @@
 //! `Session`). M0 subset: navigation, edit, regex search/replace, reporting.
 //! Subagents extend this with region/mark, kill-ring, markers, and narrowing.
 use crate::engine::{Checkpoint, SharedSession};
-use crate::motion::{is_word_char, move_units};
+use crate::motion::{is_word_char, move_paragraphs, move_units};
 use crate::syntax::{Lang, NodeRef, Syntax};
 use tulisp::{Error, Shared, TulispContext, TulispConvertible, TulispObject, TulispValue};
 
@@ -47,7 +47,6 @@ type RegexResult = Result<regex::Regex, Error>;
 type CacheCell = std::cell::RefCell<std::collections::HashMap<String, regex::Regex>>;
 
 thread_local! {
-    static RE2_CACHE: CacheCell = std::cell::RefCell::new(std::collections::HashMap::new());
     static EMACS_CACHE: CacheCell = std::cell::RefCell::new(std::collections::HashMap::new());
     static LOOKBACK_CACHE: CacheCell = std::cell::RefCell::new(std::collections::HashMap::new());
 }
@@ -60,13 +59,6 @@ fn looking_back_regex(re: &str) -> RegexResult {
             .map_err(|m| Error::lisp_error(format!("Invalid regexp: {m}")))?;
         build_regex(&format!("(?:{user})\\z"))
     })
-}
-
-/// Compile an RE2-syntax pattern, cached. The path mime's OWN wrapper patterns
-/// take (looking-back, forward-paragraph); user patterns arrive as Emacs dialect
-/// via [`cached_regex`].
-fn compile_cached(re: &str) -> RegexResult {
-    cached(&RE2_CACHE, re, || build_regex(re))
 }
 
 /// Compile a user-supplied pattern written in Emacs regexp dialect: groups are
@@ -1787,26 +1779,28 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         });
     }
     {
-        // (forward-paragraph) — move past the current paragraph to the next
-        // blank-line boundary (or point-max); returns the new point.
         let s = session.clone();
-        ctx.defun("forward-paragraph", move || -> Result<i64, Error> {
-            // mime's own pattern, written in RE2 syntax — compile it directly so
-            // it bypasses the Emacs-dialect translator user patterns go through.
-            let rx = compile_cached("\n[ \t]*\n")?;
+        // (forward-paragraph &optional N) — paragraph motion; a paragraph
+        // boundary is a line holding only spaces and tabs. Lands on the start
+        // of the next blank line (or point-max). A negative N reverses.
+        // Returns the new point.
+        ctx.defun("forward-paragraph", move |n: Option<i64>| -> i64 {
             let mut sess = s.borrow_mut();
-            match sess.buffer.re_search_forward(&rx, None) {
-                Some(_) => {
-                    // Land on the blank line itself (after the first newline).
-                    let p = sess.buffer.point();
-                    sess.buffer.goto_char(p.saturating_sub(1).max(1));
-                }
-                None => {
-                    let max = sess.buffer.point_max();
-                    sess.buffer.goto_char(max);
-                }
-            }
-            Ok(sess.buffer.point() as i64)
+            let p = move_paragraphs(&*sess.buffer, sess.buffer.point(), n.unwrap_or(1));
+            sess.buffer.goto_char(p);
+            p as i64
+        });
+    }
+    {
+        let s = session.clone();
+        // (backward-paragraph &optional N) — the mirror: lands on the start
+        // of the blank line before the paragraph (or point-min). A negative N
+        // reverses. Returns the new point.
+        ctx.defun("backward-paragraph", move |n: Option<i64>| -> i64 {
+            let mut sess = s.borrow_mut();
+            let p = move_paragraphs(&*sess.buffer, sess.buffer.point(), -n.unwrap_or(1));
+            sess.buffer.goto_char(p);
+            p as i64
         });
     }
     {
@@ -5059,5 +5053,56 @@ mod tests {
             .unwrap();
         assert_eq!(report(&r, "f"), "9");
         assert_eq!(report(&r, "b"), "4");
+    }
+
+    #[test]
+    fn paragraph_motion_takes_a_signed_count() {
+        // "one\n" = 1-4, "two\n" = 5-8, "\n" = 9, "three\n" = 10-15,
+        // "\n" = 16, "four" = 17-20, point_max = 21.
+        let mut ws = trusted("one\ntwo\n\nthree\n\nfour");
+        let r = ws
+            .run(
+                r#"(report "a" (forward-paragraph))
+                    (report "b" (forward-paragraph 2))
+                    (report "c" (backward-paragraph))
+                    (report "d" (forward-paragraph -2))
+                    (report "e" (backward-paragraph -1))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "a"), "9");
+        assert_eq!(report(&r, "b"), "21");
+        assert_eq!(report(&r, "c"), "16");
+        assert_eq!(report(&r, "d"), "1");
+        assert_eq!(report(&r, "e"), "9");
+    }
+
+    #[test]
+    fn paragraph_motion_stops_at_the_narrowing() {
+        let mut ws = trusted("one\ntwo\n\nthree\n\nfour");
+        let r = ws
+            .run(
+                r#"(narrow-to-region 5 15)
+                    (goto-char 10)
+                    (report "f" (forward-paragraph 3))
+                    (report "b" (backward-paragraph 3))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "f"), "15");
+        assert_eq!(report(&r, "b"), "5");
+    }
+
+    #[test]
+    fn an_over_long_count_stops_at_the_edge_without_spinning() {
+        let mut ws = trusted("aa bb\n\ncc");
+        let r = ws
+            .run(
+                r#"(report "w" (forward-word 9000000000))
+                    (report "p" (backward-paragraph 9000000000))
+                    (report "s" (forward-symbol -9000000000))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "w"), "10");
+        assert_eq!(report(&r, "p"), "1");
+        assert_eq!(report(&r, "s"), "1");
     }
 }
