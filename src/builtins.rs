@@ -4,7 +4,7 @@
 //! Subagents extend this with region/mark, kill-ring, markers, and narrowing.
 use crate::engine::{Checkpoint, SharedSession};
 use crate::motion::{is_word_char, move_paragraphs, move_units};
-use crate::sexp::{Kind, ScanError, Scanner};
+use crate::sexp::{Kind, ScanError, Scanner, Sexp, SexpKind, TokenKind};
 use crate::syntax::{Lang, NodeRef, Syntax};
 use tulisp::{Error, Shared, TulispContext, TulispConvertible, TulispObject, TulispValue};
 
@@ -3125,6 +3125,169 @@ fn unknown_thing(kind: &str) -> Error {
         "unknown thing: {kind} (one of {})",
         THING_KINDS.join(" ")
     ))
+}
+
+/// The `kind` thing an `after:` anchor names, widened by `up`. `pos` is the
+/// anchor line's start. `list` takes the LAST one beginning on the anchor
+/// line, or — when none begins on it — the first one beginning after the
+/// line: an anchor like `fn main() {` names the block it opens, not the `()`
+/// earlier on the same line. EVERY other kind, `sexp` included, takes the
+/// first thing at or after `pos`, so `old(1, 2);` names `old` rather than the
+/// trailing `;`. Depth-zero closers on the way are stepped over: the anchor
+/// line may sit at any depth.
+pub fn thing_after(
+    sess: &mut crate::engine::Session,
+    kind: &str,
+    pos: usize,
+    up: usize,
+) -> Result<Option<(usize, usize)>, Error> {
+    if kind == "defun" {
+        return Ok(syntax_of(sess)
+            .defuns()
+            .into_iter()
+            .filter(|d| d.start >= pos)
+            .min_by_key(|d| d.start)
+            .map(|d| (d.start, d.end)));
+    }
+    let k = Kind::parse(kind).ok_or_else(|| unknown_thing(kind))?;
+    let lang = lang_of(sess);
+    let store = &*sess.buffer;
+    let max = store.point_max();
+    let sc = Scanner::new(store, lang);
+    // A line inside a block comment or a multi-line string has no structure
+    // of its own: the sexp, list and string walks start after it.
+    let pos = match k {
+        Kind::Sexp | Kind::List | Kind::Str => sc.out_of_string_or_comment(pos),
+        _ => pos,
+    };
+    // Walk `step` forward from the anchor line's start, keeping the latest
+    // candidate that still begins on the line; the first one beginning past
+    // the line ends the walk, and is the answer only when the line held none.
+    // Only `list` wants this: an anchor line names the block it OPENS, which
+    // is the last list to begin on it. Every other kind takes the first.
+    let last_on_line = |step: &dyn Fn(usize) -> Result<Option<Sexp>, Error>| {
+        let eol = crate::motion::skip_forward(store, pos, max, &|c| c != '\n');
+        let mut p = pos;
+        let mut best = None;
+        loop {
+            match step(p)? {
+                None => return Ok(best),
+                Some(x) if x.start < eol => {
+                    best = Some((x.start, x.end));
+                    p = x.end;
+                }
+                Some(x) => return Ok(best.or(Some((x.start, x.end)))),
+            }
+        }
+    };
+    // The next sexp at or after `p`, stepping over depth-zero closers.
+    let next_sexp = |mut p: usize| loop {
+        match sc.next_token(p, max).map_err(scan_err)? {
+            None => return Ok(None),
+            Some(t) if matches!(t.kind, TokenKind::Close(_)) => p = t.end,
+            Some(t) => return sc.sexp_forward(t.start, max).map_err(scan_err),
+        }
+    };
+    let span = match k {
+        Kind::Sexp => next_sexp(pos)?.map(|x| (x.start, x.end)),
+        Kind::List => last_on_line(&|p| sc.list_forward(p, max, true).map_err(scan_err))?,
+        Kind::Str => {
+            let mut p = pos;
+            loop {
+                match sc.next_token(p, max).map_err(scan_err)? {
+                    None => break None,
+                    Some(t) if t.kind == TokenKind::Str => break Some((t.start, t.end)),
+                    Some(t) => p = t.end,
+                }
+            }
+        }
+        // No constituent left after the line means no thing, not the empty
+        // span at point-max: `bounds_of` probes the char BEFORE a point-max
+        // `pos`, which would look backwards past the anchor. Mirrors the
+        // `end > min` guard in `thing_before`.
+        Kind::Word | Kind::Symbol => {
+            let inside = constituent(k, lang);
+            let start = crate::motion::skip_forward(store, pos, max, &|c| !inside(c));
+            if start < max {
+                sc.bounds_of(k, start, 0).map_err(scan_err)?
+            } else {
+                None
+            }
+        }
+        Kind::Line | Kind::Paragraph => sc.bounds_of(k, pos, 0).map_err(scan_err)?,
+    };
+    span.map(|s| sc.widen(s, up)).transpose().map_err(scan_err)
+}
+
+/// The character test behind a `word` or `symbol` thing.
+fn constituent(k: Kind, lang: Lang) -> Box<dyn Fn(char) -> bool> {
+    match k {
+        Kind::Word => Box::new(is_word_char),
+        _ => Box::new(move |c| lang.is_symbol_char(c)),
+    }
+}
+
+/// The last `kind` thing ending at or before `pos` (an anchor line's
+/// start), widened by `up`. An opener met on the way back is stepped over.
+pub fn thing_before(
+    sess: &mut crate::engine::Session,
+    kind: &str,
+    pos: usize,
+    up: usize,
+) -> Result<Option<(usize, usize)>, Error> {
+    if kind == "defun" {
+        return Ok(syntax_of(sess)
+            .defuns()
+            .into_iter()
+            .filter(|d| d.end <= pos)
+            .max_by_key(|d| d.end)
+            .map(|d| (d.start, d.end)));
+    }
+    let k = Kind::parse(kind).ok_or_else(|| unknown_thing(kind))?;
+    let lang = lang_of(sess);
+    let store = &*sess.buffer;
+    let min = store.point_min();
+    let sc = Scanner::new(store, lang);
+    // Walk back over sexps until `accept` says yes; an `Unbalanced` at an
+    // opener before `pos` is a group being left, so continue from it.
+    let back = |accept: &dyn Fn(&Sexp) -> bool| -> Result<Option<(usize, usize)>, Error> {
+        let mut p = pos;
+        loop {
+            match sc.sexp_backward(p, min) {
+                Ok(None) => return Ok(None),
+                Ok(Some(x)) if accept(&x) => return Ok(Some((x.start, x.end))),
+                Ok(Some(x)) => p = x.start,
+                Err(ScanError::Unbalanced { at })
+                    if at < p && matches!(store.char_after(at), Some('(' | '[' | '{')) =>
+                {
+                    p = at;
+                }
+                Err(e) => return Err(scan_err(e)),
+            }
+        }
+    };
+    let span = match k {
+        Kind::Sexp => back(&|_| true)?,
+        Kind::List => back(&|x| x.kind == SexpKind::Group)?,
+        Kind::Str => back(&|x| x.kind == SexpKind::Str)?,
+        Kind::Word | Kind::Symbol => {
+            let inside = constituent(k, lang);
+            let end = crate::motion::skip_backward(store, pos, min, &|c| !inside(c));
+            if end > min {
+                sc.bounds_of(k, end - 1, 0).map_err(scan_err)?
+            } else {
+                None
+            }
+        }
+        Kind::Line | Kind::Paragraph => {
+            if pos > min {
+                sc.bounds_of(k, pos - 1, 0).map_err(scan_err)?
+            } else {
+                None
+            }
+        }
+    };
+    span.map(|s| sc.widen(s, up)).transpose().map_err(scan_err)
 }
 
 /// Where N sexp hops from point land: forward for a positive N, backward

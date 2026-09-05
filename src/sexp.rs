@@ -813,6 +813,31 @@ impl<'a> Scanner<'a> {
         }
         matches!(self.store.char_after(p), Some('(' | '[' | '{'))
     }
+
+    /// `pos`, or the end of the string or comment `pos` sits inside: a forward
+    /// scan started inside one would read its text as code. A string or
+    /// comment left unterminated before `pos` means no context is known, and
+    /// `pos` stands.
+    pub fn out_of_string_or_comment(&self, pos: usize) -> usize {
+        self.with_tokens(pos + 1, self.store.point_min(), |before, cut| {
+            cut.or_else(|| before.last().copied())
+                .filter(|t| {
+                    t.start < pos
+                        && t.end > pos
+                        && matches!(t.kind, TokenKind::Str | TokenKind::Comment)
+                })
+                .map_or(pos, |t| {
+                    // The memo cuts a line comment at its bound instead of
+                    // reading it whole: read the token again from its start.
+                    let mut whole = Reader::new(self.store, t.start, self.store.point_max());
+                    self.raw_token(&mut whole)
+                        .ok()
+                        .flatten()
+                        .map_or(t.end, |w| w.end)
+                })
+        })
+        .unwrap_or(pos)
+    }
 }
 
 #[cfg(test)]
@@ -1253,6 +1278,34 @@ mod tests {
                 .bounds_of(Kind::List, 5, 0)
                 .unwrap(),
             Some((4, 9))
+        );
+    }
+
+    #[test]
+    fn out_of_string_or_comment_reads_the_cut_construct_whole() {
+        //             1234567 8
+        let (b, l) = sc("// ab\nx");
+        let s = Scanner::new(&b, l);
+        assert_eq!(
+            s.out_of_string_or_comment(3),
+            6,
+            "a line comment, past its end"
+        );
+        assert_eq!(s.out_of_string_or_comment(7), 7, "not inside anything");
+        //             12345 67890 12
+        let (b, l) = sc("/* a\nb */ x");
+        let s = Scanner::new(&b, l);
+        assert_eq!(s.out_of_string_or_comment(6), 10, "a block comment");
+        let (b, l) = sc("\"a\nb\" x");
+        let s = Scanner::new(&b, l);
+        assert_eq!(s.out_of_string_or_comment(4), 6, "a string");
+        assert_eq!(s.out_of_string_or_comment(1), 1, "on its opening quote");
+        let (b, l) = sc("\"oops\nx");
+        let s = Scanner::new(&b, l);
+        assert_eq!(
+            s.out_of_string_or_comment(7),
+            7,
+            "unterminated: no context known"
         );
     }
 

@@ -297,6 +297,16 @@ impl Workspace {
         self.session.borrow_mut().args = args;
     }
 
+    /// Run `f` on the session behind this workspace — for tool code that
+    /// resolves positions in Rust instead of through a program. A Lisp
+    /// error is rendered the way a failed program's is.
+    pub fn with_session<R>(
+        &self,
+        f: impl FnOnce(&mut Session) -> Result<R, tulisp::Error>,
+    ) -> Result<R, String> {
+        f(&mut self.session.borrow_mut()).map_err(|e| e.format(&self.ctx))
+    }
+
     fn with_mode(
         buffer: Box<dyn TextStore>,
         read_only: bool,
