@@ -8,14 +8,14 @@ recipes (`help {topic: "recipes"}`).
 
 | Group | Primitives |
 |---|---|
-| Motion | `point` `point-min` `point-max` `goto-char` `goto-line` `forward-char` `backward-char` `forward-line` `forward-word` `backward-word` `forward-symbol` `backward-symbol` `skip-chars-forward` `skip-chars-backward` `forward-paragraph` `backward-paragraph` `beginning-of-buffer` `end-of-buffer` `beginning-of-line` `end-of-line` `back-to-indentation` `line-beginning-position` `line-end-position` `line-number-at-pos` `current-column` `current-indentation` |
+| Motion | `point` `point-min` `point-max` `goto-char` `goto-line` `forward-char` `backward-char` `forward-line` `forward-word` `backward-word` `forward-symbol` `backward-symbol` `skip-chars-forward` `skip-chars-backward` `forward-paragraph` `backward-paragraph` `beginning-of-defun` `end-of-defun` `beginning-of-buffer` `end-of-buffer` `beginning-of-line` `end-of-line` `back-to-indentation` `line-beginning-position` `line-end-position` `line-number-at-pos` `current-column` `current-indentation` |
 | Predicates / chars | `bolp` `eolp` `bobp` `eobp` `char-after` `char-before` `looking-at` `looking-back` |
 | Mark & region | `set-mark` `mark` `region-beginning` `region-end` `exchange-point-and-mark` `mark-word` `mark-symbol` `mark-paragraph` `mark-defun` |
 | Markers | `make-marker` `point-marker` `copy-marker` `set-marker` `marker-position` `markerp` (durable positions; `goto-char` accepts a marker) |
 | Edit | `insert` `insert-char` `newline` `delete-char` `delete-region` `erase-buffer` `buffer-string` `buffer-substring` `upcase-region` `downcase-region` `delete-trailing-whitespace` `keep-lines` `flush-lines` `sort-lines` |
 | Kill ring | `kill-region` `kill-line` `kill-whole-line` `copy-region-as-kill` `yank` |
 | Search & replace | `re-search-forward` `re-search-backward` `search-forward` `search-backward` `replace-match` `match-string` `match-beginning` `match-end` `replace-string` `replace-regexp` `count-matches` `regexp-quote` |
-| Narrowing & scope | `narrow-to-region` `widen` `save-excursion` `save-restriction` |
+| Narrowing & scope | `narrow-to-region` `widen` `narrow-to-defun` `save-excursion` `save-restriction` |
 | Time travel | `checkpoint` `restore-checkpoint` `list-checkpoints` `checkpoint-diff` `with-transaction` |
 | Merge conflicts | `conflicts` (overview) `conflict-count` `conflict-hunks` `conflict-goto` `conflict-context` `conflict-text` `conflict-diff` `conflict-keep` `conflict-keep-all` `conflict-replace` `conflict-resolve-trivial` (git/diff3 markers; smerge-flavored) |
 | Structural | `treesit-language` `treesit-set-language` `treesit-root-type` `treesit-has-error` `treesit-beginning-of-defun` `treesit-end-of-defun` `treesit-defun-name` `treesit-narrow-to-defun` `treesit-list-defuns` `treesit-goto-defun` (tree-sitter; Markdown, Rust, Python, HTML, JavaScript, TypeScript, TSX, Go, CSS, TOML, YAML, Elisp — `.el`/`.tl`) |

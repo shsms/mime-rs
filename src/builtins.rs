@@ -2628,12 +2628,15 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // enclosing defun and return the new point. If point is in no defun,
         // leave it put and return it unchanged.
         ctx.defun("treesit-beginning-of-defun", move || -> i64 {
-            let mut sess = s.borrow_mut();
-            let p = sess.buffer.point();
-            if let Some(d) = syntax_of(&mut sess).enclosing_defun(p) {
-                sess.buffer.goto_char(d.start);
-            }
-            sess.buffer.point() as i64
+            goto_defun_edge(&mut s.borrow_mut(), |d| d.start)
+        });
+    }
+    {
+        let s = session.clone();
+        // (beginning-of-defun) — the Emacs name; identical to
+        // treesit-beginning-of-defun so pasted Emacs scripts run.
+        ctx.defun("beginning-of-defun", move || -> i64 {
+            goto_defun_edge(&mut s.borrow_mut(), |d| d.start)
         });
     }
     {
@@ -2642,12 +2645,14 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // defun and return the new point. If point is in no defun, leave it
         // put and return it unchanged.
         ctx.defun("treesit-end-of-defun", move || -> i64 {
-            let mut sess = s.borrow_mut();
-            let p = sess.buffer.point();
-            if let Some(d) = syntax_of(&mut sess).enclosing_defun(p) {
-                sess.buffer.goto_char(d.end);
-            }
-            sess.buffer.point() as i64
+            goto_defun_edge(&mut s.borrow_mut(), |d| d.end)
+        });
+    }
+    {
+        let s = session.clone();
+        // (end-of-defun) — the Emacs name for treesit-end-of-defun.
+        ctx.defun("end-of-defun", move || -> i64 {
+            goto_defun_edge(&mut s.borrow_mut(), |d| d.end)
         });
     }
     {
@@ -2682,15 +2687,15 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // the section comment), so this can deliberately re-narrow outside
         // the current restriction.
         ctx.defun("treesit-narrow-to-defun", move |pos: Option<i64>| -> bool {
-            let mut sess = s.borrow_mut();
-            let p = pos.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
-            match syntax_of(&mut sess).enclosing_defun(p) {
-                Some(d) => {
-                    sess.buffer.narrow_to_region(d.start, d.end);
-                    true
-                }
-                None => false,
-            }
+            narrow_to_defun(&mut s.borrow_mut(), pos)
+        });
+    }
+    {
+        let s = session.clone();
+        // (narrow-to-defun &optional POS) — the Emacs name for
+        // treesit-narrow-to-defun.
+        ctx.defun("narrow-to-defun", move |pos: Option<i64>| -> bool {
+            narrow_to_defun(&mut s.borrow_mut(), pos)
         });
     }
     {
@@ -2889,6 +2894,32 @@ fn skip_chars(
 fn symbol_pred(sess: &crate::engine::Session) -> impl Fn(char) -> bool + 'static {
     let lang = lang_of(sess);
     move |c: char| lang.is_symbol_char(c)
+}
+
+/// `beginning-of-defun` / `end-of-defun`: point to the `edge` of the
+/// enclosing defun (left put when point is in none); returns point.
+fn goto_defun_edge(
+    sess: &mut crate::engine::Session,
+    edge: fn(&crate::syntax::NodeSpan) -> usize,
+) -> i64 {
+    let p = sess.buffer.point();
+    if let Some(d) = syntax_of(sess).enclosing_defun(p) {
+        sess.buffer.goto_char(edge(&d));
+    }
+    sess.buffer.point() as i64
+}
+
+/// `narrow-to-defun`: narrow to the defun at `pos` (default point); `true`
+/// when one was found. Replaces any existing restriction, like Emacs.
+fn narrow_to_defun(sess: &mut crate::engine::Session, pos: Option<i64>) -> bool {
+    let p = pos.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
+    match syntax_of(sess).enclosing_defun(p) {
+        Some(d) => {
+            sess.buffer.narrow_to_region(d.start, d.end);
+            true
+        }
+        None => false,
+    }
 }
 
 /// The current buffer's parse for the `treesit-*` builtins — cached on the
@@ -5258,5 +5289,35 @@ mod tests {
             Ok(_) => panic!("mark-defun on a blank line should error"),
         };
         assert!(e.contains("no defun"), "{e}");
+    }
+
+    #[test]
+    fn unprefixed_defun_aliases_answer_like_the_treesit_originals() {
+        let text = "fn a() {\n  1\n}\n\nfn b() {\n  2\n}\n";
+        let mut ws = trusted(text);
+        let r = ws
+            .run(
+                r#"(treesit-set-language "rust")
+                    (goto-char 20)
+                    (report "b1" (treesit-beginning-of-defun))
+                    (goto-char 20)
+                    (report "b2" (beginning-of-defun))
+                    (goto-char 20)
+                    (report "e1" (treesit-end-of-defun))
+                    (goto-char 20)
+                    (report "e2" (end-of-defun))
+                    (widen)
+                    (report "n1" (if (treesit-narrow-to-defun 20) (point-max) 0))
+                    (widen)
+                    (report "n2" (if (narrow-to-defun 20) (point-max) 0))
+                    (widen)
+                    (report "none" (if (narrow-to-defun 16) 1 0))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "b1"), report(&r, "b2"));
+        assert_eq!(report(&r, "e1"), report(&r, "e2"));
+        assert_eq!(report(&r, "n1"), report(&r, "n2"));
+        assert_ne!(report(&r, "n1"), "0");
+        assert_eq!(report(&r, "none"), "0");
     }
 }
