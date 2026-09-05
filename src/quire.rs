@@ -263,27 +263,40 @@ impl PageCache {
 /// copy, so the bytes can't be mutated under an in-flight read (mmap aliasing)
 /// and a truncated file can't SIGBUS — a short read just leaves the page's tail
 /// zero-filled, keeping document byte offsets valid.
+///
+/// Drift is observed by the stamp check on a read that TOUCHES the file: the
+/// first page a read call actually reads stats, the rest of that call rides
+/// along, and a call whose pages are all resident does not stat at all.
 struct PagedFile {
     file: std::fs::File,
     len: usize,
     cache: RefCell<PageCache>,
-    /// Identity of the file at open time. A fresh page read re-checks it (a
-    /// stat-by-path) and latches `drifted` on a mismatch — once an external
-    /// writer has touched the file, a not-yet-cached page can no longer be
-    /// trusted to be consistent with the open-time char/line summaries.
+    /// Identity of the file at open time. A read that touches the file — and
+    /// only such a read — re-checks it (a stat-by-path) and latches `drifted` on
+    /// a mismatch: once an external writer has landed, a not-yet-cached page can
+    /// no longer be trusted to be consistent with the open-time char/line
+    /// summaries. A cached page was read before the writer landed, so re-statting
+    /// to serve it would say nothing about the bytes handed back.
     stamp: crate::safety::FileStamp,
-    /// Sticky: set the first time a fresh read sees the file drifted, so the
-    /// buffer keeps reporting stale even if the writer later restores the mtime
-    /// (which a bare stat would then read as clean again).
+    /// Sticky: set the first time a read that touches the file sees it drifted,
+    /// so the buffer keeps reporting stale even if the writer later restores the
+    /// mtime (which a bare stat would then read as clean again). It latches what
+    /// a read SAW: an external in-place rewrite that restores size and mtime
+    /// between two reads served entirely from the page cache is never statted,
+    /// so it is not latched here — `Engine::is_stale` runs a live
+    /// [`crate::safety::FileStamp::check`] alongside this flag, and that catches
+    /// every change that alters size, mtime, or inode.
     drifted: std::cell::Cell<bool>,
-    /// True while a bulk [`PagedFile::for_bytes`] scan is in flight: the scan
-    /// statted for drift ONCE on entry, so the per-miss stat in
-    /// [`PagedFile::page`] is suppressed — a cold scan of a clean file used
-    /// to stat ~16k times per GB. Isolated page misses (char-at-style
-    /// lookups) keep the per-miss stat, so the latch test's contract — a
-    /// fresh read of a changed file detects it — holds at operation
-    /// granularity.
-    bulk_scan: std::cell::Cell<bool>,
+    /// Whether the read call in flight has already statted for drift.
+    /// [`PagedFile::for_bytes`] clears it on entry (restoring the outer call's
+    /// value on the way out) and the first page the call actually READS sets it.
+    /// So one read call costs one stat however many pages it misses on, where a
+    /// stat per miss made a cold pass pay ~16k syscalls per GB.
+    statted: std::cell::Cell<bool>,
+    /// Test-only: how many times `check_drift` has actually statted, so the
+    /// tests can pin the contract above rather than infer it.
+    #[cfg(test)]
+    stats: std::cell::Cell<usize>,
 }
 
 impl PagedFile {
@@ -294,18 +307,26 @@ impl PagedFile {
             cache: RefCell::new(PageCache::new()),
             stamp,
             drifted: std::cell::Cell::new(false),
-            bulk_scan: std::cell::Cell::new(false),
+            statted: std::cell::Cell::new(false),
+            #[cfg(test)]
+            stats: std::cell::Cell::new(0),
         }
     }
 
     /// Stat the visited file and latch the sticky drift flag on a mismatch.
+    /// Already latched, nothing left to learn: the stat is skipped.
     fn check_drift(&self) {
-        if !self.drifted.get() && self.stamp.check().is_some() {
+        if self.drifted.get() {
+            return;
+        }
+        #[cfg(test)]
+        self.stats.set(self.stats.get() + 1);
+        if self.stamp.check().is_some() {
             self.drifted.set(true);
         }
     }
 
-    /// Whether a fresh read has ever observed the file drifted since open.
+    /// Whether a read that touched the file has ever observed it drifted since open.
     fn drifted(&self) -> bool {
         self.drifted.get()
     }
@@ -389,16 +410,17 @@ impl PagedFile {
         if let Some(p) = self.cache.borrow_mut().get(pno) {
             return p;
         }
-        // Fresh read: the file may have drifted since open. Detect it once
-        // per read OPERATION (a bulk scan stats on entry and suppresses the
-        // per-miss stat here) so `is_stale` reports it durably. We still
-        // serve the page (no fault, no hard stop) — but note already-cached
-        // pages keep their pre-drift bytes while this fresh page reads the
-        // changed file, so a post-drift read can interleave old and new
-        // content. That's why the sticky flag is the only correctness signal
-        // here: callers must treat a drifted buffer as untrustworthy and
-        // revert, not parse it.
-        if !self.bulk_scan.get() {
+        // Fresh read: the file may have drifted since open, and THIS is the
+        // only moment it can be observed — a page already in the cache was
+        // read before any later drift and cannot tell us about it. So the stat
+        // lives here, on the first page a read call actually reads (`statted`
+        // covers the rest of the call), and nowhere else. We still serve the
+        // page (no fault, no hard stop) — but note already-cached pages keep
+        // their pre-drift bytes while this fresh page reads the changed file,
+        // so a post-drift read can interleave old and new content. That's why
+        // the sticky flag is the only correctness signal here: callers must
+        // treat a drifted buffer as untrustworthy and revert, not parse it.
+        if !self.statted.replace(true) {
             self.check_drift();
         }
         let start = pno as usize * PAGE;
@@ -410,16 +432,17 @@ impl PagedFile {
         rc
     }
 
-    /// Page-chunked [`Original::for_bytes`]. Drift is statted ONCE here for
-    /// the whole scan; the per-page check is suppressed for its duration.
+    /// Page-chunked [`Original::for_bytes`]. One read call stats at most once:
+    /// this marks the call and the first page it actually reads does the drift
+    /// check, so a cold pass over a file costs one stat rather than one per
+    /// 64 KiB page, and a range served entirely from the cache costs no syscall
+    /// at all.
     fn for_bytes(&self, start: usize, len: usize, f: &mut dyn FnMut(&[u8]) -> bool) {
-        self.check_drift();
-        let prev = self.bulk_scan.replace(true);
-        self.for_bytes_inner(start, len, f);
-        self.bulk_scan.set(prev);
-    }
-
-    fn for_bytes_inner(&self, start: usize, len: usize, f: &mut dyn FnMut(&[u8]) -> bool) {
+        // Mark the start of a read call. Restoring the outer value rather than
+        // clearing it keeps a nested read (one started from `f`) from making the
+        // enclosing call stat a second time. Nothing else resets the flag, so
+        // `page` must only be called from here.
+        let outer = self.statted.replace(false);
         let end = start + len;
         let mut pos = start;
         while pos < end {
@@ -435,6 +458,7 @@ impl PagedFile {
             }
             pos += take;
         }
+        self.statted.set(outer);
     }
 
     /// Scan the whole file once, page by page, counting chars (`\n`s); keeps
@@ -3329,6 +3353,94 @@ mod tests {
         assert!(
             TextStore::drifted(&q),
             "the drift latch survives an mtime/size reset"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Stats a paged Quire's drift check has actually made — the syscall count
+    /// the two tests below pin.
+    fn drift_stats(q: &Quire) -> usize {
+        match q.original.as_ref() {
+            Original::Paged(p) => p.stats.get(),
+            Original::Owned(_) => panic!("drift_stats: not a paged Quire"),
+        }
+    }
+
+    /// Read `[0, len)` of the original in ONE read call, returning the bytes seen.
+    fn read_all(q: &Quire, len: usize) -> usize {
+        let mut seen = 0usize;
+        q.for_bytes(Source::Original, 0, len, |chunk| {
+            seen += chunk.len();
+            true
+        });
+        seen
+    }
+
+    #[test]
+    fn paged_read_stats_once_per_call_and_never_when_cached() {
+        // The contract: one read call stats once however many pages it reads
+        // (a stat per miss made a cold pass cost ~16k syscalls per GB), and a
+        // call served entirely from the page cache stats not at all.
+        let path = tmp_path("drift-stats");
+        let len = 3 * PAGE + 7;
+        std::fs::write(&path, "a".repeat(len)).unwrap();
+        let q = Quire::open(&path).unwrap();
+        assert_eq!(
+            drift_stats(&q),
+            0,
+            "open streams the file through its own buffers, not the pager"
+        );
+
+        assert_eq!(read_all(&q, len), len);
+        assert_eq!(
+            resident_pages(&q),
+            4,
+            "the cold pass really missed on every page"
+        );
+        assert_eq!(drift_stats(&q), 1, "a cold read over four pages stats once");
+
+        assert_eq!(read_all(&q, len), len);
+        assert_eq!(
+            drift_stats(&q),
+            1,
+            "a fully cached re-read stats not at all"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn paged_cached_reads_do_not_see_a_rewrite_that_restores_size_and_mtime() {
+        // The other side of that contract, pinned rather than left implicit:
+        // drift is seen by the stat on a read that TOUCHES the file, so a
+        // rewrite landing between two reads of an already-resident file is not
+        // latched. The live `FileStamp::check` in `Engine::is_stale` does not
+        // see it either, since size, mtime and inode are all unchanged; this
+        // is the documented blind spot, not a bug the product covers elsewhere.
+        let path = tmp_path("drift-cached");
+        std::fs::write(&path, "a".repeat(100)).unwrap();
+        let orig_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let q = Quire::open(&path).unwrap();
+        assert_eq!(read_all(&q, 100), 100); // the whole (sub-page) file is resident now
+        assert_eq!(drift_stats(&q), 1);
+
+        // Same size, same mtime, same inode — different bytes.
+        std::fs::write(&path, "b".repeat(100)).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(orig_mtime))
+            .unwrap();
+
+        assert_eq!(read_all(&q, 100), 100);
+        assert_eq!(drift_stats(&q), 1, "a cached read has no reason to stat");
+        // The documented outcome: with no stat there is nothing to latch. (An
+        // unchanged stamp would not latch either, so the stat count above is
+        // the assertion that discriminates; this one records the contract.)
+        assert!(
+            !TextStore::drifted(&q),
+            "a rewrite no read ever touched is not latched"
         );
         let _ = std::fs::remove_file(&path);
     }
