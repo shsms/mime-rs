@@ -48,7 +48,7 @@
 
 use crate::buffer::MatchData;
 use crate::store::TextStore;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -85,6 +85,55 @@ impl Piece {
             lines: self.lines,
         }
     }
+}
+
+/// One remembered char→byte seek inside one piece: char `n` of that piece starts
+/// at byte `bp` (an offset within the piece) and has `nl` `\n` bytes before it.
+/// What makes a sequential walk linear instead of quadratic — see
+/// [`Quire::scan_prefix`].
+///
+/// The piece is named by `(source, start, len)`, which pins an immutable byte
+/// range of an immutable backing (`Original` is immutable, the add buffer
+/// append-only). The map depends on the view as well as the bytes — a normalized
+/// DOS view ([`Quire::strips_crlf`]) folds each `\r\n` into one char — but the
+/// view is not part of the key: it is fixed at construction and changed only by
+/// [`Quire::rebase_to`], which resets the memo anyway. So the invariant is: same
+/// key, same bytes ⇒ same char→byte map, no matter what the tree did in between.
+/// (A future setter for the VIEW would have to reset the memo too — along with
+/// far more, see [`Quire::view_coding`].)
+///
+/// That makes the memo survive ordinary edits rather than being thrown away by
+/// them: a splice re-keys only the pieces it cuts (their `len`, and a suffix's
+/// `start`, change), so a memo naming a touched piece stops matching by itself
+/// and one naming an untouched piece stays exactly as true as it was. The one
+/// path that can leave a key naming DIFFERENT bytes is [`Quire::rebase_to`],
+/// which swaps the whole `Original`, empties the add buffer and can change the
+/// view with it — so that is the only place the memo is reset.
+#[derive(Debug, Clone, Copy)]
+struct SeekMemo {
+    source: Source,
+    start: usize,
+    len: usize,
+    n: usize,
+    bp: usize,
+    nl: usize,
+}
+
+impl SeekMemo {
+    /// True when `piece` is the piece this memo was taken against — the
+    /// invariant above, and the whole self-check.
+    fn names(&self, piece: &Piece) -> bool {
+        self.source == piece.source && self.start == piece.start && self.len == piece.len
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: seeks that resumed from [`Quire::seek_memo`] rather than from
+    /// the piece head or end. Per thread, so tests running in parallel don't see
+    /// each other's; sampled around an operation, it says the memo was really
+    /// used — an answer alone can't, since the cold walk gives the same one.
+    static MEMO_RESUMES: Cell<usize> = const { Cell::new(0) };
 }
 
 /// The immutable original: either owned text (`from_string`) or a file read on
@@ -808,6 +857,12 @@ pub struct Quire {
     /// Lazy fallback cache for [`TextStore::text`] only (see module docs).
     /// `None` after any mutation; refilled on demand by [`Quire::full_text`].
     text_cache: RefCell<Option<String>>,
+    /// The last char→byte seek, so the next one resumes there instead of
+    /// rescanning its piece from the start (see [`Quire::scan_prefix`]). A pure
+    /// cache: `None` in a fresh store and after [`Quire::rebase_to`], self-checking
+    /// against every splice in between (see [`SeekMemo`]), and every answer it
+    /// produces is the one the from-start walk would have produced.
+    seek_memo: Cell<Option<SeekMemo>>,
     /// Content version (see `TextStore::version`): re-stamped on every text
     /// mutation; a snapshot keeps it — same version, same text.
     version: u64,
@@ -818,7 +873,10 @@ pub struct Quire {
     /// The format the paged Original's RAW bytes are actually in (the coding
     /// detected at open) — the basis for the normalized view (`strips_crlf`) and
     /// for a byte-exact save when it still equals `coding`. Immutable after open;
-    /// `set_coding` never touches it. `default()` for in-memory/plain.
+    /// `set_coding` never touches it. `default()` for in-memory/plain. A setter
+    /// for the VIEW (not just the save target) would have to rebuild every piece's
+    /// char/line summary, which was computed under the open-time view, and reset
+    /// the seek memo — today only `rebase_to` changes it, and it does both.
     view_coding: crate::coding::FileCoding,
 }
 
@@ -909,6 +967,7 @@ impl Quire {
             last_match: None,
             stamp: None,
             text_cache: RefCell::new(None),
+            seek_memo: Cell::new(None),
             version: crate::store::next_version(),
             coding: crate::coding::FileCoding::default(),
             view_coding: crate::coding::FileCoding::default(),
@@ -933,6 +992,7 @@ impl Quire {
             last_match: self.last_match.clone(),
             stamp: self.stamp.clone(),
             text_cache: RefCell::new(None),
+            seek_memo: Cell::new(None),
             version: self.version,
             coding: self.coding,
             view_coding: self.view_coding,
@@ -974,6 +1034,9 @@ impl Quire {
         self.root = root;
         self.stamp = Some(stamp);
         self.view_coding = self.coding; // the saved file is in the target coding now
+        // The only reset the seek memo needs: everything its key names —
+        // the Original's bytes, the add buffer, the view — was just replaced.
+        self.seek_memo.set(None);
         self.invalidate();
         Ok(())
     }
@@ -1062,24 +1125,42 @@ impl Quire {
         source == Source::Original && self.view_coding.eol == crate::coding::Eol::Dos
     }
 
-    /// Walk the chars of `piece` in order, one chunked byte pass, calling
+    /// Walk the chars of `piece` from char `ci0` (which starts at byte `bp0` and
+    /// has `nl0` `\n` bytes before it) in order, one chunked byte pass, calling
     /// `f(byte_offset_of_char_start, char_index, newlines_before_char)`; `f`
-    /// returns `false` to stop. Char starts are the non-continuation bytes, so no
+    /// returns `false` to stop. `(0, 0, 0)` walks the whole piece; any other
+    /// triple must name a char START and its two counts — exactly what a
+    /// [`SeekMemo`] holds. Char starts are the non-continuation bytes, so no
     /// UTF-8 decode is needed — chunk splits inside a multi-byte char are
-    /// invisible to the counts. The unifying primitive for every within-piece
-    /// char→byte seek (locate, summary_before, the insert/delete leaf cuts).
+    /// invisible to the counts. This is the byte pass that
+    /// [`scan_prefix`](Self::scan_prefix) resumes from an anchor; `scan_prefix` is
+    /// the primitive every within-piece char→byte seek goes through.
     ///
     /// Under a normalized DOS view (see [`strips_crlf`](Self::strips_crlf)) the
     /// byte offsets stay RAW (file offsets) while char indices are LOGICAL: a
     /// `\r\n` is one newline char whose byte-start is the `\r` (the `\n` is
     /// absorbed, so a split at a char boundary never lands between them).
-    fn for_each_char_mark(&self, piece: &Piece, mut f: impl FnMut(usize, usize, usize) -> bool) {
-        let mut bp = 0usize; // byte offset within the piece
-        let mut ci = 0usize; // chars seen so far
-        let mut nl = 0usize; // newlines seen so far
+    fn for_each_char_mark_from(
+        &self,
+        piece: &Piece,
+        bp0: usize,
+        ci0: usize,
+        nl0: usize,
+        mut f: impl FnMut(usize, usize, usize) -> bool,
+    ) {
+        let mut bp = bp0; // byte offset within the piece
+        let mut ci = ci0; // chars seen so far
+        let mut nl = nl0; // newlines seen so far
+        // `prev_cr` starts false even on a resume, and that is exact rather than
+        // approximate: `bp0` is a char start, and under the normalized DOS view
+        // the `\n` of a `\r\n` is NOT a char start (the pair is one char, whose
+        // start is the `\r`). So if a `\r` does sit at `bp0 - 1` it is a lone CR,
+        // and the byte AT `bp0` cannot be an absorbable `\n` — the only decision
+        // seeded state could change.
         let mut prev_cr = false; // previous byte was a `\r` (carried across chunks)
+        let (from, len) = (piece.start + bp0, piece.len - bp0);
         if self.strips_crlf(piece.source) {
-            self.for_bytes(piece.source, piece.start, piece.len, |chunk| {
+            self.for_bytes(piece.source, from, len, |chunk| {
                 for &b in chunk {
                     let absorbed_lf = b == b'\n' && prev_cr;
                     if (b & 0xC0) != 0x80 && !absorbed_lf {
@@ -1098,7 +1179,7 @@ impl Quire {
             });
             return;
         }
-        self.for_bytes(piece.source, piece.start, piece.len, |chunk| {
+        self.for_bytes(piece.source, from, len, |chunk| {
             for &b in chunk {
                 if (b & 0xC0) != 0x80 {
                     // A char starts here.
@@ -1118,19 +1199,68 @@ impl Quire {
 
     /// Byte offset (within `piece`) of the start of char `n`, and the newline
     /// count before it. `n == piece.chars` yields `(piece.len, piece.lines)` —
-    /// the end. One bounded chunked walk (stops at `n`, not the whole piece).
+    /// the end.
+    ///
+    /// This is the primitive every within-piece char→byte seek goes through, and
+    /// walking the piece from its start each time is what made a multi-step
+    /// motion quadratic: a freshly opened file is ONE whole-file piece, and the
+    /// motion walkers ask for one window per line or per word. So the last
+    /// answer for a piece is kept in [`Quire::seek_memo`] and the next one
+    /// resumes from it:
+    ///
+    /// * at or after the memo — carry on the forward char-mark walk from there;
+    /// * otherwise — the cold walk from the piece start, as before.
+    ///
+    /// A forward sequential walk is therefore amortized O(chars traversed); a
+    /// cold seek is still O(offset within the piece), and so is a lookup BEFORE
+    /// the memo (a following commit resumes those too).
     fn scan_prefix(&self, piece: &Piece, n: usize) -> (usize, usize) {
-        let mut mark = (piece.len, piece.lines);
-        if n < piece.chars {
-            self.for_each_char_mark(piece, |bp, ci, nl| {
-                if ci == n {
-                    mark = (bp, nl);
-                    false
-                } else {
-                    true
-                }
-            });
+        if n >= piece.chars {
+            // The piece end, known from its summary. Deliberately NOT memoized:
+            // a memo at the far end would make the next lookup near the head
+            // measure back across the whole piece.
+            return (piece.len, piece.lines);
         }
+        let memo = self.seek_memo.get().filter(|m| m.names(piece));
+        let mark = match memo {
+            Some(m) if m.n <= n => {
+                #[cfg(test)]
+                MEMO_RESUMES.with(|c| c.set(c.get() + 1));
+                self.scan_prefix_from(piece, m.bp, m.n, m.nl, n)
+            }
+            _ => self.scan_prefix_from(piece, 0, 0, 0, n),
+        };
+        self.seek_memo.set(Some(SeekMemo {
+            source: piece.source,
+            start: piece.start,
+            len: piece.len,
+            n,
+            bp: mark.0,
+            nl: mark.1,
+        }));
+        mark
+    }
+
+    /// Forward char-mark walk to char `n`, resumed at char `ci0` (byte `bp0`,
+    /// `nl0` newlines before it); `(0, 0, 0)` is the walk from the piece start.
+    /// `n >= ci0`, and `n < piece.chars` so the mark is always found.
+    fn scan_prefix_from(
+        &self,
+        piece: &Piece,
+        bp0: usize,
+        ci0: usize,
+        nl0: usize,
+        n: usize,
+    ) -> (usize, usize) {
+        let mut mark = (piece.len, piece.lines);
+        self.for_each_char_mark_from(piece, bp0, ci0, nl0, |bp, ci, nl| {
+            if ci == n {
+                mark = (bp, nl);
+                false
+            } else {
+                true
+            }
+        });
         mark
     }
 
@@ -1230,7 +1360,10 @@ impl Quire {
         self.point = p.clamp(self.point_min(), self.point_max());
     }
 
-    /// Drop the lazy `text()` cache. Called from every mutation.
+    /// Drop the lazy `text()` cache. Called from every mutation. The seek memo
+    /// is deliberately NOT dropped here: its key names an immutable byte range,
+    /// so a splice re-keys the pieces it touches and leaves the rest valid (see
+    /// [`SeekMemo`]). Only `rebase_to` resets it.
     fn invalidate(&mut self) {
         *self.text_cache.borrow_mut() = None;
     }
@@ -1430,7 +1563,11 @@ impl Quire {
     }
 
     /// Materialize the absolute char range `[lo, hi)` (1-based) into an owned
-    /// `String`. O(range + log n) — only the requested span is copied.
+    /// `String`. Only the requested span is copied; the cost of finding its two
+    /// edges is O(range + log n) AMORTIZED for sequential use — successive
+    /// ranges resume the char→byte seek from [`Quire::seek_memo`] rather than
+    /// rescanning the containing piece — and O(offset of the range within its
+    /// piece + range) for a cold seek.
     fn collect_range(&self, lo: usize, hi: usize) -> String {
         let mut out: Vec<u8> = Vec::new();
         self.for_range_bytes(lo, hi, |chunk| {
@@ -1685,26 +1822,18 @@ impl Quire {
                         out.push(*p);
                         continue;
                     }
-                    // Overlaps: keep the surviving prefix and/or suffix. ONE
-                    // bounded walk to the deletion's end inside this piece
-                    // finds both byte cuts and the newline count up to each;
-                    // the suffix summary is derived from the piece's cached
-                    // totals, never by rescanning the (possibly huge) tail —
-                    // a per-edit tail rescan made a replace sweep O(n²).
+                    // Overlaps: keep the surviving prefix and/or suffix. Two
+                    // seeks inside this piece find both byte cuts and the
+                    // newline count up to each; they go through the seek memo,
+                    // so the second resumes at the first (`keep_left <=
+                    // drop_to`) rather than restarting at the piece head. The
+                    // suffix summary is derived from the piece's cached totals,
+                    // never by rescanning the (possibly huge) tail — a per-edit
+                    // tail rescan made a replace sweep O(n²).
                     let keep_left = lo.saturating_sub(p_lo); // chars kept at front
                     let drop_to = hi.min(p_hi) - p_lo; // chars dropped up to (excl)
-                    let (mut bend, mut nl_end) = (p.len, p.lines);
-                    let (mut bstart, mut nl_start) = (p.len, p.lines);
-                    self.for_each_char_mark(p, |bp, ci, nl| {
-                        if ci == keep_left {
-                            (bend, nl_end) = (bp, nl);
-                        }
-                        if ci == drop_to {
-                            (bstart, nl_start) = (bp, nl);
-                            return false;
-                        }
-                        true
-                    });
+                    let (bend, nl_end) = self.scan_prefix(p, keep_left);
+                    let (bstart, nl_start) = self.scan_prefix(p, drop_to);
                     if keep_left > 0 {
                         out.push(Piece {
                             source: p.source,
@@ -3875,6 +4004,221 @@ mod tests {
             buf, bytes,
             "save restores the exact CRLF bytes across the seam"
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- the seek memo: sequential char→byte lookups resume, not rescan ----
+
+    /// The read surfaces a within-piece char→byte seek feeds, all at `p`:
+    /// `locate` (the chars either side), `summary_before` (the line number) and
+    /// `collect_range` (both edges of a short span). Takes any [`TextStore`], so
+    /// the same four answers are what an oracle `Buffer` is compared against.
+    fn seek_answers(q: &dyn TextStore, p: usize) -> (Option<char>, Option<char>, usize, String) {
+        let hi = (p + 3).min(TextStore::point_max(q));
+        (
+            TextStore::char_after(q, p),
+            TextStore::char_before(q, p),
+            TextStore::line_number_at_pos(q, p),
+            TextStore::substring(q, p, hi),
+        )
+    }
+
+    /// Seeks that have resumed from the memo on this thread (see [`MEMO_RESUMES`]).
+    /// Sampled around an operation, it distinguishes a memo that is really being
+    /// used from one that is silently dropped — the answers cannot, since the
+    /// cold walk gives the same ones.
+    fn memo_resumes() -> usize {
+        MEMO_RESUMES.with(|c| c.get())
+    }
+
+    /// Query `q` at each of `positions` IN ORDER — so the seek memo carries from
+    /// one lookup to the next — and assert every answer equals the one a store
+    /// built fresh for that single lookup, which has no memo at all, gives.
+    fn assert_seeks_match_fresh(q: &Quire, fresh: &dyn Fn() -> Quire, positions: &[usize]) {
+        for &p in positions {
+            assert_eq!(
+                seek_answers(q, p),
+                seek_answers(&fresh(), p),
+                "memoized lookup at {p} disagrees with a fresh store"
+            );
+        }
+    }
+
+    fn lorem(lines: usize) -> String {
+        "lorem ipsum dolor sit amet\n".repeat(lines)
+    }
+
+    #[test]
+    fn seek_memo_resumes_forward_without_changing_answers() {
+        // One whole-file piece and strictly increasing lookups: every seek after
+        // the first resumes the char-mark walk at the memo instead of restarting
+        // at the piece head. The answers must not notice.
+        let text = lorem(40);
+        let fresh = || Quire::from_string("t", text.clone());
+        let q = fresh();
+        let ps: Vec<usize> = (0..38).map(|i| 1 + i * 27).collect();
+        assert_seeks_match_fresh(&q, &fresh, &ps);
+    }
+
+    #[test]
+    fn seek_memo_walks_a_crlf_view_in_both_directions() {
+        // Under the normalized DOS view "ab\r\ncd\r\n" is "ab\ncd\n": each pair
+        // is ONE char whose byte start is the `\r`. The forward resume and the
+        // reverse char-start count both have to see that, or a lookup after a
+        // pair lands a byte off and the line count drifts.
+        let path = tmp_path("seek-crlf-small");
+        std::fs::write(&path, b"ab\r\ncd\r\n").unwrap();
+        let fresh = || Quire::open(&path).unwrap();
+        let q = fresh();
+        assert_eq!(TextStore::text(&q), "ab\ncd\n");
+        assert_seeks_match_fresh(&q, &fresh, &[1, 2, 3, 4, 5, 6, 5, 4, 3, 2, 1, 6, 3]);
+        // The line numbers, spelled out: chars 3 and 6 are the two newlines.
+        for (p, line) in [(1, 1), (3, 1), (4, 2), (6, 2), (7, 3)] {
+            assert_eq!(
+                TextStore::line_number_at_pos(&q, p),
+                line,
+                "line number at {p}"
+            );
+        }
+        std::fs::remove_file(&path).ok();
+
+        // The same over many pairs, so a reverse hop crosses several of them.
+        let path = tmp_path("seek-crlf-many");
+        std::fs::write(&path, "ünï✓ line\r\n".repeat(60).as_bytes()).unwrap();
+        let fresh = || Quire::open(&path).unwrap();
+        let q = fresh();
+        let len = TextStore::char_len(&q);
+        let mut ps: Vec<usize> = (0..30).map(|i| 1 + i * 13).collect();
+        ps.extend((0..30).map(|i| len - i * 13));
+        ps.extend([len / 2, 2, len - 1, 40]);
+        assert_seeks_match_fresh(&q, &fresh, &ps);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn seek_memo_walks_multibyte_text_in_both_directions() {
+        // 1-, 2- and 3-byte chars mixed, so a byte offset resumed or stepped
+        // back over is never just the char index.
+        let text = "ünï✓x".repeat(300);
+        let fresh = || Quire::from_string("t", text.clone());
+        let q = fresh();
+        let len = TextStore::char_len(&q);
+        let mut ps: Vec<usize> = (0..40).map(|i| 1 + i * 7).collect();
+        ps.extend((0..40).map(|i| len - i * 7));
+        ps.extend([len / 3, 5, len - 2, 111, 110, 109, 1]);
+        assert_seeks_match_fresh(&q, &fresh, &ps);
+    }
+
+    #[test]
+    fn seek_memo_survives_an_insert_and_a_delete() {
+        // A mutation does NOT throw the memo away: its key names an immutable
+        // byte range, so a splice re-keys the pieces it cuts and leaves every
+        // other one as true as it was. After an insert and a delete the answers
+        // must still match both the in-memory oracle over the same edited text
+        // and a Quire built fresh from that text, which carries no memo at all.
+        //
+        // Those answers would also come out right if the memo were silently
+        // dropped — the from-start walk gives the same ones — so the resume
+        // counter is what pins it as live, in the two places it is observable: a
+        // delete's second cut resuming from its first, and a seek resuming from a
+        // memo taken before an edit that touched no piece the memo names.
+        let text = "ünï✓x line\n".repeat(60);
+        let mut q = Quire::from_string("t", text.clone());
+        let mut b = Buffer::from_string("t", &text);
+        for (at, ins) in [(300usize, "ZZ✓"), (7, "q")] {
+            // Prime the memo deep in the piece first, then edit.
+            let _ = TextStore::char_after(&q, 400);
+            for s in [&mut q as &mut dyn TextStore, &mut b] {
+                s.goto_char(at);
+                s.insert(ins);
+            }
+            let resumes = memo_resumes();
+            for s in [&mut q as &mut dyn TextStore, &mut b] {
+                s.delete_region(at + 20, at + 26);
+            }
+            assert!(
+                memo_resumes() > resumes,
+                "the delete's two cuts in one piece must go through the memo \
+                 rather than rescan that piece from its head"
+            );
+            let ps = [1, at - 3, at, at + 1, at + 40, 500, 499, 12];
+            for p in ps {
+                assert_eq!(
+                    seek_answers(&q, p),
+                    seek_answers(&b, p),
+                    "after an edit, seek at {p} disagrees with the oracle"
+                );
+            }
+            let edited = TextStore::text(&b);
+            let fresh = || Quire::from_string("t", edited);
+            assert_seeks_match_fresh(&q, &fresh, &ps);
+        }
+
+        // Every splice above cuts a piece, and cutting one takes within-piece
+        // seeks that leave the memo slot naming the piece just re-keyed. An
+        // insert exactly at a piece boundary — typing on from where the last
+        // insert ended — splits nothing and takes no seek of its own, so it is
+        // the edit that shows survival directly: a memo taken in the tail piece
+        // before it is still there, and still used, for the next seek in that
+        // untouched piece.
+        let mut head_chars = 0usize;
+        q.for_each_piece(|p| {
+            head_chars = p.chars;
+            false
+        });
+        let probe = 500;
+        let _ = TextStore::char_after(&q, probe); // the memo now names the tail piece
+        let resumes = memo_resumes();
+        for s in [&mut q as &mut dyn TextStore, &mut b] {
+            s.goto_char(head_chars + 1);
+            s.insert("w");
+        }
+        assert_eq!(
+            memo_resumes(),
+            resumes,
+            "an insert at a piece boundary takes no within-piece seek"
+        );
+        // ONE seek, so the count can only have moved by resuming from the memo
+        // the insert left standing — a second query at the same place would
+        // resume from the first and say nothing about surviving the edit.
+        let after_insert = TextStore::char_after(&q, probe + 2);
+        assert!(
+            memo_resumes() > resumes,
+            "the first seek after the insert must resume from the memo taken before it"
+        );
+        assert_eq!(
+            after_insert,
+            TextStore::char_after(&b, probe + 2),
+            "the seek after the boundary insert disagrees with the oracle"
+        );
+        assert_eq!(
+            seek_answers(&q, probe + 2),
+            seek_answers(&b, probe + 2),
+            "the answers after the boundary insert disagree with the oracle"
+        );
+    }
+
+    #[test]
+    fn seek_memo_is_dropped_by_a_rebase_onto_different_bytes() {
+        // The one path a memo's piece key — (source, start, len), an immutable
+        // byte range of an immutable backing — cannot self-check: `rebase_to`
+        // swaps the whole Original, so the same key can name DIFFERENT bytes.
+        // Here the rewrite keeps the byte length, the char count and the line
+        // count but moves a 2-byte char, so every byte offset in between shifts.
+        // (Standing in for a save whose bytes differ from the pre-save piece.)
+        let path = tmp_path("seek-rebase");
+        let tail = "filler line\n".repeat(20);
+        let before = format!("üab{tail}");
+        let after = format!("abü{tail}");
+        assert_eq!(before.len(), after.len());
+        std::fs::write(&path, &before).unwrap();
+        let mut q = Quire::open(&path).unwrap();
+        assert_eq!(TextStore::char_after(&q, 3), Some('b')); // primes the memo
+        std::fs::write(&path, &after).unwrap();
+        q.rebase_to(&path).unwrap();
+        let fresh = || Quire::open(&path).unwrap();
+        assert_eq!(TextStore::text(&q), after);
+        assert_seeks_match_fresh(&q, &fresh, &[3, 2, 1, 4, 30, 29]);
         std::fs::remove_file(&path).ok();
     }
 }

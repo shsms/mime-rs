@@ -54,9 +54,10 @@ front end and the capability tier differ.
   a syntactically broken code buffer.
 
 - **Huge files stay cheap.** The file-backed store is a persistent B-tree piece
-  table over a paged, read-on-demand original: O(log n) seeks, O(1) snapshots,
-  streaming searches, and a single parallel validate-and-index pass at open. A
-  multi-GB file never goes fully resident, and a checkpoint is a pointer copy.
+  table over a paged, read-on-demand original: O(log n) piece lookup with
+  memoized within-piece seeks, O(1) snapshots, streaming searches, and a single
+  parallel validate-and-index pass at open. A multi-GB file never goes fully
+  resident, and a checkpoint is a pointer copy.
 
 - **In-process git history editing.** A `git_*` tool group drives rebase,
   cherry-pick, and revert as a sequencer (on `git2` / vendored libgit2): the
