@@ -62,12 +62,13 @@ Motion/inspect: point point-min point-max goto-char goto-line forward-line
   forward-sexp backward-sexp forward-list backward-list up-list
   backward-up-list down-list
 Mark: set-mark mark region-beginning region-end exchange-point-and-mark
-  mark-word mark-symbol mark-paragraph mark-defun
+  mark-word mark-symbol mark-paragraph mark-defun mark-sexp
 Search/replace: re-search-forward re-search-backward search-forward
   search-backward replace-match match-string replace-regexp replace-string
   count-matches regexp-quote
 Edit/delete: insert delete-region delete-char flush-lines keep-lines
   kill-region kill-whole-line yank sort-lines delete-trailing-whitespace
+  kill-sexp backward-kill-sexp
 Narrowing: narrow-to-region narrow-to-defun widen save-restriction save-excursion
 Structure (tree-sitter): treesit-goto-defun treesit-defun-at treesit-node-at
   treesit-node-start treesit-node-end treesit-node-text treesit-narrow-to-defun

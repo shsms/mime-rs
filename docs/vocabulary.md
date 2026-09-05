@@ -10,10 +10,10 @@ recipes (`help {topic: "recipes"}`).
 |---|---|
 | Motion | `point` `point-min` `point-max` `goto-char` `goto-line` `forward-char` `backward-char` `forward-line` `forward-word` `backward-word` `forward-symbol` `backward-symbol` `skip-chars-forward` `skip-chars-backward` `forward-paragraph` `backward-paragraph` `forward-sexp` `backward-sexp` `forward-list` `backward-list` `up-list` `backward-up-list` `down-list` `beginning-of-defun` `end-of-defun` `beginning-of-buffer` `end-of-buffer` `beginning-of-line` `end-of-line` `back-to-indentation` `line-beginning-position` `line-end-position` `line-number-at-pos` `current-column` `current-indentation` |
 | Predicates / chars | `bolp` `eolp` `bobp` `eobp` `char-after` `char-before` `looking-at` `looking-back` |
-| Mark & region | `set-mark` `mark` `region-beginning` `region-end` `exchange-point-and-mark` `mark-word` `mark-symbol` `mark-paragraph` `mark-defun` |
+| Mark & region | `set-mark` `mark` `region-beginning` `region-end` `exchange-point-and-mark` `mark-word` `mark-symbol` `mark-paragraph` `mark-defun` `mark-sexp` |
 | Markers | `make-marker` `point-marker` `copy-marker` `set-marker` `marker-position` `markerp` (durable positions; `goto-char` accepts a marker) |
 | Edit | `insert` `insert-char` `newline` `delete-char` `delete-region` `erase-buffer` `buffer-string` `buffer-substring` `upcase-region` `downcase-region` `delete-trailing-whitespace` `keep-lines` `flush-lines` `sort-lines` |
-| Kill ring | `kill-region` `kill-line` `kill-whole-line` `copy-region-as-kill` `yank` |
+| Kill ring | `kill-region` `kill-line` `kill-whole-line` `copy-region-as-kill` `yank` `kill-sexp` `backward-kill-sexp` |
 | Search & replace | `re-search-forward` `re-search-backward` `search-forward` `search-backward` `replace-match` `match-string` `match-beginning` `match-end` `replace-string` `replace-regexp` `count-matches` `regexp-quote` |
 | Narrowing & scope | `narrow-to-region` `widen` `narrow-to-defun` `save-excursion` `save-restriction` |
 | Time travel | `checkpoint` `restore-checkpoint` `list-checkpoints` `checkpoint-diff` `with-transaction` |

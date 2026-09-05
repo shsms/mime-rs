@@ -930,6 +930,17 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             Ok(d.end as i64)
         });
     }
+    {
+        let s = session.clone();
+        // (mark-sexp &optional N) — set mark where forward-sexp N would land
+        // (backward-sexp for a negative N); point stays. Returns the mark.
+        ctx.defun("mark-sexp", move |n: Option<i64>| -> Result<i64, Error> {
+            let mut sess = s.borrow_mut();
+            let m = move_sexps(&sess, n.unwrap_or(1)).map_err(scan_err)?;
+            sess.buffer.set_mark(m);
+            Ok(m as i64)
+        });
+    }
 
     // ---- markers (durable positions; the multi-cursor / viewport primitive) ----
     {
@@ -1814,9 +1825,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             } else {
                 eol
             };
-            let text = sess.buffer.substring(p, end);
-            sess.kill_ring.push(text);
-            sess.buffer.delete_region(p, end);
+            kill_span(&mut sess, p, end);
             Ok(TulispObject::nil())
         });
     }
@@ -1836,13 +1845,32 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             } else {
                 eol
             };
-            let text = sess.buffer.substring(start, end);
-            sess.kill_ring.push(text);
-            sess.buffer.delete_region(start, end);
-            let landing = start.min(sess.buffer.point_max());
-            sess.buffer.goto_char(landing);
+            kill_span(&mut sess, start, end);
             Ok(TulispObject::nil())
         });
+    }
+    {
+        let s = session.clone();
+        // (kill-sexp &optional N) — kill N sexps after point onto the kill
+        // ring (before point for a negative N). Returns nil.
+        ctx.defun(
+            "kill-sexp",
+            move |n: Option<i64>| -> Result<TulispObject, Error> {
+                kill_sexps(&mut s.borrow_mut(), n.unwrap_or(1))?;
+                Ok(TulispObject::nil())
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (backward-kill-sexp &optional N) — the mirror of kill-sexp.
+        ctx.defun(
+            "backward-kill-sexp",
+            move |n: Option<i64>| -> Result<TulispObject, Error> {
+                kill_sexps(&mut s.borrow_mut(), n.unwrap_or(1).saturating_neg())?;
+                Ok(TulispObject::nil())
+            },
+        );
     }
     {
         // (keep-lines REGEXP) — delete every line from the start of point's
@@ -5825,6 +5853,33 @@ mod tests {
     }
 
     #[test]
+    fn mark_sexp_and_kill_sexp_use_the_forward_sexp_span() {
+        let mut ws = Workspace::new_trusted(Box::new(Buffer::from_string("t.rs", "(a b) c")));
+        let r = ws
+            .run(
+                r#"(goto-char 1) (report "m" (mark-sexp)) (report "pt" (point))
+                   (goto-char 7) (report "mb" (mark-sexp -1))
+                   (goto-char 1) (kill-sexp) (report "k" (buffer-string)) (report "kp" (point))
+                   (yank) (report "y" (buffer-string))
+                   (goto-char (point-max)) (backward-kill-sexp) (report "bk" (buffer-string))
+                   (goto-char 3) (kill-sexp 0) (report "k0" (buffer-string))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "m"), "6");
+        assert_eq!(report(&r, "pt"), "1", "mark-sexp leaves point alone");
+        assert_eq!(
+            report(&r, "mb"),
+            "1",
+            "backward: the mark lands before the previous sexp"
+        );
+        assert_eq!(report(&r, "k"), "\" c\"");
+        assert_eq!(report(&r, "kp"), "1");
+        assert_eq!(report(&r, "y"), "\"(a b) c\"");
+        assert_eq!(report(&r, "bk"), "\"(a b) \"");
+        assert_eq!(report(&r, "k0"), "\"(a b) \"", "a zero count kills nothing");
+    }
+
+    #[test]
     fn a_zero_count_leaves_point_alone_on_every_counted_motion() {
         // "one two" = 1-7, the newline ending it = 8, the blank line = 9,
         // "three four" = 10-19, point-max = 20. Point starts inside "three".
@@ -5845,6 +5900,8 @@ mod tests {
             "up-list",
             "backward-up-list",
             "down-list",
+            "mark-sexp",
+            "kill-sexp",
         ] {
             let r = ws
                 .run(&format!(
