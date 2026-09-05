@@ -3,6 +3,7 @@
 //! `Session`). M0 subset: navigation, edit, regex search/replace, reporting.
 //! Subagents extend this with region/mark, kill-ring, markers, and narrowing.
 use crate::engine::{Checkpoint, SharedSession};
+use crate::motion::{is_word_char, move_units};
 use crate::syntax::{Lang, NodeRef, Syntax};
 use tulisp::{Error, Shared, TulispContext, TulispConvertible, TulispObject, TulispValue};
 
@@ -1219,58 +1220,27 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     // ---- text objects & insertion ----
     {
         let s = session.clone();
+        // (forward-word &optional N) — word motion; a word is a run of
+        // alphanumerics (`_` has symbol syntax, as in Emacs). A negative N
+        // reverses direction. Returns the new point.
         ctx.defun("forward-word", move |n: Option<i64>| -> i64 {
             let mut sess = s.borrow_mut();
-            for _ in 0..n.unwrap_or(1).max(0) {
-                let mut p = sess.buffer.point();
-                let max = sess.buffer.point_max();
-                while p < max
-                    && !sess
-                        .buffer
-                        .char_after(p)
-                        .is_some_and(|c| c.is_alphanumeric())
-                {
-                    p += 1;
-                }
-                while p < max
-                    && sess
-                        .buffer
-                        .char_after(p)
-                        .is_some_and(|c| c.is_alphanumeric())
-                {
-                    p += 1;
-                }
-                sess.buffer.goto_char(p);
-            }
-            sess.buffer.point() as i64
+            let from = sess.buffer.point();
+            let to = move_units(&*sess.buffer, from, n.unwrap_or(1), &is_word_char);
+            sess.buffer.goto_char(to);
+            to as i64
         });
     }
     {
         let s = session.clone();
+        // (backward-word &optional N) — the mirror of forward-word: N words
+        // back, a negative N forward. Returns the new point.
         ctx.defun("backward-word", move |n: Option<i64>| -> i64 {
             let mut sess = s.borrow_mut();
-            for _ in 0..n.unwrap_or(1).max(0) {
-                let mut p = sess.buffer.point();
-                let min = sess.buffer.point_min();
-                while p > min
-                    && !sess
-                        .buffer
-                        .char_before(p)
-                        .is_some_and(|c| c.is_alphanumeric())
-                {
-                    p -= 1;
-                }
-                while p > min
-                    && sess
-                        .buffer
-                        .char_before(p)
-                        .is_some_and(|c| c.is_alphanumeric())
-                {
-                    p -= 1;
-                }
-                sess.buffer.goto_char(p);
-            }
-            sess.buffer.point() as i64
+            let from = sess.buffer.point();
+            let to = move_units(&*sess.buffer, from, -n.unwrap_or(1), &is_word_char);
+            sess.buffer.goto_char(to);
+            to as i64
         });
     }
     {
@@ -4977,5 +4947,22 @@ mod tests {
             missing.is_empty(),
             "builtins registered but absent from docs/vocabulary.md: {missing:?}"
         );
+    }
+
+    #[test]
+    fn forward_word_and_backward_word_accept_a_negative_count() {
+        //                  1234567890
+        let mut ws = trusted("ab cd ef g");
+        let r = ws
+            .run(
+                r#"(goto-char (point-max))
+                    (report "a" (forward-word -2))
+                    (report "b" (backward-word -1))
+                    (report "c" (forward-word 0))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "a"), "7");
+        assert_eq!(report(&r, "b"), "9");
+        assert_eq!(report(&r, "c"), "9");
     }
 }

@@ -184,7 +184,7 @@ pub fn is_word_char(c: char) -> bool {
 
 /// One forward hop over a unit (word, symbol): skip non-constituents, then
 /// constituents. Returns the position after the unit, or `bound`.
-pub fn unit_forward(
+fn unit_forward(
     store: &dyn TextStore,
     from: usize,
     bound: usize,
@@ -195,7 +195,7 @@ pub fn unit_forward(
 }
 
 /// The mirror of [`unit_forward`]: the position before the previous unit.
-pub fn unit_backward(
+fn unit_backward(
     store: &dyn TextStore,
     from: usize,
     bound: usize,
@@ -203,6 +203,52 @@ pub fn unit_backward(
 ) -> usize {
     let p = skip_backward(store, from, bound, &|c| !is_constituent(c));
     skip_backward(store, p, bound, is_constituent)
+}
+
+/// Repeat a hop `|n|` times from `from`: `forward` for a positive count,
+/// `backward` for a negative one, each bounded by the far edge of the
+/// accessible region. The run stops early when a hop returns the position it
+/// was handed — the edge, or nothing left to cross — so an over-long count
+/// costs one wasted hop, not `n` of them. `n == 0` returns `from`.
+pub fn repeat_hop(
+    store: &dyn TextStore,
+    from: usize,
+    n: i64,
+    forward: &dyn Fn(&dyn TextStore, usize, usize) -> usize,
+    backward: &dyn Fn(&dyn TextStore, usize, usize) -> usize,
+) -> usize {
+    let (hop, bound) = if n >= 0 {
+        (forward, store.point_max())
+    } else {
+        (backward, store.point_min())
+    };
+    let mut p = from;
+    for _ in 0..n.unsigned_abs() {
+        let next = hop(store, p, bound);
+        if next == p {
+            break;
+        }
+        p = next;
+    }
+    p
+}
+
+/// Where `n` unit hops (words, symbols) from `from` land — forward for
+/// positive `n`, backward for negative — bounded by the accessible region.
+/// Never mutates the store. `is_constituent` decides what a unit is made of.
+pub fn move_units(
+    store: &dyn TextStore,
+    from: usize,
+    n: i64,
+    is_constituent: &dyn Fn(char) -> bool,
+) -> usize {
+    repeat_hop(
+        store,
+        from,
+        n,
+        &|s, p, bound| unit_forward(s, p, bound, is_constituent),
+        &|s, p, bound| unit_backward(s, p, bound, is_constituent),
+    )
 }
 
 /// Start of the line containing `p`, not below `min`.
@@ -411,6 +457,27 @@ mod tests {
         assert_eq!(unit_backward(&b, 11, min, &is_word_char), 7);
         assert_eq!(unit_backward(&b, 7, min, &is_word_char), 3);
         assert_eq!(unit_backward(&b, 3, min, &is_word_char), 1);
+    }
+
+    #[test]
+    fn repeat_hop_counts_hops_and_stops_at_the_edge() {
+        //          1234567890123
+        let b = buf("  foo_bar baz");
+        let fwd =
+            |s: &dyn TextStore, p: usize, bound: usize| unit_forward(s, p, bound, &is_word_char);
+        let back =
+            |s: &dyn TextStore, p: usize, bound: usize| unit_backward(s, p, bound, &is_word_char);
+        assert_eq!(repeat_hop(&b, 1, 2, &fwd, &back), 10);
+        // An over-long count stops at the edge instead of running the loop out.
+        assert_eq!(repeat_hop(&b, 1, i64::MAX, &fwd, &back), b.point_max());
+        assert_eq!(
+            repeat_hop(&b, b.point_max(), i64::MIN, &fwd, &back),
+            b.point_min()
+        );
+        // A negative count reverses direction.
+        assert_eq!(repeat_hop(&b, b.point_max(), -1, &fwd, &back), 11);
+        // Zero hops is a no-op.
+        assert_eq!(repeat_hop(&b, 5, 0, &fwd, &back), 5);
     }
 
     #[test]
