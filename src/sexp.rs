@@ -71,6 +71,33 @@ impl std::fmt::Display for ScanError {
     }
 }
 
+/// The shape of one sexp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SexpKind {
+    Group,
+    Str,
+    Symbol,
+    Punct,
+}
+
+/// One sexp: a 1-based char span, end exclusive. The span includes any
+/// expression-prefix characters before the sexp proper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sexp {
+    pub start: usize,
+    pub end: usize,
+    pub kind: SexpKind,
+}
+
+/// The closer that matches an opener.
+fn closer_of(open: char) -> char {
+    match open {
+        '(' => ')',
+        '[' => ']',
+        _ => '}',
+    }
+}
+
 /// A forward character reader over `[from, bound)` that fetches one bounded
 /// `substring` window at a time, starting at [`FIRST_WINDOW`] chars and
 /// doubling toward [`WINDOW`].
@@ -244,6 +271,147 @@ impl<'a> Scanner<'a> {
             kind,
         }))
     }
+
+    /// Whether the character at `at` is an expression prefix.
+    fn is_prefix(&self, at: usize) -> bool {
+        self.store
+            .char_after(at)
+            .is_some_and(|c| self.rule.prefixes.contains(&c))
+    }
+
+    /// The next sexp at or after `from`: a balanced group to its matching
+    /// closer, a string, a symbol run, or one punctuation character, with
+    /// the expression prefixes before it. `Ok(None)` when only whitespace
+    /// and comments remain before `bound`. A closer at depth zero is
+    /// `Unbalanced` at the closer, as in Emacs.
+    pub fn sexp_forward(&self, from: usize, bound: usize) -> Result<Option<Sexp>, ScanError> {
+        let mut r = Reader::new(self.store, from, bound);
+        let Some(mut first) = self.token(&mut r)? else {
+            return Ok(None);
+        };
+        let start = first.start;
+        // Prefixes are skipped like whitespace on the way to the sexp; a
+        // prefix with nothing after it is a sexp of its own.
+        while first.kind == TokenKind::Punct && self.is_prefix(first.start) {
+            match self.token(&mut r)? {
+                Some(t) => first = t,
+                None => {
+                    return Ok(Some(Sexp {
+                        start,
+                        end: first.end,
+                        kind: SexpKind::Punct,
+                    }));
+                }
+            }
+        }
+        let kind = match first.kind {
+            TokenKind::Open(o) => return self.group_from(&mut r, start, o),
+            TokenKind::Close(_) => return Err(ScanError::Unbalanced { at: first.start }),
+            TokenKind::Str => SexpKind::Str,
+            TokenKind::Symbol => SexpKind::Symbol,
+            TokenKind::Punct | TokenKind::Comment => SexpKind::Punct,
+        };
+        Ok(Some(Sexp {
+            start,
+            end: first.end,
+            kind,
+        }))
+    }
+
+    /// Finish a group whose opener `open` the reader has consumed; `start`
+    /// is where the sexp began (an expression prefix may sit before the
+    /// opener).
+    fn group_from(
+        &self,
+        r: &mut Reader,
+        start: usize,
+        open: char,
+    ) -> Result<Option<Sexp>, ScanError> {
+        let mut stack = vec![open];
+        loop {
+            let Some(t) = self.token(r)? else {
+                return Err(ScanError::Unbalanced { at: start });
+            };
+            match t.kind {
+                TokenKind::Open(o) => stack.push(o),
+                TokenKind::Close(c) => {
+                    let o = stack
+                        .pop()
+                        .expect("the stack holds at least the first opener");
+                    if closer_of(o) != c {
+                        return Err(ScanError::Unbalanced { at: t.start });
+                    }
+                    if stack.is_empty() {
+                        return Ok(Some(Sexp {
+                            start,
+                            end: t.end,
+                            kind: SexpKind::Group,
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The next bracket group at or after `from`, skipping atoms. A closer
+    /// at depth zero is `Unbalanced` unless `cross_closers`, when it is
+    /// stepped over (the `thing: {after}` resolution wants the first group
+    /// after a line, whatever depth the line sits at).
+    pub fn list_forward(
+        &self,
+        from: usize,
+        bound: usize,
+        cross_closers: bool,
+    ) -> Result<Option<Sexp>, ScanError> {
+        let mut r = Reader::new(self.store, from, bound);
+        loop {
+            let Some(t) = self.token(&mut r)? else {
+                return Ok(None);
+            };
+            match t.kind {
+                TokenKind::Open(o) => return self.group_from(&mut r, t.start, o),
+                TokenKind::Close(_) if !cross_closers => {
+                    return Err(ScanError::Unbalanced { at: t.start });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The position after the closer of the group containing `from`, or
+    /// `Ok(None)` when the bound comes first (no enclosing group).
+    pub fn up_forward(&self, from: usize, bound: usize) -> Result<Option<usize>, ScanError> {
+        let mut r = Reader::new(self.store, from, bound);
+        loop {
+            let Some(t) = self.token(&mut r)? else {
+                return Ok(None);
+            };
+            match t.kind {
+                TokenKind::Open(o) => {
+                    self.group_from(&mut r, t.start, o)?;
+                }
+                TokenKind::Close(_) => return Ok(Some(t.end)),
+                _ => {}
+            }
+        }
+    }
+
+    /// The position after the next opener at or after `from`, skipping
+    /// atoms; `Unbalanced` at a closer met first, `Ok(None)` at the bound.
+    pub fn down_forward(&self, from: usize, bound: usize) -> Result<Option<usize>, ScanError> {
+        let mut r = Reader::new(self.store, from, bound);
+        loop {
+            let Some(t) = self.token(&mut r)? else {
+                return Ok(None);
+            };
+            match t.kind {
+                TokenKind::Open(_) => return Ok(Some(t.end)),
+                TokenKind::Close(_) => return Err(ScanError::Unbalanced { at: t.start }),
+                _ => {}
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -366,6 +534,116 @@ mod tests {
             sc.next_token(5001, 5002).unwrap(),
             None,
             "only a space before the bound"
+        );
+    }
+
+    fn sc(text: &str) -> (Buffer, Lang) {
+        (Buffer::from_string("t.rs", text), Lang::Rust)
+    }
+
+    #[test]
+    fn sexp_forward_spans_groups_strings_symbols_and_punct() {
+        //             123456789012345678901234567
+        let (b, l) = sc("foo(a, [1, \"x)\"]) ; \"s\" 'q");
+        let s = Scanner::new(&b, l);
+        let max = b.point_max();
+        let x = s.sexp_forward(1, max).unwrap().unwrap();
+        assert_eq!((x.start, x.end, x.kind), (1, 4, SexpKind::Symbol));
+        let x = s.sexp_forward(4, max).unwrap().unwrap();
+        assert_eq!((x.start, x.end, x.kind), (4, 18, SexpKind::Group));
+        let x = s.sexp_forward(18, max).unwrap().unwrap();
+        assert_eq!((x.start, x.end, x.kind), (19, 20, SexpKind::Punct));
+        let x = s.sexp_forward(20, max).unwrap().unwrap();
+        assert_eq!((x.start, x.end, x.kind), (21, 24, SexpKind::Str));
+        let x = s.sexp_forward(24, max).unwrap().unwrap();
+        assert_eq!(
+            (x.start, x.end, x.kind),
+            (25, 26, SexpKind::Punct),
+            "a Rust `'` is plain punctuation"
+        );
+        assert_eq!(s.sexp_forward(27, max).unwrap(), None);
+    }
+
+    #[test]
+    fn sexp_forward_reports_unbalanced_groups() {
+        let (b, l) = sc("(a [b) c");
+        let s = Scanner::new(&b, l);
+        assert_eq!(
+            s.sexp_forward(1, b.point_max()),
+            Err(ScanError::Unbalanced { at: 6 }),
+            "mismatched closer"
+        );
+        let (b, l) = sc(") a");
+        let s = Scanner::new(&b, l);
+        assert_eq!(
+            s.sexp_forward(1, b.point_max()),
+            Err(ScanError::Unbalanced { at: 1 }),
+            "closer at depth zero"
+        );
+        let (b, l) = sc("(a (b)");
+        let s = Scanner::new(&b, l);
+        assert_eq!(
+            s.sexp_forward(1, b.point_max()),
+            Err(ScanError::Unbalanced { at: 1 }),
+            "bound inside the group"
+        );
+    }
+
+    #[test]
+    fn list_up_and_down_scans() {
+        //             12345678901234567
+        let (b, l) = sc("a (b c) d [e] ) f");
+        let s = Scanner::new(&b, l);
+        let max = b.point_max();
+        let g = s.list_forward(1, max, false).unwrap().unwrap();
+        assert_eq!((g.start, g.end), (3, 8));
+        let g = s.list_forward(8, max, false).unwrap().unwrap();
+        assert_eq!((g.start, g.end), (11, 14));
+        assert_eq!(
+            s.list_forward(14, max, false),
+            Err(ScanError::Unbalanced { at: 15 })
+        );
+        assert_eq!(
+            s.list_forward(14, max, true).unwrap(),
+            None,
+            "crossing the stray closer finds no list"
+        );
+        assert_eq!(
+            s.up_forward(1, max).unwrap(),
+            Some(16),
+            "up-list lands after the closer"
+        );
+        assert_eq!(s.up_forward(16, max).unwrap(), None);
+        assert_eq!(
+            s.down_forward(1, max).unwrap(),
+            Some(4),
+            "down-list lands after the opener"
+        );
+        assert_eq!(s.down_forward(8, max).unwrap(), Some(12));
+        assert_eq!(
+            s.down_forward(14, max),
+            Err(ScanError::Unbalanced { at: 15 })
+        );
+    }
+
+    #[test]
+    fn elisp_prefix_characters_belong_to_the_following_sexp() {
+        //                                    123456789012345
+        let b = Buffer::from_string("t.el", "'(a b) ,@x #'f");
+        let s = Scanner::new(&b, Lang::Elisp);
+        let x = s.sexp_forward(1, b.point_max()).unwrap().unwrap();
+        assert_eq!((x.start, x.end, x.kind), (1, 7, SexpKind::Group));
+        let x = s.sexp_forward(7, b.point_max()).unwrap().unwrap();
+        assert_eq!((x.start, x.end, x.kind), (8, 11, SexpKind::Symbol));
+        let x = s.sexp_forward(11, b.point_max()).unwrap().unwrap();
+        assert_eq!((x.start, x.end, x.kind), (12, 15, SexpKind::Symbol));
+        let b = Buffer::from_string("t.el", "a '");
+        let s = Scanner::new(&b, Lang::Elisp);
+        let x = s.sexp_forward(2, b.point_max()).unwrap().unwrap();
+        assert_eq!(
+            (x.start, x.end, x.kind),
+            (3, 4, SexpKind::Punct),
+            "a trailing prefix is just punctuation"
         );
     }
 }
