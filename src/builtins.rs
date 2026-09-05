@@ -3821,6 +3821,23 @@ mod tests {
         Workspace::new_trusted(Box::new(Buffer::from_string("main", text)))
     }
 
+    /// The fixture the `thing_after` / `thing_before` tests count against —
+    /// a `.rs` buffer, so the language rules and the tree-sitter defuns apply.
+    /// Char positions are 1-based; the counts are in the tests' comments.
+    const THINGS: &str = "fn one() {\n    let s = \"hi\";\n    call(s, 2);\n}\n\nfn two() {}\n";
+
+    /// `thing_after`/`thing_before` driven straight, the way `resolve_thing`
+    /// drives them: `pos` is the anchor line's start.
+    fn thing_after(ws: &Workspace, kind: &str, pos: usize, up: usize) -> Option<(usize, usize)> {
+        ws.with_session(|s| super::thing_after(s, kind, pos, up))
+            .expect("thing_after")
+    }
+
+    fn thing_before(ws: &Workspace, kind: &str, pos: usize, up: usize) -> Option<(usize, usize)> {
+        ws.with_session(|s| super::thing_before(s, kind, pos, up))
+            .expect("thing_before")
+    }
+
     fn report(r: &RunReport, key: &str) -> String {
         r.reports
             .iter()
@@ -6212,6 +6229,152 @@ mod tests {
             e.contains("unknown thing") && e.contains("paragraph"),
             "{e}"
         );
+    }
+
+    /// `after:` names the first thing at or after the anchor line's start —
+    /// except `list`, which names the block the line OPENS (the last list to
+    /// begin on it), so `fn one() {` is the body and not the argument list.
+    #[test]
+    fn thing_after_takes_the_first_thing_on_the_line_but_the_last_list() {
+        // Line 1 `fn one() {` 1-10 + newline 11; line 2 starts at 12: indent
+        // 12-15, `let` 16-18, `s` 20, `=` 22, `"hi"` 24-27, `;` 28, newline 29;
+        // line 3 starts at 30: indent 30-33, `call` 34-37, `(` 38, `s` 39,
+        // `,` 40, `2` 42, `)` 43, `;` 44, newline 45; `}` 46, newline 47;
+        // the blank line 48; line 6 `fn two() {}` 49-59, newline 60;
+        // point-max 61.
+        let ws = Workspace::new_trusted(Box::new(Buffer::from_string("t.rs", THINGS)));
+
+        // The divergence the rule is about: on line 3 the first sexp is the
+        // callee, the last list beginning on the line its argument list.
+        assert_eq!(thing_after(&ws, "sexp", 30, 0), Some((34, 38)), "call");
+        assert_eq!(thing_after(&ws, "list", 30, 0), Some((38, 44)), "(s, 2)");
+        // …and on the defun's line, `fn` against the block it opens.
+        assert_eq!(thing_after(&ws, "sexp", 1, 0), Some((1, 3)), "fn");
+        assert_eq!(thing_after(&ws, "list", 1, 0), Some((10, 47)), "the body");
+
+        // The remaining kinds all take the first one at or after the line.
+        assert_eq!(thing_after(&ws, "string", 12, 0), Some((24, 28)), "\"hi\"");
+        assert_eq!(thing_after(&ws, "word", 12, 0), Some((16, 19)), "let");
+        assert_eq!(thing_after(&ws, "symbol", 12, 0), Some((16, 19)), "let");
+        assert_eq!(thing_after(&ws, "line", 30, 0), Some((30, 46)));
+        assert_eq!(thing_after(&ws, "paragraph", 30, 0), Some((1, 48)));
+        assert_eq!(thing_after(&ws, "defun", 30, 0), Some((49, 60)), "fn two");
+
+        // Nothing left after the last line: no thing, not an empty span at
+        // point-max (which is what a raw `bounds_of` probe would hand back).
+        assert_eq!(thing_after(&ws, "word", 61, 0), None);
+        assert_eq!(thing_after(&ws, "symbol", 61, 0), None);
+
+        // `up` widens a sexp or a list by its enclosing groups; both things on
+        // line 3 sit directly inside the body.
+        assert_eq!(thing_after(&ws, "sexp", 30, 1), Some((10, 47)));
+        assert_eq!(thing_after(&ws, "list", 30, 1), Some((10, 47)));
+    }
+
+    /// `before:` walks back from the anchor line over whole sexps, stepping
+    /// OVER groups rather than into them — so it only ever names something at
+    /// the anchor's own depth or shallower.
+    #[test]
+    fn thing_after_skips_the_comment_or_string_the_anchor_line_is_inside() {
+        // `/*` 1-2, newline 3; line 2 `  if (x) { y }` 4-17, newline 18;
+        // `*/` 19-20, newline 21; line 4 `fn real() { body }` from 22.
+        let text = "/*\n  if (x) { y }\n*/\nfn real() { body }\n";
+        let ws = Workspace::new_trusted(Box::new(Buffer::from_string("t.rs", text)));
+        assert_eq!(
+            thing_after(&ws, "sexp", 4, 0),
+            Some((22, 24)),
+            "`fn`, after the comment"
+        );
+        assert_eq!(
+            thing_after(&ws, "list", 4, 0),
+            Some((29, 31)),
+            "the `()` after it"
+        );
+        assert_eq!(
+            thing_after(&ws, "line", 4, 0),
+            Some((4, 19)),
+            "the anchor line itself"
+        );
+
+        // The closing quote of a multi-line string opens the anchor line:
+        // `let s = "aaa` 1-12, newline 13, `"` 14, `;` 15, newline 16, `foo();` from 17.
+        let text = "let s = \"aaa\n\";\nfoo();\n";
+        let ws = Workspace::new_trusted(Box::new(Buffer::from_string("t.rs", text)));
+        assert_eq!(
+            thing_after(&ws, "sexp", 14, 0),
+            Some((15, 16)),
+            "the `;` after the string"
+        );
+        assert_eq!(
+            thing_after(&ws, "list", 14, 0),
+            Some((20, 22)),
+            "`()` on the next line"
+        );
+        assert_eq!(
+            thing_after(&ws, "string", 14, 0),
+            None,
+            "no string after it"
+        );
+
+        // A blank line after a line comment is not inside it: the walk must
+        // not move back to the comment.
+        let ws = Workspace::new_trusted(Box::new(Buffer::from_string(
+            "t.rs",
+            "// c\n\nfn f() { x }\n",
+        )));
+        assert_eq!(thing_after(&ws, "sexp", 6, 0), Some((7, 9)), "`fn`");
+        assert_eq!(
+            thing_after(&ws, "line", 6, 0),
+            Some((6, 7)),
+            "the blank line"
+        );
+
+        // An unterminated string before the anchor: no context is known, the
+        // walk starts at the anchor as before.
+        let ws = Workspace::new_trusted(Box::new(Buffer::from_string(
+            "t.rs",
+            "let s = \"oops;\nfn f() { x }\n",
+        )));
+        assert_eq!(thing_after(&ws, "sexp", 16, 0), Some((16, 18)), "`fn`");
+    }
+
+    #[test]
+    fn thing_before_walks_back_at_the_anchors_depth_and_over_groups() {
+        // Positions as counted in `thing_after_takes_the_first_thing_…`.
+        let ws = Workspace::new_trusted(Box::new(Buffer::from_string("t.rs", THINGS)));
+
+        // From line 3's start, the previous sexp is the `;` closing line 2.
+        assert_eq!(thing_before(&ws, "sexp", 30, 0), Some((28, 29)), ";");
+        // Rejecting everything on line 2 walks back to the body's `{`, which
+        // reads as an unbalanced open — the recovery steps to it and keeps
+        // going, landing on `one`'s argument list one level out.
+        assert_eq!(thing_before(&ws, "list", 30, 0), Some((7, 9)), "()");
+        assert_eq!(thing_before(&ws, "line", 30, 0), Some((12, 30)));
+        assert_eq!(thing_before(&ws, "paragraph", 30, 0), Some((1, 48)));
+        assert_eq!(thing_before(&ws, "defun", 49, 0), Some((1, 47)), "fn one");
+        // `"hi"` is the last text before line 3, so word/symbol find it.
+        assert_eq!(thing_before(&ws, "word", 30, 0), Some((25, 27)), "hi");
+        assert_eq!(thing_before(&ws, "symbol", 30, 0), Some((25, 27)), "hi");
+
+        // Nothing before the first line.
+        assert_eq!(thing_before(&ws, "word", 1, 0), None);
+        assert_eq!(thing_before(&ws, "symbol", 1, 0), None);
+
+        // `up` widens the same way it does forward.
+        assert_eq!(thing_before(&ws, "sexp", 30, 1), Some((10, 47)));
+    }
+
+    /// Documents a limit, not a wish: the backward walk steps over a group
+    /// instead of descending into it, so the only string before `fn two` —
+    /// `"hi"`, nested in `fn one`'s body — is invisible to it.
+    #[test]
+    fn thing_before_finds_no_string_nested_inside_a_group_it_walked_over() {
+        let ws = Workspace::new_trusted(Box::new(Buffer::from_string("t.rs", THINGS)));
+        // From inside the same group the string IS found…
+        assert_eq!(thing_before(&ws, "string", 30, 0), Some((24, 28)));
+        // …but from `fn two`'s line the walk crosses the whole body as one
+        // sexp and never sees it.
+        assert_eq!(thing_before(&ws, "string", 49, 0), None);
     }
 
     #[test]
