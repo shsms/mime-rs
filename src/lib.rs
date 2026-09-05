@@ -19,6 +19,7 @@ pub mod engine;
 pub mod help;
 pub mod http;
 pub mod mcp;
+pub mod motion;
 pub mod quire;
 pub mod regex_dialect;
 pub mod result;
