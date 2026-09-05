@@ -176,6 +176,35 @@ pub fn skip_backward(
     p
 }
 
+/// `forward-word`'s notion of a word character. `_` is deliberately not one:
+/// in Emacs it has symbol syntax, not word syntax, in every programming mode.
+pub fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric()
+}
+
+/// One forward hop over a unit (word, symbol): skip non-constituents, then
+/// constituents. Returns the position after the unit, or `bound`.
+pub fn unit_forward(
+    store: &dyn TextStore,
+    from: usize,
+    bound: usize,
+    is_constituent: &dyn Fn(char) -> bool,
+) -> usize {
+    let p = skip_forward(store, from, bound, &|c| !is_constituent(c));
+    skip_forward(store, p, bound, is_constituent)
+}
+
+/// The mirror of [`unit_forward`]: the position before the previous unit.
+pub fn unit_backward(
+    store: &dyn TextStore,
+    from: usize,
+    bound: usize,
+    is_constituent: &dyn Fn(char) -> bool,
+) -> usize {
+    let p = skip_backward(store, from, bound, &|c| !is_constituent(c));
+    skip_backward(store, p, bound, is_constituent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +314,31 @@ mod tests {
         assert_eq!(skip_backward(&b, 4, b.point_min(), &|c| a.contains(c)), 1);
         assert_eq!(skip_backward(&b, 4, 2, &|c| a.contains(c)), 2);
         assert_eq!(skip_backward(&b, 1, b.point_min(), &|_| true), 1);
+    }
+
+    #[test]
+    fn unit_forward_skips_separators_then_constituents() {
+        //          1234567890123
+        let b = buf("  foo_bar baz");
+        let max = b.point_max();
+        // Word: `_` is a separator, so the first hop ends after `foo`.
+        assert_eq!(unit_forward(&b, 1, max, &is_word_char), 6);
+        assert_eq!(unit_forward(&b, 6, max, &is_word_char), 10);
+        // Symbol: `_` is a constituent.
+        let sym = |c: char| c.is_alphanumeric() || c == '_';
+        assert_eq!(unit_forward(&b, 1, max, &sym), 10);
+        // At the end there is nothing to skip: stays at the bound.
+        assert_eq!(unit_forward(&b, max, max, &is_word_char), max);
+    }
+
+    #[test]
+    fn unit_backward_mirrors() {
+        //          1234567890123
+        let b = buf("  foo_bar baz");
+        let min = b.point_min();
+        assert_eq!(unit_backward(&b, 14, min, &is_word_char), 11);
+        assert_eq!(unit_backward(&b, 11, min, &is_word_char), 7);
+        assert_eq!(unit_backward(&b, 7, min, &is_word_char), 3);
+        assert_eq!(unit_backward(&b, 3, min, &is_word_char), 1);
     }
 }
