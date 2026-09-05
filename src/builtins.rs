@@ -5497,4 +5497,42 @@ mod tests {
              that is a per-character walk, not a slow machine"
         );
     }
+
+    #[test]
+    fn a_zero_count_leaves_point_alone_on_every_counted_motion() {
+        // "one two" = 1-7, the newline ending it = 8, the blank line = 9,
+        // "three four" = 10-19, point-max = 20. Point starts inside "three".
+        let mut ws = trusted("one two\n\nthree four");
+        for name in [
+            "forward-word",
+            "backward-word",
+            "forward-symbol",
+            "backward-symbol",
+            "forward-paragraph",
+            "backward-paragraph",
+            "mark-word",
+            "mark-symbol",
+        ] {
+            let r = ws
+                .run(&format!(
+                    r#"(goto-char 12) ({name} 0) (report "p" (point))"#
+                ))
+                .unwrap();
+            assert_eq!(report(&r, "p"), "12", "({name} 0) moved point");
+        }
+        // A negative count is Emacs's mark-paragraph over again with the
+        // directions swapped: hop back one paragraph and mark there (the
+        // blank line at 9), then hop forward one from the mark (point-max,
+        // there being no blank line after "three four").
+        let r = ws
+            .run(
+                r#"(goto-char 12)
+                    (mark-paragraph -1)
+                    (report "rb" (region-beginning))
+                    (report "re" (region-end))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "rb"), "9");
+        assert_eq!(report(&r, "re"), "20");
+    }
 }
