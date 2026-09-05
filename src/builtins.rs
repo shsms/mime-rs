@@ -5841,17 +5841,25 @@ mod tests {
 
     /// Run `prog` over `text` on both stores — the in-memory oracle and a
     /// file-backed Quire — and return both reports. Both buffers are named
-    /// with an `.el` extension so symbol motion sees the Elisp table.
-    fn on_both_stores(tag: &str, text: &str, prog: &str) -> (RunReport, RunReport) {
-        let mut oracle = Workspace::new_trusted(Box::new(Buffer::from_string("doc.el", text)));
+    /// `name`, so a caller can pick an extension that puts the right
+    /// language table (or tree-sitter grammar) behind the motions under
+    /// test.
+    fn on_both_stores_as(tag: &str, name: &str, text: &str, prog: &str) -> (RunReport, RunReport) {
+        let mut oracle = Workspace::new_trusted(Box::new(Buffer::from_string(name, text)));
         let dir = temp_dir(tag);
-        let file = dir.join("doc.el");
+        let file = dir.join(name);
         std::fs::write(&file, text).unwrap();
         let mut quire = Workspace::new_trusted(Box::new(crate::Quire::open(&file).unwrap()));
         let a = oracle.run(prog).unwrap();
         let b = quire.run(prog).unwrap();
         std::fs::remove_dir_all(&dir).ok();
         (a, b)
+    }
+
+    /// [`on_both_stores_as`] with an `.el` buffer name, so symbol motion
+    /// sees the Elisp table.
+    fn on_both_stores(tag: &str, text: &str, prog: &str) -> (RunReport, RunReport) {
+        on_both_stores_as(tag, "doc.el", text, prog)
     }
 
     #[test]
@@ -6041,6 +6049,35 @@ mod tests {
     }
 
     #[test]
+    fn sexp_motions_stop_at_the_narrowing_boundary() {
+        // `(a (b) c) d` narrowed to 4..9, the `(b) c` inside the outer group:
+        // the region edge stops a hop, the cut outer group is out of reach,
+        // and the thing at the edge is nil.
+        let mut ws = trusted("(a (b) c) d");
+        let r = ws
+            .run(
+                r#"(narrow-to-region 4 9) (goto-char 4)
+                   (report "fs" (forward-sexp)) (report "fs2" (forward-sexp 2))
+                   (goto-char 5) (report "bul" (backward-up-list))
+                   (goto-char 8) (report "no-list" (if (bounds-of-thing-at-point 'list) 1 0))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "fs"), "7");
+        assert_eq!(report(&r, "fs2"), "9", "stops at the narrowed point-max");
+        assert_eq!(report(&r, "bul"), "4");
+        assert_eq!(
+            report(&r, "no-list"),
+            "0",
+            "the outer group is outside the region"
+        );
+        let e = match ws.run("(goto-char 7) (up-list)") {
+            Err(e) => e,
+            Ok(_) => panic!("up-list must not leave the narrowed region"),
+        };
+        assert!(e.contains("Unbalanced parentheses at 7"), "{e}");
+    }
+
+    #[test]
     fn sexp_motions_error_on_unbalanced_text_and_leave_point_alone() {
         let mut ws = Workspace::new_trusted(Box::new(Buffer::from_string(
             "t.rs",
@@ -6222,5 +6259,72 @@ mod tests {
             .unwrap();
         assert_eq!(report(&r, "rb"), "9");
         assert_eq!(report(&r, "re"), "20");
+    }
+
+    #[test]
+    fn sexp_things_agree_on_both_stores() {
+        let text = "fn main() {\n    let v = vec![1, (2 + 3)]; // (\n    foo(v, \"x)\");\n}\n";
+        let prog = r#"
+            (goto-char (point-min)) (report "fs1" (forward-sexp)) (report "fs2" (forward-sexp 2)) (report "fs3" (forward-sexp))
+            (report "bs" (backward-sexp 2))
+            (goto-char 30) (report "ul" (up-list)) (goto-char 30) (report "bul" (backward-up-list))
+            (goto-char 30) (report "ul2" (up-list 2))
+            (goto-char 13) (report "fl" (forward-list)) (report "bl" (backward-list))
+            (goto-char 11) (report "dl" (down-list 2))
+            (goto-char 30) (report "bt" (car (bounds-of-thing-at-point 'list)))
+            (report "bt2" (cdr (bounds-of-thing-at-point 'list)))
+            (report "ts" (thing-at-point 'symbol)) (report "tl" (thing-at-point 'line))
+            (report "td" (thing-at-point 'defun)) (report "tstr" (if (thing-at-point 'string) 1 0))
+            (goto-char 30) (report "ms" (mark-sexp)) (report "ms-pt" (point))
+            (goto-char 30) (kill-sexp) (report "k" (buffer-substring 25 35))
+            (goto-char (point-max)) (backward-kill-sexp) (report "k2" (point))
+        "#;
+        let (a, b) = on_both_stores_as("sexp-things", "doc.rs", text, prog);
+        assert_eq!(a.reports, b.reports);
+        assert_eq!(a.point, b.point);
+        // Line 2 starts at 13: `[` 29, `1` 30, `(` 33, `]` 40, `;` 41; the
+        // block closes at 66 and point-max is 68.
+        assert_eq!(report(&a, "fs1"), "3");
+        assert_eq!(report(&a, "fs3"), "67");
+        assert_eq!(report(&a, "bs"), "8");
+        assert_eq!(report(&a, "ul"), "41");
+        assert_eq!(report(&a, "bul"), "29");
+        assert_eq!(report(&a, "fl"), "41");
+        assert_eq!(report(&a, "dl"), "30");
+        assert_eq!(report(&a, "bt"), "29");
+        assert_eq!(report(&a, "bt2"), "41");
+        assert_eq!(report(&a, "ms"), "31");
+    }
+
+    #[test]
+    fn sexp_motions_stay_linear_on_a_large_group() {
+        // One 200 KB group holding 7000 small groups: every motion here
+        // walks a long way, and the backward ones lex the region once.
+        let text = "(\n".to_string() + &"lorem ipsum (dolor) sit amet\n".repeat(7000) + ")\n";
+        let max = text.chars().count() + 1;
+        let prog = r#"
+            (goto-char (point-min)) (report "fs" (forward-sexp))
+            (goto-char (point-max)) (report "bs" (backward-sexp))
+            (goto-char 100000) (report "ul" (up-list))
+            (goto-char 100000) (report "bul" (backward-up-list))
+            (goto-char 100000) (report "bt" (car (bounds-of-thing-at-point 'list)))
+            (goto-char 2) (report "fl" (forward-list 7000))
+            (report "bl" (backward-list 7000))
+        "#;
+        let started = std::time::Instant::now();
+        let (a, b) = on_both_stores_as("sexp-linear", "doc.rs", &text, prog);
+        let elapsed = started.elapsed();
+        assert_eq!(a.reports, b.reports);
+        assert_eq!(report(&a, "fs"), (max - 1).to_string());
+        assert_eq!(report(&a, "bs"), "1");
+        assert_eq!(report(&a, "ul"), (max - 1).to_string());
+        assert_eq!(report(&a, "bul"), "1");
+        assert_eq!(report(&a, "bt"), "1");
+        assert_eq!(report(&a, "fl"), "202993");
+        assert_eq!(report(&a, "bl"), "15");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "took {elapsed:?} on both stores"
+        );
     }
 }
