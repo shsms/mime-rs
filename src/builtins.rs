@@ -864,6 +864,70 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         });
     }
 
+    {
+        let s = session.clone();
+        // (mark-word &optional N) — set mark N words ahead (behind for a
+        // negative N); point stays. Returns the mark.
+        ctx.defun("mark-word", move |n: Option<i64>| -> i64 {
+            let mut sess = s.borrow_mut();
+            let here = sess.buffer.point();
+            let m = move_units(&*sess.buffer, here, n.unwrap_or(1), &is_word_char);
+            sess.buffer.set_mark(m);
+            m as i64
+        });
+    }
+    {
+        let s = session.clone();
+        // (mark-symbol &optional N) — the symbol twin of mark-word: mark N
+        // symbols ahead (behind for a negative N). Returns the mark.
+        ctx.defun("mark-symbol", move |n: Option<i64>| -> i64 {
+            let mut sess = s.borrow_mut();
+            let here = sess.buffer.point();
+            let pred = symbol_pred(&sess);
+            let m = move_units(&*sess.buffer, here, n.unwrap_or(1), &pred);
+            sess.buffer.set_mark(m);
+            m as i64
+        });
+    }
+    {
+        let s = session.clone();
+        // (mark-paragraph &optional N) — point to the start of the current
+        // paragraph (the blank line before it, or point-min), mark N
+        // paragraphs ahead, as Emacs: forward N, mark, then back N. Returns
+        // the mark. A count of zero is an error, as in Emacs.
+        ctx.defun(
+            "mark-paragraph",
+            move |n: Option<i64>| -> Result<i64, Error> {
+                let mut sess = s.borrow_mut();
+                let n = n.unwrap_or(1);
+                if n == 0 {
+                    return Err(err("Cannot mark zero paragraphs"));
+                }
+                let end = move_paragraphs(&*sess.buffer, sess.buffer.point(), n);
+                let start = move_paragraphs(&*sess.buffer, end, -n);
+                sess.buffer.set_mark(end);
+                sess.buffer.goto_char(start);
+                Ok(end as i64)
+            },
+        );
+    }
+    // (mark-defun) — point to the start of the enclosing defun (attributes
+    // and decorators included), mark at its end. Errors when point is in no
+    // defun. Returns the mark.
+    {
+        let s = session.clone();
+        ctx.defun("mark-defun", move || -> Result<i64, Error> {
+            let mut sess = s.borrow_mut();
+            let p = sess.buffer.point();
+            let d = syntax_of(&mut sess)
+                .enclosing_defun(p)
+                .ok_or_else(|| err("mark-defun: no defun at point"))?;
+            sess.buffer.set_mark(d.end);
+            sess.buffer.goto_char(d.start);
+            Ok(d.end as i64)
+        });
+    }
+
     // ---- markers (durable positions; the multi-cursor / viewport primitive) ----
     {
         let s = session.clone();
@@ -5104,5 +5168,95 @@ mod tests {
         assert_eq!(report(&r, "w"), "10");
         assert_eq!(report(&r, "p"), "1");
         assert_eq!(report(&r, "s"), "1");
+    }
+
+    #[test]
+    fn mark_word_and_mark_symbol_set_mark_and_leave_point() {
+        //                  123456789012
+        let mut ws = trusted("foo_bar baz");
+        let r = ws
+            .run(
+                r#"(report "w" (mark-word))
+                    (report "p" (point))
+                    (report "m" (mark))
+                    (report "w2" (mark-word 2))
+                    (report "s" (mark-symbol))
+                    (goto-char (point-max))
+                    (report "back" (mark-word -1))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "w"), "4");
+        assert_eq!(report(&r, "p"), "1");
+        assert_eq!(report(&r, "m"), "4");
+        assert_eq!(report(&r, "w2"), "8");
+        assert_eq!(report(&r, "s"), "8");
+        assert_eq!(report(&r, "back"), "9");
+        assert_eq!(r.point, 12);
+    }
+
+    #[test]
+    fn mark_paragraph_brackets_the_paragraph() {
+        // "one\n" = 1-4, "two\n" = 5-8, "\n" = 9, "three\n" = 10-15,
+        // "\n" = 16, "four" = 17-20, point_max = 21.
+        let mut ws = trusted("one\ntwo\n\nthree\n\nfour");
+        let r = ws
+            .run(
+                r#"(goto-char 12)
+                    (report "m" (mark-paragraph))
+                    (report "p" (point))
+                    (report "rb" (region-beginning))
+                    (report "re" (region-end))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "m"), "16");
+        assert_eq!(report(&r, "p"), "9");
+        assert_eq!(report(&r, "rb"), "9");
+        assert_eq!(report(&r, "re"), "16");
+        // The first paragraph: point lands on point-min.
+        let r = ws
+            .run(r#"(goto-char 6) (report "m" (mark-paragraph)) (report "p" (point))"#)
+            .unwrap();
+        assert_eq!(report(&r, "m"), "9");
+        assert_eq!(report(&r, "p"), "1");
+        // Two paragraphs at once.
+        let r = ws
+            .run(r#"(goto-char 2) (report "m" (mark-paragraph 2)) (report "p" (point))"#)
+            .unwrap();
+        assert_eq!(report(&r, "m"), "16");
+        assert_eq!(report(&r, "p"), "1");
+    }
+
+    #[test]
+    fn mark_paragraph_rejects_a_zero_count() {
+        let mut ws = trusted("one\ntwo\n\nthree\n\nfour");
+        let e = match ws.run("(mark-paragraph 0)") {
+            Err(e) => e,
+            Ok(_) => panic!("mark-paragraph with a zero count should error"),
+        };
+        assert!(e.contains("zero paragraphs"), "{e}");
+    }
+
+    #[test]
+    fn mark_defun_brackets_the_decorated_defun_or_errors() {
+        let text = "#[test]\nfn a() {}\n\nfn b() {}\n";
+        let mut ws = trusted(text);
+        let r = ws
+            .run(
+                r#"(treesit-set-language "rust")
+                    (goto-char 12)
+                    (report "m" (mark-defun))
+                    (report "p" (point))
+                    (report "text" (buffer-substring (region-beginning) (region-end)))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "p"), "1");
+        assert_eq!(report(&r, "m"), "18");
+        assert_eq!(report(&r, "text"), "\"#[test]\\nfn a() {}\"");
+        // The blank line between the defuns is in no defun.
+        let e = match ws.run("(goto-char 19) (mark-defun)") {
+            Err(e) => e,
+            Ok(_) => panic!("mark-defun on a blank line should error"),
+        };
+        assert!(e.contains("no defun"), "{e}");
     }
 }
