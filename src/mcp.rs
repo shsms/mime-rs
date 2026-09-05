@@ -601,7 +601,20 @@ fn run_in_session(
     session: &str,
     program: &str,
 ) -> Result<crate::RunReport, String> {
-    run_or_rehearse(sessions, session, program, false, false).map(|(report, _value)| report)
+    run_in_session_expecting(sessions, session, program, None)
+}
+
+/// [`run_in_session`] for a program whose positions were computed against
+/// buffer version `expect_version` (a `thing` edit): after the auto-revert
+/// the run takes, a moved version means those positions describe nothing.
+fn run_in_session_expecting(
+    sessions: &mut HashMap<String, Workspace>,
+    session: &str,
+    program: &str,
+    expect_version: Option<u64>,
+) -> Result<crate::RunReport, String> {
+    run_or_rehearse(sessions, session, program, false, false, expect_version)
+        .map(|(report, _value)| report)
 }
 
 /// Like [`run_in_session`], but `rehearse` selects a dry-run that rolls the
@@ -612,6 +625,7 @@ fn run_or_rehearse(
     program: &str,
     rehearse: bool,
     keep_partial: bool,
+    expect_version: Option<u64>,
 ) -> Result<(crate::RunReport, String), String> {
     if !sessions.contains_key(session) {
         return Err(no_such_session(sessions, session));
@@ -626,6 +640,9 @@ fn run_or_rehearse(
     // discards nothing (the buffer is clean), and without it the preview would
     // run against bytes the committing run — which does revert — won't use.
     ws.auto_revert_if_clean();
+    if expect_version.is_some_and(|v| ws.version() != v) {
+        return Err("the buffer changed since its positions were resolved; retry".to_string());
+    }
     if !rehearse {
         // Auto-capture the pre-program state (version-deduped, bounded) so
         // undo_last can rewind a misfired edit without prior checkpoint
@@ -810,6 +827,7 @@ fn tool_run_program(
         &program,
         rehearse,
         bool_arg(args, "keep_partial"),
+        None,
     ) {
         Ok(rv) => rv,
         // A failed program still said things before it died: the error
@@ -1003,13 +1021,13 @@ fn tool_read_region(
     // wrong pick visible without a second call.
     if let Some(spec) = thing_spec(args, "read_region")? {
         reject_with_thing(args, "read_region", &["start", "end", "lines"])?;
-        let (a, b) = resolve_thing(sessions, &session, &spec)?;
+        let (a, b, version) = resolve_thing(sessions, &session, &spec)?;
         let program = format!(
             "(progn (report \"la\" (line-number-at-pos {a})) \
                     (report \"lb\" (line-number-at-pos (max {a} (- {b} 1)))) \
                     (message (buffer-substring {a} {b})))"
         );
-        let r = run_in_session(sessions, &session, &program)?;
+        let r = run_in_session_expecting(sessions, &session, &program, Some(version))?;
         let la = report_value(&r, "la").unwrap_or_default();
         let lb = report_value(&r, "lb").unwrap_or_default();
         let text = logged_message(&r, "read_region")?;
@@ -1199,10 +1217,12 @@ fn tool_insert_text(
             .to_string());
     }
     let mut placed = String::new();
+    let mut thing_version = None;
     let thing_pos = match &thing {
         Some(spec) => {
             reject_with_thing(args, "insert_text", &["pos", "anchor"])?;
-            let (a, b) = resolve_thing(sessions, &session, spec)?;
+            let (a, b, version) = resolve_thing(sessions, &session, spec)?;
+            thing_version = Some(version);
             placed = format!(" {where_} the {} @{a}-{b}", spec.kind);
             Some(if where_ == "before" { a } else { b })
         }
@@ -1237,7 +1257,7 @@ fn tool_insert_text(
         }
         (None, None) => format!("(progn (insert \"{escaped}\") (report \"point\" (point)))"),
     };
-    let report = match run_in_session(sessions, &session, &program) {
+    let report = match run_in_session_expecting(sessions, &session, &program, thing_version) {
         Ok(r) => r,
         Err(e) if e.contains("__no_defun__") => {
             let name = anchor.map(|(n, _)| n).unwrap_or_default();
@@ -1661,12 +1681,23 @@ fn with_session_of<R>(
     ws.with_session(f).map_err(|e| format!("thing: {e}"))
 }
 
-/// The span a `thing` selector names, or why it names none.
+/// The span a `thing` selector names, or why it names none, plus the buffer
+/// version it was resolved against. Each step of the resolve, and the
+/// program run after it, auto-reverts a clean buffer whose file drifted, so
+/// the version is taken first and the program runs through
+/// [`run_in_session_expecting`] with it: any drift in between refuses.
 fn resolve_thing(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
     spec: &ThingSpec,
-) -> Result<(usize, usize), String> {
+) -> Result<(usize, usize, u64), String> {
+    let version = {
+        let ws = sessions
+            .get_mut(session)
+            .ok_or_else(|| format!("unknown session {session:?}"))?;
+        ws.auto_revert_if_clean();
+        ws.version()
+    };
     let kind = spec.kind.as_str();
     let found = match &spec.at {
         ThingAt::Pos(p) => with_session_of(sessions, session, |s| {
@@ -1685,14 +1716,15 @@ fn resolve_thing(
             })?
         }
     };
-    found.ok_or_else(|| {
+    let (a, b) = found.ok_or_else(|| {
         let where_ = match &spec.at {
             ThingAt::Pos(p) => format!("at {p}"),
             ThingAt::After(t) => format!("after the line {:?}", truncate_for_error(t)),
             ThingAt::Before(t) => format!("before the line {:?}", truncate_for_error(t)),
         };
         format!("thing: no {kind} {where_}")
-    })
+    })?;
+    Ok((a, b, version))
 }
 
 /// `replace_text {thing, replacement}` — splice `replacement` over the span
@@ -1705,13 +1737,13 @@ fn replace_thing(
     spec: &ThingSpec,
     replacement: &str,
 ) -> Result<String, String> {
-    let (a, b) = resolve_thing(sessions, session, spec)?;
+    let (a, b, version) = resolve_thing(sessions, session, spec)?;
     let rep = lisp_literal(replacement);
     let program = format!(
         "(with-transaction (goto-char {a}) (delete-region {a} {b}) (insert \"{rep}\") \
            (report \"line\" (line-number-at-pos {a})) (report \"point\" (point)))"
     );
-    let report = run_in_session(sessions, session, &program)?;
+    let report = run_in_session_expecting(sessions, session, &program, Some(version))?;
     audit_tool(session, &program, &report);
     let line = report_value(&report, "line").unwrap_or_default();
     let point = report_value(&report, "point").unwrap_or_default();
@@ -4583,6 +4615,53 @@ mod git_tool_tests {
 
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
+    }
+
+    /// A `thing` edit resolves its span, then runs a program that auto-reverts
+    /// a clean drifted buffer — so a file rewritten in that window would be
+    /// spliced at positions computed against the old contents. The program
+    /// run carries the version the span was resolved against and refuses
+    /// when its own revert moved it. Driven here at the helpers, because the
+    /// disk write has to land INSIDE a single tool call.
+    #[test]
+    fn a_thing_edit_refuses_a_buffer_that_changed_under_the_resolve() {
+        struct Tmp(std::path::PathBuf);
+        impl Drop for Tmp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let pid = std::process::id();
+        let f = Tmp(std::env::temp_dir().join(format!("mime-thing-race-{pid}.rs")));
+        std::fs::write(&f.0, "fn f() {\n    old(1, 2);\n}\n").unwrap();
+        let mut sessions: HashMap<String, Workspace> = HashMap::new();
+        sessions.insert(
+            "s".into(),
+            Workspace::new(Box::new(crate::quire::Quire::open(&f.0).unwrap())),
+        );
+
+        let args = json!({ "thing": { "kind": "list", "after": "old(1, 2);" } });
+        let spec = thing_spec(&args, "replace_text").unwrap().unwrap();
+        let (a, b, version) = resolve_thing(&mut sessions, "s", &spec).unwrap();
+        assert_eq!((a, b), (17, 23), "the arg list of old(1, 2)");
+
+        // Nothing moved: a program at that version runs.
+        let probe = "(report \"p\" (point))";
+        assert!(run_in_session_expecting(&mut sessions, "s", probe, Some(version)).is_ok());
+
+        // An external writer replaces the file in the window between the
+        // resolve and the edit program. 17-23 now names other text, so the
+        // resolve is void and the program must not run.
+        std::fs::write(
+            &f.0,
+            "fn f() {\n    // a new line pushes everything down\n    old(1, 2);\n}\n",
+        )
+        .unwrap();
+        let err = match run_in_session_expecting(&mut sessions, "s", probe, Some(version)) {
+            Err(e) => e,
+            Ok(_) => panic!("a program at a stale version must not run"),
+        };
+        assert!(err.contains("the buffer changed"), "got: {err}");
     }
 
     #[test]
