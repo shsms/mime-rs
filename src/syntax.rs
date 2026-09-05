@@ -184,7 +184,103 @@ impl Lang {
         };
         c.is_alphanumeric() || c == '_' || extra.contains(c)
     }
+
+    /// The syntax the sexp scanner (`crate::sexp`) needs for this language.
+    /// Brackets are `()` `[]` `{}` everywhere; this names the string quotes,
+    /// the comment openers and the expression-prefix characters. Not an
+    /// Emacs syntax table: Rust char literals and lifetimes, Python f-strings
+    /// and JS regex literals are read as plain strings or symbols, and the
+    /// backslashes in Rust and Python raw strings still escape.
+    pub fn sexp_rule(&self) -> &'static SexpRule {
+        match self {
+            Lang::Rust => &C_LIKE_RULE,
+            Lang::Go => &GO_RULE,
+            Lang::Javascript | Lang::Typescript | Lang::Tsx => &JS_RULE,
+            Lang::Python => &PYTHON_RULE,
+            Lang::Css => &CSS_RULE,
+            Lang::Toml | Lang::Yaml => &HASH_RULE,
+            Lang::Elisp => &ELISP_RULE,
+            Lang::Html => &HTML_RULE,
+            Lang::Markdown => &MARKDOWN_RULE,
+        }
+    }
 }
+
+/// What the sexp scanner knows about one language; see [`Lang::sexp_rule`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SexpRule {
+    /// Characters that both open and close a string. A backslash escapes the
+    /// next character inside every string except the `raw_quotes` ones.
+    pub quotes: &'static [char],
+    /// The `quotes` that take no escapes at all (Go's backtick): a backslash
+    /// inside is text.
+    pub raw_quotes: &'static [char],
+    /// Three of the same quote in a row open a string that three close
+    /// (Python).
+    pub triple_quotes: bool,
+    /// Line comment openers; the comment runs to the end of the line.
+    pub line_comments: &'static [&'static str],
+    /// Block comment opener and closer pairs.
+    pub block_comments: &'static [(&'static str, &'static str)],
+    /// Expression prefixes: characters that belong to the sexp after them,
+    /// as `'` in `'(a b)` (Emacs's prefix syntax flag).
+    pub prefixes: &'static [char],
+}
+
+const C_LIKE_RULE: SexpRule = SexpRule {
+    quotes: &['"'],
+    raw_quotes: &[],
+    triple_quotes: false,
+    line_comments: &["//"],
+    block_comments: &[("/*", "*/")],
+    prefixes: &[],
+};
+const GO_RULE: SexpRule = SexpRule {
+    quotes: &['"', '`'],
+    raw_quotes: &['`'],
+    ..C_LIKE_RULE
+};
+const JS_RULE: SexpRule = SexpRule {
+    quotes: &['"', '\'', '`'],
+    ..C_LIKE_RULE
+};
+const PYTHON_RULE: SexpRule = SexpRule {
+    quotes: &['"', '\''],
+    raw_quotes: &[],
+    triple_quotes: true,
+    line_comments: &["#"],
+    block_comments: &[],
+    prefixes: &[],
+};
+const CSS_RULE: SexpRule = SexpRule {
+    quotes: &['"', '\''],
+    line_comments: &[],
+    ..C_LIKE_RULE
+};
+const HASH_RULE: SexpRule = SexpRule {
+    triple_quotes: false,
+    ..PYTHON_RULE
+};
+const ELISP_RULE: SexpRule = SexpRule {
+    quotes: &['"'],
+    raw_quotes: &[],
+    triple_quotes: false,
+    line_comments: &[";"],
+    block_comments: &[],
+    prefixes: &['\'', '`', ',', '@', '#'],
+};
+const HTML_RULE: SexpRule = SexpRule {
+    quotes: &['"', '\''],
+    raw_quotes: &[],
+    triple_quotes: false,
+    line_comments: &[],
+    block_comments: &[("<!--", "-->")],
+    prefixes: &[],
+};
+const MARKDOWN_RULE: SexpRule = SexpRule {
+    quotes: &['"'],
+    ..HTML_RULE
+};
 
 /// The parse result: Markdown keeps the dedicated `MarkdownTree` (block +
 /// inline trees), code languages a plain `tree_sitter::Tree`.
@@ -1242,5 +1338,34 @@ mod tests {
         assert!(!Lang::Elisp.is_symbol_char('\''));
         assert!(Lang::Css.is_symbol_char('-'));
         assert!(!Lang::Markdown.is_symbol_char('-'));
+    }
+
+    #[test]
+    fn sexp_rules_name_each_languages_quotes_comments_and_prefixes() {
+        let rs = Lang::Rust.sexp_rule();
+        assert_eq!(rs.quotes, &['"']);
+        assert!(!rs.triple_quotes);
+        assert_eq!(rs.line_comments, &["//"]);
+        assert_eq!(rs.block_comments, &[("/*", "*/")]);
+        assert!(rs.prefixes.is_empty());
+        assert!(rs.raw_quotes.is_empty());
+        let py = Lang::Python.sexp_rule();
+        assert_eq!(py.quotes, &['"', '\'']);
+        assert!(py.triple_quotes);
+        assert_eq!(py.line_comments, &["#"]);
+        assert!(py.block_comments.is_empty());
+        let js = Lang::Javascript.sexp_rule();
+        assert_eq!(js.quotes, &['"', '\'', '`']);
+        assert_eq!(Lang::Typescript.sexp_rule(), js);
+        assert_eq!(Lang::Tsx.sexp_rule(), js);
+        assert_eq!(Lang::Go.sexp_rule().quotes, &['"', '`']);
+        assert_eq!(Lang::Go.sexp_rule().raw_quotes, &['`']);
+        let el = Lang::Elisp.sexp_rule();
+        assert_eq!(el.line_comments, &[";"]);
+        assert_eq!(el.prefixes, &['\'', '`', ',', '@', '#']);
+        assert_eq!(Lang::Toml.sexp_rule(), Lang::Yaml.sexp_rule());
+        assert_eq!(Lang::Html.sexp_rule().block_comments, &[("<!--", "-->")]);
+        assert_eq!(Lang::Markdown.sexp_rule().quotes, &['"']);
+        assert!(Lang::Css.sexp_rule().line_comments.is_empty());
     }
 }
