@@ -72,6 +72,17 @@ impl Buffer {
         self.narrowing.map_or(self.char_len() + 1, |(_, hi)| hi)
     }
 
+    /// Seed the next char↔byte conversion with a known-good pair, clamping the
+    /// position into the buffer so the hint always names a position the text
+    /// has — `byte_of`'s backward seek walks `text[..hb]` counting on it. Only
+    /// `insert` can reach here with a position past the end (point can sit
+    /// outside the text when a stale narrowing left it there); the insert then
+    /// happened at `text.len()`, so the recorded byte is exactly the byte of
+    /// `char_len + 1`, which is what the clamp names.
+    fn set_hint(&self, p: usize, byte: usize) {
+        self.byte_hint.set((p.min(self.char_len + 1), byte));
+    }
+
     /// Byte offset of 1-based char position `p` (clamped into the buffer). Seeds
     /// from `byte_hint` so sequential conversions cost O(distance), not O(p).
     /// Boundary answers (start/end) are O(1) and deliberately leave the hint
@@ -90,13 +101,24 @@ impl Buffer {
                 .char_indices()
                 .nth(p - hc)
                 .map_or(self.text.len() - hb, |(rb, _)| rb)
+        } else if hc - p < p - 1 {
+            // Behind the hint but nearer to it than to the buffer start: seek
+            // backward from the hint. `text[..hb]` holds chars 1..=hc-1, so
+            // reversed its nth(0) is char hc-1 and char `p` is nth(hc-p-1).
+            // So a backward walk (a motion, a reverse search) stays
+            // O(distance) from the hint instead of rescanning from byte 0.
+            self.text[..hb]
+                .char_indices()
+                .rev()
+                .nth(hc - p - 1)
+                .map_or(0, |(b, _)| b)
         } else {
             self.text
                 .char_indices()
                 .nth(p - 1)
                 .map_or(self.text.len(), |(b, _)| b)
         };
-        self.byte_hint.set((p, byte));
+        self.set_hint(p, byte);
         byte
     }
 
@@ -115,7 +137,7 @@ impl Buffer {
         } else {
             self.text[..byte].chars().count() + 1
         };
-        self.byte_hint.set((ch, byte));
+        self.set_hint(ch, byte);
         ch
     }
 
@@ -130,7 +152,7 @@ impl Buffer {
         self.text.insert_str(at, s);
         self.point += n;
         self.char_len += n;
-        self.byte_hint.set((self.point, at + s.len()));
+        self.set_hint(self.point, at + s.len());
         if let Some((_, hi)) = self.narrowing.as_mut() {
             *hi += n; // inserted text falls inside the accessible region
         }
@@ -144,7 +166,7 @@ impl Buffer {
         let (lb, hb) = (self.byte_of(lo), self.byte_of(hi));
         self.text.replace_range(lb..hb, "");
         self.char_len -= hi - lo;
-        self.byte_hint.set((lo, lb));
+        self.set_hint(lo, lb);
         if self.point >= hi {
             self.point -= hi - lo;
         } else if self.point > lo {
@@ -239,7 +261,7 @@ impl Buffer {
         self.text.replace_range(lb..hb, &expanded);
         self.point = md.start + new_len;
         self.char_len = self.char_len + new_len - old_len;
-        self.byte_hint.set((self.point, lb + expanded.len()));
+        self.set_hint(self.point, lb + expanded.len());
         // The narrowing's upper bound must track the net length change (the
         // replaced span lies inside the region), exactly as insert/delete_region
         // do — otherwise a length-changing replace leaves a stale restriction.
@@ -678,6 +700,43 @@ mod tests {
         assert_eq!(b.char_after(5), None, "'e' is outside the narrowing");
         assert_eq!(b.char_before(4), Some('c'));
         assert_eq!(b.char_before(3), None, "'b' is outside the narrowing");
+    }
+
+    #[test]
+    fn decreasing_char_access_matches_a_hintless_buffer() {
+        // `byte_of` seeds from its byte hint in both directions; a walk that
+        // asks for strictly decreasing positions must still answer exactly
+        // what a fresh, unhinted buffer answers — the oracle for the oracle.
+        // Multibyte throughout, so an off-by-one in the backward seek lands
+        // on a non-boundary byte instead of merely a wrong char.
+        let text = "aéb✓c—dñe😀f".repeat(40);
+        let warm = Buffer::from_string("t", &text);
+        let max = warm.point_max();
+        assert_eq!(warm.char_after(max - 1), text.chars().last());
+        // A strictly decreasing walk: every step leaves the hint one position
+        // above the next question, so every step takes the backward seek.
+        for p in (1..=max).rev() {
+            let fresh = Buffer::from_string("t", &text);
+            assert_eq!(
+                warm.char_after(p),
+                fresh.char_after(p),
+                "char_after({p}) after a decreasing walk"
+            );
+        }
+        // The mirror through `char_before`, and then a forward walk over the
+        // hint the backward one left behind.
+        for p in (1..=max).rev() {
+            let fresh = Buffer::from_string("t", &text);
+            assert_eq!(
+                warm.char_before(p),
+                fresh.char_before(p),
+                "char_before({p})"
+            );
+        }
+        for p in 1..=max {
+            let fresh = Buffer::from_string("t", &text);
+            assert_eq!(warm.char_after(p), fresh.char_after(p), "char_after({p})");
+        }
     }
 
     #[test]
