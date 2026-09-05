@@ -4,7 +4,7 @@
 //! Subagents extend this with region/mark, kill-ring, markers, and narrowing.
 use crate::engine::{Checkpoint, SharedSession};
 use crate::motion::{is_word_char, move_paragraphs, move_units};
-use crate::sexp::{ScanError, Scanner};
+use crate::sexp::{Kind, ScanError, Scanner};
 use crate::syntax::{Lang, NodeRef, Syntax};
 use tulisp::{Error, Shared, TulispContext, TulispConvertible, TulispObject, TulispValue};
 
@@ -2840,6 +2840,43 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         let s = session.clone();
+        // (bounds-of-thing-at-point THING) — `(START . END)` of the THING at
+        // point, or nil. THING is a symbol: sexp list string word symbol
+        // line paragraph defun.
+        ctx.defun(
+            "bounds-of-thing-at-point",
+            move |thing: TulispObject| -> Result<TulispObject, Error> {
+                let kind = name_arg("THING", &thing)?;
+                let mut sess = s.borrow_mut();
+                let p = sess.buffer.point();
+                Ok(match thing_bounds(&mut sess, &kind, p, 0)? {
+                    Some((a, b)) => TulispObject::cons(
+                        TulispValue::from(a as i64).into_ref(None),
+                        TulispValue::from(b as i64).into_ref(None),
+                    ),
+                    None => TulispObject::nil(),
+                })
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (thing-at-point THING) — the text of the THING at point, or nil.
+        ctx.defun(
+            "thing-at-point",
+            move |thing: TulispObject| -> Result<TulispObject, Error> {
+                let kind = name_arg("THING", &thing)?;
+                let mut sess = s.borrow_mut();
+                let p = sess.buffer.point();
+                Ok(match thing_bounds(&mut sess, &kind, p, 0)? {
+                    Some((a, b)) => TulispValue::from(sess.buffer.substring(a, b)).into_ref(None),
+                    None => TulispObject::nil(),
+                })
+            },
+        );
+    }
+    {
+        let s = session.clone();
         // (treesit-list-defuns) — the buffer outline: report every defun in
         // document order (nested ones included) as "KIND START END NAME" and
         // return the list of names. How an agent surveys a source file
@@ -3040,6 +3077,54 @@ fn symbol_pred(sess: &crate::engine::Session) -> impl Fn(char) -> bool + 'static
 /// point.
 fn scan_err(e: ScanError) -> Error {
     err(&e.to_string())
+}
+
+/// The names `bounds-of-thing-at-point` and the MCP `thing` selector accept.
+pub const THING_KINDS: [&str; 8] = [
+    "sexp",
+    "list",
+    "string",
+    "word",
+    "symbol",
+    "line",
+    "paragraph",
+    "defun",
+];
+
+/// The span of the `kind` thing at `pos` — see `sexp::Scanner::bounds_of` —
+/// with `defun` resolved through the tree-sitter parse as the decorated span
+/// of the enclosing defun. `up` widens a sexp or list by enclosing groups.
+pub fn thing_bounds(
+    sess: &mut crate::engine::Session,
+    kind: &str,
+    pos: usize,
+    up: usize,
+) -> Result<Option<(usize, usize)>, Error> {
+    if kind == "defun" {
+        return Ok(syntax_of(sess)
+            .enclosing_defun(pos)
+            .map(|d| (d.start, d.end)));
+    }
+    let k = Kind::parse(kind).ok_or_else(|| unknown_thing(kind))?;
+    // The scanner clamps a position into the accessible region, which would
+    // quietly name the LAST thing for a typo'd position; point-max stays
+    // valid as the probe for the thing at the region's end.
+    let (min, max) = (sess.buffer.point_min(), sess.buffer.point_max());
+    if pos < min || pos > max {
+        return Err(err(&format!(
+            "position {pos} is outside the accessible region ({min}..{max})"
+        )));
+    }
+    Scanner::new(&*sess.buffer, lang_of(sess))
+        .bounds_of(k, pos, up)
+        .map_err(scan_err)
+}
+
+fn unknown_thing(kind: &str) -> Error {
+    err(&format!(
+        "unknown thing: {kind} (one of {})",
+        THING_KINDS.join(" ")
+    ))
 }
 
 /// Where N sexp hops from point land: forward for a positive N, backward
@@ -5877,6 +5962,56 @@ mod tests {
         assert_eq!(report(&r, "y"), "\"(a b) c\"");
         assert_eq!(report(&r, "bk"), "\"(a b) \"");
         assert_eq!(report(&r, "k0"), "\"(a b) \"", "a zero count kills nothing");
+    }
+
+    #[test]
+    fn thing_at_point_answers_every_kind_or_nil() {
+        let text = "fn a() {}\n\nfn b() {\n    foo(x, \"s\");\n}\n";
+        let mut ws = Workspace::new_trusted(Box::new(Buffer::from_string("x.rs", text)));
+        let r = ws
+            .run(
+                r#"(goto-char 29) (report "sym" (thing-at-point 'symbol))
+                   (report "b-car" (car (bounds-of-thing-at-point 'symbol)))
+                   (report "b-cdr" (cdr (bounds-of-thing-at-point 'symbol)))
+                   (report "list" (thing-at-point 'list))
+                   (report "sexp" (thing-at-point 'sexp))
+                   (goto-char 33) (report "str" (thing-at-point 'string))
+                   (report "line" (thing-at-point 'line))
+                   (report "defun" (thing-at-point 'defun))
+                   (report "para" (car (bounds-of-thing-at-point 'paragraph)))
+                   (goto-char 22) (report "none" (if (thing-at-point 'sexp) 1 0))
+                   (report "no-list" (if (bounds-of-thing-at-point 'list) 1 0))
+                   (goto-char 4) (report "word" (thing-at-point 'word))
+                   (report "no-defun" (if (progn (goto-char 11) (thing-at-point 'defun)) 1 0))"#,
+            )
+            .unwrap();
+        // Line 2 is the blank line at 11; line 3 `fn b() {` starts at 12; line 4
+        // at 21: 4 spaces, `foo` 25-27, `(` 28, `x` 29, `,` 30, space 31,
+        // `"s"` 32-34, `)` 35, `;` 36, newline 37; `}` 38; point-max 40.
+        assert_eq!(report(&r, "sym"), "\"x\"");
+        assert_eq!(report(&r, "b-car"), "29");
+        assert_eq!(report(&r, "b-cdr"), "30");
+        assert_eq!(report(&r, "list"), "\"(x, \\\"s\\\")\"");
+        assert_eq!(report(&r, "sexp"), "\"x\"");
+        assert_eq!(report(&r, "str"), "\"\\\"s\\\"\"");
+        assert_eq!(report(&r, "line"), "\"    foo(x, \\\"s\\\");\\n\"");
+        assert_eq!(
+            report(&r, "defun"),
+            "\"fn b() {\\n    foo(x, \\\"s\\\");\\n}\""
+        );
+        assert_eq!(report(&r, "para"), "11");
+        assert_eq!(report(&r, "none"), "0", "whitespace before `foo`: no sexp");
+        assert_eq!(report(&r, "no-list"), "1", "but inside the block");
+        assert_eq!(report(&r, "word"), "\"a\"");
+        assert_eq!(report(&r, "no-defun"), "0", "the blank line is in no defun");
+        let e = match ws.run("(thing-at-point 'sentence)") {
+            Err(e) => e,
+            Ok(_) => panic!("an unknown thing must fail"),
+        };
+        assert!(
+            e.contains("unknown thing") && e.contains("paragraph"),
+            "{e}"
+        );
     }
 
     #[test]

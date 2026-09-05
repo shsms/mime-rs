@@ -63,6 +63,8 @@ Motion/inspect: point point-min point-max goto-char goto-line forward-line
   backward-up-list down-list
 Mark: set-mark mark region-beginning region-end exchange-point-and-mark
   mark-word mark-symbol mark-paragraph mark-defun mark-sexp
+Things: bounds-of-thing-at-point thing-at-point (sexp list string word
+  symbol line paragraph defun)
 Search/replace: re-search-forward re-search-backward search-forward
   search-backward replace-match match-string replace-regexp replace-string
   count-matches regexp-quote
