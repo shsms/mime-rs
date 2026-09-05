@@ -25,6 +25,7 @@ pub mod regex_dialect;
 pub mod result;
 pub mod safety;
 pub mod sequencer;
+pub mod sexp;
 pub mod store;
 pub mod strings;
 pub mod syntax;

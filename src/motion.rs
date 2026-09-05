@@ -160,14 +160,14 @@ impl CharSet {
 /// The largest `substring` a skip walker asks for: big enough that the
 /// per-fetch position seek is amortized away over a long run, small enough
 /// that a walk over a multi-gigabyte file holds only kilobytes at a time.
-const WINDOW: usize = 4096;
+pub(crate) const WINDOW: usize = 4096;
 
 /// The first window of a walk, doubling toward [`WINDOW`] as the walk runs on.
 /// A store prices a `substring` in characters crossed (the byte offset of its
 /// far edge has to be found), so a walk that stops after a few characters —
 /// the line and word hops the paragraph and unit walkers make — must not pay
 /// for a full window to read them.
-const FIRST_WINDOW: usize = 64;
+pub(crate) const FIRST_WINDOW: usize = 64;
 
 /// The first position in `[from, bound]` whose char fails `pred`, or `bound`.
 ///
