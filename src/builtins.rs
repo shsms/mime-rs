@@ -1245,6 +1245,33 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         let s = session.clone();
+        // (forward-symbol &optional N) — like forward-word but `_` (and
+        // per-language extras: `-` in Lisp and CSS, `:` in Lisp …) are
+        // constituents, so `foo_bar` and `string-trim-left` are one hop.
+        ctx.defun("forward-symbol", move |n: Option<i64>| -> i64 {
+            let mut sess = s.borrow_mut();
+            let pred = symbol_pred(&sess);
+            let from = sess.buffer.point();
+            let to = move_units(&*sess.buffer, from, n.unwrap_or(1), &pred);
+            sess.buffer.goto_char(to);
+            to as i64
+        });
+    }
+    {
+        let s = session.clone();
+        // (backward-symbol &optional N) — the mirror of forward-symbol: N
+        // symbols back, a negative N forward. Returns the new point.
+        ctx.defun("backward-symbol", move |n: Option<i64>| -> i64 {
+            let mut sess = s.borrow_mut();
+            let pred = symbol_pred(&sess);
+            let from = sess.buffer.point();
+            let to = move_units(&*sess.buffer, from, -n.unwrap_or(1), &pred);
+            sess.buffer.goto_char(to);
+            to as i64
+        });
+    }
+    {
+        let s = session.clone();
         ctx.defun(
             "insert-char",
             move |ch: i64, count: Option<i64>| -> Result<TulispObject, Error> {
@@ -2798,6 +2825,12 @@ fn skip_chars(
     };
     sess.buffer.goto_char(to);
     Ok(to as i64 - from as i64)
+}
+
+/// `forward-symbol`'s constituent test for the current buffer's language.
+fn symbol_pred(sess: &crate::engine::Session) -> impl Fn(char) -> bool + 'static {
+    let lang = lang_of(sess);
+    move |c: char| lang.is_symbol_char(c)
 }
 
 /// The current buffer's parse for the `treesit-*` builtins — cached on the
@@ -4964,5 +4997,67 @@ mod tests {
         assert_eq!(report(&r, "a"), "7");
         assert_eq!(report(&r, "b"), "9");
         assert_eq!(report(&r, "c"), "9");
+    }
+
+    #[test]
+    fn forward_symbol_treats_underscore_as_a_constituent_but_forward_word_does_not() {
+        //                  123456789012
+        let mut ws = trusted("foo_bar baz");
+        let r = ws
+            .run(
+                r#"(report "w" (forward-word))
+                    (goto-char 1)
+                    (report "s" (forward-symbol))
+                    (report "s2" (forward-symbol))
+                    (report "b" (backward-symbol 2))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "w"), "4");
+        assert_eq!(report(&r, "s"), "8");
+        assert_eq!(report(&r, "s2"), "12");
+        assert_eq!(report(&r, "b"), "1");
+    }
+
+    #[test]
+    fn symbol_constituents_follow_the_buffer_language() {
+        // Rust: `-` splits `string-trim-left` into three symbols.
+        let mut ws = trusted("string-trim-left x");
+        let r = ws
+            .run(r#"(treesit-set-language "rust") (forward-symbol)"#)
+            .unwrap();
+        assert_eq!(r.point, 7);
+        // Elisp: one symbol, and a keyword `:foo` is one symbol.
+        let mut ws = trusted("string-trim-left :foo");
+        let r = ws
+            .run(
+                r#"(treesit-set-language "elisp")
+                    (report "a" (forward-symbol))
+                    (report "b" (forward-symbol))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "a"), "17");
+        assert_eq!(report(&r, "b"), "22");
+        // Extension detection: a .el buffer needs no override.
+        let mut ws = Workspace::new_trusted(Box::new(Buffer::from_string("main.el", "'foo-bar")));
+        let r = ws.run("(forward-symbol)").unwrap();
+        // The leading quote is not a constituent: skipped, then `foo-bar`.
+        assert_eq!(r.point, 9);
+        let r = ws.run("(backward-symbol)").unwrap();
+        assert_eq!(r.point, 2);
+    }
+
+    #[test]
+    fn unit_motions_stop_at_the_narrowing() {
+        let mut ws = trusted("aa bb cc dd");
+        let r = ws
+            .run(
+                r#"(narrow-to-region 4 9)
+                    (goto-char 4)
+                    (report "f" (forward-word 5))
+                    (report "b" (backward-symbol 5))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "f"), "9");
+        assert_eq!(report(&r, "b"), "4");
     }
 }

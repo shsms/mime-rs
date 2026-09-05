@@ -170,6 +170,20 @@ impl Lang {
             ],
         }
     }
+
+    /// Whether `c` is a symbol constituent: an alphanumeric or `_`
+    /// everywhere, plus the per-mode syntax-table extras `forward-symbol`
+    /// cares about — in Emacs Lisp `string-trim-left` is one symbol and
+    /// `:foo` is a keyword; in CSS `font-size` is one identifier. A quote or
+    /// backquote is never part of a symbol, matching Emacs.
+    pub fn is_symbol_char(&self, c: char) -> bool {
+        let extra = match self {
+            Lang::Elisp => "-+*/<>=!?:%&$~^",
+            Lang::Css => "-",
+            _ => "",
+        };
+        c.is_alphanumeric() || c == '_' || extra.contains(c)
+    }
 }
 
 /// The parse result: Markdown keeps the dedicated `MarkdownTree` (block +
@@ -1217,5 +1231,16 @@ mod tests {
         for p in poss {
             assert_eq!(syn.byte_of(p), naive_byte_of(p), "byte_of({p})");
         }
+    }
+
+    #[test]
+    fn symbol_constituents_are_per_language() {
+        assert!(Lang::Rust.is_symbol_char('_'));
+        assert!(!Lang::Rust.is_symbol_char('-'));
+        assert!(Lang::Elisp.is_symbol_char('-'));
+        assert!(Lang::Elisp.is_symbol_char(':'));
+        assert!(!Lang::Elisp.is_symbol_char('\''));
+        assert!(Lang::Css.is_symbol_char('-'));
+        assert!(!Lang::Markdown.is_symbol_char('-'));
     }
 }
