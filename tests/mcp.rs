@@ -538,6 +538,190 @@ fn read_region_takes_line_ranges_and_view_rejects_them_loudly() {
 }
 
 #[test]
+fn read_region_resolves_a_thing_by_position_or_anchor_line() {
+    let mut s = Server::spawn();
+    let text =
+        "fn main() {\n    let v = vec![1, (2 + 3)];\n    foo(v);\n}\n\nfn foo(v: Vec<i32>) {}\n";
+    s.call_ok(1, "open_text", json!({ "text": text, "name": "m.rs" }));
+
+    // The block after a line: `{` is at 11 and the block is 45 chars.
+    let block = "{\n    let v = vec![1, (2 + 3)];\n    foo(v);\n}";
+    let out = s.call_ok(
+        2,
+        "read_region",
+        json!({ "thing": { "kind": "list", "after": "fn main() {" } }),
+    );
+    assert_eq!(
+        out,
+        format!(
+            "list @11-{} (lines 1-4):\n{block}",
+            11 + block.chars().count()
+        )
+    );
+
+    // By position: 30 is the `1` inside `[1, (2 + 3)]`, which spans 29-41.
+    let out = s.call_ok(
+        3,
+        "read_region",
+        json!({ "thing": { "kind": "list", "at": 30 } }),
+    );
+    assert_eq!(out, "list @29-41 (lines 2-2):\n[1, (2 + 3)]");
+    let out = s.call_ok(
+        4,
+        "read_region",
+        json!({ "thing": { "kind": "list", "at": 30, "up": 1 } }),
+    );
+    assert!(out.starts_with("list @11-56"), "{out}");
+    let out = s.call_ok(
+        5,
+        "read_region",
+        json!({ "thing": { "kind": "sexp", "at": 34 } }),
+    );
+    assert_eq!(out, "sexp @34-35 (lines 2-2):\n2");
+    let out = s.call_ok(
+        6,
+        "read_region",
+        json!({ "thing": { "kind": "list", "before": "foo(v);" } }),
+    );
+    assert_eq!(out, "list @29-41 (lines 2-2):\n[1, (2 + 3)]");
+    let out = s.call_ok(
+        7,
+        "read_region",
+        json!({ "thing": { "kind": "defun", "after": "fn foo" } }),
+    );
+    assert!(
+        out.starts_with("defun @") && out.ends_with("fn foo(v: Vec<i32>) {}"),
+        "{out}"
+    );
+    // The anchor line sits inside the block, so the walk crosses the `}` that
+    // closes it at depth zero — but `(v)` began on the line, so it wins.
+    let out = s.call_ok(
+        17,
+        "read_region",
+        json!({ "thing": { "kind": "list", "after": "foo(v);" } }),
+    );
+    assert_eq!(out, "list @50-53 (lines 3-3):\n(v)");
+
+    // Errors name the problem.
+    let err = s.call_err(
+        8,
+        "read_region",
+        json!({ "thing": { "kind": "string", "at": 30 } }),
+    );
+    assert!(err.contains("no string at 30"), "{err}");
+    let err = s.call_err(
+        9,
+        "read_region",
+        json!({ "thing": { "kind": "list", "after": "fn" } }),
+    );
+    assert!(err.contains("unique") && err.contains("lines"), "{err}");
+    let err = s.call_err(
+        10,
+        "read_region",
+        json!({ "thing": { "kind": "list", "after": "absent" } }),
+    );
+    assert!(err.contains("no line matches"), "{err}");
+    let err = s.call_err(11, "read_region", json!({ "thing": { "at": 30 } }));
+    assert!(err.contains("kind"), "{err}");
+    let err = s.call_err(
+        12,
+        "read_region",
+        json!({ "thing": { "kind": "list", "at": 30, "after": "x" } }),
+    );
+    assert!(err.contains("one of"), "{err}");
+    let err = s.call_err(
+        13,
+        "read_region",
+        json!({ "thing": { "kind": "string", "at": 30, "up": 1 } }),
+    );
+    assert!(err.contains("sexp and list"), "{err}");
+    let err = s.call_err(
+        14,
+        "read_region",
+        json!({ "thing": { "kind": "list", "at": 30 }, "lines": [1, 2] }),
+    );
+    assert!(err.contains("not both"), "{err}");
+    s.call_ok(15, "open_text", json!({ "text": "(a b", "name": "u.rs" }));
+    let err = s.call_err(
+        16,
+        "read_region",
+        json!({ "thing": { "kind": "list", "at": 2 } }),
+    );
+    assert!(err.contains("Unbalanced parentheses at 1"), "{err}");
+}
+
+/// `after:` reads the anchor line differently per kind: a `list` is the block
+/// the line OPENS (the last list beginning on it), while every other kind —
+/// `sexp` included — is the FIRST thing at or after the line's start. Without
+/// that split, `{kind: "sexp", after: "old(1, 2);"}` named the trailing `;`.
+#[test]
+fn a_sexp_after_a_line_is_the_first_one_a_list_the_last_the_line_opens() {
+    let mut s = Server::spawn();
+    // 1-8 "fn f() {", 9 newline, 10-13 the indent, 14-16 "old", 17 "(",
+    // 18 "1", 19 ",", 20 " ", 21 "2", 22 ")", 23 ";", 24 newline, 25 "}".
+    s.call_ok(
+        1,
+        "open_text",
+        json!({ "text": "fn f() {\n    old(1, 2);\n}\n", "name": "m.rs" }),
+    );
+
+    // The first sexp at or after the line start is the call's name.
+    let out = s.call_ok(
+        2,
+        "read_region",
+        json!({ "thing": { "kind": "sexp", "after": "old(1, 2);" } }),
+    );
+    assert_eq!(out, "sexp @14-17 (lines 2-2):\nold");
+    // The last list beginning on the same line is its argument list.
+    let out = s.call_ok(
+        3,
+        "read_region",
+        json!({ "thing": { "kind": "list", "after": "old(1, 2);" } }),
+    );
+    assert_eq!(out, "list @17-23 (lines 2-2):\n(1, 2)");
+
+    // On the defun's own line the two diverge the other way: the sexp is the
+    // `fn` keyword, the list the block the line opens.
+    let out = s.call_ok(
+        4,
+        "read_region",
+        json!({ "thing": { "kind": "sexp", "after": "fn f() {" } }),
+    );
+    assert_eq!(out, "sexp @1-3 (lines 1-1):\nfn");
+    let out = s.call_ok(
+        5,
+        "read_region",
+        json!({ "thing": { "kind": "list", "after": "fn f() {" } }),
+    );
+    assert_eq!(out, "list @8-26 (lines 1-3):\n{\n    old(1, 2);\n}");
+}
+
+#[test]
+fn read_region_thing_after_with_nothing_left_to_find_is_an_error() {
+    let mut s = Server::spawn();
+    s.call_ok(
+        1,
+        "open_text",
+        json!({ "text": "zz\n---\n", "name": "n.md" }),
+    );
+
+    // Nothing follows the anchor line, so there is no word to read — the
+    // lookup must say so, not hand back an empty span.
+    let err = s.call_err(
+        2,
+        "read_region",
+        json!({ "thing": { "kind": "word", "after": "---" } }),
+    );
+    assert!(err.contains("no word after the line"), "{err}");
+    let err = s.call_err(
+        3,
+        "read_region",
+        json!({ "thing": { "kind": "symbol", "after": "---" } }),
+    );
+    assert!(err.contains("no symbol after the line"), "{err}");
+}
+
+#[test]
 fn replace_text_regex_mode_expands_backrefs() {
     let mut s = Server::spawn();
     s.call_ok(

@@ -975,12 +975,18 @@ fn run_message(
     what: &str,
 ) -> Result<String, String> {
     let report = run_in_session(sessions, session, &format!("(message {expr})"))?;
-    let text = report
-        .log
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("{what}: no text returned"))?;
+    let text = logged_message(&report, what)?;
     Ok(format!("{text}{}", stale_note(sessions, session)))
+}
+
+/// The text a `(message …)` in `report` logged, raw; `what: no text returned`
+/// when the program logged nothing.
+fn logged_message(report: &crate::RunReport, what: &str) -> Result<String, String> {
+    report
+        .log
+        .first()
+        .cloned()
+        .ok_or_else(|| format!("{what}: no text returned"))
 }
 
 /// `read_region {session?, start, end}` — the substring `[start, end)`, fetched
@@ -991,6 +997,28 @@ fn tool_read_region(
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
     let session = resolve_session(args, sessions)?;
+    // The structural form: `thing: {kind, at | after | before, up?}` — the
+    // region named by syntax rather than by counted positions. It resolves to
+    // a span here, and the echoed `KIND @START-END (lines A-B)` header makes a
+    // wrong pick visible without a second call.
+    if let Some(spec) = thing_spec(args, "read_region")? {
+        reject_with_thing(args, "read_region", &["start", "end", "lines"])?;
+        let (a, b) = resolve_thing(sessions, &session, &spec)?;
+        let program = format!(
+            "(progn (report \"la\" (line-number-at-pos {a})) \
+                    (report \"lb\" (line-number-at-pos (max {a} (- {b} 1)))) \
+                    (message (buffer-substring {a} {b})))"
+        );
+        let r = run_in_session(sessions, &session, &program)?;
+        let la = report_value(&r, "la").unwrap_or_default();
+        let lb = report_value(&r, "lb").unwrap_or_default();
+        let text = logged_message(&r, "read_region")?;
+        return Ok(format!(
+            "{} @{a}-{b} (lines {la}-{lb}):\n{text}{}",
+            spec.kind,
+            stale_note(sessions, &session)
+        ));
+    }
     // The line-based form: `lines: [a, b]` (1-based inclusive, narrowing-
     // relative like goto-line) — the natural shape for "read around this
     // line"; start/end stay the char-position form conflicts output feeds.
@@ -1404,6 +1432,219 @@ fn tool_replace_text(
     })
 }
 
+/// The `thing` selector: `{kind, at | after | before, up?}` names a region
+/// by structure. Parsed once here, resolved by [`resolve_thing`].
+struct ThingSpec {
+    kind: String,
+    at: ThingAt,
+    up: usize,
+}
+
+enum ThingAt {
+    /// The thing containing this char position.
+    Pos(usize),
+    /// The thing the unique line containing the text names: for `list`, the
+    /// last one beginning on that line (the block the line opens), else the
+    /// first one beginning after it; for every other kind, the first one at
+    /// or after the line.
+    After(String),
+    /// The last thing ending before the unique line containing the text.
+    Before(String),
+}
+
+fn thing_spec(args: &Value, tool: &str) -> Result<Option<ThingSpec>, String> {
+    let Some(v) = args.get("thing") else {
+        return Ok(None);
+    };
+    let kinds = crate::builtins::THING_KINDS.join(", ");
+    let Some(obj) = v.as_object() else {
+        return Err(format!(
+            "{tool}: `thing` must be an object {{kind, at | after | before, up?}}"
+        ));
+    };
+    let kind = obj
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{tool}: thing.kind is required — one of {kinds}"))?;
+    if !crate::builtins::THING_KINDS.contains(&kind) {
+        return Err(format!(
+            "{tool}: unknown thing.kind {kind:?} — one of {kinds}"
+        ));
+    }
+    let locators: Vec<&str> = ["at", "after", "before"]
+        .into_iter()
+        .filter(|k| obj.contains_key(*k))
+        .collect();
+    let at = match locators.as_slice() {
+        ["at"] => {
+            let p = obj["at"]
+                .as_i64()
+                .filter(|p| *p >= 1)
+                .ok_or_else(|| format!("{tool}: thing.at must be a 1-based char position"))?;
+            ThingAt::Pos(p as usize)
+        }
+        ["after"] => ThingAt::After(line_text(obj, "after", tool)?),
+        ["before"] => ThingAt::Before(line_text(obj, "before", tool)?),
+        [] => {
+            return Err(format!(
+                "{tool}: thing needs exactly one of at (a char position), after or \
+                 before (the unique line containing a literal text)"
+            ));
+        }
+        many => {
+            return Err(format!(
+                "{tool}: thing takes one of at/after/before, got {}",
+                many.join(", ")
+            ));
+        }
+    };
+    let up = match obj.get("up") {
+        None => 0,
+        Some(u) => u
+            .as_u64()
+            .ok_or_else(|| format!("{tool}: thing.up must be a non-negative integer"))?
+            as usize,
+    };
+    if up > 0 && !matches!(kind, "sexp" | "list") {
+        return Err(format!(
+            "{tool}: thing.up applies to sexp and list only, not {kind}"
+        ));
+    }
+    Ok(Some(ThingSpec {
+        kind: kind.to_string(),
+        at,
+        up,
+    }))
+}
+
+fn line_text(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    tool: &str,
+) -> Result<String, String> {
+    match obj[key].as_str() {
+        Some(s) if !s.is_empty() => Ok(s.to_string()),
+        _ => Err(format!(
+            "{tool}: thing.{key} takes the literal text of the anchor line"
+        )),
+    }
+}
+
+/// The `thing` selector property shared by read_region, insert_text and
+/// replace_text. `lead` says what the tool does with the span; `tail`
+/// continues the last sentence and names the keys the selector excludes.
+fn thing_schema(lead: &str, tail: &str) -> Value {
+    let kinds = crate::builtins::THING_KINDS;
+    let description = format!(
+        r#"{lead} {{"kind": "list", "after": "fn main() {{"}} is the block that line opens. With "after", kind `list` takes the LAST list beginning on the line (else the first one after it), while every other kind takes the FIRST thing at or after the line — {{"kind": "sexp", "after": "old(1, 2);"}} is `old`. {{"kind": "sexp", "at": 1234}} is the expression containing a position; "before" the last one ending before the line. kind: {}. "up": N widens a sexp/list by N enclosing groups. Balanced brackets, strings and comments follow the file's language{tail}"#,
+        kinds.join(" | ")
+    );
+    json!({
+        "type": "object",
+        "description": description,
+        "properties": {
+            "kind": { "type": "string", "enum": kinds },
+            "at": { "type": "integer" },
+            "after": { "type": "string" },
+            "before": { "type": "string" },
+            "up": { "type": "integer" }
+        }
+    })
+}
+
+/// `thing` names the region by itself: the other addressing keys conflict.
+fn reject_with_thing(args: &Value, tool: &str, keys: &[&str]) -> Result<(), String> {
+    for k in keys {
+        if args.get(*k).is_some() {
+            return Err(format!("{tool}: pass either `thing` or `{k}`, not both"));
+        }
+    }
+    Ok(())
+}
+
+/// The start and end positions of the unique line containing `pat`, with
+/// the same errors as insert_text's anchor.
+fn anchor_line(
+    sessions: &mut HashMap<String, Workspace>,
+    session: &str,
+    pat: &str,
+) -> Result<usize, String> {
+    let lp = lisp_literal(pat);
+    let program = format!(
+        "(save-excursion {})",
+        unique_line_program(
+            &lp,
+            "(goto-char (match-beginning 0)) (beginning-of-line) (report \"bol\" (point))"
+        )
+    );
+    match run_in_session(sessions, session, &program) {
+        Ok(r) => report_value(&r, "bol")
+            .and_then(|v| v.parse::<usize>().ok())
+            .ok_or_else(|| "thing: the anchor line reported no position".to_string()),
+        Err(e) if e.contains("__no_anchor__") => Err(format!(
+            "thing: no line matches the pattern {:?}",
+            truncate_for_error(pat)
+        )),
+        Err(e) if e.contains("__ambiguous_anchor__") => {
+            let lines = match_lines(sessions, session, &lp, false);
+            Err(format!(
+                "thing: the pattern {:?} matches at lines {lines} — an anchor must be unique \
+                 (occur shows every match in context)",
+                truncate_for_error(pat)
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Run `f` on the session's `Session`, after the auto-revert a program run
+/// would do, mapping a Lisp error to the tool error text.
+fn with_session_of<R>(
+    sessions: &mut HashMap<String, Workspace>,
+    session: &str,
+    f: impl FnOnce(&mut crate::engine::Session) -> Result<R, tulisp::Error>,
+) -> Result<R, String> {
+    let ws = sessions
+        .get_mut(session)
+        .ok_or_else(|| format!("unknown session {session:?}"))?;
+    ws.auto_revert_if_clean();
+    ws.with_session(f).map_err(|e| format!("thing: {e}"))
+}
+
+/// The span a `thing` selector names, or why it names none.
+fn resolve_thing(
+    sessions: &mut HashMap<String, Workspace>,
+    session: &str,
+    spec: &ThingSpec,
+) -> Result<(usize, usize), String> {
+    let kind = spec.kind.as_str();
+    let found = match &spec.at {
+        ThingAt::Pos(p) => with_session_of(sessions, session, |s| {
+            crate::builtins::thing_bounds(s, kind, *p, spec.up)
+        })?,
+        ThingAt::After(pat) => {
+            let bol = anchor_line(sessions, session, pat)?;
+            with_session_of(sessions, session, |s| {
+                crate::builtins::thing_after(s, kind, bol, spec.up)
+            })?
+        }
+        ThingAt::Before(pat) => {
+            let bol = anchor_line(sessions, session, pat)?;
+            with_session_of(sessions, session, |s| {
+                crate::builtins::thing_before(s, kind, bol, spec.up)
+            })?
+        }
+    };
+    found.ok_or_else(|| {
+        let where_ = match &spec.at {
+            ThingAt::Pos(p) => format!("at {p}"),
+            ThingAt::After(t) => format!("after the line {:?}", truncate_for_error(t)),
+            ThingAt::Before(t) => format!("before the line {:?}", truncate_for_error(t)),
+        };
+        format!("thing: no {kind} {where_}")
+    })
+}
+
 /// Parse `anchor: {defun: NAME | pattern: TEXT, where?: "after"|"before"}`
 /// into the motion prelude for insert_text. The defun form is "add this block
 /// right after function X"; the pattern form anchors on the unique LINE
@@ -1448,24 +1689,30 @@ fn anchor_prelude(args: &Value) -> Result<Option<(String, String)>, String> {
             if pattern.is_empty() {
                 return Err("anchor: pattern must not be empty".to_string());
             }
-            let lp = lisp_literal(pattern);
             let motion = match where_ {
                 "after" => "(end-of-line)",
                 _ => "(goto-char (match-beginning 0)) (beginning-of-line)",
             };
             Ok(Some((
                 pattern.to_string(),
-                format!(
-                    "(progn (goto-char (point-min)) \
-                     (if (search-forward \"{lp}\" nil t) \
-                         (if (save-excursion (search-forward \"{lp}\" nil t)) \
-                             (error \"__ambiguous_anchor__\") \
-                           (progn {motion})) \
-                       (error \"__no_anchor__\")))"
-                ),
+                unique_line_program(&lisp_literal(pattern), motion),
             )))
         }
     }
+}
+
+/// A program that finds the UNIQUE line containing `lp` (an escaped literal)
+/// and runs `then` with point after the match, or signals `__no_anchor__` /
+/// `__ambiguous_anchor__` for the caller to name.
+fn unique_line_program(lp: &str, then: &str) -> String {
+    format!(
+        "(progn (goto-char (point-min)) \
+         (if (search-forward \"{lp}\" nil t) \
+             (if (save-excursion (search-forward \"{lp}\" nil t)) \
+                 (error \"__ambiguous_anchor__\") \
+               (progn {then})) \
+           (error \"__no_anchor__\")))"
+    )
 }
 
 /// Parse `scope: {defun: NAME}` into a prelude that narrows to that defun
@@ -3962,13 +4209,14 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "read_region",
-            "description": "Return the buffer text between two 1-based char positions [start, end) — or a LINE range via lines: [a, b]. Use this to pull context on demand instead of dumping the whole buffer. Char positions are what conflicts/occur output feeds (@N); the lines form fits 'read around this line'.",
+            "description": "Return the buffer text between two 1-based char positions [start, end) — or a LINE range via lines: [a, b] — or a structural thing via thing: {kind, at | after | before}. Use this to pull context on demand instead of dumping the whole buffer. Char positions are what conflicts/occur output feeds (@N); the lines form fits 'read around this line'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "start": { "type": "integer", "description": "1-based start position (inclusive). Pass start+end OR lines." },
                     "end": { "type": "integer", "description": "1-based end position (exclusive)." },
                     "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based INCLUSIVE line numbers (narrowing-relative, like goto-line), e.g. {lines: [313, 322]} — instead of char positions." },
+                    "thing": thing_schema("Read a region named by structure instead of positions:", "; the result starts with `KIND @START-END (lines A-B):` so a wrong pick is visible. Not combinable with start/end/lines."),
                     "session": session,
                     "path": path,
                 },

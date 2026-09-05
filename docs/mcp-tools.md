@@ -43,13 +43,14 @@ Dry-run an Emacs-Lisp (tulisp) edit program and return the same RunReport run_pr
 
 ## read_region
 
-Return the buffer text between two 1-based char positions [start, end) — or a LINE range via lines: [a, b]. Use this to pull context on demand instead of dumping the whole buffer. Char positions are what conflicts/occur output feeds (@N); the lines form fits 'read around this line'.
+Return the buffer text between two 1-based char positions [start, end) — or a LINE range via lines: [a, b] — or a structural thing via thing: {kind, at | after | before}. Use this to pull context on demand instead of dumping the whole buffer. Char positions are what conflicts/occur output feeds (@N); the lines form fits 'read around this line'.
 
 - `end` — 1-based end position (exclusive).
 - `lines` — [start, end] 1-based INCLUSIVE line numbers (narrowing-relative, like goto-line), e.g. {lines: [313, 322]} — instead of char positions.
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `session` — Warm session id; defaults to "default" when omitted.
 - `start` — 1-based start position (inclusive). Pass start+end OR lines.
+- `thing` — Read a region named by structure instead of positions: {"kind": "list", "after": "fn main() {"} is the block that line opens. With "after", kind `list` takes the LAST list beginning on the line (else the first one after it), while every other kind takes the FIRST thing at or after the line — {"kind": "sexp", "after": "old(1, 2);"} is `old`. {"kind": "sexp", "at": 1234} is the expression containing a position; "before" the last one ending before the line. kind: sexp | list | string | word | symbol | line | paragraph | defun. "up": N widens a sexp/list by N enclosing groups. Balanced brackets, strings and comments follow the file's language; the result starts with `KIND @START-END (lines A-B):` so a wrong pick is visible. Not combinable with start/end/lines.
 
 ## view
 
