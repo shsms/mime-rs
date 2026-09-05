@@ -1189,6 +1189,33 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         });
     }
 
+    // ---- skip-chars ----
+    {
+        let s = session.clone();
+        // (skip-chars-forward SPEC &optional LIM) — the Emacs character-set
+        // skip: move point forward over chars in SPEC (literals, `a-z`
+        // ranges, [:class:] names, leading `^` negates), bounded by LIM and
+        // the narrowing. Returns the distance moved.
+        ctx.defun(
+            "skip-chars-forward",
+            move |spec: String, lim: Option<i64>| -> Result<i64, Error> {
+                skip_chars(&mut s.borrow_mut(), &spec, lim, true)
+            },
+        );
+    }
+    {
+        let s = session.clone();
+        // (skip-chars-backward SPEC &optional LIM) — the mirror: move point
+        // back over the run of chars in SPEC, bounded by LIM and the
+        // narrowing. Returns the signed distance moved (≤ 0).
+        ctx.defun(
+            "skip-chars-backward",
+            move |spec: String, lim: Option<i64>| -> Result<i64, Error> {
+                skip_chars(&mut s.borrow_mut(), &spec, lim, false)
+            },
+        );
+    }
+
     // ---- text objects & insertion ----
     {
         let s = session.clone();
@@ -2776,6 +2803,31 @@ fn lang_of(sess: &crate::engine::Session) -> Lang {
         .map(|(_, l)| *l)
         .or_else(|| Lang::from_buffer_name(name))
         .unwrap_or(Lang::Markdown)
+}
+
+/// `skip-chars-forward` (`forward`) and `skip-chars-backward`: move point
+/// over the run of characters matching SPEC, bounded by LIM — clamped to the
+/// side of point the walk runs on — and by the narrowing. Returns the signed
+/// distance moved (backward ≤ 0).
+fn skip_chars(
+    sess: &mut crate::engine::Session,
+    spec: &str,
+    lim: Option<i64>,
+    forward: bool,
+) -> Result<i64, Error> {
+    let set = crate::motion::CharSet::parse(spec).map_err(|e| err(&e))?;
+    let from = sess.buffer.point();
+    let to = if forward {
+        let max = sess.buffer.point_max();
+        let bound = lim.map_or(max, |l| (l.max(0) as usize).min(max).max(from));
+        crate::motion::skip_forward(&*sess.buffer, from, bound, &|c| set.contains(c))
+    } else {
+        let min = sess.buffer.point_min();
+        let bound = lim.map_or(min, |l| (l.max(0) as usize).max(min).min(from));
+        crate::motion::skip_backward(&*sess.buffer, from, bound, &|c| set.contains(c))
+    };
+    sess.buffer.goto_char(to);
+    Ok(to as i64 - from as i64)
 }
 
 /// The current buffer's parse for the `treesit-*` builtins — cached on the
@@ -4776,6 +4828,114 @@ mod tests {
                 "sandboxed tier must not expose {prog}"
             );
         }
+    }
+
+    #[test]
+    fn skip_chars_forward_moves_point_and_returns_the_distance() {
+        //                  123456789
+        let mut ws = trusted("   abc  x");
+        let r = ws
+            .run(
+                r#"(report "n" (skip-chars-forward " "))
+                    (report "p" (point))
+                    (report "z" (skip-chars-forward " "))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "n"), "3");
+        assert_eq!(report(&r, "p"), "4");
+        assert_eq!(report(&r, "z"), "0");
+        assert_eq!(r.point, 4);
+    }
+
+    #[test]
+    fn skip_chars_backward_returns_a_non_positive_distance() {
+        let mut ws = trusted("abc   ");
+        let r = ws
+            .run(
+                r#"(goto-char (point-max))
+                    (report "n" (skip-chars-backward " "))
+                    (report "p" (point))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "n"), "-3");
+        assert_eq!(report(&r, "p"), "4");
+    }
+
+    #[test]
+    fn skip_chars_lim_bounds_the_walk_and_is_inert_on_the_wrong_side() {
+        let mut ws = trusted("aaaaaa");
+        let r = ws
+            .run(
+                r#"(report "capped" (skip-chars-forward "a" 3))
+                    (report "wrong" (skip-chars-forward "a" 1))
+                    (report "p" (point))
+                    (goto-char 6)
+                    (report "back" (skip-chars-backward "a" 4))
+                    (report "backwrong" (skip-chars-backward "a" 7))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "capped"), "2");
+        assert_eq!(report(&r, "wrong"), "0");
+        assert_eq!(report(&r, "p"), "3");
+        assert_eq!(report(&r, "back"), "-2");
+        assert_eq!(report(&r, "backwrong"), "0");
+    }
+
+    #[test]
+    fn skip_chars_respects_the_narrowing() {
+        let mut ws = trusted("aaaaaa");
+        let r = ws
+            .run(
+                r#"(narrow-to-region 2 4)
+                    (goto-char 2)
+                    (report "n" (skip-chars-forward "a"))
+                    (report "b" (skip-chars-backward "a"))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "n"), "2");
+        assert_eq!(report(&r, "b"), "-2");
+    }
+
+    #[test]
+    fn skip_chars_does_not_panic_when_point_is_outside_the_region() {
+        // A delete-region spanning outside the narrowing can leave point
+        // outside the accessible region; the LIM bound must cope with that
+        // rather than panicking on an inverted `clamp` range.
+        let mut ws = trusted("aaaaaaaaaa");
+        let r = ws
+            .run(
+                r#"(narrow-to-region 5 10)
+                    (goto-char 5)
+                    (delete-region 1 3)
+                    (report "b" (skip-chars-backward "a" 7))
+                    (report "p" (point))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "b"), "0");
+        assert_eq!(report(&r, "p"), "5");
+        let mut ws = trusted("aaaaaaaaaa");
+        let r = ws
+            .run(
+                r#"(narrow-to-region 1 3)
+                    (goto-char 2)
+                    (delete-region 4 7)
+                    (report "f" (skip-chars-forward "a" 5))
+                    (report "p" (point))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "f"), "0");
+        assert_eq!(report(&r, "p"), "1");
+    }
+
+    #[test]
+    fn skip_chars_rejects_a_malformed_spec() {
+        let mut ws = trusted("abc");
+        let e = match ws.run(r#"(skip-chars-forward "[:nope:]")"#) {
+            Err(e) => e,
+            Ok(_) => panic!("skip-chars-forward with an unknown class must fail"),
+        };
+        assert!(e.contains("nope"), "error should name the class: {e}");
+        assert_eq!(ws.run("(point)").unwrap().point, 1);
     }
 
     #[test]
