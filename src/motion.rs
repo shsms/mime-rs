@@ -1,9 +1,18 @@
 //! Foundation motions: the `skip-chars` character-set parser and the
 //! position walkers (skip, word/symbol unit, paragraph) the motion builtins
 //! are written on. Every walker is a pure function over `&dyn TextStore`:
-//! it reads through `char_after` / `char_before` only (never `text()`, so a
-//! file-backed buffer never materializes) and returns a position; the
+//! it reads in bounded windows via `substring`, never `text()` — so a
+//! file-backed buffer never materializes more than one [`WINDOW`]-char
+//! window at a time, however long the walk — and returns a position; the
 //! builtin does the `goto_char` / `set_mark`.
+//!
+//! The window is what keeps a walk linear. Reaching a position costs a store
+//! O(distance) — `Buffer::byte_of` seeks from its byte hint, `Quire` scans
+//! the piece holding the position — so stepping one `char_after` /
+//! `char_before` at a time is quadratic in the distance walked. One
+//! `substring` per window amortizes that seek over the whole window, and the
+//! window starts at [`FIRST_WINDOW`] and doubles, so a short hop pays for a
+//! handful of characters and only a long run grows to [`WINDOW`].
 
 use crate::store::TextStore;
 
@@ -148,30 +157,83 @@ impl CharSet {
     }
 }
 
+/// The largest `substring` a skip walker asks for: big enough that the
+/// per-fetch position seek is amortized away over a long run, small enough
+/// that a walk over a multi-gigabyte file holds only kilobytes at a time.
+const WINDOW: usize = 4096;
+
+/// The first window of a walk, doubling toward [`WINDOW`] as the walk runs on.
+/// A store prices a `substring` in characters crossed (the byte offset of its
+/// far edge has to be found), so a walk that stops after a few characters —
+/// the line and word hops the paragraph and unit walkers make — must not pay
+/// for a full window to read them.
+const FIRST_WINDOW: usize = 64;
+
 /// The first position in `[from, bound]` whose char fails `pred`, or `bound`.
+///
+/// Reads forward one bounded `substring` at a time, fetching the next window
+/// only once the current one is exhausted and `bound` is still ahead.
 pub fn skip_forward(
     store: &dyn TextStore,
     from: usize,
     bound: usize,
     pred: &dyn Fn(char) -> bool,
 ) -> usize {
+    // `char_after` reads nothing at or past point-max, so clamp `bound`
+    // there to match: a bound beyond the accessible region stops the walk at
+    // its edge.
+    let bound = bound.min(store.point_max());
     let mut p = from;
-    while p < bound && store.char_after(p).is_some_and(pred) {
-        p += 1;
+    let mut span = FIRST_WINDOW;
+    while p < bound {
+        let window = store.substring(p, bound.min(p + span));
+        let mut n = 0;
+        for c in window.chars() {
+            if !pred(c) {
+                return p + n;
+            }
+            n += 1;
+        }
+        if n == 0 {
+            return p; // an empty window: nothing left to read
+        }
+        p += n;
+        span = (span * 2).min(WINDOW);
     }
     p
 }
 
-/// The mirror of [`skip_forward`]: walks `char_before` down to `bound`.
+/// The mirror of [`skip_forward`]: walks back to `bound`, a window at a time,
+/// stepping through each window's chars in reverse.
 pub fn skip_backward(
     store: &dyn TextStore,
     from: usize,
     bound: usize,
     pred: &dyn Fn(char) -> bool,
 ) -> usize {
+    // The mirror of the `skip_forward` clamp: `char_before` reads nothing at
+    // or below point-min, so clamp `bound` there; and nothing above
+    // point-max, so a `from` past it has no character to walk over.
+    let bound = bound.max(store.point_min());
+    if from > store.point_max() {
+        return from;
+    }
     let mut p = from;
-    while p > bound && store.char_before(p).is_some_and(pred) {
-        p -= 1;
+    let mut span = FIRST_WINDOW;
+    while p > bound {
+        let window = store.substring(bound.max(p.saturating_sub(span)), p);
+        let mut n = 0;
+        for c in window.chars().rev() {
+            if !pred(c) {
+                return p - n;
+            }
+            n += 1;
+        }
+        if n == 0 {
+            return p; // an empty window: nothing left to read
+        }
+        span = (span * 2).min(WINDOW);
+        p -= n;
     }
     p
 }
