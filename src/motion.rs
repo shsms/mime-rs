@@ -5,6 +5,8 @@
 //! file-backed buffer never materializes) and returns a position; the
 //! builtin does the `goto_char` / `set_mark`.
 
+use crate::store::TextStore;
+
 /// One `[:name:]` class of the Emacs `skip-chars` spec syntax. Membership
 /// uses Rust's Unicode predicates, except for `[:digit:]`, which is ASCII
 /// `0`-`9` as in Emacs, so a `[:digit:]` skip is narrower than a
@@ -146,6 +148,34 @@ impl CharSet {
     }
 }
 
+/// The first position in `[from, bound]` whose char fails `pred`, or `bound`.
+pub fn skip_forward(
+    store: &dyn TextStore,
+    from: usize,
+    bound: usize,
+    pred: &dyn Fn(char) -> bool,
+) -> usize {
+    let mut p = from;
+    while p < bound && store.char_after(p).is_some_and(pred) {
+        p += 1;
+    }
+    p
+}
+
+/// The mirror of [`skip_forward`]: walks `char_before` down to `bound`.
+pub fn skip_backward(
+    store: &dyn TextStore,
+    from: usize,
+    bound: usize,
+    pred: &dyn Fn(char) -> bool,
+) -> usize {
+    let mut p = from;
+    while p > bound && store.char_before(p).is_some_and(pred) {
+        p -= 1;
+    }
+    p
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +252,38 @@ mod tests {
     fn empty_spec_matches_nothing_and_negated_empty_matches_everything() {
         assert!(!set("").contains('a'));
         assert!(set("^").contains('a'));
+    }
+
+    use crate::buffer::Buffer;
+
+    // `Buffer` has inherent `point_min` / `point_max` / `narrow_to_region`,
+    // and `&Buffer` coerces to `&dyn TextStore` at the call sites, so the
+    // trait needs no import here (an unused import fails the clippy gate).
+    fn buf(text: &str) -> Buffer {
+        Buffer::from_string("t", text)
+    }
+
+    #[test]
+    fn skip_forward_stops_at_the_first_non_member_or_the_bound() {
+        //          123456789
+        let b = buf("aaab  cde");
+        let a = CharSet::parse("a").unwrap();
+        assert_eq!(skip_forward(&b, 1, b.point_max(), &|c| a.contains(c)), 4);
+        // Already on a non-member: no movement.
+        assert_eq!(skip_forward(&b, 4, b.point_max(), &|c| a.contains(c)), 4);
+        // The bound caps the walk.
+        assert_eq!(skip_forward(&b, 1, 3, &|c| a.contains(c)), 3);
+        // Everything matches: lands on point_max.
+        assert_eq!(skip_forward(&b, 1, b.point_max(), &|_| true), b.point_max());
+    }
+
+    #[test]
+    fn skip_backward_mirrors_over_char_before() {
+        //          123456789
+        let b = buf("aaab  cde");
+        let a = CharSet::parse("a").unwrap();
+        assert_eq!(skip_backward(&b, 4, b.point_min(), &|c| a.contains(c)), 1);
+        assert_eq!(skip_backward(&b, 4, 2, &|c| a.contains(c)), 2);
+        assert_eq!(skip_backward(&b, 1, b.point_min(), &|_| true), 1);
     }
 }
