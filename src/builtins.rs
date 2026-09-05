@@ -5364,6 +5364,8 @@ mod tests {
             (goto-char 10)
             (report "md" (mark-defun))
             (report "md-pt" (point))
+            (report "nd" (if (narrow-to-defun) (point-max) 0))
+            (widen)
             (narrow-to-region 8 40)
             (goto-char 8)
             (report "nw" (forward-word 20))
@@ -5377,5 +5379,6 @@ mod tests {
         // symbol hop lands at 24; the first blank line starts at 52.
         assert_eq!(report(&a, "s"), "24");
         assert_eq!(report(&a, "p"), "52");
+        assert_eq!(report(&a, "nd"), "51");
     }
 }
