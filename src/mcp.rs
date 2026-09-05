@@ -1172,22 +1172,61 @@ fn tool_insert_text(
     if anchor.is_some() && args.get("pos").is_some() {
         return Err("pass either \"pos\" or \"anchor\", not both".to_string());
     }
+    // The structural form: `thing` names a span, and top-level `where` picks
+    // which end of it to insert at. The result echoes the span so a wrong
+    // pick is visible without a follow-up read.
+    let thing = thing_spec(args, "insert_text")?;
+    // Typed explicitly: `validate_args` checks key names, not value types, so a
+    // non-string `where` (a number, a bool) would fall through a `as_str()` to
+    // the default and insert at the other end of the span without a word.
+    let where_ = match args.get("where") {
+        None => "after",
+        Some(v) => match v.as_str() {
+            Some(s @ ("after" | "before")) => s,
+            _ => {
+                return Err(format!(
+                    "insert_text: `where` must be \"after\" or \"before\", got {v}"
+                ));
+            }
+        },
+    };
+    // A top-level `where` only means anything with a `thing`; the anchor form
+    // carries its own inside the anchor object. Dropping a stray one would
+    // silently place the text at the other end, so it is an error.
+    if thing.is_none() && args.get("where").is_some() {
+        return Err("insert_text: top-level `where` applies to `thing`; for an \
+                    anchor put `where` inside the anchor object"
+            .to_string());
+    }
+    let mut placed = String::new();
+    let thing_pos = match &thing {
+        Some(spec) => {
+            reject_with_thing(args, "insert_text", &["pos", "anchor"])?;
+            let (a, b) = resolve_thing(sessions, &session, spec)?;
+            placed = format!(" {where_} the {} @{a}-{b}", spec.kind);
+            Some(if where_ == "before" { a } else { b })
+        }
+        None => None,
+    };
     // `pos` is a char position, or the "eob"/"bob" sentinels — appending at
     // the end of the file needs no anchor and no position arithmetic.
-    let pos_form = match args.get("pos") {
-        None => None,
-        Some(v) => Some(match (v.as_i64(), v.as_str()) {
-            (Some(n), _) => n.to_string(),
-            (None, Some("eob" | "end")) => "(point-max)".to_string(),
-            (None, Some("bob" | "start")) => "(point-min)".to_string(),
-            _ => {
-                return Err(
-                    "insert_text: `pos` is a 1-based char position, or \"eob\"/\"bob\" \
-                     (end/beginning of the accessible region)"
-                        .to_string(),
-                );
-            }
-        }),
+    let pos_form = match thing_pos {
+        Some(p) => Some(p.to_string()),
+        None => match args.get("pos") {
+            None => None,
+            Some(v) => Some(match (v.as_i64(), v.as_str()) {
+                (Some(n), _) => n.to_string(),
+                (None, Some("eob" | "end")) => "(point-max)".to_string(),
+                (None, Some("bob" | "start")) => "(point-min)".to_string(),
+                _ => {
+                    return Err(
+                        "insert_text: `pos` is a 1-based char position, or \"eob\"/\"bob\" \
+                         (end/beginning of the accessible region)"
+                            .to_string(),
+                    );
+                }
+            }),
+        },
     };
     let program = match (&anchor, pos_form) {
         (Some((_, prelude)), _) => {
@@ -1238,7 +1277,7 @@ fn tool_insert_text(
     let stale = stale_edit_note(sessions, &session);
     let view = view_echo(args, sessions, &session);
     Ok(format!(
-        "inserted {chars} chars; point is now {point}{saved}{unsaved}{stale}{view}"
+        "inserted {chars} chars{placed}; point is now {point}{saved}{unsaved}{stale}{view}"
     ))
 }
 
@@ -1256,6 +1295,17 @@ fn tool_replace_text(
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
     let session = resolve_session(args, sessions)?;
+    // The structural form: `thing` names the span to splice over, so there is
+    // no pattern to search for and none of the search options apply.
+    if let Some(spec) = thing_spec(args, "replace_text")? {
+        reject_with_thing(
+            args,
+            "replace_text",
+            &["pattern", "edits", "all", "mode", "expect_unique", "scope"],
+        )?;
+        let replacement = str_arg(args, "replacement")?;
+        return replace_thing(args, sessions, &session, &spec, &replacement);
+    }
     if let Some(edits) = args.get("edits") {
         if args.get("pattern").is_some() || args.get("replacement").is_some() {
             return Err("pass either \"edits\" or pattern/replacement, not both".to_string());
@@ -1643,6 +1693,41 @@ fn resolve_thing(
         };
         format!("thing: no {kind} {where_}")
     })
+}
+
+/// `replace_text {thing, replacement}` — splice `replacement` over the span
+/// the selector names. One transaction, so a failed insert leaves the
+/// buffer as it was.
+fn replace_thing(
+    args: &Value,
+    sessions: &mut HashMap<String, Workspace>,
+    session: &str,
+    spec: &ThingSpec,
+    replacement: &str,
+) -> Result<String, String> {
+    let (a, b) = resolve_thing(sessions, session, spec)?;
+    let rep = lisp_literal(replacement);
+    let program = format!(
+        "(with-transaction (goto-char {a}) (delete-region {a} {b}) (insert \"{rep}\") \
+           (report \"line\" (line-number-at-pos {a})) (report \"point\" (point)))"
+    );
+    let report = run_in_session(sessions, session, &program)?;
+    audit_tool(session, &program, &report);
+    let line = report_value(&report, "line").unwrap_or_default();
+    let point = report_value(&report, "point").unwrap_or_default();
+    let saved = if bool_arg(args, "save") {
+        save_visited(sessions, session)?
+    } else {
+        String::new()
+    };
+    let unsaved = unsaved_note(sessions, session);
+    let stale = stale_edit_note(sessions, session);
+    let view = view_echo(args, sessions, session);
+    Ok(format!(
+        "replaced the {} @{a}-{b} (line {line}) with {} chars; point is now {point}{saved}{unsaved}{stale}{view}",
+        spec.kind,
+        replacement.chars().count()
+    ))
 }
 
 /// Parse `anchor: {defun: NAME | pattern: TEXT, where?: "after"|"before"}`
@@ -4239,13 +4324,15 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "insert_text",
-            "description": "Insert literal text at point, at `pos` (a char position, or \"eob\" to append at the end of the file), or relative to an `anchor` (a named defun, or the unique line containing a literal pattern). Pass the text as a plain string — no Lisp escaping needed, the server handles it. Prefer this over run_program with (insert …) for multi-line or quote-heavy content, and over shell appends for end-of-file additions. Edits the warm buffer; call save_buffer to persist.",
+            "description": "Insert literal text at point, at `pos` (a char position, or \"eob\" to append at the end of the file), relative to an `anchor` (a named defun, or the unique line containing a literal pattern), or relative to a structural `thing` (the block a line opens, the sexp at a position). Pass the text as a plain string — no Lisp escaping needed, the server handles it. Prefer this over run_program with (insert …) for multi-line or quote-heavy content, and over shell appends for end-of-file additions. Edits the warm buffer; call save_buffer to persist.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "text": { "type": "string", "description": "The literal text to insert." },
                     "pos": { "type": ["integer", "string"], "description": "1-based position to insert at (default: current point) — or \"eob\" / \"bob\" to append at the end / insert at the beginning of the accessible region (no position arithmetic for the common append)." },
                     "anchor": { "type": "object", "description": "E.g. {\"pattern\": \"fn main() {\", \"where\": \"before\"} — insert relative to the UNIQUE line containing a literal text ({\"before\": \"line text\"} / {\"after\": \"line text\"} are accepted shorthand for the same) — or {\"defun\": \"name\"} to target a named defun. An ambiguous pattern errors, listing the match lines. \"where\": \"after\" (default) puts the text at the end of the defun or the matched line — include separating newlines in the text. \"before\" puts it above the whole decorated defun (Rust #[attributes] / Python decorators included), or at the start of the matched line. Not combinable with pos.", "properties": { "defun": { "type": "string" }, "pattern": { "type": "string" }, "where": { "type": "string", "enum": ["after", "before"] }, "before": { "type": "string", "description": "Shorthand for {\"pattern\": <this text>, \"where\": \"before\"}." }, "after": { "type": "string", "description": "Shorthand for {\"pattern\": <this text>, \"where\": \"after\"}." } } },
+                    "thing": thing_schema("Insert relative to a structural thing instead of a position:", ". `where` picks the end to insert at: \"after\" (default, at its end) or \"before\" (at its start); the result names the span it landed against, so a wrong pick is visible. Not combinable with pos/anchor."),
+                    "where": { "type": "string", "enum": ["after", "before"], "description": "With `thing`: insert at its end (after, default) or its start (before). Applies to `thing` ONLY — the anchor form carries its own `where` inside the anchor object, and a top-level one without a `thing` is an error rather than a silently dropped placement." },
                     "view": { "type": ["boolean", "integer"], "description": "Append a rendered viewport around point after the edit (true = 4 context lines, or a line count) — confirm the insert landed right without a follow-up view call." },
                     "session": session,
                     "path": path,
@@ -4256,12 +4343,13 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "replace_text",
-            "description": "Replace the FIRST occurrence of a pattern (searching from the top of the accessible region); pass all:true to replace every occurrence. By default both strings are plain literals — no Lisp escaping, no regex (insert_text's counterpart; the fix for quote-heavy edits). mode:\"regex\" switches the pattern to the Emacs regex dialect (as occur/grep) with \\1..\\9 and \\& backrefs expanding in the replacement — the one-call form of the goto-char/while/re-search-forward/replace-match loop. Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Edits the warm buffer; call save_buffer to persist. For position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.",
+            "description": "Replace the FIRST occurrence of a pattern (searching from the top of the accessible region); pass all:true to replace every occurrence, or `thing` to replace a region named by structure instead of by searching. By default both strings are plain literals — no Lisp escaping, no regex (insert_text's counterpart; the fix for quote-heavy edits). mode:\"regex\" switches the pattern to the Emacs regex dialect (as occur/grep) with \\1..\\9 and \\& backrefs expanding in the replacement — the one-call form of the goto-char/while/re-search-forward/replace-match loop. Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Edits the warm buffer; call save_buffer to persist. For position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string", "description": "The text to find — literal by default; the Emacs regex dialect with mode:\"regex\"." },
                     "replacement": { "type": "string", "description": "The replacement text — literal by default; with mode:\"regex\", \\1..\\9 insert the numbered capture group and \\& the whole match." },
+                    "thing": thing_schema("Replace the region named by structure instead of by searching:", ". Pass `replacement` only; the result names the replaced span (`KIND @START-END`) so a wrong pick is visible. Not combinable with pattern/edits/all/mode/expect_unique/scope."),
                     "mode": { "type": "string", "enum": ["exact", "regex"], "description": "exact (default): literal search and replacement. regex: Emacs-dialect pattern with backref expansion in the replacement. With `edits`, acts as the default for entries that don't set their own." },
                     "all": { "type": "boolean", "description": "Replace every occurrence (default false: first only)." },
                     "expect_unique": { "type": "boolean", "description": "Require the pattern to match exactly once: more than one match is an error (listing the match lines) and nothing is replaced. RECOMMENDED whenever the anchor text could plausibly repeat — first-match semantics would silently edit the wrong site. Default false." },

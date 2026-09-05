@@ -722,6 +722,141 @@ fn read_region_thing_after_with_nothing_left_to_find_is_an_error() {
 }
 
 #[test]
+fn replace_text_and_insert_text_take_a_thing() {
+    let mut s = Server::spawn();
+    s.call_ok(
+        1,
+        "open_text",
+        json!({ "text": "fn f() {\n    old(1, 2);\n}\n", "name": "m.rs" }),
+    );
+
+    let out = s.call_ok(
+        2,
+        "replace_text",
+        json!({ "thing": { "kind": "list", "after": "old(1, 2);" }, "replacement": "(3)" }),
+    );
+    assert!(
+        out.starts_with("replaced the list @17-23 (line 2) with 3 chars"),
+        "{out}"
+    );
+    assert_eq!(
+        s.call_ok(3, "read_region", json!({ "lines": [1, 3] })),
+        "fn f() {\n    old(3);\n}"
+    );
+
+    // By position: 14 is inside `old`.
+    let out = s.call_ok(
+        4,
+        "replace_text",
+        json!({ "thing": { "kind": "sexp", "at": 14 }, "replacement": "new" }),
+    );
+    assert!(out.starts_with("replaced the sexp @14-17"), "{out}");
+    assert_eq!(
+        s.call_ok(5, "read_region", json!({ "lines": [1, 3] })),
+        "fn f() {\n    new(3);\n}"
+    );
+
+    // insert_text: before the line containing the anchor, and after a list.
+    let out = s.call_ok(
+        6,
+        "insert_text",
+        json!({ "text": "    pre();\n", "thing": { "kind": "line", "after": "new(3);" }, "where": "before" }),
+    );
+    assert!(out.contains("before the line @10-"), "{out}");
+    let out = s.call_ok(
+        7,
+        "insert_text",
+        json!({ "text": " // done", "thing": { "kind": "list", "after": "new(3);" } }),
+    );
+    assert!(out.contains("after the list @"), "{out}");
+    assert_eq!(
+        s.call_ok(8, "read_region", json!({ "lines": [1, 4] })),
+        "fn f() {\n    pre();\n    new(3) // done;\n}"
+    );
+
+    // Exclusivity and bad shapes.
+    let err = s.call_err(
+        9,
+        "replace_text",
+        json!({ "thing": { "kind": "list", "at": 9 }, "pattern": "x", "replacement": "y" }),
+    );
+    assert!(err.contains("not both"), "{err}");
+    let err = s.call_err(
+        10,
+        "insert_text",
+        json!({ "text": "x", "thing": { "kind": "list", "at": 9 }, "pos": 1 }),
+    );
+    assert!(err.contains("not both"), "{err}");
+    let err = s.call_err(
+        11,
+        "insert_text",
+        json!({ "text": "x", "thing": { "kind": "list", "at": 9 }, "where": "middle" }),
+    );
+    assert!(err.contains("after") && err.contains("before"), "{err}");
+    let err = s.call_err(
+        12,
+        "replace_text",
+        json!({ "thing": { "kind": "string", "at": 3 }, "replacement": "y" }),
+    );
+    assert!(err.contains("no string at 3"), "{err}");
+
+    // A top-level `where` with no `thing` names nothing: the anchor form keeps
+    // its own `where` inside the anchor object, so this is an error rather
+    // than an insert silently landing at the other end.
+    let err = s.call_err(
+        13,
+        "insert_text",
+        json!({ "text": "x", "anchor": { "pattern": "fn f() {", "where": "before" }, "where": "before" }),
+    );
+    assert!(err.contains("anchor") && err.contains("where"), "{err}");
+
+    // A non-string `where` is a mistyped argument, not a silent default:
+    // schema validation checks key names, not value types.
+    let err = s.call_err(
+        14,
+        "insert_text",
+        json!({ "text": "x", "thing": { "kind": "list", "at": 9 }, "where": 1 }),
+    );
+    assert!(
+        err.contains("must be \"after\" or \"before\"") && err.contains("got 1"),
+        "{err}"
+    );
+    let err = s.call_err(
+        15,
+        "insert_text",
+        json!({ "text": "x", "thing": { "kind": "list", "at": 9 }, "where": true }),
+    );
+    assert!(err.contains("got true"), "{err}");
+
+    // An `at` past the end of the buffer clamps inside the scanner, which
+    // would name the LAST thing in the file and splice over it. It is an
+    // error instead — but point-max itself stays a valid probe point.
+    let err = s.call_err(
+        16,
+        "replace_text",
+        json!({ "thing": { "kind": "sexp", "at": 999999 }, "replacement": "y" }),
+    );
+    assert!(
+        err.contains("999999 is outside the accessible region"),
+        "{err}"
+    );
+    let err = s.call_err(
+        17,
+        "read_region",
+        json!({ "thing": { "kind": "sexp", "at": 999999 } }),
+    );
+    assert!(err.contains("outside the accessible region"), "{err}");
+    // "fn f() {\n    pre();\n    new(3) // done;\n}\n" is 42 chars, so
+    // point-max is 43 and the thing there is the last one in the buffer.
+    let out = s.call_ok(
+        18,
+        "read_region",
+        json!({ "thing": { "kind": "line", "at": 43 } }),
+    );
+    assert_eq!(out, "line @41-43 (lines 4-4):\n}\n");
+}
+
+#[test]
 fn replace_text_regex_mode_expands_backrefs() {
     let mut s = Server::spawn();
     s.call_ok(
