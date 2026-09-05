@@ -5416,23 +5416,21 @@ mod tests {
     fn motions_stay_linear_on_a_large_blank_line_free_buffer() {
         // Every one of these motions has to walk the whole ~200 KB buffer:
         // there is no blank line to stop a paragraph hop, no `Z` to stop a
-        // skip, and 100000 words is more than the buffer holds. This program
-        // did not finish in 20 minutes when the walkers stepped one
-        // `char_after` / `char_before` at a time over a `Buffer` that rescanned
-        // from byte 0 on every backward step; it now takes ~0.35 s, so the
-        // wall clock is the assertion that matters here. It pins the in-memory
-        // store's paragraph and word hops at that ceiling — with the buffer's
-        // backward byte hint in place a per-character walk would pass it too,
-        // so the guard on the windowing itself is the next test, over a
-        // `Quire`.
+        // skip, and 100000 words is more than the buffer holds. So the wall
+        // clock is the assertion that matters, and the ceiling covers BOTH
+        // stores — the program runs once over the in-memory oracle and once
+        // over a file-backed `Quire`, and the two must agree as well.
         //
-        // The oracle only, deliberately: the same program over a `Quire` of
-        // this size still takes ~3 minutes, because `Quire::locate` scans the
-        // containing piece from its start on every call and the paragraph and
-        // word walkers make one call per line and per word. Windowing the
-        // skips cannot fix that — it is a missing position hint in the store,
-        // the counterpart of this buffer's byte hint, and a separate finding —
-        // so pinning a `Quire` ceiling here would pin a known failure.
+        // Each store had its own way of making this quadratic, and the ceiling
+        // pins both fixes. The oracle rescanned from byte 0 on every backward
+        // step, and this program did not finish in 20 minutes before it grew a
+        // backward byte hint. `Quire` then took ~3 minutes on the same program,
+        // because the paragraph and word walkers seek once per line and per
+        // word while `Quire::locate` scanned the containing piece from its
+        // start every time; its seek memo resumes those seeks, forward and
+        // backward, and brings it down with the oracle. Windowing the skips
+        // could not have fixed either — the neighbouring test is the guard on
+        // the windowing itself.
         let text = "lorem ipsum dolor sit amet\n".repeat(7500) + "end";
         let point_max = text.chars().count() + 1;
         let prog = r#"
@@ -5444,10 +5442,11 @@ mod tests {
             (report "sf" (skip-chars-forward "^Z"))
             (report "bw" (backward-word 100000))
         "#;
-        let mut ws = trusted(&text);
         let started = std::time::Instant::now();
-        let r = ws.run(prog).unwrap();
+        let (r, q) = on_both_stores("linear-motions", &text, prog);
         let elapsed = started.elapsed();
+        assert_eq!(r.reports, q.reports, "the two stores must agree");
+        assert_eq!(r.point, q.point);
         // No blank line anywhere: forward runs to point-max, backward to 1.
         assert_eq!(report(&r, "fp"), point_max.to_string());
         assert_eq!(report(&r, "bp"), "1");
@@ -5457,8 +5456,8 @@ mod tests {
         assert_eq!(report(&r, "bw"), "1");
         assert!(
             elapsed < std::time::Duration::from_secs(10),
-            "the motions took {elapsed:?} over {point_max} chars; that is the \
-             quadratic walk back, not a slow machine"
+            "the motions took {elapsed:?} over {point_max} chars on both \
+             stores; that is the quadratic walk back, not a slow machine"
         );
     }
 
@@ -5467,10 +5466,12 @@ mod tests {
         // The `Quire` half of the guard above, and what actually pins the
         // windowing: over 200 KB a per-character skip costs `Quire` minutes
         // (each `char_after` makes `Quire::locate` rescan the piece from its
-        // start), a windowed one milliseconds. Long skips and a couple of
-        // short hops only — no paragraph walk and no long word walk, which
-        // make one store call per line and per word and stay quadratic on a
-        // `Quire` until the store grows a seek memo of its own.
+        // start), a windowed one milliseconds. This test stays skip-only
+        // because it isolates the windowed reads — on `Quire` a per-character
+        // 200 KB walk takes minutes on its own, so a paragraph or word walk
+        // sharing the program would just add noise to what it's timing — while
+        // the sibling test above covers the store's seek memo through the
+        // paragraph and word walks.
         let text = "lorem ipsum dolor sit amet
 "
         .repeat(7500)
