@@ -136,6 +136,10 @@ thread_local! {
     static MEMO_RESUMES: Cell<usize> = const { Cell::new(0) };
 }
 
+/// Bytes the backward seek reads at a time (see [`Quire::scan_prefix_back`]), so
+/// a long hop back costs bounded memory rather than the piece prefix.
+const BACK_WINDOW: usize = 8 * 1024;
+
 /// The immutable original: either owned text (`from_string`) or a file read on
 /// demand a page at a time (`open`). Read uniformly through [`Original::for_bytes`]
 /// — never one contiguous `&[u8]` over the whole thing — so the file backing
@@ -359,7 +363,7 @@ impl PagedFile {
     /// streaming pass; bounded RAM (the view never materializes the file).
     fn count_view(&self, had_bom: bool, dos: bool) -> (usize, usize) {
         let (mut chars, mut lines) = (0usize, 0usize);
-        let mut prev_cr = false;
+        let mut prev: Option<u8> = None; // carried across page reads
         let mut off = 0usize;
         let mut buf = vec![0u8; PAGE];
         while off < self.len {
@@ -369,10 +373,9 @@ impl PagedFile {
             }
             for (k, &b) in buf[..n].iter().enumerate() {
                 let is_bom = had_bom && off + k < 3;
-                let absorbed_lf = dos && b == b'\n' && prev_cr;
-                chars += usize::from((b & 0xC0) != 0x80 && !is_bom && !absorbed_lf);
+                chars += usize::from(starts_char(b, prev, dos) && !is_bom);
                 lines += usize::from(b == b'\n');
-                prev_cr = dos && b == b'\r';
+                prev = Some(b);
             }
             off += n;
         }
@@ -570,9 +573,11 @@ const PARALLEL_INDEX_THRESHOLD: usize = 1024 * 1024;
 ///
 /// Chars are counted as the number of non-continuation bytes — in valid UTF-8
 /// every scalar value has exactly one leading byte `b` with `(b & 0xC0) != 0x80`
-/// — which equals `bytes.chars().count()` but works directly on `&[u8]`. This
-/// is a *pure* helper so the parallel driver and the unit tests can compare it
-/// against the sequential count. O(bytes).
+/// — which equals `bytes.chars().count()` but works directly on `&[u8]`. The
+/// view-blind, chunk-at-a-time form of [`starts_char`]: it is only used where no
+/// `\r\n` folding applies, so it needs no previous byte and no per-byte branch.
+/// This is a *pure* helper so the parallel driver and the unit tests can compare
+/// it against the sequential count. O(bytes).
 fn count_chars_lines(bytes: &[u8]) -> (usize, usize) {
     let mut chars = 0;
     let mut lines = 0;
@@ -583,6 +588,53 @@ fn count_chars_lines(bytes: &[u8]) -> (usize, usize) {
         lines += usize::from(b == b'\n');
     }
     (chars, lines)
+}
+
+/// Whether byte `b` — preceded by `prev`, `None` at the start of the scanned
+/// range — is the FIRST byte of a char under the view [`Quire::strips_crlf`]
+/// selects. A byte starts a char unless it is a UTF-8 continuation byte, or,
+/// under a normalized DOS view (`strips_crlf`), it is the `\n` of a `\r\n`: the
+/// pair is one newline char whose start is the `\r`. The one spelling of that
+/// rule — every forward walk, the reverse scan and both counters go through it,
+/// so a view that folds bytes can never be half-applied.
+///
+/// `prev` may be `None` where the previous byte is genuinely out of reach (the
+/// front edge of a reverse window at piece byte 0, a resumed forward walk): a
+/// char START never has a `\r` immediately before it under the DOS view, so the
+/// byte at such a boundary can never be an absorbable `\n` and `None` is exact.
+fn starts_char(b: u8, prev: Option<u8>, strips_crlf: bool) -> bool {
+    let absorbed_lf = strips_crlf && b == b'\n' && prev == Some(b'\r');
+    (b & 0xC0) != 0x80 && !absorbed_lf
+}
+
+/// Scan one reverse window right to left, counting `\n` bytes into `newlines`
+/// and char starts into `seen`; returns the index in `win` of the `want`th char
+/// start, or `None` when the window ran out with fewer than that. `win[..ctx]`
+/// is left context for [`starts_char`] alone and is never counted. Both counters
+/// are carried in and out, so successive windows of one hop simply chain.
+fn scan_char_starts_back(
+    win: &[u8],
+    ctx: usize,
+    strips_crlf: bool,
+    want: usize,
+    seen: &mut usize,
+    newlines: &mut usize,
+) -> Option<usize> {
+    let mut i = win.len();
+    while i > ctx {
+        i -= 1;
+        let b = win[i];
+        if b == b'\n' {
+            *newlines += 1; // the char's own leading `\n` counts too
+        }
+        if starts_char(b, win.get(i.wrapping_sub(1)).copied(), strips_crlf) {
+            *seen += 1;
+            if *seen == want {
+                return Some(i);
+            }
+        }
+    }
+    None
 }
 
 /// A root that is one whole-file Original piece `[start, start+len)` with the
@@ -1151,38 +1203,16 @@ impl Quire {
         let mut bp = bp0; // byte offset within the piece
         let mut ci = ci0; // chars seen so far
         let mut nl = nl0; // newlines seen so far
-        // `prev_cr` starts false even on a resume, and that is exact rather than
-        // approximate: `bp0` is a char start, and under the normalized DOS view
-        // the `\n` of a `\r\n` is NOT a char start (the pair is one char, whose
-        // start is the `\r`). So if a `\r` does sit at `bp0 - 1` it is a lone CR,
-        // and the byte AT `bp0` cannot be an absorbable `\n` — the only decision
-        // seeded state could change.
-        let mut prev_cr = false; // previous byte was a `\r` (carried across chunks)
+        // `prev` starts `None` even on a resume, and that is exact rather than
+        // approximate — see [`starts_char`]: `bp0` is a char start, so the byte
+        // at `bp0` can never be the `\n` of a `\r\n`, the only decision seeded
+        // state could change.
+        let mut prev: Option<u8> = None; // previous byte (carried across chunks)
+        let strips = self.strips_crlf(piece.source);
         let (from, len) = (piece.start + bp0, piece.len - bp0);
-        if self.strips_crlf(piece.source) {
-            self.for_bytes(piece.source, from, len, |chunk| {
-                for &b in chunk {
-                    let absorbed_lf = b == b'\n' && prev_cr;
-                    if (b & 0xC0) != 0x80 && !absorbed_lf {
-                        if !f(bp, ci, nl) {
-                            return false;
-                        }
-                        ci += 1;
-                    }
-                    if b == b'\n' {
-                        nl += 1;
-                    }
-                    prev_cr = b == b'\r';
-                    bp += 1;
-                }
-                true
-            });
-            return;
-        }
         self.for_bytes(piece.source, from, len, |chunk| {
             for &b in chunk {
-                if (b & 0xC0) != 0x80 {
-                    // A char starts here.
+                if starts_char(b, prev, strips) {
                     if !f(bp, ci, nl) {
                         return false;
                     }
@@ -1191,6 +1221,7 @@ impl Quire {
                 if b == b'\n' {
                     nl += 1;
                 }
+                prev = Some(b);
                 bp += 1;
             }
             true
@@ -1198,46 +1229,64 @@ impl Quire {
     }
 
     /// Byte offset (within `piece`) of the start of char `n`, and the newline
-    /// count before it. `n == piece.chars` yields `(piece.len, piece.lines)` —
+    /// count before it. `n >= piece.chars` yields `(piece.len, piece.lines)` —
     /// the end.
     ///
     /// This is the primitive every within-piece char→byte seek goes through, and
     /// walking the piece from its start each time is what made a multi-step
     /// motion quadratic: a freshly opened file is ONE whole-file piece, and the
-    /// motion walkers ask for one window per line or per word. So the last
-    /// answer for a piece is kept in [`Quire::seek_memo`] and the next one
-    /// resumes from it:
+    /// motion walkers ask for one window per line or per word. So the seek starts
+    /// from the NEAREST exact anchor it holds for this piece, by char distance:
     ///
-    /// * at or after the memo — carry on the forward char-mark walk from there;
-    /// * otherwise — the cold walk from the piece start, as before.
+    /// * the head, `(0, 0, 0)`;
+    /// * the end, `(chars, len, lines)` — free from the tree summary and in the
+    ///   very shape an anchor takes, so even a first lookup near the tail costs
+    ///   the tail rather than the whole piece;
+    /// * the last answer for this piece, kept in [`Quire::seek_memo`].
     ///
-    /// A forward sequential walk is therefore amortized O(chars traversed); a
-    /// cold seek is still O(offset within the piece), and so is a lookup BEFORE
-    /// the memo (a following commit resumes those too).
+    /// From an anchor at or before `n` the forward char-mark walk carries on
+    /// ([`scan_prefix_from`](Self::scan_prefix_from)); from one past it the
+    /// bounded reverse windows step back
+    /// ([`scan_prefix_back`](Self::scan_prefix_back)). Sequential use in either
+    /// direction is therefore amortized O(chars traversed), and a cold seek costs
+    /// the distance to the nearer END of the piece, not to its head.
     fn scan_prefix(&self, piece: &Piece, n: usize) -> (usize, usize) {
-        if n >= piece.chars {
-            // The piece end, known from its summary. Deliberately NOT memoized:
-            // a memo at the far end would make the next lookup near the head
-            // measure back across the whole piece.
-            return (piece.len, piece.lines);
-        }
-        let memo = self.seek_memo.get().filter(|m| m.names(piece));
-        let mark = match memo {
-            Some(m) if m.n <= n => {
-                #[cfg(test)]
-                MEMO_RESUMES.with(|c| c.set(c.get() + 1));
-                self.scan_prefix_from(piece, m.bp, m.n, m.nl, n)
-            }
-            _ => self.scan_prefix_from(piece, 0, 0, 0, n),
-        };
-        self.seek_memo.set(Some(SeekMemo {
+        let anchor = |at: usize, bp: usize, nl: usize| SeekMemo {
             source: piece.source,
             start: piece.start,
             len: piece.len,
-            n,
-            bp: mark.0,
-            nl: mark.1,
-        }));
+            n: at,
+            bp,
+            nl,
+        };
+        let dist = |a: &SeekMemo| a.n.abs_diff(n);
+        // The end anchor satisfies a memo's invariant by construction: `[0,
+        // piece.len)` holds exactly `piece.chars` char starts and `piece.lines`
+        // `\n` bytes, which is all `scan_prefix_back` asks of it. It stays a
+        // LOCAL anchor — storing it in the memo slot would leave the next lookup
+        // near the head measuring back across the whole piece, and it costs
+        // nothing to rebuild.
+        let (head, end) = (anchor(0, 0, 0), anchor(piece.chars, piece.len, piece.lines));
+        let mut from = if dist(&end) < dist(&head) { end } else { head };
+        if let Some(m) = self
+            .seek_memo
+            .get()
+            .filter(|m| m.names(piece) && dist(m) < dist(&from))
+        {
+            from = m;
+            #[cfg(test)]
+            MEMO_RESUMES.with(|c| c.set(c.get() + 1));
+        }
+        let mark = if from.n <= n {
+            // Forward from the anchor. Off the end anchor (`n >= piece.chars`)
+            // this reads no bytes and hands the piece end straight back.
+            self.scan_prefix_from(piece, from.bp, from.n, from.nl, n)
+        } else {
+            self.scan_prefix_back(piece, &from, n)
+        };
+        if n < piece.chars {
+            self.seek_memo.set(Some(anchor(n, mark.0, mark.1)));
+        }
         mark
     }
 
@@ -1264,6 +1313,65 @@ impl Quire {
         mark
     }
 
+    /// Step BACKWARD from `memo` to char `n` (`n < memo.n`): read bounded byte
+    /// windows ending at `memo.bp`, right to left, counting char starts until
+    /// `memo.n - n` of them have been passed. Returns `(byte offset of char `n`
+    /// within the piece, `\n` bytes before it)`.
+    ///
+    /// The loop normally finds its `want`th char start: the anchor's invariant is
+    /// that `[0, memo.bp)` holds exactly `memo.n` of them, and `want = memo.n - n
+    /// <= memo.n - 1`. It can still run out of piece when the paged backing has
+    /// DRIFTED — an external rewrite that raises the bytes per char leaves
+    /// `[0, piece.len)` holding fewer char starts than `piece.chars`, so even the
+    /// end anchor overshoots. That is reachable from any Lisp-chosen position
+    /// rather than a broken invariant, so the exhausted loop falls through to the
+    /// from-start walk, which is bounded by the piece and answers over whatever
+    /// bytes are there now.
+    ///
+    /// Char starts are judged by [`starts_char`], which needs the byte before the
+    /// one under test — so each window is read with one byte of left context. At
+    /// piece byte 0 there is none and none is needed: pieces are cut on char
+    /// boundaries, which never fall between a `\r` and its `\n`.
+    ///
+    /// `nl` counts `\n` BYTES before the char, so the answer is `memo.nl` less
+    /// the `\n`s in `[bp, memo.bp)` — additive, hence carried across windows.
+    fn scan_prefix_back(&self, piece: &Piece, memo: &SeekMemo, n: usize) -> (usize, usize) {
+        let strips = self.strips_crlf(piece.source);
+        let want = memo.n - n; // char starts to step back over
+        let (mut seen, mut newlines) = (0usize, 0usize);
+        let mut hi = memo.bp; // exclusive end of the window being read
+        // A char is at most 4 bytes, so 4 per char plus 4 for the one the front
+        // edge may cut in half spans the whole hop. The loop bounds the window's
+        // SIZE for a long hop; it is not a retry of a guess that fell short.
+        let mut width = (4 * want + 4).min(BACK_WINDOW);
+        // One buffer for the whole hop: `for_bytes` reads front to back while the
+        // scan runs back to front, so a window is gathered whole before it can be
+        // scanned. Sized for the first window and reused (cleared, never
+        // reallocated past `BACK_WINDOW + 1`) by every later one.
+        let mut win: Vec<u8> = Vec::with_capacity(width + 1);
+        while hi > 0 {
+            // The window is `[lo, hi)`; the read starts one byte earlier where
+            // there is one, so `win[ctx]` is the window's first byte and
+            // `win[ctx - 1]`, when it exists, its `\r\n` context.
+            let lo = hi.saturating_sub(width);
+            let read_lo = lo.saturating_sub(1);
+            let ctx = lo - read_lo;
+            let span = hi - read_lo;
+            win.clear();
+            self.for_bytes(piece.source, piece.start + read_lo, span, |chunk| {
+                win.extend_from_slice(chunk);
+                true
+            });
+            let found = scan_char_starts_back(&win, ctx, strips, want, &mut seen, &mut newlines);
+            if let Some(i) = found {
+                return (read_lo + i, memo.nl - newlines);
+            }
+            hi = lo;
+            width = BACK_WINDOW;
+        }
+        self.scan_prefix_from(piece, 0, 0, 0, n)
+    }
+
     /// Char and newline counts of `[start, start+len)` in `source`, summed over
     /// chunks (chars = non-continuation bytes, lines = `\n` bytes — both additive
     /// across chunk splits). Under a normalized DOS view, counts are LOGICAL: a
@@ -1271,13 +1379,12 @@ impl Quire {
     fn count_range(&self, source: Source, start: usize, len: usize) -> (usize, usize) {
         let (mut chars, mut lines) = (0usize, 0usize);
         if self.strips_crlf(source) {
-            let mut prev_cr = false;
+            let mut prev: Option<u8> = None;
             self.for_bytes(source, start, len, |chunk| {
                 for &b in chunk {
-                    let absorbed_lf = b == b'\n' && prev_cr;
-                    chars += usize::from((b & 0xC0) != 0x80 && !absorbed_lf);
+                    chars += usize::from(starts_char(b, prev, true));
                     lines += usize::from(b == b'\n');
-                    prev_cr = b == b'\r';
+                    prev = Some(b);
                 }
                 true
             });
@@ -1825,9 +1932,10 @@ impl Quire {
                     // Overlaps: keep the surviving prefix and/or suffix. Two
                     // seeks inside this piece find both byte cuts and the
                     // newline count up to each; they go through the seek memo,
-                    // so the second resumes at the first (`keep_left <=
-                    // drop_to`) rather than restarting at the piece head. The
-                    // suffix summary is derived from the piece's cached totals,
+                    // so the second resumes from whichever of the first seek's
+                    // memo, the piece head or the piece end is nearest, never a
+                    // full rescan from the head. The suffix summary is derived
+                    // from the piece's cached totals,
                     // never by rescanning the (possibly huge) tail — a per-edit
                     // tail rescan made a replace sweep O(n²).
                     let keep_left = lo.saturating_sub(p_lo); // chars kept at front
@@ -4061,6 +4169,20 @@ mod tests {
     }
 
     #[test]
+    fn seek_memo_resumes_backward_and_falls_back_to_the_piece_start() {
+        // Decreasing lookups over one whole-file piece: exactly at the memo, one
+        // char before it, a short hop back (the windowed reverse scan), and one
+        // far enough below that the piece start is nearer than the memo — where
+        // the from-start walk runs instead.
+        let text = lorem(40);
+        let fresh = || Quire::from_string("t", text.clone());
+        let q = fresh();
+        let len = TextStore::char_len(&q);
+        let ps = [len - 5, len - 5, len - 6, len - 40, 700, 3, 900, 899, 2];
+        assert_seeks_match_fresh(&q, &fresh, &ps);
+    }
+
+    #[test]
     fn seek_memo_walks_a_crlf_view_in_both_directions() {
         // Under the normalized DOS view "ab\r\ncd\r\n" is "ab\ncd\n": each pair
         // is ONE char whose byte start is the `\r`. The forward resume and the
@@ -4093,6 +4215,158 @@ mod tests {
         ps.extend([len / 2, 2, len - 1, 40]);
         assert_seeks_match_fresh(&q, &fresh, &ps);
         std::fs::remove_file(&path).ok();
+
+        // `Quire::open` classifies a whole file as DOS from the byte before
+        // its FIRST `\n`, so a DOS-view file can still hold bytes an actual
+        // `\r\n` never produces: a lone `\r` (not followed by `\n`, "cd\re"
+        // below), a bare `\n` (not preceded by `\r`, "e\nf"), and a `\r\r\n`
+        // run — a lone CR immediately before a real pair ("✓\r\r\ngh"). None
+        // of those fold; only an actual `\r\n` does. Repeat the chunk enough
+        // that the file spans more than one `BACK_WINDOW`, so the forward walk
+        // resumes across every one of them far from the piece start, and the
+        // short backward hops below run far from it too.
+        let chunk = "ab\r\ncd\re\nfü✓\r\r\ngh\r\n";
+        let decoded_chunk = chunk.replace("\r\n", "\n");
+        let reps = BACK_WINDOW / chunk.len() + 4;
+        let text = format!("x\r\n{}", chunk.repeat(reps));
+        let decoded = format!("x\n{}", decoded_chunk.repeat(reps));
+        assert_eq!(
+            text.replace("\r\n", "\n"),
+            decoded,
+            "sanity: decoding by hand agrees with `.replace`"
+        );
+
+        let path = tmp_path("seek-dos-mixed-eol");
+        std::fs::write(&path, text.as_bytes()).unwrap();
+        let fresh = || Quire::open(&path).unwrap();
+        let q = fresh();
+        assert_eq!(TextStore::text(&q), decoded);
+        let b = Buffer::from_string("t", &decoded);
+
+        // 1-based char position of decoded-char index `i` within `decoded_chunk`,
+        // in repeat `rep` (0-based) of the chunk.
+        let prefix_chars = "x\n".chars().count();
+        let period = decoded_chunk.chars().count();
+        let pos = |rep: usize, i: usize| prefix_chars + rep * period + i + 1;
+        let char_idx_of_byte = |byte: usize| decoded_chunk[..byte].chars().count();
+
+        // The four landmark bytes, located by their surrounding context so the
+        // indices can't drift out of sync with `chunk` under edits.
+        let lone_cr = char_idx_of_byte(decoded_chunk.find("cd\re").unwrap() + 2);
+        let bare_lf = char_idx_of_byte(decoded_chunk.find("e\nf").unwrap() + 1);
+        let rr_lone_cr = char_idx_of_byte(decoded_chunk.find("✓\r\n").unwrap() + "✓".len());
+        let rr_folded_lf = rr_lone_cr + 1; // the `\r\n` right after it, folded to one `\n` char
+        let landmarks = [lone_cr, bare_lf, rr_lone_cr, rr_folded_lf];
+
+        let last_rep = reps - 1;
+        let edge_rep = BACK_WINDOW / chunk.len(); // the repeat straddling a window edge
+        let mut ps: Vec<usize> = Vec::new();
+        // Forward: early repeats in increasing order (resumes via `scan_prefix_from`).
+        for rep in [0, 1, 2] {
+            for &i in &landmarks {
+                ps.push(pos(rep, i));
+            }
+        }
+        // Backward: the far end down through the repeats around the window edge,
+        // then back to the start. Each hop within a repeat is a few chars, so it
+        // takes the short `scan_prefix_back` path over these byte patterns; the
+        // jump from `edge_rep - 1` down to the first repeats is nearer the piece
+        // start than the memo and falls back to the from-start walk. A single
+        // hop that itself crosses a `BACK_WINDOW` is the sibling test's job.
+        for rep in [
+            last_rep,
+            last_rep - 1,
+            edge_rep + 1,
+            edge_rep,
+            edge_rep - 1,
+            1,
+            0,
+        ] {
+            for &i in landmarks.iter().rev() {
+                ps.push(pos(rep, i));
+            }
+        }
+        assert_seeks_match_fresh(&q, &fresh, &ps);
+        for &p in &ps {
+            assert_eq!(
+                seek_answers(&q, p),
+                seek_answers(&b, p),
+                "seek at {p} disagrees with the Buffer oracle"
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn seek_memo_hops_back_across_a_reverse_window_edge_between_cr_and_lf() {
+        // The reverse scan reads BACK_WINDOW bytes at a time, so a window's
+        // first byte can be the `\n` of a `\r\n` whose `\r` is in the NEXT
+        // window down — the case each window's one byte of left context exists
+        // for. Without it that `\n` reads as a char start and the hop lands one
+        // char off.
+        //
+        // "abc\r\n" is 5 bytes and 4 chars, so a char start's byte offset is
+        // never ≡ 4 (mod 5) — the LF — but the window edge `bp - BACK_WINDOW`,
+        // measured back from the memo's byte, can be. The shift sweeps that edge
+        // across the line; that it really lands on an LF is checked below rather
+        // than argued here. The hop is one window's worth of chars plus a little,
+        // so the scan always crosses into a second window, and stays shorter than
+        // the distance to the piece start so the backward path (not the from-start
+        // walk) is the one taken.
+        let path = tmp_path("seek-crlf-window");
+        let text = "abc\r\n".repeat(4000);
+        std::fs::write(&path, text.as_bytes()).unwrap();
+        let bytes = text.as_bytes();
+        let fresh = || Quire::open(&path).unwrap();
+        let hop = BACK_WINDOW / 5 * 4 + 8;
+        // Four chars to every five bytes: char index `n` starts at byte
+        // `n / 4 * 5 + n % 4` (offset 3 is the `\r` that starts the folded
+        // newline char, so no char starts at offset 4, the LF).
+        let char_byte = |n: usize| n / 4 * 5 + n % 4;
+        let mut edge_on_lf = 0usize;
+        for shift in 0..10 {
+            let target = hop + 2 + shift;
+            let anchor = target + hop;
+            let q = fresh();
+            assert_eq!(
+                TextStore::char_after(&q, anchor),
+                TextStore::char_after(&fresh(), anchor),
+                "priming lookup at {anchor}"
+            );
+            // Where the hop starts, and therefore where its first window's front
+            // edge falls. The memo is the store's own answer, so the byte
+            // arithmetic above is cross-checked rather than assumed.
+            let memo = q.seek_memo.get().expect("the priming lookup leaves a memo");
+            assert_eq!(
+                (memo.n, memo.bp),
+                (anchor - 1, char_byte(anchor - 1)),
+                "the memo left at {anchor} (shift {shift})"
+            );
+            edge_on_lf += usize::from(bytes[memo.bp - BACK_WINDOW] == b'\n');
+            // The char AND the line count: `nl` is carried across the windows
+            // the same way the char starts are.
+            let got = (
+                TextStore::char_after(&q, target),
+                TextStore::line_number_at_pos(&q, target),
+            );
+            let want = {
+                let f = fresh();
+                (
+                    TextStore::char_after(&f, target),
+                    TextStore::line_number_at_pos(&f, target),
+                )
+            };
+            assert_eq!(
+                got, want,
+                "hop back to {target} from {anchor} (shift {shift})"
+            );
+        }
+        assert!(
+            edge_on_lf > 0,
+            "no shift put a window edge on the LF of a `\\r\\n` — the case this \
+             test exists for was never exercised"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -4107,6 +4381,51 @@ mod tests {
         ps.extend((0..40).map(|i| len - i * 7));
         ps.extend([len / 3, 5, len - 2, 111, 110, 109, 1]);
         assert_seeks_match_fresh(&q, &fresh, &ps);
+    }
+
+    /// Pages a paged Quire currently holds resident — the read-volume counter
+    /// the guard below needs: `Quire::open` streams the file through its own
+    /// buffers, so a freshly opened store has none, and every page a later read
+    /// touches lands here.
+    fn resident_pages(q: &Quire) -> usize {
+        match q.original.as_ref() {
+            Original::Paged(p) => p.cache.borrow().pages.len(),
+            Original::Owned(_) => panic!("resident_pages: not a paged Quire"),
+        }
+    }
+
+    #[test]
+    fn first_seek_near_the_tail_reads_the_tail_not_the_whole_piece() {
+        // A freshly opened file is ONE piece and there is no memo yet — but its
+        // END is an exact anchor the tree summary already holds, in the shape the
+        // reverse scan consumes. So a first lookup a few chars from the tail must
+        // step back over those few chars, not walk every page from the head.
+        let path = tmp_path("seek-tail-anchor");
+        let line = "the quick brown fox jumps over the lazy dog\n";
+        let pages = 40;
+        std::fs::write(&path, line.repeat(pages * PAGE / line.len())).unwrap();
+        let fresh = || Quire::open(&path).unwrap();
+
+        let q = fresh();
+        assert_eq!(
+            resident_pages(&q),
+            0,
+            "open reads nothing through the cache"
+        );
+        let target = TextStore::char_len(&q) - 3;
+        assert_eq!(
+            seek_answers(&q, target),
+            seek_answers(&fresh(), target),
+            "the tail lookup disagrees with a fresh store"
+        );
+        // Three chars back from the end: the last page, plus at most one more if
+        // a read straddles its edge. Walking from the head would touch all 40.
+        assert!(
+            resident_pages(&q) <= 2,
+            "a first lookup 3 chars from the end read {} of the file's {pages} pages",
+            resident_pages(&q)
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
