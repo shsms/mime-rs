@@ -904,7 +904,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                     return Err(err("Cannot mark zero paragraphs"));
                 }
                 let end = move_paragraphs(&*sess.buffer, sess.buffer.point(), n);
-                let start = move_paragraphs(&*sess.buffer, end, -n);
+                // `saturating_neg`, not `-n`: `i64::MIN` has no positive twin
+                // and negating it panics in a debug build.
+                let start = move_paragraphs(&*sess.buffer, end, n.saturating_neg());
                 sess.buffer.set_mark(end);
                 sess.buffer.goto_char(start);
                 Ok(end as i64)
@@ -1294,7 +1296,10 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun("backward-word", move |n: Option<i64>| -> i64 {
             let mut sess = s.borrow_mut();
             let from = sess.buffer.point();
-            let to = move_units(&*sess.buffer, from, -n.unwrap_or(1), &is_word_char);
+            // `saturating_neg`, not `-n`: `i64::MIN` has no positive twin
+            // and negating it panics in a debug build.
+            let n = n.unwrap_or(1).saturating_neg();
+            let to = move_units(&*sess.buffer, from, n, &is_word_char);
             sess.buffer.goto_char(to);
             to as i64
         });
@@ -1321,7 +1326,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             let mut sess = s.borrow_mut();
             let pred = symbol_pred(&sess);
             let from = sess.buffer.point();
-            let to = move_units(&*sess.buffer, from, -n.unwrap_or(1), &pred);
+            let to = move_units(&*sess.buffer, from, n.unwrap_or(1).saturating_neg(), &pred);
             sess.buffer.goto_char(to);
             to as i64
         });
@@ -1862,7 +1867,11 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // reverses. Returns the new point.
         ctx.defun("backward-paragraph", move |n: Option<i64>| -> i64 {
             let mut sess = s.borrow_mut();
-            let p = move_paragraphs(&*sess.buffer, sess.buffer.point(), -n.unwrap_or(1));
+            let p = move_paragraphs(
+                &*sess.buffer,
+                sess.buffer.point(),
+                n.unwrap_or(1).saturating_neg(),
+            );
             sess.buffer.goto_char(p);
             p as i64
         });
@@ -5086,6 +5095,27 @@ mod tests {
         assert_eq!(report(&r, "a"), "7");
         assert_eq!(report(&r, "b"), "9");
         assert_eq!(report(&r, "c"), "9");
+        // `i64::MIN` has no positive twin, so negating the count has to
+        // saturate rather than panic in a debug build. The saturated forward
+        // count simply runs out of buffer and stops at point-max.
+        let r = ws
+            .run(
+                r#"(goto-char (point-min))
+                    (report "w" (backward-word -9223372036854775808))
+                    (goto-char (point-min))
+                    (report "s" (backward-symbol -9223372036854775808))
+                    (goto-char (point-min))
+                    (report "p" (backward-paragraph -9223372036854775808))
+                    (goto-char (point-min))
+                    (report "mp" (mark-paragraph -9223372036854775808))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "w"), "11");
+        assert_eq!(report(&r, "s"), "11");
+        assert_eq!(report(&r, "p"), "11");
+        // mark-paragraph negates the count twice over, so it saturates too:
+        // the mark is the saturated backward hop, point the forward one.
+        assert_eq!(report(&r, "mp"), "1");
     }
 
     #[test]
