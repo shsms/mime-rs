@@ -314,7 +314,7 @@ pub fn move_units(
 }
 
 /// Start of the line containing `p`, not below `min`.
-fn bol(store: &dyn TextStore, p: usize, min: usize) -> usize {
+pub(crate) fn bol(store: &dyn TextStore, p: usize, min: usize) -> usize {
     skip_backward(store, p, min, &|c| c != '\n')
 }
 

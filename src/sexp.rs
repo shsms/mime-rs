@@ -25,7 +25,9 @@
 
 use std::cell::RefCell;
 
-use crate::motion::{FIRST_WINDOW, WINDOW};
+use crate::motion::{
+    FIRST_WINDOW, WINDOW, bol, is_word_char, move_paragraphs, skip_backward, skip_forward,
+};
 use crate::store::TextStore;
 use crate::syntax::{Lang, SexpRule};
 
@@ -89,6 +91,64 @@ pub struct Sexp {
     pub start: usize,
     pub end: usize,
     pub kind: SexpKind,
+}
+
+/// The kinds of thing `bounds_of` resolves. `defun` is not here: it needs a
+/// tree-sitter parse and is resolved by the caller (`thing_bounds` in
+/// `builtins.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Sexp,
+    List,
+    Str,
+    Word,
+    Symbol,
+    Line,
+    Paragraph,
+}
+
+impl Kind {
+    pub fn parse(name: &str) -> Option<Kind> {
+        Some(match name {
+            "sexp" => Kind::Sexp,
+            "list" => Kind::List,
+            "string" => Kind::Str,
+            "word" => Kind::Word,
+            "symbol" => Kind::Symbol,
+            "line" => Kind::Line,
+            "paragraph" => Kind::Paragraph,
+            _ => return None,
+        })
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Kind::Sexp => "sexp",
+            Kind::List => "list",
+            Kind::Str => "string",
+            Kind::Word => "word",
+            Kind::Symbol => "symbol",
+            Kind::Line => "line",
+            Kind::Paragraph => "paragraph",
+        }
+    }
+}
+
+/// The run of `pred` characters containing `probe`, or an empty span.
+fn run_at(
+    store: &dyn TextStore,
+    probe: usize,
+    min: usize,
+    max: usize,
+    pred: &dyn Fn(char) -> bool,
+) -> (usize, usize) {
+    if !store.char_after(probe).is_some_and(pred) {
+        return (probe, probe);
+    }
+    (
+        skip_backward(store, probe, min, pred),
+        skip_forward(store, probe, max, pred),
+    )
 }
 
 /// The closer that matches an opener.
@@ -621,6 +681,138 @@ impl<'a> Scanner<'a> {
             None
         })
     }
+
+    /// The span of the `kind` thing at `pos`, widened by `up` enclosing
+    /// groups (sexp and list only), or `Ok(None)` when there is none. A
+    /// `pos` at point-max probes the character before it, so the thing at
+    /// the end of the region is the last one, as in Emacs.
+    pub fn bounds_of(
+        &self,
+        kind: Kind,
+        pos: usize,
+        up: usize,
+    ) -> Result<Option<(usize, usize)>, ScanError> {
+        let (min, max) = (self.store.point_min(), self.store.point_max());
+        let pos = pos.clamp(min, max);
+        let probe = if pos == max && pos > min {
+            pos - 1
+        } else {
+            pos
+        };
+        let span = match kind {
+            Kind::Sexp => self.sexp_at(probe, min, max)?,
+            Kind::List => match self.sexp_at(probe, min, max)? {
+                Some(g) if self.is_group(g) => Some(g),
+                _ => match self.up_backward(probe, min)? {
+                    Some(open) => self.sexp_forward(open, max)?.map(|g| (g.start, g.end)),
+                    None => None,
+                },
+            },
+            Kind::Str => match self.token_at(probe, min)? {
+                Some(t) if t.kind == TokenKind::Str => Some((t.start, t.end)),
+                _ => None,
+            },
+            Kind::Word => Some(run_at(self.store, probe, min, max, &is_word_char)),
+            Kind::Symbol => {
+                let lang = self.lang;
+                Some(run_at(self.store, probe, min, max, &move |c| {
+                    lang.is_symbol_char(c)
+                }))
+            }
+            Kind::Line => {
+                let start = bol(self.store, probe, min);
+                let eol = skip_forward(self.store, probe, max, &|c| c != '\n');
+                Some((start, (eol + 1).min(max)))
+            }
+            Kind::Paragraph => {
+                let end = move_paragraphs(self.store, pos, 1);
+                Some((move_paragraphs(self.store, end, -1), end))
+            }
+        };
+        // `run_at` answers "none" with an empty span.
+        let span = span.filter(|(a, b)| a < b);
+        match (span, kind) {
+            (Some(s), Kind::Sexp | Kind::List) => self.widen(s, up).map(Some),
+            (s, _) => Ok(s),
+        }
+    }
+
+    /// `span` widened to its `up`-th enclosing group; `Unbalanced` at the
+    /// span start when the groups run out.
+    pub fn widen(&self, span: (usize, usize), up: usize) -> Result<(usize, usize), ScanError> {
+        let mut span = span;
+        for _ in 0..up {
+            let Some(open) = self.up_backward(span.0, self.store.point_min())? else {
+                return Err(ScanError::Unbalanced { at: span.0 });
+            };
+            let g = self
+                .sexp_forward(open, self.store.point_max())?
+                .expect("an opener starts a sexp");
+            span = (g.start, g.end);
+        }
+        Ok(span)
+    }
+
+    /// The token containing `probe` (a string or a symbol also when the
+    /// probe is inside it), or `None` on whitespace.
+    fn token_at(&self, probe: usize, min: usize) -> Result<Option<Token>, ScanError> {
+        let t = self.with_tokens(probe + 1, min, |before, cut| {
+            cut.or_else(|| {
+                before
+                    .last()
+                    .copied()
+                    .filter(|t| t.start <= probe && t.end == probe + 1)
+            })
+        })?;
+        // A symbol may have been cut by the lex bound at `probe + 1`, same
+        // as `before`'s last token was; extend it to its real end (a no-op
+        // when it already reached its real end there).
+        Ok(match t {
+            Some(mut t) if t.kind == TokenKind::Symbol && t.end == probe + 1 => {
+                t.end = skip_forward(self.store, t.end, self.store.point_max(), &|c| {
+                    self.lang.is_symbol_char(c)
+                });
+                Some(t)
+            }
+            other => other,
+        })
+    }
+
+    /// The sexp at `probe`: the whole group when the probe is on a bracket,
+    /// the prefixed sexp when it is on a prefix.
+    fn sexp_at(
+        &self,
+        probe: usize,
+        min: usize,
+        max: usize,
+    ) -> Result<Option<(usize, usize)>, ScanError> {
+        let Some(t) = self.token_at(probe, min)? else {
+            return Ok(None);
+        };
+        Ok(match t.kind {
+            TokenKind::Comment => None,
+            TokenKind::Open(_) => self.sexp_forward(t.start, max)?.map(|g| (g.start, g.end)),
+            TokenKind::Punct if self.is_prefix(t.start) => {
+                self.sexp_forward(t.start, max)?.map(|g| (g.start, g.end))
+            }
+            TokenKind::Close(_) => {
+                let g = self.with_tokens(t.end, min, |before, _| {
+                    Self::group_back(before, before.len() - 1)
+                })??;
+                Some((g.start, g.end))
+            }
+            _ => Some((t.start, t.end)),
+        })
+    }
+
+    /// Whether `span` is a bracket group (after any prefixes).
+    fn is_group(&self, span: (usize, usize)) -> bool {
+        let mut p = span.0;
+        while p < span.1 && self.is_prefix(p) {
+            p += 1;
+        }
+        matches!(self.store.char_after(p), Some('(' | '[' | '{'))
+    }
 }
 
 #[cfg(test)]
@@ -968,5 +1160,145 @@ mod tests {
         }
         assert_eq!(p, text.chars().count() - 100 * 6 + 1);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    fn bounds(
+        text: &str,
+        kind: Kind,
+        pos: usize,
+        up: usize,
+    ) -> Result<Option<(usize, usize)>, ScanError> {
+        let b = Buffer::from_string("t.rs", text);
+        Scanner::new(&b, Lang::Rust).bounds_of(kind, pos, up)
+    }
+
+    #[test]
+    fn bounds_of_sexp_and_list_at_a_position() {
+        //       123456789012345678901
+        let t = "foo(a, [b, \"c)\"]) x";
+        assert_eq!(
+            bounds(t, Kind::Sexp, 2, 0).unwrap(),
+            Some((1, 4)),
+            "mid-symbol"
+        );
+        assert_eq!(
+            bounds(t, Kind::Sexp, 1, 0).unwrap(),
+            Some((1, 4)),
+            "on the symbol's first character"
+        );
+        assert_eq!(
+            bounds(t, Kind::Sexp, 4, 0).unwrap(),
+            Some((4, 18)),
+            "on the opener"
+        );
+        assert_eq!(
+            bounds(t, Kind::Sexp, 17, 0).unwrap(),
+            Some((4, 18)),
+            "on the closer"
+        );
+        assert_eq!(
+            bounds(t, Kind::Sexp, 13, 0).unwrap(),
+            Some((12, 16)),
+            "inside the string"
+        );
+        assert_eq!(bounds(t, Kind::Sexp, 7, 0).unwrap(), None, "whitespace");
+        assert_eq!(
+            bounds(t, Kind::Sexp, 6, 0).unwrap(),
+            Some((6, 7)),
+            "punctuation"
+        );
+        assert_eq!(
+            bounds(t, Kind::List, 7, 0).unwrap(),
+            Some((4, 18)),
+            "innermost containing group"
+        );
+        assert_eq!(bounds(t, Kind::List, 9, 0).unwrap(), Some((8, 17)));
+        assert_eq!(
+            bounds(t, Kind::List, 9, 1).unwrap(),
+            Some((4, 18)),
+            "up one"
+        );
+        assert_eq!(
+            bounds(t, Kind::List, 9, 2),
+            Err(ScanError::Unbalanced { at: 4 }),
+            "up runs out"
+        );
+        assert_eq!(
+            bounds(t, Kind::List, 20, 0).unwrap(),
+            None,
+            "outside every group"
+        );
+        assert_eq!(
+            bounds(t, Kind::Sexp, 8, 1).unwrap(),
+            Some((4, 18)),
+            "sexp widened"
+        );
+        // Fixture is 19 chars (point-max 20): pos 21 clamps to 20, probing
+        // the last char at 19 -- the symbol `x` at (19, 20).
+        assert_eq!(
+            bounds(t, Kind::Sexp, 21, 0).unwrap(),
+            Some((19, 20)),
+            "point-max probes the last char"
+        );
+        let b = Buffer::from_string("t.el", "x '(a b)");
+        assert_eq!(
+            Scanner::new(&b, Lang::Elisp)
+                .bounds_of(Kind::Sexp, 3, 0)
+                .unwrap(),
+            Some((3, 9)),
+            "on a prefix"
+        );
+        assert_eq!(
+            Scanner::new(&b, Lang::Elisp)
+                .bounds_of(Kind::List, 5, 0)
+                .unwrap(),
+            Some((4, 9))
+        );
+    }
+
+    #[test]
+    fn bounds_of_string_word_symbol_line_and_paragraph() {
+        //       12345678901234 5678901234567 8 90123
+        let t = "let s = \"a b\";\nfoo_bar baz\n\nnext";
+        assert_eq!(bounds(t, Kind::Str, 10, 0).unwrap(), Some((9, 14)));
+        assert_eq!(
+            bounds(t, Kind::Str, 9, 0).unwrap(),
+            Some((9, 14)),
+            "on the quote"
+        );
+        assert_eq!(bounds(t, Kind::Str, 3, 0).unwrap(), None);
+        assert_eq!(
+            bounds(t, Kind::Word, 17, 0).unwrap(),
+            Some((16, 19)),
+            "`foo` only"
+        );
+        assert_eq!(
+            bounds(t, Kind::Symbol, 17, 0).unwrap(),
+            Some((16, 23)),
+            "`foo_bar`"
+        );
+        assert_eq!(
+            bounds(t, Kind::Word, 15, 0).unwrap(),
+            None,
+            "on the newline"
+        );
+        assert_eq!(
+            bounds(t, Kind::Line, 17, 0).unwrap(),
+            Some((16, 28)),
+            "newline included"
+        );
+        assert_eq!(
+            bounds(t, Kind::Line, 30, 0).unwrap(),
+            Some((29, 33)),
+            "last line, no newline"
+        );
+        assert_eq!(bounds(t, Kind::Paragraph, 3, 0).unwrap(), Some((1, 28)));
+        assert_eq!(Kind::parse("string"), Some(Kind::Str));
+        assert_eq!(
+            Kind::parse("defun"),
+            None,
+            "defun is resolved by the caller"
+        );
+        assert_eq!(Kind::Str.name(), "string");
     }
 }
