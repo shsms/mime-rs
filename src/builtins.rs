@@ -5320,4 +5320,62 @@ mod tests {
         assert_ne!(report(&r, "n1"), "0");
         assert_eq!(report(&r, "none"), "0");
     }
+
+    /// Run `prog` over `text` on both stores — the in-memory oracle and a
+    /// file-backed Quire — and return both reports. Both buffers are named
+    /// with an `.el` extension so symbol motion sees the Elisp table.
+    fn on_both_stores(tag: &str, text: &str, prog: &str) -> (RunReport, RunReport) {
+        let mut oracle = Workspace::new_trusted(Box::new(Buffer::from_string("doc.el", text)));
+        let dir = temp_dir(tag);
+        let file = dir.join("doc.el");
+        std::fs::write(&file, text).unwrap();
+        let mut quire = Workspace::new_trusted(Box::new(crate::Quire::open(&file).unwrap()));
+        let a = oracle.run(prog).unwrap();
+        let b = quire.run(prog).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        (a, b)
+    }
+
+    #[test]
+    fn foundation_motions_agree_on_both_stores() {
+        let text = "(defun string-trim-left (s)\n  \"doc\"\n  (foo_bar s))\n\n  \n;; ünïcode ✓ line\n(bar)\n";
+        let prog = r#"
+            (report "sk1" (skip-chars-forward "^\""))
+            (report "sk2" (skip-chars-backward "^("))
+            (report "sk3" (skip-chars-forward "[:alpha:]-" 20))
+            (goto-char (point-min))
+            (report "w" (forward-word 3))
+            (report "wb" (backward-word 2))
+            (goto-char (point-min))
+            (report "s" (forward-symbol 2))
+            (report "sb" (backward-symbol 1))
+            (goto-char (point-min))
+            (report "p" (forward-paragraph))
+            (report "p2" (forward-paragraph 2))
+            (report "pb" (backward-paragraph 2))
+            (goto-char 30)
+            (report "mw" (mark-word))
+            (report "ms" (mark-symbol -1))
+            (report "mp" (mark-paragraph))
+            (report "mp-pt" (point))
+            (goto-char 10)
+            (report "bod" (beginning-of-defun))
+            (report "eod" (end-of-defun))
+            (goto-char 10)
+            (report "md" (mark-defun))
+            (report "md-pt" (point))
+            (narrow-to-region 8 40)
+            (goto-char 8)
+            (report "nw" (forward-word 20))
+            (report "np" (backward-paragraph 3))
+        "#;
+        let (a, b) = on_both_stores("motions", text, prog);
+        assert_eq!(a.reports, b.reports);
+        assert_eq!(a.point, b.point);
+        // And the oracle's answers are the intended ones, not merely equal.
+        // `string-trim-left` is one Elisp symbol ending at 23, so the second
+        // symbol hop lands at 24; the first blank line starts at 52.
+        assert_eq!(report(&a, "s"), "24");
+        assert_eq!(report(&a, "p"), "52");
+    }
 }

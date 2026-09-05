@@ -55,14 +55,18 @@ these editor builtins. For syntax + examples: help {regex} (patterns/replace),
 help {treesit} (structure), help {recipes} (worked programs).
 
 Motion/inspect: point point-min point-max goto-char goto-line forward-line
-  beginning-of-line end-of-line line-number-at-pos current-column looking-at
-  char-after buffer-substring buffer-string
+  beginning-of-line end-of-line forward-word backward-word forward-symbol
+  backward-symbol forward-paragraph backward-paragraph skip-chars-forward
+  skip-chars-backward beginning-of-defun end-of-defun line-number-at-pos
+  current-column looking-at char-after buffer-substring buffer-string
+Mark: set-mark mark region-beginning region-end exchange-point-and-mark
+  mark-word mark-symbol mark-paragraph mark-defun
 Search/replace: re-search-forward re-search-backward search-forward
   search-backward replace-match match-string replace-regexp replace-string
   count-matches regexp-quote
 Edit/delete: insert delete-region delete-char flush-lines keep-lines
   kill-region kill-whole-line yank sort-lines delete-trailing-whitespace
-Narrowing: narrow-to-region widen save-restriction save-excursion
+Narrowing: narrow-to-region narrow-to-defun widen save-restriction save-excursion
 Structure (tree-sitter): treesit-goto-defun treesit-defun-at treesit-node-at
   treesit-node-start treesit-node-end treesit-node-text treesit-narrow-to-defun
   treesit-list-defuns treesit-has-error treesit-query; node edits
