@@ -111,6 +111,186 @@ writable run on an ~open_text~ (Buffer-backed) session clones the whole
 text for the transactional snapshot — Quire shares structure; consider
 Quire-backing open_text or snapshotting lazily on first mutation.
 
+** TODO [#C] Motion walkers: a walk-scoped reader cursor instead of a per-call window
+:LOGBOOK:
+- State "TODO"       from              [2026-09-05 Sa 15:53]
+:END:
+
+~skip_forward~ / ~skip_backward~ in ~motion.rs~ fetch a growing window
+(64 → 4096 chars) per call. The paragraph and unit walkers hop one line or
+word at a time, so every hop starts a fresh window and re-seeks. A reader
+cursor owned by the whole walk (or a ~TextStore::chars_from~ iterator each
+store implements natively) would delete ~FIRST_WINDOW~ / ~WINDOW~, the
+doubling schedule and the empty-window guards, and turn the skips into
+~take_while~. Signature change across every walker; do it as its own branch.
+
+** TODO [#C] Word and symbol motion split decomposed graphemes
+:LOGBOOK:
+- State "TODO"       from              [2026-09-05 Sa 15:53]
+:END:
+
+~is_word_char~ is ~is_alphanumeric~, which is false for combining marks
+(category Mn), so on NFD text ~forward-word~ stops between a base letter and
+its accent and ~mark-word~ orphans the mark. Emacs gives Mn word syntax.
+~[:punct:]~'s non-ASCII fallback also classifies marks as punctuation.
+Needs a Unicode category test; the crate has no table and the ~regex~ crate
+is the only dependency with ~\p{M}~.
+
+** TODO [#C] [:alnum:] and [:punct:] accept numeric forms Emacs rejects
+:LOGBOOK:
+- State "TODO"       from              [2026-09-05 Sa 15:53]
+:END:
+
+~Class::Alnum~ is ~is_alphanumeric~, whose numeric half covers Nd/Nl/No, so
+~½~ and ~²~ are alnum here and not in Emacs (alphabetic or decimal digit
+only); ~[:punct:]~ excludes them where Emacs includes them. ~[:digit:]~ is
+already ASCII-only. Documented on ~Class~ in ~motion.rs~; closing it needs a
+decimal-digit (Nd) test, the same table gap as the combining-marks item.
+
+** TODO [#C] Vocabulary drift guard only sees literal defun("name") registrations
+:LOGBOOK:
+- State "TODO"       from              [2026-09-05 Sa 15:53]
+:END:
+
+~vocabulary_doc_lists_every_registered_builtin~ greps the source for
+~defun("literal")~, so a builtin registered through a helper, a loop or a
+table is invisible to it (and passes undocumented). That is also why the
+defun aliases are separate literal registrations. Asking the interpreter for
+its bound names after ~register~ would make the guard exact and free the
+registration shape.
+
+** TODO [#C] delete_region underflows char_len on an unclamped upper bound
+:LOGBOOK:
+- State "TODO"       from              [2026-09-05 Sa 15:53]
+:END:
+
+~Buffer::delete_region~ does ~self.char_len -= hi - lo~ with the caller's
+unclamped ~hi~, so ~delete_region(5, 100)~ on a 10-char buffer underflows
+(debug panic; release wraps). Same family as the narrowing that leaves point
+outside the text after a delete spanning past it. ~Buffer~ is the
+differential oracle, so the wrong answer would be trusted.
+
+** DONE [#C] collect_range doc overstates its cost
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-09-05 Sa 16:31]
+- State "TODO"       from              [2026-09-05 Sa 15:53]
+:END:
+
+~quire.rs~ ~collect_range~ says O(range + log n), but ~for_range_bytes~
+resolves both edges with ~scan_prefix~, which walks the containing piece from
+its start: O(offset within the piece + range). A whole-file piece makes that
+O(position). Fix the sentence when the seek memo lands, or now.
+
+** TODO [#C] Quire: substring resolves and streams the range twice, and reaches its first piece linearly
+:LOGBOOK:
+- State "TODO"       from              [2026-09-05 Sa 17:21]
+:END:
+
+~for_range_bytes~ resolves both edges with ~scan_prefix~ (the second
+resumes from the first through the seek memo, so that pass is cheap), then
+~for_view_bytes~ streams the same bytes again: ~2R byte passes for a
+substring of R chars. And ~for_each_piece~ starts at the document's first
+piece and skips forward, so a substring near the end of a many-piece buffer
+is O(pieces) where ~locate~ reaches it in O(log n). Nil on a freshly opened
+one-piece file; grows with edits. The motion walkers call ~substring~ per
+window, so this is the next per-step ceiling after the seek memo.
+
+** TODO [#C] Quire: derive BACK_WINDOW from the read unit
+:LOGBOOK:
+- State "TODO"       from              [2026-09-05 Sa 17:21]
+:END:
+
+~BACK_WINDOW~ (8 KiB) is the third independent 8 KiB in ~quire.rs~ beside
+~SEARCH_WINDOW_START~ and the open-time ~CHUNK~, and unrelated to ~PAGE~
+(64 KiB), the unit ~for_bytes~ fetches, so a long reverse seek makes eight
+round trips per resident page. Express it against ~PAGE~ (or decide the
+three 8 KiBs together). Naming/derivation only, no behaviour claim.
+
+** TODO [#C] Quire: an Anchor type for the seek memo, and fold the forward byte pass into its one caller
+:LOGBOOK:
+- State "TODO"       from              [2026-09-05 Sa 17:51]
+:END:
+
+~SeekMemo~ does double duty as cache key and as anchor: ~scan_prefix~
+builds its head and end anchors with four key fields nothing reads, and
+~scan_prefix_back~ / ~scan_prefix_from~ / ~for_each_char_mark_from~ thread
+~(bp, n, nl)~ as three positional ~usize~ in differing orders. An
+~Anchor { n, bp, nl }~ with ~distance(n)~, and ~SeekMemo { key, at: Anchor }~,
+makes the nearest-anchor choice read as a min over three anchors and removes
+the arg-order hazard. ~for_each_char_mark_from~ now has exactly one caller
+(~scan_prefix_from~) whose closure only stops at ~n~; fold the byte loop
+into it. Shape change only; do both together.
+
+** TODO [#C] Sexp things: one Thing type as the single source of the kind list
+:LOGBOOK:
+- State "TODO"       from              [2026-09-06 So 07:29]
+:END:
+
+From the ~sexp-things~ pr-prep review. The thing vocabulary is written in
+five places with no compiler check between them: ~sexp::Kind~ (7 variants,
+scanner-only), ~builtins::THING_KINDS~ (8 strings, ~defun~ added),
+~Kind::parse~/~Kind::name~, and the ~thing_schema~ enum built from
+~THING_KINDS~. ~defun~ is dispatched by string compare at the top of
+~thing_bounds~, ~thing_after~ and ~thing_before~, and ~up~ means something
+different in each (~bounds_of~ widens sexp/list only, the after/before
+lookups widen every kind, ~thing_spec~ rejects it outside sexp/list).
+Idea: one ~Thing~ enum (~Scanned(Kind)~ | ~Defun~) with ~parse~/~name~/~ALL~,
+and one entry ~thing(sess, kind, Where::{At, After, Before}, up)~ that takes
+the defun/scanner fork and the widen rule once; ~resolve_thing~ maps
+~ThingAt~ onto ~Where~ instead of choosing among three functions.
+
+** TODO [#C] Sexp scanner: move thing_after/thing_before onto Scanner beside bounds_of
+:LOGBOOK:
+- State "TODO"       from              [2026-09-06 So 07:29]
+:END:
+
+Past the ~defun~ branch the two lookups in ~builtins.rs~ touch nothing
+session-shaped: store, lang, ~Scanner~, the motion skip walkers. That is
+the ~last_on_line~ walk, the closer-stepping loop, the opener-recovery loop
+in ~thing_before~ and the region-edge guards, a module away from
+~bounds_of~, which answers the same question for ~at~. Do it after the
+~Thing~ type item above, or it only relocates the triplication. Also: the
+~sexp~/~list~/~string~ after-anchor now lexes from the region start once per
+call (~out_of_string_or_comment~), linear and memoised but new on the
+common path; a walk-scoped reader cursor (see the motion-walkers item)
+would let the forward walk reuse it.
+
+** TODO [#C] Sexp scanner review leftovers
+:LOGBOOK:
+- State "TODO"       from              [2026-09-06 So 07:29]
+:END:
+
+Small items from the ~sexp-things~ reviews, none blocking:
+- ~thing_before {kind: string}~ cannot see a string nested inside a group it
+  steps over (top-level backward walk); a ~list~ probe on an Elisp prefix
+  char includes the prefix, on the bracket it does not — decide and pin.
+- The memo timing test's 2 s budget does not pin memo reuse; a lex counter
+  or a ~memo.upto~ assertion would. ~with_prefixes~ could start at the
+  opener index ~group_back~ already knows.
+- ~Scanner::next_token~ builds a fresh ~Reader~ per token, so the anchor
+  walks in ~thing_after~ reset the window doubling per step.
+- ~closer_of~'s ~_ => '}'~ wildcard; ~group_from~ returns
+  ~Result<Option<_>>~ but never ~Ok(None)~; ~Kind::name~ is pub with only a
+  test caller; ~list_forward~'s ~cross_closers~ flag and ~thing_after~'s
+  closer-skipping loop are one concept twice.
+- The version guard in ~run_or_rehearse~ still lets a write land between
+  the stamp and the run's own revert (microseconds); closing it fully means
+  reverting once per tool call, not per program.
+- Documented misreads worth a real fix some day: a ~'"'~ char literal opens
+  a phantom string; Rust ~r"…"~ raw strings still escape; nested block
+  comments close early; TOML ~"""~.
+
+** TODO [#C] File-I/O tests leak temp dirs on failure paths
+:LOGBOOK:
+- State "TODO"       from              [2026-09-06 So 07:29]
+:END:
+
+During the ~sexp-things~ gate the shared /tmp tmpfs ran out of inodes:
+about 19k stale ~mime-*~ leftovers from failing file-backed tests. Tests
+that create a temp dir or file remove it only on the success path; a Drop
+guard (as ~a_thing_edit_refuses_a_buffer_that_changed_under_the_resolve~
+now uses) or ~tempfile~ would clean up on panic too.
+
 * MCP / agent UX
 
 The agent-facing tool surface. Recurring lens: conveniences that
@@ -970,6 +1150,33 @@ identical, not where they differ. The agent fell back to shell
 with per-file patches on request (capped like other outputs). Would also
 pair well with the "tree differs in: <files>" line ~git_rebase~ already
 prints.
+
+** TODO [#C] validate_nested: enforce schema type and enum, drop the hand-rolled checks :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-06 So 07:29]
+:END:
+
+~validate_args~/~validate_nested~ check key names only. The ~sexp-things~
+branch therefore hand-writes a typed ~where~ match in ~insert_text~ and a
+~kind~ enum check in ~thing_spec~, while ~anchor.where~ still falls through
+~as_str()~ to "after" on a number. Teaching the validator to enforce ~type~
+and ~enum~ where the schema declares them protects every existing enum
+(~mode~, ~anchor.where~, ~scope~, ~thing.kind~, ~thing.at~, ~thing.up~) for
+free and deletes the bespoke checks. Run the whole suite: any test passing
+a loosely typed value will surface.
+
+** TODO [#C] thing selector: nest where inside the thing object         :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-06 So 07:29]
+:END:
+
+~insert_text~ has ~where~ at two nesting levels: inside ~anchor~ and, for
+~thing~, at the top level. The split costs a parse before it is known
+whether it applies, a guard that rejects a stray top-level ~where~ without a
+~thing~, and prose in two schema descriptions. Putting it inside the
+~thing~ object (~thing: {kind, after, where}~) mirrors ~anchor~, lets
+~thing_spec~ validate it, and drops the guard and the eager parse.
+Changes the tool schema.
 
 * Structural editing
 
