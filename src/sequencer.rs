@@ -4315,6 +4315,55 @@ fn reword(
     ))
 }
 
+/// The oid `c` gets when re-created unsigned with `msg` and its own tree,
+/// parents, author and committer — what msg_rewrite writes for a commit
+/// whose parents did not move.
+fn recreated_oid(repo: &Repository, c: &git2::Commit, msg: &str) -> Result<Oid, Error> {
+    let parents: Vec<git2::Commit> = c.parents().collect();
+    let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+    let buf =
+        repo.commit_create_buffer(&c.author(), &c.committer(), msg, &c.tree()?, &parent_refs)?;
+    Oid::hash_object(git2::ObjectType::Commit, &buf)
+}
+
+/// Branches and tags other than `branch` that msg_rewrite leaves on the old
+/// history: those at `first_changed` (the oldest commit whose oid changes)
+/// or at a descendant of it. Empty when nothing is left behind.
+fn stranded_refs(
+    repo: &Repository,
+    branch: &str,
+    first_changed: Option<Oid>,
+) -> Result<String, Error> {
+    let Some(first) = first_changed else {
+        return Ok(String::new());
+    };
+    let mut out = String::new();
+    for r in repo.references()? {
+        let r = r?;
+        let Some(name) = r.name().filter(|n| {
+            *n != branch && (n.starts_with("refs/heads/") || n.starts_with("refs/tags/"))
+        }) else {
+            continue;
+        };
+        if let Ok(c) = r.peel_to_commit()
+            && (c.id() == first || repo.graph_descendant_of(c.id(), first).unwrap_or(false))
+        {
+            out.push_str(&format!(
+                "  {name} → old {}
+",
+                short(c.id())
+            ));
+        }
+    }
+    if !out.is_empty() {
+        out = format!(
+            "left behind on the old history (only {branch} is moved):
+{out}"
+        );
+    }
+    Ok(out)
+}
+
 fn msg_rewrite(
     repo: &Repository,
     range: &str,
@@ -4350,6 +4399,13 @@ fn msg_rewrite(
     // range-wide miss aborts before anything is created.
     let mut new_msgs: Vec<(Oid, String, Vec<usize>)> = Vec::new();
     let mut totals = vec![0usize; edits.len()];
+    // The oldest commit whose oid will change: the first that re-creates to
+    // a different object (a rewritten message, or a header libgit2 does not
+    // reproduce) — or the first of the range when commits are signed, since
+    // a fresh signature changes the oid by itself. Everything after it is
+    // re-parented, so it changes too.
+    let mut first_changed: Option<Oid> = None;
+    let resigned = signing_required(repo)?;
     for oid in &commits {
         let c = repo.find_commit(*oid)?;
         if c.parent_count() > 1 {
@@ -4360,6 +4416,9 @@ fn msg_rewrite(
             )));
         }
         let (msg, counts) = apply_msg_edits_counted(c.message().unwrap_or(""), edits);
+        if first_changed.is_none() && (resigned || recreated_oid(repo, &c, &msg)? != *oid) {
+            first_changed = Some(*oid);
+        }
         for (t, n) in totals.iter_mut().zip(&counts) {
             *t += n;
         }
@@ -4373,6 +4432,8 @@ fn msg_rewrite(
             )));
         }
     }
+
+    let stranded = stranded_refs(repo, &branch, first_changed)?;
 
     let counts_line = |counts: &[usize]| {
         counts
@@ -4394,6 +4455,7 @@ fn msg_rewrite(
                 counts_line(counts)
             ));
         }
+        out.push_str(&stranded);
         out.push_str(&signing_rehearsal_note(repo));
         return Ok(out);
     }
@@ -4438,6 +4500,7 @@ fn msg_rewrite(
     }
     repo.reference(&branch, tip, true, "mime msg_rewrite")?;
 
+    out.push_str(&stranded);
     Ok(format!(
         "rewrote the messages of {} commit(s) in {range}; every tree is \
          byte-identical{}\n{out}",
@@ -6915,6 +6978,95 @@ mod tests {
         // Below the merge, an A..B range still works.
         let out = cmd_msg_rewrite(&dir, "HEAD~1..HEAD", &specs, false).unwrap();
         assert!(out.contains("1 commit(s)"), "{out}");
+    }
+
+    #[test]
+    fn msg_rewrite_reports_refs_left_behind_on_the_old_history() {
+        let dir = tmp("strand-warn");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base\n");
+        let c1 = commit(&repo, &[base], &[("a", "2\n")], "mid old_name\n");
+        let c2 = commit(&repo, &[c1], &[("a", "3\n")], "tip old_name\n");
+        on_branch(&repo, "main", c2);
+        repo.reference("refs/tags/v0", base, true, "t").unwrap();
+        repo.reference("refs/tags/v1", c1, true, "t").unwrap();
+        repo.reference("refs/heads/dev", c1, true, "t").unwrap();
+        // A branch AHEAD of HEAD: its tip is not rewritten, but its ancestry
+        // below it is — it is stranded all the same.
+        let f1 = commit(&repo, &[c2], &[("a", "4\n")], "feature extra");
+        repo.reference("refs/heads/feature", f1, true, "t").unwrap();
+        // A branch forked below the rewritten commits is not touched.
+        let s1 = commit(&repo, &[base], &[("b", "1\n")], "side");
+        repo.reference("refs/heads/side", s1, true, "t").unwrap();
+        let specs = vec![MsgEditSpec {
+            find: Some("old_name".into()),
+            replace: Some("new_name".into()),
+            append: None,
+        }];
+
+        // The rehearsal names the refs before anything moves.
+        let out = cmd_msg_rewrite(&dir, "HEAD", &specs, true).unwrap();
+        assert!(out.contains("left behind"), "{out}");
+        assert!(out.contains("refs/heads/dev"), "{out}");
+        assert_eq!(repo.head().unwrap().target(), Some(c2));
+
+        let out = cmd_msg_rewrite(&dir, "HEAD", &specs, false).unwrap();
+        for stranded in ["refs/tags/v1", "refs/heads/dev", "refs/heads/feature"] {
+            assert!(out.contains(stranded), "{stranded} missing: {out}");
+        }
+        // The untouched root kept its oid, so a tag on it or a branch forked
+        // from it is not stranded.
+        assert!(!out.contains("refs/tags/v0"), "{out}");
+        assert!(!out.contains("refs/heads/side"), "{out}");
+    }
+
+    #[test]
+    fn msg_rewrite_counts_a_dropped_header_as_a_changed_commit() {
+        let dir = tmp("strand-header");
+        let repo = Repository::init(&dir).unwrap();
+        // A signed root in a repository that no longer signs: re-creating it
+        // drops the gpgsig header, so its oid changes although its message
+        // does not, and a tag on it is left behind.
+        let sig = Signature::now("test", "test@example.invalid").unwrap();
+        let tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let buf = repo
+            .commit_create_buffer(&sig, &sig, "base\n", &tree, &[])
+            .unwrap();
+        let base = repo
+            .commit_signed(std::str::from_utf8(&buf).unwrap(), "fake signature", None)
+            .unwrap();
+        let tip = commit(&repo, &[base], &[("a", "1\n")], "tip old_name\n");
+        on_branch(&repo, "main", tip);
+        repo.reference("refs/tags/v0", base, true, "t").unwrap();
+        let specs = vec![MsgEditSpec {
+            find: Some("old_name".into()),
+            replace: Some("new_name".into()),
+            append: None,
+        }];
+        let out = cmd_msg_rewrite(&dir, "HEAD", &specs, false).unwrap();
+        assert!(out.contains("refs/tags/v0"), "{out}");
+    }
+
+    #[test]
+    fn msg_rewrite_range_reports_only_refs_inside_or_ahead_of_it() {
+        let dir = tmp("strand-range");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base old_name\n");
+        let c1 = commit(&repo, &[base], &[("a", "2\n")], "mid\n");
+        let c2 = commit(&repo, &[c1], &[("a", "3\n")], "tip old_name\n");
+        on_branch(&repo, "main", c2);
+        repo.reference("refs/tags/below", c1, true, "t").unwrap();
+        repo.reference("refs/tags/inside", c2, true, "t").unwrap();
+        let specs = vec![MsgEditSpec {
+            find: Some("old_name".into()),
+            replace: Some("new_name".into()),
+            append: None,
+        }];
+        let out = cmd_msg_rewrite(&dir, "HEAD~1..HEAD", &specs, false).unwrap();
+        assert!(out.contains("refs/tags/inside"), "{out}");
+        assert!(!out.contains("refs/tags/below"), "{out}");
     }
 
     #[test]

@@ -242,7 +242,8 @@ into git_fixup, or let git_absorb fold them all).
     to EVERY commit of the range (must end at HEAD, linear history only; a
     bare HEAD covers the whole history, root included): the bulk trailer
     strip/add or symbol sweep. Only messages change — every tree stays
-    byte-identical; the report carries per-commit replacement counts.
+    byte-identical; the report carries per-commit replacement counts and
+    names other branches/tags left on the old history.
   git_exec_over {range, command}  run a shell command at every commit of
     the range, oldest-first (the pr-prep "does every commit build?" gate);
     a bare HEAD covers the whole history from the root. Stops on the

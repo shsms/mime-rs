@@ -3941,7 +3941,7 @@ fn git_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "git_msg_rewrite",
-            "description": "Apply one message_edits vocabulary to EVERY commit of `range` (which must end at HEAD) — the bulk trailer strip/add, or the s/old-symbol/new/ sweep after a rename. A sparse rewrite touching only messages: each commit is re-created with its OWN tree (byte-identical by construction, nothing can conflict) and re-parented; an untouched prefix keeps its identical oids. The report carries per-commit replacement counts, so zero application in one commit is visible; a `find` matching NOWHERE in the range is an error and nothing changes. rehearse:true previews the counts. For one commit's message use git_reword.",
+            "description": "Apply one message_edits vocabulary to EVERY commit of `range` (which must end at HEAD) — the bulk trailer strip/add, or the s/old-symbol/new/ sweep after a rename. A sparse rewrite touching only messages: each commit is re-created with its OWN tree (byte-identical by construction, nothing can conflict) and re-parented; an untouched prefix keeps its identical oids. Other branches/tags left on the old history — at a rewritten commit or ahead of one — are named in the report, in a rehearsal too. The report carries per-commit replacement counts, so zero application in one commit is visible; a `find` matching NOWHERE in the range is an error and nothing changes. rehearse:true previews the counts. For one commit's message use git_reword.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
