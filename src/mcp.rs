@@ -3772,7 +3772,7 @@ fn git_tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "repo": repo,
-                    "range": { "type": "string", "description": "A revision range like main..HEAD; omit for HEAD's history." },
+                    "range": { "type": "string", "description": "A revision range like main..HEAD, or a bare rev like a branch name for its whole history; omit for HEAD's history." },
                     "stat": { "type": "boolean", "description": "Follow each commit with its changed files (mark, path, +/- line counts, vs first parent) and a totals line. Default false." }
                 },
                 "required": ["repo"],
@@ -3946,7 +3946,7 @@ fn git_tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "repo": repo,
-                    "range": { "type": "string", "description": "Revision range whose commit messages to rewrite, e.g. main..HEAD; must end at HEAD." },
+                    "range": { "type": "string", "description": "Revision range whose commit messages to rewrite, e.g. main..HEAD, or a bare rev like HEAD to cover every commit from the root; must end at HEAD, and the history it covers must be linear (a merge is refused)." },
                     "message_edits": {
                         "type": "array",
                         "description": "Edits applied in order to EVERY message: {find, replace?} replaces every occurrence (omit replace — or say delete: true — to delete); {append} adds a trailing line.",
@@ -3972,7 +3972,7 @@ fn git_tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "repo": repo,
-                    "range": { "type": "string", "description": "Revision range whose commits to visit, e.g. main..HEAD." },
+                    "range": { "type": "string", "description": "Revision range whose commits to visit, e.g. main..HEAD, or a bare HEAD for the whole history from the root (a bare rev must resolve to HEAD)." },
                     "command": { "type": "string", "description": "Shell command to run at each commit (via sh -c), e.g. \"cargo check -q\"." }
                 },
                 "required": ["repo", "range", "command"],

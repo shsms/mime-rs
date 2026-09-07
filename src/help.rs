@@ -189,9 +189,9 @@ In-process rebase/cherry-pick/revert: no network or hooks. With
 commit.gpgsign=true, MIME_EXEC=1 permits the configured OpenPGP signer;
 without it write operations refuse rather than create unsigned commits. The
 worktree is the warm buffer set. Plan with git_log (oid + summary over a
-range like main..HEAD; stat:true adds each commit's files + line counts —
-review a series without a git_show per commit) and git_show (a commit's
-diff + metadata). git_blame
+range like main..HEAD, or a bare rev for its whole history; stat:true
+adds each commit's files + line counts — review a series without a
+git_show per commit) and git_show (a commit's diff + metadata). git_blame
 {path?, lines?, since?, worktree?} reports which commit last touched each line —
 the find-the-commit half for a fixup/edit plan; `since` scopes to your commits,
 `worktree` maps each UNCOMMITTED hunk to the commit that owns it (omit path to
@@ -239,12 +239,14 @@ into git_fixup, or let git_absorb fold them all).
     (wholesale or via edits) as a sparse rewrite — trees byte-identical, no
     plan to transcribe. The everyday review-comment follow-up.
   git_msg_rewrite {range, message_edits}  apply one message_edits vocabulary
-    to EVERY commit of the range (must end at HEAD): the bulk trailer
+    to EVERY commit of the range (must end at HEAD, linear history only; a
+    bare HEAD covers the whole history, root included): the bulk trailer
     strip/add or symbol sweep. Only messages change — every tree stays
     byte-identical; the report carries per-commit replacement counts.
-  git_exec_over {range, command}  run a shell command at every commit of the
-    range, oldest-first (the pr-prep "does every commit build?" gate); stops
-    on the first failure naming the commit, HEAD restored either way.
+  git_exec_over {range, command}  run a shell command at every commit of
+    the range, oldest-first (the pr-prep "does every commit build?" gate);
+    a bare HEAD covers the whole history from the root. Stops on the
+    first failure naming the commit, HEAD restored either way.
     Disabled unless the server was launched with MIME_EXEC=1.
   git_range_diff {old, new}  compare a branch before/after a rewrite, commit
     by commit ('=' unchanged, '!' drifted, '-' dropped, '+' added) — pair

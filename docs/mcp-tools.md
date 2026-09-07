@@ -308,7 +308,7 @@ Porcelain status: branch, upstream and ahead/behind counts, every dirty path wit
 
 One line per commit (oid + summary), for `range` (e.g. main..HEAD) or from HEAD; capped at 50. Use to build a rebase plan. stat: true adds each commit's changed files with +/- line counts — the review-a-series view (git log --stat) without a git_show per commit.
 
-- `range` — A revision range like main..HEAD; omit for HEAD's history.
+- `range` — A revision range like main..HEAD, or a bare rev like a branch name for its whole history; omit for HEAD's history.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 - `stat` — Follow each commit with its changed files (mark, path, +/- line counts, vs first parent) and a totals line. Default false.
 
@@ -392,7 +392,7 @@ Change ONE commit's message — `message` replaces it wholesale, `message_edits`
 Apply one message_edits vocabulary to EVERY commit of `range` (which must end at HEAD) — the bulk trailer strip/add, or the s/old-symbol/new/ sweep after a rename. A sparse rewrite touching only messages: each commit is re-created with its OWN tree (byte-identical by construction, nothing can conflict) and re-parented; an untouched prefix keeps its identical oids. The report carries per-commit replacement counts, so zero application in one commit is visible; a `find` matching NOWHERE in the range is an error and nothing changes. rehearse:true previews the counts. For one commit's message use git_reword.
 
 - `message_edits` (required) — Edits applied in order to EVERY message: {find, replace?} replaces every occurrence (omit replace — or say delete: true — to delete); {append} adds a trailing line.
-- `range` (required) — Revision range whose commit messages to rewrite, e.g. main..HEAD; must end at HEAD.
+- `range` (required) — Revision range whose commit messages to rewrite, e.g. main..HEAD, or a bare rev like HEAD to cover every commit from the root; must end at HEAD, and the history it covers must be linear (a merge is refused).
 - `rehearse` — Preview the per-commit replacement counts without applying.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 
@@ -401,6 +401,6 @@ Apply one message_edits vocabulary to EVERY commit of `range` (which must end at
 Run a shell command at EVERY commit of `range`, oldest-first — the pr-prep gate loop (git rebase -x's standalone sibling): each commit is checked out in place (detached), the command runs in the worktree, and the walk stops on the first failure naming the commit and the output tail. HEAD is restored afterwards either way. Refuses on a dirty worktree. DISABLED unless whoever launches the server sets MIME_EXEC=1 (the same launcher gate used for configured commit signing).
 
 - `command` (required) — Shell command to run at each commit (via sh -c), e.g. "cargo check -q".
-- `range` (required) — Revision range whose commits to visit, e.g. main..HEAD.
+- `range` (required) — Revision range whose commits to visit, e.g. main..HEAD, or a bare HEAD for the whole history from the root (a bare rev must resolve to HEAD).
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 
