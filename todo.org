@@ -1181,6 +1181,69 @@ whether it applies, a guard that rejects a stray top-level ~where~ without a
 ~thing_spec~ validate it, and drops the guard and the eager parse.
 Changes the tool schema.
 
+** TODO [#C] git_exec_over: the bare-rev guard is a string-shape special case :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-07 Mo 11:27]
+:END:
+
+~exec_over~ rejects a bare ~HEAD~5~ (must resolve to HEAD) by testing the
+argument for ~..~, while ~main..HEAD~5~ visits a subset of the same commits
+and is accepted; ~log~ gives a bare rev its full rev-list meaning. Three
+tools share ~push_range_or_rev~ and disagree about what a bare rev means.
+Options: uniform semantics everywhere, a commit-count confirmation instead
+of a shape rule, or a post-walk end-at-HEAD check like ~msg_rewrite~'s. A
+~repo.revparse~ / ~RevparseMode~ dispatch would also drop the ~contains("..")~
+sniff and the separate ~A...B~ check.
+
+** TODO [#C] git_exec_over: a whole-history run has no cap              :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-07 Mo 11:27]
+:END:
+
+A bare ~HEAD~ expands to every commit with no bound anywhere: the untracked
+pre-scan does a ~tree.get_path~ per commit × per untracked path (with
+~recurse_untracked_dirs~), then one forced checkout plus ~sh -c~ per commit,
+and the report grows one line per commit with no truncation (~log~ caps at
+50 and says "pass a tighter range", which a bare rev cannot). Refuse above a
+threshold naming the count, walk each tree once against a set of untracked
+paths, and truncate the report the way ~log~ does. ~msg_rewrite~'s report is
+uncapped too.
+
+** TODO [#C] Refs left behind: report from reword and the rebase paths too :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-07 Mo 11:27]
+:END:
+
+~stranded_refs~ (branches/tags at the first re-created commit or ahead of
+it) only runs from ~msg_rewrite~, but the condition holds for ~reword~ and
+every sequencer op that moves one branch (rebase, move, split, absorb,
+fixup). Make it a sibling of ~backup_note~ and call it from the paths that
+move a single branch.
+
+** TODO [#C] git_msg_rewrite wipes a non-UTF-8 commit message           :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-07 Mo 11:27]
+:END:
+
+~Commit::message()~ is ~None~ for a non-UTF-8 message, so
+~apply_msg_edits_counted("")~ writes an empty (or append-only) message and
+the original is lost with no warning. The range-wide "matches nowhere"
+guard does not catch it when other commits match. Refuse the range when
+~message()~ is ~None~ (or ~message_encoding()~ is set), the way merges are
+refused.
+
+** TODO [#C] msg_rewrite docs: an untouched prefix does not always keep its oids :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-07 Mo 11:27]
+:END:
+
+The ~git_msg_rewrite~ schema and the second-pass comment say an untouched
+prefix reproduces identical oids. With ~commit.gpgsign=true~ every commit is
+re-signed, and a commit carrying a header libgit2 does not reproduce
+(~gpgsig~, ~encoding~, ~mergetag~) re-creates to a new oid even with the
+same message. ~recreated_oid~ already knows; say so in the description and
+the comment.
+
 * Structural editing
 
 ** TODO Incremental re-parse (~InputEdit~s) [#C]
