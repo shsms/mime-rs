@@ -142,6 +142,27 @@ client onboards its model straight from the protocol — no per-client setup fil
 make claude   # cargo install + register `mime --mcp` (MIME_ROOTS) with Claude Code
 ```
 
+### Protocol
+
+mime is a *dual-era* MCP server. It speaks the stateless `2026-07-28`
+revision (every request carries its protocol version and client capabilities
+in `_meta`; `server/discover` advertises the server; no handshake) and the
+`initialize`-based legacy revisions `2025-11-25`, `2025-06-18`, `2025-03-26`
+and `2024-11-05`. Both work on stdio and on Streamable HTTP, and a dual-era
+client may probe with `server/discover` and then fall back to `initialize`
+on the same process.
+
+Warm state lives in **workspaces**: bounded sets of named sessions behind an
+unguessable handle. On stdio there is one implicit workspace and you never
+see the handle. On HTTP a legacy client's `Mcp-Session-Id` *is* its
+workspace; a `2026-07-28` client gets a fresh workspace on any stateful call
+that omits `workspace`, reads the handle back from the result
+(`structuredContent.workspace` and a trailing `workspace:` line), and passes
+it to later calls. `open_workspace` / `close_workspace` manage them explicitly.
+
+`session_status`, `run_program`, `rehearse`, `grep` and `outline` also return
+`structuredContent` (with an `outputSchema`) beside their text.
+
 Each tool takes a `path` and auto-opens the file into a warm session keyed by its
 canonical path; mutating tools take `save: true` for an atomic, stale-guarded
 write-back. The catalogue is generated from the live schemas into

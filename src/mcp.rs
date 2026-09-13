@@ -4265,7 +4265,9 @@ pub(crate) fn instructions() -> String {
          file changes on disk auto-reverts on next use; one with unsaved edits is left alone \
          and flagged stale instead. Positions: \
          @N and point are ABSOLUTE (goto-char); line numbers are narrowing-relative \
-         (goto-line).\n\nTools:\n",
+         (goto-line). On the stateless HTTP protocol, a stateful result reports a \
+         `workspace` handle; pass it back on every later call (stdio: ignore \
+         workspaces).\n\nTools:\n",
     );
     let cat = catalogue();
     for category in Category::ORDER {

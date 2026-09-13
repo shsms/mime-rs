@@ -364,15 +364,10 @@ the read-only set; gate the destructive set).
 
 *** Protocol conformance hardening
 
-- protocolVersion: mcp.rs:165-172 ECHOES the client's version. Clamp to a set
-  mime actually implements; echo if supported, else return mime's latest. Echoing
-  an unknown version falsely claims support.
-- Audit JSON-RPC error objects for protocol-level errors (bad method/params) vs
-  the tool-level ~isError~ content (which is correct as-is).
-- Decide ~tools/list~ pagination (~29 tools — likely fine with no cursor; say so).
-- Add a CONFORMANCE TEST: drive initialize → initialized → ping → tools/list →
-  tools/call → error cases per spec; run the official MCP Inspector against the
-  stdio server. Turns "tested with Claude Code" into "tested against the spec".
+- DONE [2026-09-13]: versions clamped to the implemented set; initialize echoes only legacy versions and answers 2025-11-25 otherwise.
+- DONE [2026-09-13]: protocol-level errors are JSON-RPC errors (-32601/-32602/-32020/-32022 with data); tool failures stay isError.
+- tools/list has no cursor: ~31 tools, static, ttlMs 24h + cacheScope public so clients cache it.
+- Conformance: legacy wire format frozen in tests/fixtures/legacy; modern + interleaved conversations in tests/mcp.rs; ~make inspector~ runs the MCP Inspector. Still manual: a pass against a live 2026-07-28 client once one ships.
 
 *** Transport, distribution, onboarding
 
@@ -446,16 +441,24 @@ allocation for a long-lived session with many checkpoints — return a borrow /
 iterator, or skip when empty.
 
 ** TODO Structured tool output (structuredContent + outputSchema) [#C] :mcp:
-From the 2026-06-24 surface usability analysis. Every tool returns prose/text
-(only ~run_program~ returns JSON-as-text). MCP 2025-06-18 supports
-~structuredContent~ + per-tool ~outputSchema~; populating them for the
-machine-shaped read tools (~occur~, ~grep~, ~outline~, ~session_status~,
-~git_log~, ~git_status~) would let programmatic/hybrid clients consume results
-without parsing prose. Deliberately deferred: (1) LLM agents — the only client
-today — read prose fine, so there is no consumer yet; (2) ~outputSchema~ adds to
-the always-loaded schema surface, in tension with keeping it lean. Revisit when
-a non-LLM client appears. Note ~structuredContent~ is additive (text stays), so
-it can land incrementally per tool.
+DONE for session_status, run_program/rehearse, grep, outline (2026-09).
+Remaining: occur (text comes from the Lisp occur builtin), git_log and
+git_status (formatted inside sequencer) — each needs its producer to emit
+data before text.
+
+** TODO MCP 2026-07-28 follow-ups [#C] :mcp:
+Deferred from the 2026-09-13 dual-era design (the mcp-dual-era branch: legacy
+initialize era plus stateless 2026-07-28, workspace handles, structured output):
+- SSE response streams with notifications/progress and per-request logLevel
+  (would stream (message ...) output during run_program; needs text/event-stream
+  responses in http.rs).
+- Multi round-trip elicitation (resultType input_required): confirm destructive
+  git ops, pick among expect_unique candidates.
+- Tasks extension (io.modelcontextprotocol/tasks) for long replace_in_files /
+  git_exec_over runs.
+- Icons on tools.
+- From 2027-07 (end of the spec's 12-month deprecation window): reconsider
+  dropping the legacy era (initialize, Mcp-Session-Id, ping).
 
 ** TODO MCP surface redesign — possibilities (intent-shaped, depth-discoverable) :mcp:
 Possibilities from a 2026-06-24 from-scratch design discussion — captured for

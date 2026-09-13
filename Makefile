@@ -7,7 +7,7 @@ CARGO_BIN ?= $(HOME)/.cargo/bin
 # each Claude Code session to its own working directory.
 MIME_ROOTS ?= $(abspath ..)
 
-.PHONY: build test install claude claude-mcp uninstall-mcp docs
+.PHONY: build test install claude claude-mcp uninstall-mcp docs inspector
 
 build:
 	cargo build --release
@@ -42,3 +42,8 @@ claude-mcp:
 
 uninstall-mcp:
 	claude mcp remove --scope user mime
+
+# Conformance: drive the stdio server with the official MCP Inspector
+# (interactive; needs node). Use `--cli` for a scripted tools/list.
+inspector: build
+	npx @modelcontextprotocol/inspector target/release/mime --mcp

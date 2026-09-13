@@ -282,6 +282,13 @@ lists them with narrowed/stale/unsaved flags and each session's checkpoint
 labels, plus the writable roots. close_session drops one (force: true
 discards unsaved edits).
 
+Workspaces: a workspace is one isolated set of sessions behind an
+unguessable handle. On stdio there is exactly one and you normally omit it.
+On the stateless HTTP protocol (2026-07-28) every stateful result reports
+`workspace: <handle>`; pass it as `workspace` on later calls or each call
+starts a fresh, empty workspace. open_workspace mints one explicitly;
+close_workspace drops one with all its sessions (unsaved edits included).
+
 Saving: edits live in the warm buffer until saved. Pass save:true on an
 edit tool, or call save_buffer ({path} = save the visited file; to:"…" on a
 DIFFERENT file = save-as a COPY — it does not rebind the session, so a later
