@@ -1302,7 +1302,18 @@
           "properties": {},
           "type": "object"
         },
-        "name": "open_workspace"
+        "name": "open_workspace",
+        "outputSchema": {
+          "properties": {
+            "workspace": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace"
+          ],
+          "type": "object"
+        }
       },
       {
         "annotations": {

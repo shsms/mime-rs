@@ -114,7 +114,12 @@ struct Peek {
     method: String,
     /// `params.name` (tools/call).
     name: Option<String>,
-    /// `_meta` protocol version: present means a modern request.
+    /// Whether `_meta` carries the protocol-version KEY — the era test, the
+    /// same one [`crate::rpc::era_of`] applies. A non-string value is still
+    /// modern, so a malformed request gets the protocol layer's `-32602`
+    /// rather than a legacy "unknown session" 404.
+    meta_present: bool,
+    /// That key's value when it is a string, for the header comparison.
     meta_version: Option<String>,
 }
 
@@ -128,6 +133,9 @@ fn peek(body: &str) -> Option<Peek> {
             .unwrap_or("")
             .to_string(),
         name: v["params"]["name"].as_str().map(str::to_string),
+        meta_present: v["params"]["_meta"]
+            .get(crate::rpc::META_PROTOCOL_VERSION)
+            .is_some(),
         meta_version: v["params"]["_meta"][crate::rpc::META_PROTOCOL_VERSION]
             .as_str()
             .map(str::to_string),
@@ -173,9 +181,10 @@ fn route(req: &HttpRequest, store: &mut WorkspaceStore) -> HttpReply {
         };
     };
 
-    match pk.meta_version.as_deref() {
-        Some(version) => route_modern(req, &pk, version, store),
-        None => route_legacy(req, &pk, store),
+    if pk.meta_present {
+        route_modern(req, &pk, store)
+    } else {
+        route_legacy(req, &pk, store)
     }
 }
 
@@ -216,24 +225,23 @@ fn route_legacy(req: &HttpRequest, pk: &Peek, store: &mut WorkspaceStore) -> Htt
 
 /// Modern era (2026-07-28): stateless. The standard request headers must
 /// agree with the body; `Mcp-Session-Id` / `Last-Event-ID` are ignored.
-fn route_modern(
-    req: &HttpRequest,
-    pk: &Peek,
-    version: &str,
-    store: &mut WorkspaceStore,
-) -> HttpReply {
-    let mut checks: Vec<(&str, Option<String>, String)> = vec![
-        (
+fn route_modern(req: &HttpRequest, pk: &Peek, store: &mut WorkspaceStore) -> HttpReply {
+    let mut checks: Vec<(&str, Option<String>, String)> = Vec::new();
+    // Nothing to compare the header against when the body's version is not a
+    // string: skip this one check and let `handle_line` report the malformed
+    // `_meta` as -32602 (mapped to 400 below), which is the accurate error.
+    if let Some(version) = pk.meta_version.as_deref() {
+        checks.push((
             "MCP-Protocol-Version",
             req.header("mcp-protocol-version").map(str::to_string),
             version.to_string(),
-        ),
-        (
-            "Mcp-Method",
-            req.header("mcp-method").map(str::to_string),
-            pk.method.clone(),
-        ),
-    ];
+        ));
+    }
+    checks.push((
+        "Mcp-Method",
+        req.header("mcp-method").map(str::to_string),
+        pk.method.clone(),
+    ));
     if pk.method == "tools/call" {
         checks.push((
             "Mcp-Name",
@@ -717,5 +725,19 @@ mod tests {
         );
         assert_eq!(r.status, 200);
         assert_eq!(json(&r)["result"]["isError"], true);
+    }
+
+    #[test]
+    fn a_non_string_meta_version_is_a_modern_400_not_a_legacy_404() {
+        // The era is decided by the KEY, so a malformed version is a modern
+        // request with bad `_meta` — not a legacy one missing its session id.
+        let mut store = WorkspaceStore::new();
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":7,"io.modelcontextprotocol/clientCapabilities":{}}}}"#;
+        let r = route(
+            &req(HttpMethod::Post, &[("Mcp-Method", "ping")], body),
+            &mut store,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert_eq!(json(&r)["error"]["code"], -32602);
     }
 }

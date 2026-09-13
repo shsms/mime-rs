@@ -4715,6 +4715,11 @@ fn build_tool_schemas() -> Vec<Value> {
             "name": "open_workspace",
             "description": "Mint a fresh, empty workspace (an isolated set of warm sessions) and return its handle. Pass the handle as `workspace` to scope later calls. Needed only on the stateless HTTP protocol when isolating several agents on one server; stdio has one implicit workspace.",
             "inputSchema": { "type": "object", "properties": {} },
+            "outputSchema": {
+                "type": "object",
+                "properties": { "workspace": { "type": "string" } },
+                "required": ["workspace"]
+            },
         }),
         json!({
             "name": "close_workspace",
