@@ -8,11 +8,103 @@ use std::io::Read;
 use crate::Workspace;
 use serde_json::{Value, json};
 
-/// MCP protocol versions mime implements (latest first — the tools surface is
-/// stable across them). `initialize` echoes the client's if it's one of these,
-/// else returns the latest, per the spec.
-const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
-pub(crate) const PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
+/// Every protocol version mime implements, newest first. `2026-07-28` is the
+/// stateless "modern" era (per-request `_meta`, no handshake); the rest are
+/// the `initialize`-based legacy era. A dual-era server in the spec's sense.
+pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 5] = [
+    "2026-07-28",
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+];
+pub const PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
+/// The stateless era: selected per request by `_meta`, never by `initialize`.
+const MODERN_VERSION: &str = "2026-07-28";
+/// What `initialize` answers when it cannot echo the client's version.
+const LATEST_LEGACY_VERSION: &str = "2025-11-25";
+
+/// The reserved `_meta` keys of the modern era.
+pub const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+pub const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+pub const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+
+/// Freshness hint on `tools/list` and `server/discover`: the catalogue is
+/// static for the life of the process, so a long TTL lets clients keep the
+/// list in their prompt cache.
+pub const LIST_TTL_MS: u64 = 86_400_000;
+
+/// Which of the two protocol eras a request speaks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Era {
+    Legacy,
+    Modern,
+}
+
+/// A request is modern iff its `_meta` carries the protocol-version key.
+/// Malformed values still select modern — they then fail validation with a
+/// precise error instead of being silently served as legacy.
+pub fn era_of(params: &Value) -> Era {
+    match params
+        .get("_meta")
+        .and_then(|m| m.get(META_PROTOCOL_VERSION))
+    {
+        Some(_) => Era::Modern,
+        None => Era::Legacy,
+    }
+}
+
+/// Validate a modern request's `_meta`: `(code, message, data)` on failure.
+fn validate_modern_meta(params: &Value) -> Result<(), (i64, String, Value)> {
+    let meta = &params["_meta"];
+    let Some(version) = meta.get(META_PROTOCOL_VERSION).and_then(Value::as_str) else {
+        return Err((
+            -32602,
+            format!("_meta.{META_PROTOCOL_VERSION} must be a string"),
+            Value::Null,
+        ));
+    };
+    if !meta
+        .get(META_CLIENT_CAPABILITIES)
+        .is_some_and(Value::is_object)
+    {
+        return Err((
+            -32602,
+            format!("_meta.{META_CLIENT_CAPABILITIES} must be an object"),
+            Value::Null,
+        ));
+    }
+    if !SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
+        return Err((
+            -32022,
+            "unsupported protocol version".to_string(),
+            json!({ "supported": SUPPORTED_PROTOCOL_VERSIONS, "requested": version }),
+        ));
+    }
+    Ok(())
+}
+
+/// Who the client is talking to — the same object in `initialize`'s
+/// `serverInfo` and in a modern reply's `_meta`.
+pub fn server_info() -> Value {
+    json!({
+        "name": "mime-rs",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": env!("CARGO_PKG_DESCRIPTION"),
+    })
+}
+
+/// `server/discover`: the handshake-free way to learn what this server speaks.
+fn discover_result() -> Value {
+    json!({
+        "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
+        "capabilities": { "tools": {} },
+        "serverInfo": server_info(),
+        "instructions": crate::mcp::instructions(),
+        "ttlMs": LIST_TTL_MS,
+        "cacheScope": "public",
+    })
+}
 
 /// One client's warm-session map: session id -> that session's engine
 /// state (a `Workspace` buffer, not the handle-scoped workspace above).
@@ -145,81 +237,122 @@ pub fn handle_line(line: &str, store: &mut WorkspaceStore, ctx: &CallContext) ->
 
     // No `id` => a notification: act on it but never reply.
     let is_notification = id.is_none();
+    let err_id = || id.clone().unwrap_or(Value::Null);
 
-    match method {
-        "initialize" => reply(id, is_notification, initialize_result(&params)),
-        "notifications/initialized" | "initialized" => {
-            // Pure notification — nothing to do, no response.
-            None
-        }
-        "ping" => reply(id, is_notification, json!({})),
-        "tools/list" => reply(id, is_notification, crate::mcp::tools_list_result()),
-        "tools/call" => reply(id, is_notification, tools_call(&params, store, ctx)),
+    // A modern request must carry a well-formed, supported `_meta` before it
+    // is dispatched; a malformed notification is still silently dropped.
+    let era = era_of(&params);
+    if era == Era::Modern
+        && let Err((code, message, data)) = validate_modern_meta(&params)
+    {
+        return (!is_notification).then(|| rpc_error_data(err_id(), code, &message, data));
+    }
+
+    let (result, workspace) = match method {
+        "initialize" => (initialize_result(&params), None),
+        // Pure notification — nothing to do, no response.
+        "notifications/initialized" | "initialized" => return None,
+        "ping" => (json!({}), None),
+        "server/discover" => (discover_result(), None),
+        "tools/list" => (crate::mcp::tools_list_result(), None),
+        "tools/call" => tools_call(&params, store, ctx, era),
         other => {
             if is_notification {
                 eprintln!("mime-mcp: ignoring unknown notification {other}");
-                None
-            } else {
-                Some(rpc_error(
-                    id.unwrap_or(Value::Null),
-                    -32601,
-                    "method not found",
-                ))
+                return None;
             }
+            return Some(rpc_error(err_id(), -32601, "method not found"));
         }
-    }
+    };
+    reply(
+        id,
+        is_notification,
+        shape_result(era, result, workspace.as_deref()),
+    )
 }
 
 /// Dispatch `tools/call`: the two workspace tools act on the store itself;
 /// everything else runs against one resolved workspace's session map (or a
 /// throwaway map for tools that never touch warm state: git_*, help).
-fn tools_call(params: &Value, store: &mut WorkspaceStore, ctx: &CallContext) -> Value {
+fn tools_call(
+    params: &Value,
+    store: &mut WorkspaceStore,
+    ctx: &CallContext,
+    era: Era,
+) -> (Value, Option<String>) {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     match name {
         "open_workspace" => {
             if let Err(m) = crate::mcp::validate_args(name, &args) {
-                return crate::mcp::tool_text(m, true);
+                return (crate::mcp::tool_text(m, true), None);
             }
             let h = store.mint();
-            return crate::mcp::tool_text(format!("workspace: {h}"), false);
+            // open_workspace's reply IS the handle — nothing to report on top.
+            return (
+                crate::mcp::tool_text(format!("workspace: {h}"), false),
+                None,
+            );
         }
         "close_workspace" => {
             if let Err(m) = crate::mcp::validate_args(name, &args) {
-                return crate::mcp::tool_text(m, true);
+                return (crate::mcp::tool_text(m, true), None);
             }
             let Some(h) = args.get("workspace").and_then(Value::as_str) else {
-                return crate::mcp::tool_text("close_workspace needs `workspace`".into(), true);
+                return (
+                    crate::mcp::tool_text("close_workspace needs `workspace`".into(), true),
+                    None,
+                );
             };
             if ctx.transport == Transport::Stdio && ctx.implicit_workspace == Some(h) {
-                return crate::mcp::tool_text(
-                    "cannot close the stdio default workspace — close_session drops one session"
-                        .into(),
-                    true,
+                return (
+                    crate::mcp::tool_text(
+                        "cannot close the stdio default workspace — close_session drops one session"
+                            .into(),
+                        true,
+                    ),
+                    None,
                 );
             }
             return if store.remove(h) {
-                crate::mcp::tool_text(format!("workspace {h} closed"), false)
+                (
+                    crate::mcp::tool_text(format!("workspace {h} closed"), false),
+                    None,
+                )
             } else {
-                crate::mcp::tool_text(unknown_workspace(h), true)
+                (crate::mcp::tool_text(unknown_workspace(h), true), None)
             };
         }
         _ => {}
     }
     if !crate::mcp::tool_uses_workspace(name) {
         let mut scratch = Sessions::new();
-        return crate::mcp::tools_call_result(params, &mut scratch, "");
+        return (
+            crate::mcp::tools_call_result(params, &mut scratch, ""),
+            None,
+        );
     }
     let handle = match resolve_workspace(args.get("workspace").and_then(Value::as_str), store, ctx)
     {
         Ok(h) => h,
-        Err(m) => return crate::mcp::tool_text(m, true),
+        Err(m) => return (crate::mcp::tool_text(m, true), None),
     };
+    // Only the modern HTTP client is handed its workspace back: it has no
+    // session header and a bare call mints a fresh one, so without the handle
+    // it could never return to these warm buffers. Stdio and the legacy
+    // session header already know where they are.
+    let report = (era == Era::Modern && ctx.transport == Transport::Http).then(|| handle.clone());
     // Resolution already proved the handle is present; treat a miss as a tool
     // error anyway, so no reachable panic can take the server down with it.
     match store.get_mut(&handle) {
-        Some(sessions) => crate::mcp::tools_call_result(params, sessions, &handle),
-        None => crate::mcp::tool_text(unknown_workspace(&handle), true),
+        Some(sessions) => (
+            crate::mcp::tools_call_result(params, sessions, &handle),
+            report,
+        ),
+        None => (
+            crate::mcp::tool_text(unknown_workspace(&handle), true),
+            None,
+        ),
     }
 }
 
@@ -260,26 +393,59 @@ fn reply(id: Option<Value>, is_notification: bool, result: Value) -> Option<Valu
     }))
 }
 
-fn rpc_error(id: Value, code: i64, message: &str) -> Value {
-    json!({
+/// A JSON-RPC error with an optional `data` payload. A `Null` payload leaves
+/// the `data` key off entirely, so legacy error bytes are unchanged.
+pub fn rpc_error_data(id: Value, code: i64, message: &str, data: Value) -> Value {
+    let mut e = json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": { "code": code, "message": message },
-    })
+    });
+    if !data.is_null() {
+        e["error"]["data"] = data;
+    }
+    e
+}
+
+fn rpc_error(id: Value, code: i64, message: &str) -> Value {
+    rpc_error_data(id, code, message, Value::Null)
+}
+
+/// The last step for every successful result. Modern requests get the
+/// `resultType` and `serverInfo` envelope; legacy results are returned
+/// untouched (byte-identical to before the dual-era work). `report_workspace`
+/// is the handle a modern HTTP stateful call ran in, surfaced in text and
+/// `structuredContent` so the agent can pass it back.
+fn shape_result(era: Era, mut result: Value, report_workspace: Option<&str>) -> Value {
+    if era == Era::Modern {
+        result["resultType"] = json!("complete");
+        result["_meta"][META_SERVER_INFO] = server_info();
+    }
+    if let Some(h) = report_workspace {
+        if let Some(text) = result["content"][0]["text"].as_str().map(str::to_string) {
+            result["content"][0]["text"] = Value::String(format!("{text}\nworkspace: {h}"));
+        }
+        if !result["structuredContent"].is_object() {
+            result["structuredContent"] = json!({});
+        }
+        result["structuredContent"]["workspace"] = json!(h);
+    }
+    result
 }
 
 fn initialize_result(params: &Value) -> Value {
-    // Echo the client's requested version when we actually implement it; for an
-    // unknown/absent one, return our latest rather than falsely claiming theirs.
+    // Echo the client's version when it is a legacy one we implement; an
+    // unknown or absent one — or the modern version, which has no handshake —
+    // gets our newest legacy version.
     let version = params
         .get("protocolVersion")
         .and_then(Value::as_str)
-        .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v))
-        .unwrap_or(PROTOCOL_VERSION);
+        .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v) && *v != MODERN_VERSION)
+        .unwrap_or(LATEST_LEGACY_VERSION);
     json!({
         "protocolVersion": version,
         "capabilities": { "tools": {} },
-        "serverInfo": { "name": "mime-rs", "version": "0.1.0" },
+        "serverInfo": server_info(),
         "instructions": crate::mcp::instructions(),
     })
 }
@@ -333,7 +499,7 @@ mod tests {
             &mut store,
             &ctx,
         );
-        assert_eq!(old["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(old["result"]["protocolVersion"], "2025-11-25");
 
         // notifications/initialized is a pure notification — no reply.
         assert!(
@@ -610,5 +776,268 @@ mod tests {
             &ctx,
         );
         assert_eq!(store.len(), 0);
+    }
+    const META: &str = r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}"#;
+
+    fn modern(id: u32, method: &str, params_body: &str) -> String {
+        let sep = if params_body.is_empty() { "" } else { "," };
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{{params_body}{sep}{META}}}}}"#
+        )
+    }
+
+    #[test]
+    fn era_is_decided_by_the_meta_protocol_version_key() {
+        assert_eq!(era_of(&json!({})), Era::Legacy);
+        assert_eq!(era_of(&json!({"_meta": {}})), Era::Legacy);
+        assert_eq!(
+            era_of(&json!({"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}})),
+            Era::Modern
+        );
+        // Present but malformed still selects modern (then fails validation).
+        assert_eq!(
+            era_of(&json!({"_meta": {"io.modelcontextprotocol/protocolVersion": 7}})),
+            Era::Modern
+        );
+    }
+
+    #[test]
+    fn initialize_negotiates_only_legacy_versions() {
+        let mut store = WorkspaceStore::new();
+        let h = store.mint();
+        let ctx = stdio_ctx(&h);
+        for (asked, want) in [
+            ("2024-11-05", "2024-11-05"),
+            ("2025-03-26", "2025-03-26"),
+            ("2025-06-18", "2025-06-18"),
+            ("2025-11-25", "2025-11-25"),
+            ("2026-07-28", "2025-11-25"),
+            ("1999-01-01", "2025-11-25"),
+        ] {
+            let req = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"{asked}"}}}}"#
+            );
+            let r = call(&req, &mut store, &ctx);
+            assert_eq!(r["result"]["protocolVersion"], want, "asked {asked}");
+            assert!(
+                r["result"].get("resultType").is_none(),
+                "legacy replies are unshaped"
+            );
+        }
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            &mut store,
+            &ctx,
+        );
+        assert_eq!(r["result"]["protocolVersion"], "2025-11-25");
+        assert_eq!(
+            r["result"]["serverInfo"]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(
+            r["result"]["serverInfo"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("editing")
+        );
+    }
+
+    #[test]
+    fn server_discover_answers_in_both_eras() {
+        let mut store = WorkspaceStore::new();
+        let h = store.mint();
+        let ctx = stdio_ctx(&h);
+        let legacy = call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"server/discover"}"#,
+            &mut store,
+            &ctx,
+        );
+        assert_eq!(legacy["result"]["supportedVersions"][0], "2026-07-28");
+        assert_eq!(
+            legacy["result"]["supportedVersions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(legacy["result"]["ttlMs"], 86_400_000u64);
+        assert_eq!(legacy["result"]["cacheScope"], "public");
+        // Both eras learn who the server is, not only what it speaks.
+        assert_eq!(legacy["result"]["serverInfo"]["name"], "mime-rs");
+        assert_eq!(
+            legacy["result"]["serverInfo"]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(legacy["result"].get("resultType").is_none());
+
+        let modern = call(&modern(2, "server/discover", ""), &mut store, &ctx);
+        assert_eq!(modern["result"]["resultType"], "complete");
+        assert_eq!(
+            modern["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "mime-rs"
+        );
+        assert!(
+            modern["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("mime-rs")
+        );
+    }
+
+    #[test]
+    fn modern_results_carry_result_type_and_server_info_legacy_ones_do_not() {
+        let mut store = WorkspaceStore::new();
+        let h = store.mint();
+        let ctx = stdio_ctx(&h);
+        let m = call(&modern(1, "tools/list", ""), &mut store, &ctx);
+        assert_eq!(m["result"]["resultType"], "complete");
+        assert_eq!(
+            m["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(m["result"]["ttlMs"], 86_400_000u64);
+        let l = call(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &mut store,
+            &ctx,
+        );
+        assert!(l["result"].get("resultType").is_none());
+        assert!(l["result"].get("_meta").is_none());
+        assert_eq!(
+            l["result"]["ttlMs"], 86_400_000u64,
+            "cache hints ride in both eras"
+        );
+    }
+
+    #[test]
+    fn malformed_or_unsupported_meta_is_rejected() {
+        let mut store = WorkspaceStore::new();
+        let h = store.mint();
+        let ctx = stdio_ctx(&h);
+        let no_caps = call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+            &mut store,
+            &ctx,
+        );
+        assert_eq!(no_caps["error"]["code"], -32602);
+        assert!(
+            no_caps["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("clientCapabilities")
+        );
+        let bad_type = call(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":7,"io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+            &mut store,
+            &ctx,
+        );
+        assert_eq!(bad_type["error"]["code"], -32602);
+        let unsupported = call(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2030-01-01","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+            &mut store,
+            &ctx,
+        );
+        assert_eq!(unsupported["error"]["code"], -32022);
+        assert_eq!(unsupported["error"]["data"]["requested"], "2030-01-01");
+        assert_eq!(unsupported["error"]["data"]["supported"][0], "2026-07-28");
+        // A legacy version inside modern _meta is served (the client chose the shape).
+        let legacy_in_meta = call(
+            r#"{"jsonrpc":"2.0","id":4,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-06-18","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+            &mut store,
+            &ctx,
+        );
+        assert_eq!(legacy_in_meta["result"]["resultType"], "complete");
+        // A malformed modern NOTIFICATION gets no reply at all.
+        assert!(
+            handle_line(
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":7}}}"#,
+                &mut store,
+                &ctx
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn modern_http_calls_report_their_workspace_stdio_ones_do_not() {
+        let mut store = WorkspaceStore::new();
+        let http = CallContext {
+            transport: Transport::Http,
+            implicit_workspace: None,
+        };
+        let r = call(
+            &modern(
+                1,
+                "tools/call",
+                r#""name":"open_text","arguments":{"text":"x","session":"c"}"#,
+            ),
+            &mut store,
+            &http,
+        );
+        let h = r["result"]["structuredContent"]["workspace"]
+            .as_str()
+            .expect("handle reported")
+            .to_string();
+        assert_eq!(h.len(), 32);
+        assert!(
+            text_of(&r).ends_with(&format!("workspace: {h}")),
+            "{}",
+            text_of(&r)
+        );
+        // Passing it back lands in the same workspace.
+        let body = format!(r#""name":"view","arguments":{{"session":"c","workspace":"{h}"}}"#);
+        let v = call(&modern(2, "tools/call", &body), &mut store, &http);
+        assert!(text_of(&v).contains('x'));
+        assert_eq!(store.len(), 1);
+        // git/help report nothing.
+        let help = call(
+            &modern(3, "tools/call", r#""name":"help","arguments":{}"#),
+            &mut store,
+            &http,
+        );
+        assert!(help["result"].get("structuredContent").is_none());
+
+        let h2 = store.mint();
+        let stdio = stdio_ctx(&h2);
+        let s = call(
+            &modern(
+                4,
+                "tools/call",
+                r#""name":"open_text","arguments":{"text":"x"}"#,
+            ),
+            &mut store,
+            &stdio,
+        );
+        assert!(s["result"].get("structuredContent").is_none());
+        assert!(!text_of(&s).contains("workspace:"));
+    }
+
+    #[test]
+    fn tools_list_order_is_stable_and_matches_the_catalogue() {
+        let mut store = WorkspaceStore::new();
+        let h = store.mint();
+        let ctx = stdio_ctx(&h);
+        let a = call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            &mut store,
+            &ctx,
+        );
+        let b = call(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &mut store,
+            &ctx,
+        );
+        assert_eq!(a["result"]["tools"], b["result"]["tools"]);
+        let names: Vec<&str> = a["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        let catalogue: Vec<&str> = crate::mcp::tool_schemas()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, catalogue);
     }
 }

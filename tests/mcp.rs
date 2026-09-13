@@ -2226,6 +2226,105 @@ fn rehearse_accepts_full_diff_and_view() {
     );
 }
 
+/// The modern era's per-request `_meta`: protocol version + client
+/// capabilities on every call, in place of the `initialize` handshake.
+fn meta() -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {"name": "e2e", "version": "0"},
+    })
+}
+
+/// A 2026-07-28 client never handshakes: it discovers, lists and calls, and
+/// every reply comes back shaped (`resultType` + `_meta.serverInfo`).
+#[test]
+fn modern_stdio_conversation_needs_no_handshake() {
+    let mut s = Server::spawn();
+    let d = s.request(
+        json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta": meta()}}),
+    );
+    assert_eq!(d["result"]["resultType"], "complete");
+    assert_eq!(d["result"]["supportedVersions"][0], "2026-07-28");
+    assert_eq!(
+        d["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "mime-rs"
+    );
+    assert_eq!(d["result"]["serverInfo"]["name"], "mime-rs");
+
+    let l =
+        s.request(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta": meta()}}));
+    assert_eq!(l["result"]["cacheScope"], "public");
+    assert!(
+        l["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "open_workspace")
+    );
+
+    let o = s.request(
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"open_text","arguments":{"text":"a\nb\n","session":"m"},"_meta": meta()}}),
+    );
+    assert_eq!(o["result"]["isError"], false);
+    assert_eq!(o["result"]["resultType"], "complete");
+    assert!(
+        o["result"].get("structuredContent").is_none(),
+        "stdio reports no handle"
+    );
+
+    let v = s.request(
+        json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"view","arguments":{"session":"m"},"_meta": meta()}}),
+    );
+    assert!(
+        v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("a")
+    );
+
+    let bad = s.request(
+        json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"view","arguments":{"session":"m","workspace":"0000000000000000ffffffffffffffff"},"_meta": meta()}}),
+    );
+    assert_eq!(bad["result"]["isError"], true);
+    assert!(
+        bad["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown workspace")
+    );
+
+    let unsupported = s.request(
+        json!({"jsonrpc":"2.0","id":6,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2031-01-01","io.modelcontextprotocol/clientCapabilities":{}}}}),
+    );
+    assert_eq!(unsupported["error"]["code"], -32022);
+}
+
+/// One process serves both eras at once: a dual-era client can probe the
+/// modern way, fall back to the handshake, and keep using either shape.
+#[test]
+fn both_eras_interleave_on_one_process() {
+    let mut s = Server::spawn();
+    // A dual-era client probes, then falls back to the handshake.
+    let d = s.request(
+        json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta": meta()}}),
+    );
+    assert_eq!(d["result"]["resultType"], "complete");
+    let i = s.request(
+        json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}}),
+    );
+    assert_eq!(i["result"]["protocolVersion"], "2025-11-25");
+    assert!(i["result"].get("resultType").is_none());
+    s.notify(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    // Modern and legacy calls share stdio's one implicit workspace.
+    let m = s.request(
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"open_text","arguments":{"text":"shared\n","session":"x"},"_meta": meta()}}),
+    );
+    assert_eq!(m["result"]["resultType"], "complete");
+    let text = s.call_ok(4, "view", json!({"session":"x"}));
+    assert!(text.contains("shared"));
+}
+
 /// The legacy (initialize-based) wire format is frozen: every response below
 /// must stay byte-identical (after `normalise`) across the dual-era work.
 /// Regenerate deliberately with `MIME_UPDATE_FIXTURES=1 cargo test --test mcp

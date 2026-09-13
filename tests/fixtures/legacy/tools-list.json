@@ -2,6 +2,7 @@
   "id": 6,
   "jsonrpc": "2.0",
   "result": {
+    "cacheScope": "public",
     "tools": [
       {
         "annotations": {
@@ -1977,6 +1978,7 @@
         },
         "name": "git_exec_over"
       }
-    ]
+    ],
+    "ttlMs": 86400000
   }
 }

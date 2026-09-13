@@ -3021,7 +3021,11 @@ fn unprint_string_value(value: &str) -> Option<String> {
 
 /// `tools/list` result — every tool with a JSON Schema `inputSchema`.
 pub(crate) fn tools_list_result() -> Value {
-    json!({ "tools": tool_schemas() })
+    json!({
+        "tools": tool_schemas(),
+        "ttlMs": crate::rpc::LIST_TTL_MS,
+        "cacheScope": "public",
+    })
 }
 
 // ---- git sequencer tools ----------------------------------------------------
