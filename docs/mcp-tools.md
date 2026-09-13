@@ -9,6 +9,7 @@ Open a file from disk into a warm session (replacing any existing session of tha
 - `path` (required) — Filesystem path to open.
 - `read_only` — Attach the buffer unwritable; mutating programs are rejected. Default false.
 - `session` — Warm session id; defaults to "default" when omitted.
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## open_text
 
@@ -18,6 +19,7 @@ Open an in-memory text buffer into a warm session (replacing any existing sessio
 - `read_only` — Attach the buffer unwritable; mutating programs are rejected. Default false.
 - `session` — Warm session id; defaults to "default" when omitted.
 - `text` (required) — Initial buffer contents.
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## run_program
 
@@ -30,6 +32,7 @@ Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and retu
 - `save` — After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.
 - `session` — Warm session id; defaults to "default" when omitted.
 - `view` — Add a rendered viewport around point to the report (true = 4 context lines, or a line count).
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## rehearse
 
@@ -40,6 +43,7 @@ Dry-run an Emacs-Lisp (tulisp) edit program and return the same RunReport run_pr
 - `program` (required) — Emacs-Lisp program to rehearse (run then roll back).
 - `session` — Warm session id; defaults to "default" when omitted.
 - `view` — Add a rendered viewport around point to the report (true = 4 context lines, or a line count).
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## read_region
 
@@ -51,6 +55,7 @@ Return the buffer text between two 1-based char positions [start, end) — or a 
 - `session` — Warm session id; defaults to "default" when omitted.
 - `start` — 1-based start position (inclusive). Pass start+end OR lines.
 - `thing` — Read a region named by structure instead of positions: {"kind": "list", "after": "fn main() {"} is the block that line opens. With "after", kind `list` takes the LAST list beginning on the line (else the first one after it), while every other kind takes the FIRST thing at or after the line — {"kind": "sexp", "after": "old(1, 2);"} is `old`. {"kind": "sexp", "at": 1234} is the expression containing a position; "before" the last one ending before the line. kind: sexp | list | string | word | symbol | line | paragraph | defun. "up": N widens a sexp/list by N enclosing groups. Balanced brackets, strings and comments follow the file's language; the result starts with `KIND @START-END (lines A-B):` so a wrong pick is visible. Not combinable with start/end/lines.
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## view
 
@@ -60,6 +65,7 @@ Render a viewport around the cursor (or a given position): a few lines of contex
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `pos` — 1-based CHAR position to center on (default: current point). To center on a line, first find its position via occur, or read_region {lines: [n, n]}.
 - `session` — Warm session id; defaults to "default" when omitted.
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## insert_text
 
@@ -74,6 +80,7 @@ Insert literal text at point, at `pos` (a char position, or "eob" to append at t
 - `thing` — Insert relative to a structural thing instead of a position: {"kind": "list", "after": "fn main() {"} is the block that line opens. With "after", kind `list` takes the LAST list beginning on the line (else the first one after it), while every other kind takes the FIRST thing at or after the line — {"kind": "sexp", "after": "old(1, 2);"} is `old`. {"kind": "sexp", "at": 1234} is the expression containing a position; "before" the last one ending before the line. kind: sexp | list | string | word | symbol | line | paragraph | defun. "up": N widens a sexp/list by N enclosing groups. Balanced brackets, strings and comments follow the file's language. `where` picks the end to insert at: "after" (default, at its end) or "before" (at its start); the result names the span it landed against, so a wrong pick is visible. Not combinable with pos/anchor.
 - `view` — Append a rendered viewport around point after the edit (true = 4 context lines, or a line count) — confirm the insert landed right without a follow-up view call.
 - `where` — With `thing`: insert at its end (after, default) or its start (before). Applies to `thing` ONLY — the anchor form carries its own `where` inside the anchor object, and a top-level one without a `thing` is an error rather than a silently dropped placement.
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## replace_text
 
@@ -91,6 +98,7 @@ Replace the FIRST occurrence of a pattern (searching from the top of the accessi
 - `session` — Warm session id; defaults to "default" when omitted.
 - `thing` — Replace the region named by structure instead of by searching: {"kind": "list", "after": "fn main() {"} is the block that line opens. With "after", kind `list` takes the LAST list beginning on the line (else the first one after it), while every other kind takes the FIRST thing at or after the line — {"kind": "sexp", "after": "old(1, 2);"} is `old`. {"kind": "sexp", "at": 1234} is the expression containing a position; "before" the last one ending before the line. kind: sexp | list | string | word | symbol | line | paragraph | defun. "up": N widens a sexp/list by N enclosing groups. Balanced brackets, strings and comments follow the file's language. Pass `replacement` only; the result names the replaced span (`KIND @START-END`) so a wrong pick is visible. Not combinable with pattern/edits/all/mode/expect_unique/scope.
 - `view` — Append a rendered viewport around point after the edit (true = 4 context lines, or a line count).
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## replace_in_files
 
@@ -105,6 +113,7 @@ Apply the SAME edit spec to EVERY listed file in one call — the cross-file ren
 - `replacement` — The replacement text — with mode:"regex", \1..\9/\& backrefs expand.
 - `save` — After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.
 - `scope` — Restrict this call to one part of the buffer without writing a program. {"defun": "name"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## occur
 
@@ -118,6 +127,7 @@ Overview of every line matching a pattern in the whole accessible region (compos
 - `pattern` (required) — What to list matches for.
 - `scope` — Restrict this call to one part of the buffer without writing a program. {"defun": "name"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.
 - `session` — Warm session id; defaults to "default" when omitted.
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## grep
 
@@ -130,6 +140,7 @@ Read-only cross-file search: which files (and lines) mention a pattern — occur
 - `mode` — exact (literal) or regex (Emacs dialect, line-oriented). Defaults to exact.
 - `nlines` — Context lines around each hit (default 0).
 - `pattern` (required) — What to search for.
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## outline
 
@@ -137,6 +148,7 @@ The buffer's structural outline: one 'KIND START END NAME' line per defun (Rust/
 
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `session` — Warm session id; defaults to "default" when omitted.
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## conflicts
 
@@ -144,6 +156,7 @@ Overview of the merge-conflict hunks in the buffer: number, position + line, bra
 
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `session` — Warm session id; defaults to "default" when omitted.
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## checkpoint
 
@@ -152,6 +165,7 @@ Capture a named restore point of the current buffer (cheap — structural sharin
 - `label` — Optional label; auto-generated (auto-N) when omitted.
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `session` — Warm session id; defaults to "default" when omitted.
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## undo_last
 
@@ -159,6 +173,7 @@ Rewind the buffer to its state before the most recent mutating call — the auto
 
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `session` — Warm session id; defaults to "default" when omitted.
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## restore_checkpoint
 
@@ -167,6 +182,7 @@ Rewind the buffer to a previously captured checkpoint by label (the labels are l
 - `label` (required) — Label of the checkpoint to restore.
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `session` — Warm session id; defaults to "default" when omitted.
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## save_buffer
 
@@ -175,6 +191,7 @@ Write the session buffer's text to disk. Without `to`, save back to the session'
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `session` — Warm session id; defaults to "default" when omitted.
 - `to` — Optional save-as destination — writes a copy there without rebinding the session. Omitted: write back to the visited file.
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## close_session
 
@@ -183,6 +200,7 @@ Drop a warm session: releases its buffer and the open file handle a file-backed 
 - `force` — Discard unsaved edits. Default false: closing an unsaved session is an error.
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `session` — Warm session id; defaults to "default" when omitted.
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## help
 
@@ -197,11 +215,24 @@ The unified diff between a warm buffer and its visited file on disk — 'what ex
 
 - `path` — The visited file — matches the warm session opened for it.
 - `session` — Warm session id; defaults to "default" when omitted. Pass path OR session, not both.
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## session_status
 
 Report engine status: per live session the current buffer, its visited file, and whether it is narrowed, stale (its file drifted on disk), or unsaved (has edits not yet written to that file — so a forgotten save is visible); plus the allowed filesystem roots that open_file/save_buffer are confined to (MIME_ROOTS, default cwd), and whether the audit journal is on. Check the roots before opening or saving to learn the writable sandbox up front.
 
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
+
+## open_workspace
+
+Mint a fresh, empty workspace (an isolated set of warm sessions) and return its handle. Pass the handle as `workspace` to scope later calls. Needed only on the stateless HTTP protocol when isolating several agents on one server; stdio has one implicit workspace.
+
+
+## close_workspace
+
+Drop a workspace and every session in it, unsaved edits included. The stdio default workspace cannot be closed (use close_session for one session).
+
+- `workspace` (required) — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## git_rebase
 

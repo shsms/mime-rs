@@ -15,55 +15,13 @@
 //! the daemon): simple and race-free, at the cost of head-of-line blocking if a
 //! single op runs long.
 
-use crate::Workspace;
-use std::collections::{HashMap, VecDeque};
+use crate::rpc::WorkspaceStore;
 use std::io::Read;
 use std::sync::Mutex;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 /// Cap on a request body — programs and buffers can be large, but not unbounded.
 const MAX_BODY: u64 = 64 * 1024 * 1024;
-
-/// Cap on concurrent client sessions (oldest FIFO-evicted past this). Bounds
-/// memory and open file descriptors against an `initialize` flood.
-const SESSION_CAP: usize = 256;
-
-/// One client's warm-session map (the same type the stdio server holds).
-type Sessions = HashMap<String, Workspace>;
-
-/// Bounded set of per-client session maps, keyed by an unguessable
-/// `Mcp-Session-Id`. `order` tracks creation order for FIFO eviction.
-struct Store {
-    map: HashMap<String, Sessions>,
-    order: VecDeque<String>,
-}
-
-impl Store {
-    fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-            order: VecDeque::new(),
-        }
-    }
-    /// Create a fresh empty session, evicting the oldest while at capacity.
-    fn insert(&mut self, id: String) {
-        while self.map.len() >= SESSION_CAP {
-            match self.order.pop_front() {
-                Some(old) => {
-                    self.map.remove(&old);
-                }
-                None => break,
-            }
-        }
-        self.order.push_back(id.clone());
-        self.map.entry(id).or_default();
-    }
-    /// Drop a session by id; returns whether it existed.
-    fn remove(&mut self, id: &str) -> bool {
-        self.order.retain(|x| x != id);
-        self.map.remove(id).is_some()
-    }
-}
 
 /// Serve the MCP protocol over Streamable HTTP at `addr` until killed.
 pub fn run(addr: &str) {
@@ -79,13 +37,13 @@ pub fn run(addr: &str) {
         crate::rpc::PROTOCOL_VERSION
     );
 
-    let store = Mutex::new(Store::new());
+    let store = Mutex::new(WorkspaceStore::new());
     for request in server.incoming_requests() {
         serve(request, &store);
     }
 }
 
-fn serve(mut request: Request, store: &Mutex<Store>) {
+fn serve(mut request: Request, store: &Mutex<WorkspaceStore>) {
     // Anti-DNS-rebinding: a browser-set Origin must be localhost. A missing
     // Origin (curl, an SDK, a CLI harness) is allowed — the attack is browser-only.
     if let Some(origin) = header(&request, "origin")
@@ -148,18 +106,22 @@ fn serve(mut request: Request, store: &Mutex<Store>) {
     let (reply, new_id) = {
         let mut store = store.lock().unwrap();
         if is_init {
-            let id = new_session_id();
-            store.insert(id.clone());
-            let sessions = store.map.get_mut(&id).expect("just inserted");
-            (crate::rpc::handle_line(&body, sessions), Some(id))
+            let id = store.mint();
+            let ctx = crate::rpc::CallContext {
+                transport: crate::rpc::Transport::Http,
+                implicit_workspace: Some(&id),
+            };
+            let reply = crate::rpc::handle_line(&body, &mut store, &ctx);
+            (reply, Some(id))
         } else {
-            match id_header
-                .as_deref()
-                .filter(|id| store.map.contains_key(*id))
-            {
+            match id_header.as_deref().filter(|id| store.contains(id)) {
                 Some(id) => {
-                    let sessions = store.map.get_mut(id).expect("checked present");
-                    (crate::rpc::handle_line(&body, sessions), None)
+                    let id = id.to_string();
+                    let ctx = crate::rpc::CallContext {
+                        transport: crate::rpc::Transport::Http,
+                        implicit_workspace: Some(&id),
+                    };
+                    (crate::rpc::handle_line(&body, &mut store, &ctx), None)
                 }
                 None => {
                     drop(store);
@@ -222,20 +184,6 @@ fn is_initialize(body: &str) -> bool {
         .is_some_and(|m| m == "initialize")
 }
 
-/// A 128-bit random session id (hex). The id is the client's bearer token, so
-/// it must not be guessable — read it from the OS CSPRNG, failing closed if
-/// that is somehow unavailable rather than minting a predictable id.
-fn new_session_id() -> String {
-    let mut buf = [0u8; 16];
-    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)) {
-        Ok(()) => buf.iter().map(|b| format!("{b:02x}")).collect(),
-        Err(e) => {
-            eprintln!("mime-http: cannot read /dev/urandom for a session id: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
 fn json_header() -> Header {
     Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap()
 }
@@ -284,30 +232,5 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#
         ));
         assert!(!is_initialize("not json"));
-    }
-
-    #[test]
-    fn session_ids_are_random_hex_and_distinct() {
-        let a = new_session_id();
-        let b = new_session_id();
-        assert_eq!(a.len(), 32, "128 bits as hex");
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(a, b, "two ids must differ");
-    }
-
-    #[test]
-    fn store_caps_at_session_cap_and_evicts_oldest() {
-        let mut s = Store::new();
-        for i in 0..SESSION_CAP + 5 {
-            s.insert(format!("id{i}"));
-        }
-        assert_eq!(s.map.len(), SESSION_CAP);
-        assert!(!s.map.contains_key("id0"), "oldest evicted");
-        assert!(
-            s.map.contains_key(&format!("id{}", SESSION_CAP + 4)),
-            "newest kept"
-        );
-        assert!(s.remove(&format!("id{}", SESSION_CAP + 4)));
-        assert!(!s.remove("nope"));
     }
 }

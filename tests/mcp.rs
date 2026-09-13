@@ -2303,9 +2303,10 @@ fn legacy_wire_format_is_frozen() {
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
-/// Strip the parts of a response that legitimately vary between machines:
-/// `session_status` reports the allowed roots and audit flag, which depend on
-/// the environment. Everything else is compared verbatim.
+/// Strip the parts of a response that legitimately vary between runs and
+/// machines: `session_status` reports the allowed roots and audit flag, which
+/// depend on the environment, and the workspace handle, which is random.
+/// Everything else is compared verbatim.
 fn normalise(v: &mut Value) {
     let Some(text) = v["result"]["content"][0]["text"].as_str() else {
         return;
@@ -2313,9 +2314,18 @@ fn normalise(v: &mut Value) {
     let Ok(mut inner) = serde_json::from_str::<Value>(text) else {
         return;
     };
+    let mut touched = false;
     if inner.get("roots").is_some() {
         inner["roots"] = json!([]);
         inner["audit"] = json!(false);
+        touched = true;
+    }
+    // The workspace handle is freshly minted per run.
+    if inner.get("workspace").is_some() {
+        inner["workspace"] = json!("<handle>");
+        touched = true;
+    }
+    if touched {
         v["result"]["content"][0]["text"] = Value::String(inner.to_string());
     }
 }

@@ -27,6 +27,7 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 use std::sync::LazyLock;
 
+use crate::rpc::Sessions;
 use crate::{Buffer, Quire, TextStore, Workspace};
 use serde_json::{Value, json};
 
@@ -70,9 +71,18 @@ pub fn run() {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
-    // The single source of truth: session id -> warm workspace. Not behind a
+    // One store; stdio is a single client, so one implicit workspace minted
+    // at startup is where every call without a `workspace` lands. Not behind a
     // lock — the server is single-threaded (a `Workspace` is `!Send`).
-    let mut sessions: HashMap<String, Workspace> = HashMap::new();
+    let mut store = crate::rpc::WorkspaceStore::new();
+    let default = store.mint();
+    // Pinned: an open_workspace flood must not evict the workspace every
+    // handle-free call lands in, warm unsaved buffers and all.
+    store.pin(&default);
+    let ctx = crate::rpc::CallContext {
+        transport: crate::rpc::Transport::Stdio,
+        implicit_workspace: Some(&default),
+    };
 
     eprintln!(
         "mime-mcp: ready on stdio (protocol {})",
@@ -92,7 +102,7 @@ pub fn run() {
         }
         // `handle_line` returns `None` for notifications (no `id`) — those get
         // no response per JSON-RPC.
-        if let Some(response) = crate::rpc::handle_line(&line, &mut sessions) {
+        if let Some(response) = crate::rpc::handle_line(&line, &mut store, &ctx) {
             if writeln!(out, "{response}").is_err() {
                 break;
             }
@@ -106,10 +116,7 @@ pub fn run() {
 /// Dispatch `tools/call`. Always returns a tool *result* envelope
 /// (`{content, isError}`) — even on failure — because at the JSON-RPC layer the
 /// call itself succeeded; the tool-level error rides in `isError` + the text.
-pub(crate) fn tools_call_result(
-    params: &Value,
-    sessions: &mut HashMap<String, Workspace>,
-) -> Value {
+pub(crate) fn tools_call_result(params: &Value, sessions: &mut Sessions, workspace: &str) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let mut args = params.get("arguments").cloned().unwrap_or(json!({}));
 
@@ -146,7 +153,7 @@ pub(crate) fn tools_call_result(
         "undo_last" => tool_undo_last(&args, sessions),
         "close_session" => tool_close_session(&args, sessions),
         "save_buffer" => tool_save_buffer(&args, sessions),
-        "session_status" => tool_session_status(sessions),
+        "session_status" => tool_session_status(sessions, workspace),
         "unsaved_diff" => tool_unsaved_diff(&args, sessions),
         "help" => tool_help(&args),
         git if git.starts_with("git_") => dispatch_git(git, &args),
@@ -306,7 +313,7 @@ fn normalize_insert_sugar(args: &mut Value) -> Result<(), String> {
 /// should silently ignore — so name the offender and list what is accepted.
 /// Tools absent from the schema list, or declaring no properties, are not
 /// constrained (nothing to validate against).
-fn validate_args(name: &str, args: &Value) -> Result<(), String> {
+pub(crate) fn validate_args(name: &str, args: &Value) -> Result<(), String> {
     let Some(obj) = args.as_object() else {
         return Ok(());
     };
@@ -365,11 +372,21 @@ fn validate_nested(schema: &Value, value: &Value, path: &str) -> Result<(), Stri
 }
 
 /// Build the `{content, isError}` envelope MCP expects for a tool result.
-fn tool_text(text: String, is_error: bool) -> Value {
+pub(crate) fn tool_text(text: String, is_error: bool) -> Value {
     json!({
         "content": [{ "type": "text", "text": text }],
         "isError": is_error,
     })
+}
+
+/// Whether a tool reads or writes the warm-session map — i.e. declares
+/// `workspace`. Driven by the schemas so it can't drift.
+pub(crate) fn tool_uses_workspace(name: &str) -> bool {
+    tool_schemas()
+        .iter()
+        .find(|t| t["name"] == name)
+        .and_then(|t| t["inputSchema"]["properties"].as_object())
+        .is_some_and(|p| p.contains_key("workspace"))
 }
 
 fn session_arg(args: &Value) -> String {
@@ -2819,7 +2836,7 @@ fn tool_save_buffer(
 /// enforces: the allowed filesystem roots (as display strings) and whether the
 /// audit journal is on. Advertising the roots lets the agent target a writable
 /// path up front instead of discovering the bounds via a rejected save.
-fn tool_session_status(sessions: &HashMap<String, Workspace>) -> Result<String, String> {
+fn tool_session_status(sessions: &Sessions, workspace: &str) -> Result<String, String> {
     let mut ids: Vec<&String> = sessions.keys().collect();
     ids.sort();
     // Per session: the current buffer, its visited file, and the states a
@@ -2856,6 +2873,7 @@ fn tool_session_status(sessions: &HashMap<String, Workspace>) -> Result<String, 
         .map(|r| r.display().to_string())
         .collect();
     Ok(json!({
+        "workspace": workspace,
         "sessions": sessions_json,
         "roots": roots,
         "audit": crate::safety::audit_enabled(),
@@ -4087,6 +4105,17 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             "reference briefs: lisp/regex/treesit/conflicts/git/sessions/recipes",
         ),
 
+        "open_workspace" => (
+            Session,
+            A::append(),
+            "mint an isolated workspace, return its handle",
+        ),
+        "close_workspace" => (
+            Session,
+            A::destructive(),
+            "drop a workspace and all its sessions",
+        ),
+
         _ => (Inspection, A::append(), ""),
     }
 }
@@ -4174,6 +4203,10 @@ fn build_tool_schemas() -> Vec<Value> {
         "type": "string",
         "description": "Warm session id; defaults to \"default\" when omitted."
     });
+    let workspace = json!({
+        "type": "string",
+        "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session."
+    });
     let path = json!({
         "type": "string",
         "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both."
@@ -4194,6 +4227,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "path": { "type": "string", "description": "Filesystem path to open." },
                     "read_only": { "type": "boolean", "description": "Attach the buffer unwritable; mutating programs are rejected. Default false." },
                     "session": session,
@@ -4207,6 +4241,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "text": { "type": "string", "description": "Initial buffer contents." },
                     "name": { "type": "string", "description": "Optional buffer name." },
                     "read_only": { "type": "boolean", "description": "Attach the buffer unwritable; mutating programs are rejected. Default false." },
@@ -4221,6 +4256,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "program": { "type": "string", "description": "Emacs-Lisp program, e.g. (while (re-search-forward \"foo\" nil t) (replace-match \"bar\"))." },
                     "full_diff": { "type": "boolean", "description": "Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count." },
                     "keep_partial": { "type": "boolean", "description": "On program error, KEEP the pre-error edits in the warm buffer (dirty:true in the failure JSON; undo_last reverts them) instead of rolling back to the pre-program state. Default false: a failed run is transactional." },
@@ -4238,6 +4274,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "program": { "type": "string", "description": "Emacs-Lisp program to rehearse (run then roll back)." },
                     "full_diff": { "type": "boolean", "description": "Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count." },
                     "view": { "type": ["boolean", "integer"], "description": "Add a rendered viewport around point to the report (true = 4 context lines, or a line count)." },
@@ -4253,6 +4290,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "start": { "type": "integer", "description": "1-based start position (inclusive). Pass start+end OR lines." },
                     "end": { "type": "integer", "description": "1-based end position (exclusive)." },
                     "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based INCLUSIVE line numbers (narrowing-relative, like goto-line), e.g. {lines: [313, 322]} — instead of char positions." },
@@ -4269,6 +4307,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "lines": { "type": "integer", "description": "Context lines on EACH SIDE of the cursor line — a count, not a range (worked example: view {path: \"f.rs\", pos: 3130, lines: 8} renders 17 lines centered on position 3130). For a line RANGE use read_region {lines: [a, b]}." },
                     "pos": { "type": "integer", "description": "1-based CHAR position to center on (default: current point). To center on a line, first find its position via occur, or read_region {lines: [n, n]}." },
                     "session": session,
@@ -4283,6 +4322,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "text": { "type": "string", "description": "The literal text to insert." },
                     "pos": { "type": ["integer", "string"], "description": "1-based position to insert at (default: current point) — or \"eob\" / \"bob\" to append at the end / insert at the beginning of the accessible region (no position arithmetic for the common append)." },
                     "anchor": { "type": "object", "description": "E.g. {\"pattern\": \"fn main() {\", \"where\": \"before\"} — insert relative to the UNIQUE line containing a literal text ({\"before\": \"line text\"} / {\"after\": \"line text\"} are accepted shorthand for the same) — or {\"defun\": \"name\"} to target a named defun. An ambiguous pattern errors, listing the match lines. \"where\": \"after\" (default) puts the text at the end of the defun or the matched line — include separating newlines in the text. \"before\" puts it above the whole decorated defun (Rust #[attributes] / Python decorators included), or at the start of the matched line. Not combinable with pos.", "properties": { "defun": { "type": "string" }, "pattern": { "type": "string" }, "where": { "type": "string", "enum": ["after", "before"] }, "before": { "type": "string", "description": "Shorthand for {\"pattern\": <this text>, \"where\": \"before\"}." }, "after": { "type": "string", "description": "Shorthand for {\"pattern\": <this text>, \"where\": \"after\"}." } } },
@@ -4302,6 +4342,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "pattern": { "type": "string", "description": "The text to find — literal by default; the Emacs regex dialect with mode:\"regex\"." },
                     "replacement": { "type": "string", "description": "The replacement text — literal by default; with mode:\"regex\", \\1..\\9 insert the numbered capture group and \\& the whole match." },
                     "thing": thing_schema("Replace the region named by structure instead of by searching:", ". Pass `replacement` only; the result names the replaced span (`KIND @START-END`) so a wrong pick is visible. Not combinable with pattern/edits/all/mode/expect_unique/scope."),
@@ -4324,6 +4365,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "files": { "type": "array", "items": { "type": "string" }, "description": "The files to edit — each must match the edit spec." },
                     "pattern": { "type": "string", "description": "The text to find — literal by default; the Emacs regex dialect with mode:\"regex\"." },
                     "replacement": { "type": "string", "description": "The replacement text — with mode:\"regex\", \\1..\\9/\\& backrefs expand." },
@@ -4343,6 +4385,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "pattern": { "type": "string", "description": "What to list matches for." },
                     "mode": {
                         "type": "string",
@@ -4365,6 +4408,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "pattern": { "type": "string", "description": "What to search for." },
                     "glob": { "type": "string", "description": "Keep only paths matching this glob, relative to the search dir: * within a segment, ** across directories, ? one char (e.g. **/*.rs). Omit to search every file." },
                     "dir": { "type": "string", "description": "Directory to search (must resolve inside an allowed root). Omit to search every root." },
@@ -4386,6 +4430,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "session": session,
                     "path": path,
                 },
@@ -4398,6 +4443,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "session": session,
                     "path": path,
                 },
@@ -4410,6 +4456,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "label": { "type": "string", "description": "Optional label; auto-generated (auto-N) when omitted." },
                     "session": session,
                     "path": path,
@@ -4423,6 +4470,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "session": session,
                     "path": path,
                 },
@@ -4435,6 +4483,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "label": { "type": "string", "description": "Label of the checkpoint to restore." },
                     "session": session,
                     "path": path,
@@ -4448,6 +4497,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "to": { "type": "string", "description": "Optional save-as destination — writes a copy there without rebinding the session. Omitted: write back to the visited file." },
                     "session": session,
                     "path": path,
@@ -4461,6 +4511,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "force": { "type": "boolean", "description": "Discard unsaved edits. Default false: closing an unsaved session is an error." },
                     "session": session,
                     "path": path,
@@ -4486,6 +4537,7 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "workspace": workspace.clone(),
                     "path": { "type": "string", "description": "The visited file — matches the warm session opened for it." },
                     "session": { "type": "string", "description": "Warm session id; defaults to \"default\" when omitted. Pass path OR session, not both." }
                 },
@@ -4497,8 +4549,24 @@ fn build_tool_schemas() -> Vec<Value> {
             "description": "Report engine status: per live session the current buffer, its visited file, and whether it is narrowed, stale (its file drifted on disk), or unsaved (has edits not yet written to that file — so a forgotten save is visible); plus the allowed filesystem roots that open_file/save_buffer are confined to (MIME_ROOTS, default cwd), and whether the audit journal is on. Check the roots before opening or saving to learn the writable sandbox up front.",
             "inputSchema": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "workspace": workspace.clone(),
+                },
                 "required": [],
+            },
+        }),
+        json!({
+            "name": "open_workspace",
+            "description": "Mint a fresh, empty workspace (an isolated set of warm sessions) and return its handle. Pass the handle as `workspace` to scope later calls. Needed only on the stateless HTTP protocol when isolating several agents on one server; stdio has one implicit workspace.",
+            "inputSchema": { "type": "object", "properties": {} },
+        }),
+        json!({
+            "name": "close_workspace",
+            "description": "Drop a workspace and every session in it, unsaved edits included. The stdio default workspace cannot be closed (use close_session for one session).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "workspace": workspace.clone() },
+                "required": ["workspace"],
             },
         }),
     ]
@@ -5031,5 +5099,20 @@ mod git_tool_tests {
             let err = autosquash_arg(&json!({ "autosquash": junk })).unwrap_err();
             assert!(err.contains("autosquash must be"), "{err}");
         }
+    }
+
+    #[test]
+    fn every_tool_except_git_help_and_open_workspace_declares_workspace() {
+        for t in tool_schemas() {
+            let name = t["name"].as_str().unwrap();
+            let exempt = name.starts_with("git_") || name == "help" || name == "open_workspace";
+            assert_eq!(tool_uses_workspace(name), !exempt, "{name}");
+        }
+        assert!(tool_schemas().iter().any(|t| t["name"] == "open_workspace"));
+        assert!(
+            tool_schemas()
+                .iter()
+                .any(|t| t["name"] == "close_workspace")
+        );
     }
 }

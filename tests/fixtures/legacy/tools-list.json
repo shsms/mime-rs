@@ -24,6 +24,10 @@
             "session": {
               "description": "Warm session id; defaults to \"default\" when omitted.",
               "type": "string"
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
+              "type": "string"
             }
           },
           "required": [
@@ -57,6 +61,10 @@
             },
             "text": {
               "description": "Initial buffer contents.",
+              "type": "string"
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
               "type": "string"
             }
           },
@@ -107,6 +115,10 @@
                 "boolean",
                 "integer"
               ]
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
+              "type": "string"
             }
           },
           "required": [
@@ -148,6 +160,10 @@
                 "boolean",
                 "integer"
               ]
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
+              "type": "string"
             }
           },
           "required": [
@@ -220,6 +236,10 @@
                 }
               },
               "type": "object"
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
+              "type": "string"
             }
           },
           "required": [],
@@ -251,6 +271,10 @@
             },
             "session": {
               "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
               "type": "string"
             }
           },
@@ -363,6 +387,10 @@
                 "after",
                 "before"
               ],
+              "type": "string"
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
               "type": "string"
             }
           },
@@ -493,6 +521,10 @@
                 "boolean",
                 "integer"
               ]
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
+              "type": "string"
             }
           },
           "required": [],
@@ -581,6 +613,10 @@
                 }
               },
               "type": "object"
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
+              "type": "string"
             }
           },
           "required": [
@@ -640,6 +676,10 @@
             "session": {
               "description": "Warm session id; defaults to \"default\" when omitted.",
               "type": "string"
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
+              "type": "string"
             }
           },
           "required": [
@@ -690,6 +730,10 @@
             "pattern": {
               "description": "What to search for.",
               "type": "string"
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
+              "type": "string"
             }
           },
           "required": [
@@ -716,6 +760,10 @@
             "session": {
               "description": "Warm session id; defaults to \"default\" when omitted.",
               "type": "string"
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
+              "type": "string"
             }
           },
           "required": [],
@@ -739,6 +787,10 @@
             },
             "session": {
               "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
               "type": "string"
             }
           },
@@ -768,6 +820,10 @@
             "session": {
               "description": "Warm session id; defaults to \"default\" when omitted.",
               "type": "string"
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
+              "type": "string"
             }
           },
           "required": [],
@@ -791,6 +847,10 @@
             },
             "session": {
               "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
               "type": "string"
             }
           },
@@ -819,6 +879,10 @@
             },
             "session": {
               "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
               "type": "string"
             }
           },
@@ -850,6 +914,10 @@
             "to": {
               "description": "Optional save-as destination — writes a copy there without rebinding the session. Omitted: write back to the visited file.",
               "type": "string"
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
+              "type": "string"
             }
           },
           "required": [],
@@ -877,6 +945,10 @@
             },
             "session": {
               "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
               "type": "string"
             }
           },
@@ -935,6 +1007,10 @@
             "session": {
               "description": "Warm session id; defaults to \"default\" when omitted. Pass path OR session, not both.",
               "type": "string"
+            },
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
+              "type": "string"
             }
           },
           "required": [],
@@ -951,11 +1027,52 @@
         },
         "description": "Report engine status: per live session the current buffer, its visited file, and whether it is narrowed, stale (its file drifted on disk), or unsaved (has edits not yet written to that file — so a forgotten save is visible); plus the allowed filesystem roots that open_file/save_buffer are confined to (MIME_ROOTS, default cwd), and whether the audit journal is on. Check the roots before opening or saving to learn the writable sandbox up front.",
         "inputSchema": {
-          "properties": {},
+          "properties": {
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
+              "type": "string"
+            }
+          },
           "required": [],
           "type": "object"
         },
         "name": "session_status"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Mint a fresh, empty workspace (an isolated set of warm sessions) and return its handle. Pass the handle as `workspace` to scope later calls. Needed only on the stateless HTTP protocol when isolating several agents on one server; stdio has one implicit workspace.",
+        "inputSchema": {
+          "properties": {},
+          "type": "object"
+        },
+        "name": "open_workspace"
+      },
+      {
+        "annotations": {
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Drop a workspace and every session in it, unsaved edits included. The stdio default workspace cannot be closed (use close_session for one session).",
+        "inputSchema": {
+          "properties": {
+            "workspace": {
+              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace"
+          ],
+          "type": "object"
+        },
+        "name": "close_workspace"
       },
       {
         "annotations": {

@@ -4,7 +4,7 @@
   "result": {
     "content": [
       {
-        "text": "{\"audit\":false,\"roots\":[],\"sessions\":[{\"buffer\":\"g\",\"checkpoints\":[],\"file\":null,\"id\":\"g\",\"narrowed\":false,\"stale\":false,\"unsaved\":false}]}",
+        "text": "{\"audit\":false,\"roots\":[],\"sessions\":[{\"buffer\":\"g\",\"checkpoints\":[],\"file\":null,\"id\":\"g\",\"narrowed\":false,\"stale\":false,\"unsaved\":false}],\"workspace\":\"<handle>\"}",
         "type": "text"
       }
     ],
