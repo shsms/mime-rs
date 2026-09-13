@@ -2769,8 +2769,10 @@ fn tool_outline(
         .map(|l| {
             let mut it = l.splitn(4, ' ');
             let kind = it.next().unwrap_or("");
-            let start = it.next().and_then(|s| s.parse::<u64>().ok());
-            let end = it.next().and_then(|s| s.parse::<u64>().ok());
+            // Always integers: the outputSchema says so, and a malformed
+            // report line must not turn them into nulls.
+            let start = it.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            let end = it.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
             let name = it.next().unwrap_or("");
             json!({ "kind": kind, "start": start, "end": end, "name": name })
         })
@@ -4726,7 +4728,10 @@ fn build_tool_schemas() -> Vec<Value> {
             "description": "Drop a workspace and every session in it, unsaved edits included. The stdio default workspace cannot be closed (use close_session for one session).",
             "inputSchema": {
                 "type": "object",
-                "properties": { "workspace": workspace.clone() },
+                "properties": { "workspace": json!({
+                    "type": "string",
+                    "description": "The handle of the workspace to drop (required — there is no implicit target for a close)."
+                }) },
                 "required": ["workspace"],
             },
         }),

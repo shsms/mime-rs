@@ -1,7 +1,10 @@
 //! The MCP protocol layer: JSON-RPC 2.0 framing, the `initialize`
 //! handshake and version negotiation. Transport-agnostic — the stdio loop
 //! (`mcp::run`) and the HTTP front end (`http`) both feed lines to
-//! [`handle_line`]. Tools live in `mcp`; this file never touches a buffer.
+//! [`handle_line`]. This file never touches a buffer: every buffer-touching
+//! tool lives in `mcp`. The two exceptions dispatched here are the workspace
+//! tools `open_workspace` and `close_workspace`, because they act on the
+//! [`WorkspaceStore`] itself rather than on any one session map.
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 
@@ -432,6 +435,11 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
 fn shape_result(era: Era, mut result: Value, report_workspace: Option<&str>) -> Value {
     if era == Era::Modern {
         result["resultType"] = json!("complete");
+        // Index-assignment on a non-object would silently drop the serverInfo,
+        // so make sure `_meta` is one first (as `structuredContent` is below).
+        if !result["_meta"].is_object() {
+            result["_meta"] = json!({});
+        }
         result["_meta"][META_SERVER_INFO] = server_info();
     }
     if let Some(h) = report_workspace {

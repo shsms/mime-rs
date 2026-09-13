@@ -1326,7 +1326,7 @@
         "inputSchema": {
           "properties": {
             "workspace": {
-              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
+              "description": "The handle of the workspace to drop (required — there is no implicit target for a close).",
               "type": "string"
             }
           },

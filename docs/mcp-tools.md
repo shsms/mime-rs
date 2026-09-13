@@ -232,7 +232,7 @@ Mint a fresh, empty workspace (an isolated set of warm sessions) and return its 
 
 Drop a workspace and every session in it, unsaved edits included. The stdio default workspace cannot be closed (use close_session for one session).
 
-- `workspace` (required) — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
+- `workspace` (required) — The handle of the workspace to drop (required — there is no implicit target for a close).
 
 ## git_rebase
 
