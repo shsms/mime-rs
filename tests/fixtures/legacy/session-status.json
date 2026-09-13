@@ -8,6 +8,22 @@
         "type": "text"
       }
     ],
-    "isError": false
+    "isError": false,
+    "structuredContent": {
+      "audit": false,
+      "roots": [],
+      "sessions": [
+        {
+          "buffer": "g",
+          "checkpoints": [],
+          "file": null,
+          "id": "g",
+          "narrowed": false,
+          "stale": false,
+          "unsaved": false
+        }
+      ],
+      "workspace": "<handle>"
+    }
   }
 }

@@ -134,35 +134,43 @@ pub(crate) fn tools_call_result(params: &Value, sessions: &mut Sessions, workspa
         return tool_text(message, true);
     }
 
-    let outcome: Result<String, String> = match name {
-        "open_file" => tool_open_file(&args, sessions),
-        "open_text" => tool_open_text(&args, sessions),
+    // The tools that also answer as JSON ride `ToolOutput`; the rest still
+    // return prose and are lifted into one via `From<String>`.
+    let outcome: Result<ToolOutput, String> = match name {
         "run_program" => tool_run_program(&args, sessions, false),
         "rehearse" => tool_run_program(&args, sessions, true),
-        "read_region" => tool_read_region(&args, sessions),
-        "view" => tool_view(&args, sessions),
-        "insert_text" => tool_insert_text(&args, sessions),
-        "replace_text" => tool_replace_text(&args, sessions),
-        "replace_in_files" => tool_replace_files(&args, sessions),
-        "occur" => tool_occur(&args, sessions),
         "grep" => tool_grep(&args, sessions),
         "outline" => tool_outline(&args, sessions),
-        "conflicts" => tool_conflicts(&args, sessions),
-        "checkpoint" => tool_checkpoint(&args, sessions),
-        "restore_checkpoint" => tool_restore_checkpoint(&args, sessions),
-        "undo_last" => tool_undo_last(&args, sessions),
-        "close_session" => tool_close_session(&args, sessions),
-        "save_buffer" => tool_save_buffer(&args, sessions),
         "session_status" => tool_session_status(sessions, workspace),
-        "unsaved_diff" => tool_unsaved_diff(&args, sessions),
-        "help" => tool_help(&args),
-        git if git.starts_with("git_") => dispatch_git(git, &args),
-        other => Err(format!("unknown tool: {other}")),
+        _ => text_tool(name, &args, sessions).map(ToolOutput::from),
     };
-
     match outcome {
-        Ok(text) => tool_text(text, false),
+        Ok(out) => tool_result(out),
         Err(message) => tool_text(message, true),
+    }
+}
+
+/// The tools that answer in prose only.
+fn text_tool(name: &str, args: &Value, sessions: &mut Sessions) -> Result<String, String> {
+    match name {
+        "open_file" => tool_open_file(args, sessions),
+        "open_text" => tool_open_text(args, sessions),
+        "read_region" => tool_read_region(args, sessions),
+        "view" => tool_view(args, sessions),
+        "insert_text" => tool_insert_text(args, sessions),
+        "replace_text" => tool_replace_text(args, sessions),
+        "replace_in_files" => tool_replace_files(args, sessions),
+        "occur" => tool_occur(args, sessions),
+        "conflicts" => tool_conflicts(args, sessions),
+        "checkpoint" => tool_checkpoint(args, sessions),
+        "restore_checkpoint" => tool_restore_checkpoint(args, sessions),
+        "undo_last" => tool_undo_last(args, sessions),
+        "close_session" => tool_close_session(args, sessions),
+        "save_buffer" => tool_save_buffer(args, sessions),
+        "unsaved_diff" => tool_unsaved_diff(args, sessions),
+        "help" => tool_help(args),
+        git if git.starts_with("git_") => dispatch_git(git, args),
+        other => Err(format!("unknown tool: {other}")),
     }
 }
 
@@ -371,11 +379,59 @@ fn validate_nested(schema: &Value, value: &Value, path: &str) -> Result<(), Stri
     Ok(())
 }
 
-/// Build the `{content, isError}` envelope MCP expects for a tool result.
+/// What a tool hands back: readable text, optionally the same information
+/// as JSON for `structuredContent`, and whether it is a tool-level failure.
+pub(crate) struct ToolOutput {
+    pub text: String,
+    pub structured: Option<Value>,
+    pub is_error: bool,
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            structured: None,
+            is_error: false,
+        }
+    }
+}
+
+impl ToolOutput {
+    pub(crate) fn with(text: String, structured: Value) -> Self {
+        Self {
+            text,
+            structured: Some(structured),
+            is_error: false,
+        }
+    }
+    pub(crate) fn failed(text: String, structured: Value) -> Self {
+        Self {
+            text,
+            structured: Some(structured),
+            is_error: true,
+        }
+    }
+}
+
+/// Build the `{content, structuredContent?, isError}` envelope MCP expects.
+pub(crate) fn tool_result(out: ToolOutput) -> Value {
+    let mut v = json!({
+        "content": [{ "type": "text", "text": out.text }],
+        "isError": out.is_error,
+    });
+    if let Some(s) = out.structured {
+        v["structuredContent"] = s;
+    }
+    v
+}
+
+/// The text-only shorthand: the same envelope with no `structuredContent`.
 pub(crate) fn tool_text(text: String, is_error: bool) -> Value {
-    json!({
-        "content": [{ "type": "text", "text": text }],
-        "isError": is_error,
+    tool_result(ToolOutput {
+        text,
+        structured: None,
+        is_error,
     })
 }
 
@@ -756,7 +812,7 @@ fn tool_run_program(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
     rehearse: bool,
-) -> Result<String, String> {
+) -> Result<ToolOutput, String> {
     let session = resolve_session(args, sessions)?;
     let program = str_arg(args, "program")?;
     // TODO: resource limits (needs tulisp eval interruption) — a per-program
@@ -796,7 +852,9 @@ fn tool_run_program(
                     ));
                 }
             }
-            return Err(pretty(&json));
+            // A tool-level failure: the same JSON rides both the text and
+            // `structuredContent`, so a structured client need not re-parse it.
+            return Ok(ToolOutput::failed(pretty(&json), json));
         }
     };
     // A rehearsal persists nothing, so it audits as a non-mutating event.
@@ -843,7 +901,7 @@ fn tool_run_program(
     if !view.is_empty() {
         json["view"] = Value::String(view.trim_start_matches('\n').to_string());
     }
-    Ok(pretty(&json))
+    Ok(ToolOutput::with(pretty(&json), json))
 }
 
 /// One warning line appended to read-tool output when the visited file has
@@ -2450,7 +2508,7 @@ impl Walk<'_> {
 /// CANONICAL absolute paths that feed `replace_in_files {files: …}` directly. No
 /// session needed — reads files within the sandbox (each routed through the
 /// path chokepoint). Caps files visited and matches rendered.
-fn tool_grep(args: &Value, sessions: &HashMap<String, Workspace>) -> Result<String, String> {
+fn tool_grep(args: &Value, sessions: &HashMap<String, Workspace>) -> Result<ToolOutput, String> {
     const MAX_FILES: usize = 5000;
     const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
     const MAX_LINE: usize = 200;
@@ -2503,6 +2561,11 @@ fn tool_grep(args: &Value, sessions: &HashMap<String, Workspace>) -> Result<Stri
     let mut files_with_hits = 0usize;
     let mut truncated = false;
     let mut out = String::new();
+    // The same hits, as data: one entry per RENDERED match line (context
+    // lines stay prose-only), plus the files whose warm buffer has edits the
+    // disk scan could not see.
+    let mut matches: Vec<Value> = Vec::new();
+    let mut unsaved: Vec<String> = Vec::new();
 
     'outer: for base in &dirs {
         // Discover the repo (if any) enclosing `base` so the walk can skip
@@ -2569,6 +2632,7 @@ fn tool_grep(args: &Value, sessions: &HashMap<String, Workspace>) -> Result<Stri
             // grep reads DISK; if a warm buffer holds unsaved edits for this
             // file, the hits may be stale — flag it at the moment of reading.
             let unsaved_flag = if clobbers_unsaved_session(sessions, "", &canonical).is_some() {
+                unsaved.push(canonical.display().to_string());
                 "  ⚠ a warm buffer has UNSAVED edits for this file — disk shown \
                  (occur/view read the buffer; unsaved_diff shows the difference)"
             } else {
@@ -2610,11 +2674,13 @@ fn tool_grep(args: &Value, sessions: &HashMap<String, Workspace>) -> Result<Stri
                             .find(raw)
                             .map(|m| raw[..m.start()].chars().count())
                             .unwrap_or(0);
-                        out.push_str(&format!(
-                            "  L{} @{pos}: {}\n",
-                            i + 1,
-                            clamp_line(raw, focus, MAX_LINE)
-                        ));
+                        let shown = clamp_line(raw, focus, MAX_LINE);
+                        matches.push(json!({
+                            "path": canonical.display().to_string(),
+                            "line": i + 1,
+                            "text": shown,
+                        }));
+                        out.push_str(&format!("  L{} @{pos}: {shown}\n", i + 1));
                     }
                     None => out.push_str(&format!(
                         "  L{}    {}\n",
@@ -2643,9 +2709,12 @@ fn tool_grep(args: &Value, sessions: &HashMap<String, Workspace>) -> Result<Stri
         } else {
             String::new()
         };
-        return Ok(format!(
-            "no matches for {pattern:?}{g} (visited {visited} files{cap}){}",
-            exact_regex_hint(args, &pattern)
+        return Ok(ToolOutput::with(
+            format!(
+                "no matches for {pattern:?}{g} (visited {visited} files{cap}){}",
+                exact_regex_hint(args, &pattern)
+            ),
+            json!({ "matches": matches, "truncated": truncated, "unsaved": unsaved }),
         ));
     }
     let mut tail = format!(
@@ -2664,14 +2733,20 @@ fn tool_grep(args: &Value, sessions: &HashMap<String, Workspace>) -> Result<Stri
     tail.push_str(").");
     out.push_str(&tail);
     out.push_str(exact_regex_hint(args, &pattern));
-    Ok(out)
+    Ok(ToolOutput::with(
+        out,
+        json!({ "matches": matches, "truncated": truncated, "unsaved": unsaved }),
+    ))
 }
 
 /// `outline {session?|path?}` — the buffer's structural outline: one
 /// `KIND START END NAME` line per defun (Rust/Python functions, types,
 /// impls; Markdown sections), via `treesit-list-defuns`. The natural first
 /// move on a code file — survey without reading it whole.
-fn tool_outline(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result<String, String> {
+fn tool_outline(
+    args: &Value,
+    sessions: &mut HashMap<String, Workspace>,
+) -> Result<ToolOutput, String> {
     let session = resolve_session(args, sessions)?;
     let report = run_in_session(
         sessions,
@@ -2687,18 +2762,38 @@ fn tool_outline(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Resu
         .filter(|(k, _)| k == "defun")
         .map(|(_, v)| v.clone())
         .collect();
+    // Each report line is `KIND START END NAME`; NAME may contain spaces
+    // (a Markdown section title), so split at most four ways.
+    let defuns: Vec<Value> = lines
+        .iter()
+        .map(|l| {
+            let mut it = l.splitn(4, ' ');
+            let kind = it.next().unwrap_or("");
+            let start = it.next().and_then(|s| s.parse::<u64>().ok());
+            let end = it.next().and_then(|s| s.parse::<u64>().ok());
+            let name = it.next().unwrap_or("");
+            json!({ "kind": kind, "start": start, "end": end, "name": name })
+        })
+        .collect();
+    let structured = json!({ "lang": lang, "defuns": defuns });
     let note = stale_note(sessions, &session);
     if lines.is_empty() {
-        return Ok(format!(
-            "no defuns found (language: {lang}) — for an extension-less buffer, \
-             treesit-set-language (rust|python|javascript|typescript|tsx|go|html|css|toml|yaml|elisp|markdown) \
-             overrides detection{note}"
+        return Ok(ToolOutput::with(
+            format!(
+                "no defuns found (language: {lang}) — for an extension-less buffer, \
+                 treesit-set-language (rust|python|javascript|typescript|tsx|go|html|css|toml|yaml|elisp|markdown) \
+                 overrides detection{note}"
+            ),
+            structured,
         ));
     }
-    Ok(format!(
-        "— outline ({lang}, {} defuns): KIND START END NAME —\n{}{note}",
-        lines.len(),
-        lines.join("\n")
+    Ok(ToolOutput::with(
+        format!(
+            "— outline ({lang}, {} defuns): KIND START END NAME —\n{}{note}",
+            lines.len(),
+            lines.join("\n")
+        ),
+        structured,
     ))
 }
 
@@ -2836,7 +2931,7 @@ fn tool_save_buffer(
 /// enforces: the allowed filesystem roots (as display strings) and whether the
 /// audit journal is on. Advertising the roots lets the agent target a writable
 /// path up front instead of discovering the bounds via a rejected save.
-fn tool_session_status(sessions: &Sessions, workspace: &str) -> Result<String, String> {
+fn tool_session_status(sessions: &Sessions, workspace: &str) -> Result<ToolOutput, String> {
     let mut ids: Vec<&String> = sessions.keys().collect();
     ids.sort();
     // Per session: the current buffer, its visited file, and the states a
@@ -2872,13 +2967,13 @@ fn tool_session_status(sessions: &Sessions, workspace: &str) -> Result<String, S
         .iter()
         .map(|r| r.display().to_string())
         .collect();
-    Ok(json!({
+    let json = json!({
         "workspace": workspace,
         "sessions": sessions_json,
         "roots": roots,
         "audit": crate::safety::audit_enabled(),
-    })
-    .to_string())
+    });
+    Ok(ToolOutput::with(json.to_string(), json))
 }
 
 /// `help {topic?}` — the canonical reference briefs (regex dialect, treesit
@@ -4224,6 +4319,24 @@ fn build_tool_schemas() -> Vec<Value> {
         "description": "Restrict this call to one part of the buffer without writing a program. {\"defun\": \"name\"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.",
         "properties": { "defun": { "type": "string" } },
     });
+    // The RunReport shape run_program and rehearse both answer with. Every
+    // key either tool can emit is declared: the conditional ones (`stale`,
+    // `saved`, `unsaved`, `view`) ride only when they apply, and `workspace`
+    // is merged in by the stateless-HTTP result shaper.
+    let run_report_output = json!({
+        "type": "object",
+        "properties": {
+            "ok": { "type": "boolean" }, "buffer": { "type": "string" }, "dirty": { "type": "boolean" },
+            "rehearsed": { "type": "boolean" }, "point": { "type": "integer" },
+            "len_before": { "type": "integer" }, "len_after": { "type": "integer" },
+            "diff": { "type": "string" }, "reports": { "type": "object" }, "log": { "type": "array" },
+            "value": { "type": "string" }, "error": { "type": "string" }, "rolled_back": { "type": "boolean" },
+            "stale": { "type": "boolean" }, "saved": { "type": "string" },
+            "unsaved": { "type": "boolean" }, "view": { "type": "string" },
+            "workspace": { "type": "string" }
+        },
+        "required": ["ok"]
+    });
     vec![
         json!({
             "name": "open_file",
@@ -4271,6 +4384,7 @@ fn build_tool_schemas() -> Vec<Value> {
                 },
                 "required": ["program"],
             },
+            "outputSchema": run_report_output.clone(),
         }),
         json!({
             "name": "rehearse",
@@ -4287,6 +4401,7 @@ fn build_tool_schemas() -> Vec<Value> {
                 },
                 "required": ["program"],
             },
+            "outputSchema": run_report_output.clone(),
         }),
         json!({
             "name": "read_region",
@@ -4427,6 +4542,17 @@ fn build_tool_schemas() -> Vec<Value> {
                 },
                 "required": ["pattern"],
             },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "matches": { "type": "array", "items": { "type": "object", "properties": {
+                        "path": { "type": "string" }, "line": { "type": "integer" }, "text": { "type": "string" } } } },
+                    "truncated": { "type": "boolean" },
+                    "unsaved": { "type": "array", "items": { "type": "string" } },
+                    "workspace": { "type": "string" }
+                },
+                "required": ["matches", "truncated", "unsaved"]
+            },
         }),
         json!({
             "name": "outline",
@@ -4439,6 +4565,16 @@ fn build_tool_schemas() -> Vec<Value> {
                     "path": path,
                 },
                 "required": [],
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "lang": { "type": "string" },
+                    "defuns": { "type": "array", "items": { "type": "object", "properties": {
+                        "kind": { "type": "string" }, "start": { "type": "integer" }, "end": { "type": "integer" }, "name": { "type": "string" } } } },
+                    "workspace": { "type": "string" }
+                },
+                "required": ["lang", "defuns"]
             },
         }),
         json!({
@@ -4558,6 +4694,20 @@ fn build_tool_schemas() -> Vec<Value> {
                 },
                 "required": [],
             },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": { "type": "string" },
+                    "sessions": { "type": "array", "items": { "type": "object", "properties": {
+                        "id": { "type": "string" }, "buffer": { "type": "string" }, "file": {},
+                        "narrowed": { "type": "boolean" }, "stale": { "type": "boolean" },
+                        "unsaved": { "type": "boolean" }, "checkpoints": { "type": "array" },
+                        "coding": { "type": "string" } } } },
+                    "roots": { "type": "array", "items": { "type": "string" } },
+                    "audit": { "type": "boolean" }
+                },
+                "required": ["workspace", "sessions", "roots", "audit"]
+            },
         }),
         json!({
             "name": "open_workspace",
@@ -4579,6 +4729,169 @@ fn build_tool_schemas() -> Vec<Value> {
 #[cfg(test)]
 mod git_tool_tests {
     use super::*;
+
+    /// Minimal JSON-schema conformance: type, required, declared keys only,
+    /// recursing through properties/items. Enough to keep an outputSchema
+    /// honest without a validator crate.
+    fn conforms(schema: &Value, value: &Value, at: &str) -> Result<(), String> {
+        let ty = schema["type"].as_str().unwrap_or("");
+        let ok = match ty {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "boolean" => value.is_boolean(),
+            "" => true,
+            other => return Err(format!("{at}: unknown schema type {other}")),
+        };
+        if !ok {
+            return Err(format!("{at}: expected {ty}, got {value}"));
+        }
+        if let (Some(props), Some(obj)) = (schema["properties"].as_object(), value.as_object()) {
+            for r in schema["required"].as_array().into_iter().flatten() {
+                let r = r.as_str().unwrap();
+                if !obj.contains_key(r) {
+                    return Err(format!("{at}: missing required {r}"));
+                }
+            }
+            for (k, v) in obj {
+                let Some(sub) = props.get(k) else {
+                    return Err(format!("{at}: undeclared key {k}"));
+                };
+                conforms(sub, v, &format!("{at}.{k}"))?;
+            }
+        }
+        if let (Some(items), Some(arr)) = (schema.get("items"), value.as_array()) {
+            for (i, v) in arr.iter().enumerate() {
+                conforms(items, v, &format!("{at}[{i}]"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn output_schema(name: &str) -> Value {
+        tool_schemas().iter().find(|t| t["name"] == name).unwrap()["outputSchema"].clone()
+    }
+
+    #[test]
+    fn structured_outputs_conform_to_their_output_schemas() {
+        // Under the crate's own `target/` so it sits inside the default
+        // allowed root (cwd) for grep; a git-ignored base dir is walked
+        // unfiltered, so the ignore rule does not hide it.
+        let pid = std::process::id();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("mime-structured-{pid}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.py");
+        std::fs::write(&file, "def f():\n    return 1\n\ndef g():\n    return 2\n").unwrap();
+        let mut sessions: Sessions = HashMap::new();
+
+        let outline =
+            tool_outline(&json!({"path": file.display().to_string()}), &mut sessions).unwrap();
+        let s = outline.structured.expect("outline is structured");
+        conforms(&output_schema("outline"), &s, "outline").unwrap();
+        assert_eq!(s["lang"], "python");
+        assert_eq!(s["defuns"][0]["name"], "f");
+        assert_eq!(s["defuns"][0]["kind"], "function_definition");
+        assert_eq!(s["defuns"][1]["name"], "g");
+        assert!(
+            outline.text.contains("function_definition"),
+            "text unchanged"
+        );
+
+        let status = tool_session_status(&sessions, "abc").unwrap();
+        let s = status.structured.unwrap();
+        conforms(&output_schema("session_status"), &s, "session_status").unwrap();
+        assert_eq!(s["workspace"], "abc");
+        assert_eq!(status.text, s.to_string());
+
+        let run = tool_run_program(&json!({"path": file.display().to_string(), "program": "(report \"n\" (count-matches \"def\"))"}), &mut sessions, false).unwrap();
+        let s = run.structured.unwrap();
+        conforms(&output_schema("run_program"), &s, "run_program").unwrap();
+        assert_eq!(s["ok"], true);
+        assert_eq!(s["reports"]["n"], "2");
+        assert!(!run.is_error);
+
+        let failed = tool_run_program(
+            &json!({"path": file.display().to_string(), "program": "(error \"boom\")"}),
+            &mut sessions,
+            false,
+        )
+        .unwrap();
+        assert!(failed.is_error);
+        let s = failed.structured.unwrap();
+        conforms(&output_schema("run_program"), &s, "run_program(failed)").unwrap();
+        assert_eq!(s["ok"], false);
+        assert!(s["error"].as_str().unwrap().contains("boom"));
+
+        // grep walks the allowed roots (cwd when MIME_ROOTS is unset, which
+        // the unit tests rely on); `dir` narrows it to our scratch directory.
+        let grep = tool_grep(
+            &json!({"pattern": "return", "dir": dir.display().to_string()}),
+            &sessions,
+        )
+        .unwrap();
+        let s = grep.structured.unwrap();
+        conforms(&output_schema("grep"), &s, "grep").unwrap();
+        assert_eq!(s["matches"].as_array().unwrap().len(), 2);
+        assert_eq!(s["matches"][0]["line"], 2);
+        assert!(s["matches"][0]["path"].as_str().unwrap().ends_with("a.py"));
+        assert_eq!(s["truncated"], false);
+        assert_eq!(s["unsaved"], json!([]));
+
+        // The conditional report keys: `save: true` adds `saved`, `view: true`
+        // adds `view` — both must be declared, or the tool breaks its own
+        // schema on an ordinary call.
+        let saved = tool_run_program(
+            &json!({
+                "path": file.display().to_string(),
+                "program": "(progn (goto-char (point-max)) (insert \"# tail\\n\"))",
+                "save": true,
+                "view": true,
+            }),
+            &mut sessions,
+            false,
+        )
+        .unwrap();
+        let s = saved.structured.unwrap();
+        conforms(&output_schema("run_program"), &s, "run_program(save+view)").unwrap();
+        assert!(s["saved"].is_string(), "saved is a string: {s}");
+        assert!(s["view"].is_string(), "view is a string: {s}");
+
+        let rehearsed = tool_run_program(
+            &json!({"path": file.display().to_string(), "program": "(insert \"x\")"}),
+            &mut sessions,
+            true,
+        )
+        .unwrap();
+        let s = rehearsed.structured.unwrap();
+        conforms(&output_schema("rehearse"), &s, "rehearse").unwrap();
+        assert_eq!(s["rehearsed"], true);
+
+        // On the stateless protocol `shape_result` merges the workspace handle
+        // into whatever structuredContent the tool produced — the schema has
+        // to allow it, or the shaped result stops conforming.
+        let mut shaped = tool_outline(&json!({"path": file.display().to_string()}), &mut sessions)
+            .unwrap()
+            .structured
+            .unwrap();
+        shaped["workspace"] = json!("abc");
+        conforms(&output_schema("outline"), &shaped, "outline(shaped)").unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_result_carries_structured_content_only_when_present() {
+        let plain = tool_result(ToolOutput::from("hi".to_string()));
+        assert!(plain.get("structuredContent").is_none());
+        assert_eq!(plain["isError"], false);
+        let rich = tool_result(ToolOutput::failed("bad".into(), json!({"ok": false})));
+        assert_eq!(rich["structuredContent"]["ok"], false);
+        assert_eq!(rich["isError"], true);
+        assert_eq!(rich["content"][0]["text"], "bad");
+    }
 
     #[test]
     fn clobbers_unsaved_session_flags_only_a_dirty_cross_session_collision() {

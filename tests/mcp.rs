@@ -2427,4 +2427,11 @@ fn normalise(v: &mut Value) {
     if touched {
         v["result"]["content"][0]["text"] = Value::String(inner.to_string());
     }
+    // session_status also answers as `structuredContent`; blank the same
+    // per-run fields there, or the fixture would freeze this machine's roots.
+    if v["result"]["structuredContent"].get("roots").is_some() {
+        v["result"]["structuredContent"]["roots"] = json!([]);
+        v["result"]["structuredContent"]["audit"] = json!(false);
+        v["result"]["structuredContent"]["workspace"] = json!("<handle>");
+    }
 }

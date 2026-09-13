@@ -127,7 +127,69 @@
           ],
           "type": "object"
         },
-        "name": "run_program"
+        "name": "run_program",
+        "outputSchema": {
+          "properties": {
+            "buffer": {
+              "type": "string"
+            },
+            "diff": {
+              "type": "string"
+            },
+            "dirty": {
+              "type": "boolean"
+            },
+            "error": {
+              "type": "string"
+            },
+            "len_after": {
+              "type": "integer"
+            },
+            "len_before": {
+              "type": "integer"
+            },
+            "log": {
+              "type": "array"
+            },
+            "ok": {
+              "type": "boolean"
+            },
+            "point": {
+              "type": "integer"
+            },
+            "rehearsed": {
+              "type": "boolean"
+            },
+            "reports": {
+              "type": "object"
+            },
+            "rolled_back": {
+              "type": "boolean"
+            },
+            "saved": {
+              "type": "string"
+            },
+            "stale": {
+              "type": "boolean"
+            },
+            "unsaved": {
+              "type": "boolean"
+            },
+            "value": {
+              "type": "string"
+            },
+            "view": {
+              "type": "string"
+            },
+            "workspace": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "ok"
+          ],
+          "type": "object"
+        }
       },
       {
         "annotations": {
@@ -172,7 +234,69 @@
           ],
           "type": "object"
         },
-        "name": "rehearse"
+        "name": "rehearse",
+        "outputSchema": {
+          "properties": {
+            "buffer": {
+              "type": "string"
+            },
+            "diff": {
+              "type": "string"
+            },
+            "dirty": {
+              "type": "boolean"
+            },
+            "error": {
+              "type": "string"
+            },
+            "len_after": {
+              "type": "integer"
+            },
+            "len_before": {
+              "type": "integer"
+            },
+            "log": {
+              "type": "array"
+            },
+            "ok": {
+              "type": "boolean"
+            },
+            "point": {
+              "type": "integer"
+            },
+            "rehearsed": {
+              "type": "boolean"
+            },
+            "reports": {
+              "type": "object"
+            },
+            "rolled_back": {
+              "type": "boolean"
+            },
+            "saved": {
+              "type": "string"
+            },
+            "stale": {
+              "type": "boolean"
+            },
+            "unsaved": {
+              "type": "boolean"
+            },
+            "value": {
+              "type": "string"
+            },
+            "view": {
+              "type": "string"
+            },
+            "workspace": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "ok"
+          ],
+          "type": "object"
+        }
       },
       {
         "annotations": {
@@ -742,7 +866,46 @@
           ],
           "type": "object"
         },
-        "name": "grep"
+        "name": "grep",
+        "outputSchema": {
+          "properties": {
+            "matches": {
+              "items": {
+                "properties": {
+                  "line": {
+                    "type": "integer"
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "unsaved": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "workspace": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "matches",
+            "truncated",
+            "unsaved"
+          ],
+          "type": "object"
+        }
       },
       {
         "annotations": {
@@ -770,7 +933,42 @@
           "required": [],
           "type": "object"
         },
-        "name": "outline"
+        "name": "outline",
+        "outputSchema": {
+          "properties": {
+            "defuns": {
+              "items": {
+                "properties": {
+                  "end": {
+                    "type": "integer"
+                  },
+                  "kind": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "lang": {
+              "type": "string"
+            },
+            "workspace": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "lang",
+            "defuns"
+          ],
+          "type": "object"
+        }
       },
       {
         "annotations": {
@@ -1037,7 +1235,60 @@
           "required": [],
           "type": "object"
         },
-        "name": "session_status"
+        "name": "session_status",
+        "outputSchema": {
+          "properties": {
+            "audit": {
+              "type": "boolean"
+            },
+            "roots": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "sessions": {
+              "items": {
+                "properties": {
+                  "buffer": {
+                    "type": "string"
+                  },
+                  "checkpoints": {
+                    "type": "array"
+                  },
+                  "coding": {
+                    "type": "string"
+                  },
+                  "file": {},
+                  "id": {
+                    "type": "string"
+                  },
+                  "narrowed": {
+                    "type": "boolean"
+                  },
+                  "stale": {
+                    "type": "boolean"
+                  },
+                  "unsaved": {
+                    "type": "boolean"
+                  }
+                },
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "workspace": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace",
+            "sessions",
+            "roots",
+            "audit"
+          ],
+          "type": "object"
+        }
       },
       {
         "annotations": {
