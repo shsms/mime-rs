@@ -284,9 +284,11 @@ discards unsaved edits).
 
 Workspaces: a workspace is one isolated set of sessions behind an
 unguessable handle. On stdio there is exactly one and you normally omit it.
-On the stateless HTTP protocol (2026-07-28) every stateful result reports
-`workspace: <handle>`; pass it as `workspace` on later calls or each call
-starts a fresh, empty workspace. open_workspace mints one explicitly;
+On the stateless HTTP protocol (2026-07-28) a call reports `workspace: <handle>`
+when it was given one, or when it was made without one and created warm state
+(JSON tools carry it inside their JSON); pass it as `workspace` on later calls.
+session_status shows `workspace: null` except on that protocol.
+open_workspace mints one explicitly;
 close_workspace drops one with all its sessions (unsaved edits included).
 
 Saving: edits live in the warm buffer until saved. Pass save:true on an

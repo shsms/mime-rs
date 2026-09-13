@@ -4,7 +4,7 @@
   "result": {
     "content": [
       {
-        "text": "{\"audit\":false,\"roots\":[],\"sessions\":[{\"buffer\":\"g\",\"checkpoints\":[],\"file\":null,\"id\":\"g\",\"narrowed\":false,\"stale\":false,\"unsaved\":false}],\"workspace\":\"<handle>\"}",
+        "text": "{\"audit\":false,\"roots\":[],\"sessions\":[{\"buffer\":\"g\",\"checkpoints\":[],\"file\":null,\"id\":\"g\",\"narrowed\":false,\"stale\":false,\"unsaved\":false}],\"workspace\":null}",
         "type": "text"
       }
     ],
@@ -23,7 +23,7 @@
           "unsaved": false
         }
       ],
-      "workspace": "<handle>"
+      "workspace": null
     }
   }
 }

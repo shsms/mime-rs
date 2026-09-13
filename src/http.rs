@@ -4,9 +4,10 @@
 //! request, while a 2026-07-28 client is stateless — no session header at all,
 //! each request self-describing through its standard headers, with the
 //! `workspace` handle it wants to reuse passed as a tool argument in the
-//! body. Both eras share the
-//! transport-agnostic [`crate::rpc::handle_line`] dispatch and answer with
-//! plain JSON: mime never sends a server-initiated message, so there is no SSE
+//! body. Both eras share the transport-agnostic
+//! [`crate::rpc::handle_request`] dispatch (stdio enters through
+//! [`crate::rpc::handle_line`], which parses a line and calls it) and answer
+//! with plain JSON: mime never sends a server-initiated message, so there is no SSE
 //! stream to open (a spec-valid choice — a server MAY return `application/json`
 //! for any request).
 //!
@@ -16,10 +17,11 @@
 //! sessions under it; the id is the client's bearer token, so every later
 //! request MUST carry it (an absent/unknown one is a 404 — re-initialize). A
 //! modern request instead names its workspace handle, which is equally
-//! unguessable. The workspace store is capped and FIFO-evicted so a flood can't
-//! exhaust memory or file descriptors. Requests are served one at a time (like
-//! the daemon): simple and race-free, at the cost of head-of-line blocking if a
-//! single op runs long.
+//! unguessable. The workspace store is bounded: past its cap the oldest
+//! workspace without unsaved edits is evicted, so a flood of handshakes cannot
+//! exhaust memory or file descriptors, while unsaved work is never dropped.
+//! Requests are served one at a time (like the daemon): simple and race-free,
+//! at the cost of head-of-line blocking if a single op runs long.
 
 use crate::rpc::{CallContext, Transport, WorkspaceStore};
 use serde_json::{Value, json};
@@ -108,38 +110,28 @@ impl HttpReply {
     }
 }
 
-/// What the router needs from the body without dispatching it.
-struct Peek {
-    id: Value,
-    method: String,
-    /// `params.name` (tools/call).
-    name: Option<String>,
-    /// Whether `_meta` carries the protocol-version KEY — the era test, the
-    /// same one [`crate::rpc::era_of`] applies. A non-string value is still
-    /// modern, so a malformed request gets the protocol layer's `-32602`
-    /// rather than a legacy "unknown session" 404.
-    meta_present: bool,
-    /// That key's value when it is a string, for the header comparison.
-    meta_version: Option<String>,
-}
+/// The 404 an `initialize`-less legacy request gets: the session id is the
+/// client's bearer token, so a missing or stale one can only be re-earned.
+const NO_SESSION: &str = "unknown or missing Mcp-Session-Id — send initialize first";
 
-fn peek(body: &str) -> Option<Peek> {
-    let v: Value = serde_json::from_str(body).ok()?;
-    Some(Peek {
-        id: v.get("id").cloned().unwrap_or(Value::Null),
-        method: v
-            .get("method")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        name: v["params"]["name"].as_str().map(str::to_string),
-        meta_present: v["params"]["_meta"]
-            .get(crate::rpc::META_PROTOCOL_VERSION)
-            .is_some(),
-        meta_version: v["params"]["_meta"][crate::rpc::META_PROTOCOL_VERSION]
-            .as_str()
-            .map(str::to_string),
-    })
+/// Build this request's [`CallContext`], dispatch it, and map the protocol
+/// layer's answer onto an HTTP reply: a notification (no reply) is a 202, and
+/// `status` picks the code for a real one (legacy always 200; the modern era
+/// maps JSON-RPC error codes onto HTTP ones).
+fn dispatch(
+    req: Value,
+    store: &mut WorkspaceStore,
+    implicit: Option<&str>,
+    status: impl Fn(&Value) -> u16,
+) -> HttpReply {
+    let ctx = CallContext {
+        transport: Transport::Http,
+        implicit_workspace: implicit,
+    };
+    match crate::rpc::handle_request(req, store, &ctx) {
+        Some(v) => HttpReply::json(status(&v), &v),
+        None => HttpReply::empty(202),
+    }
 }
 
 fn route(req: &HttpRequest, store: &mut WorkspaceStore) -> HttpReply {
@@ -168,69 +160,67 @@ fn route(req: &HttpRequest, store: &mut WorkspaceStore) -> HttpReply {
         HttpMethod::Other => return HttpReply::empty(405),
     }
 
-    let Some(pk) = peek(&req.body) else {
-        // Not JSON: let the JSON-RPC layer produce the -32700.
-        let mut scratch = WorkspaceStore::new();
-        let ctx = CallContext {
-            transport: Transport::Http,
-            implicit_workspace: None,
-        };
-        return match crate::rpc::handle_line(&req.body, &mut scratch, &ctx) {
-            Some(v) => HttpReply::json(400, &v),
-            None => HttpReply::empty(202),
-        };
+    // Parsed once, here: the era comes off the parsed value, and the same
+    // value is handed to the protocol layer instead of being re-parsed.
+    let body: Value = match serde_json::from_str(&req.body) {
+        Ok(v) => v,
+        // An unparseable body names no era — the era lives inside it — so the
+        // client's own headers have to say which answer it can understand. An
+        // `MCP-Protocol-Version` header naming the modern version can only come
+        // from a modern client (legacy clients since 2025-06-18 send the header
+        // too, with their own version), so that client gets the modern shape for
+        // a bad request: HTTP 400 carrying the `-32700` JSON-RPC body. A legacy
+        // version, or no header, is answered the way the
+        // legacy path answers everything else, which is also how this server
+        // answered before it was dual-era: a client holding a known session gets
+        // the `-32700` body at HTTP 200 (the error is at the protocol layer, not
+        // the transport), and one without gets the same 404 as any other
+        // sessionless legacy request. Garbage must not reveal more about the
+        // server than well-formed JSON does.
+        Err(e) => {
+            if req.header("mcp-protocol-version") == Some(crate::rpc::PROTOCOL_VERSION) {
+                return HttpReply::json(400, &crate::rpc::parse_error(&e));
+            }
+            return match req.header("mcp-session-id").filter(|id| store.contains(id)) {
+                Some(_) => HttpReply::json(200, &crate::rpc::parse_error(&e)),
+                None => HttpReply::text(404, NO_SESSION),
+            };
+        }
     };
-
-    if pk.meta_present {
-        route_modern(req, &pk, store)
-    } else {
-        route_legacy(req, &pk, store)
+    // A malformed `_meta` is still modern, so it gets the protocol layer's
+    // `-32602` rather than a legacy "unknown session" 404.
+    match crate::rpc::era_of(&body["params"]) {
+        crate::rpc::Era::Modern => route_modern(req, body, store),
+        crate::rpc::Era::Legacy => route_legacy(req, body, store),
     }
 }
 
 /// Legacy era: `initialize` mints a session; every other request must carry
 /// a known `Mcp-Session-Id`. A missing `MCP-Protocol-Version` header is
 /// tolerated (the spec allows it for servers supporting pre-2025-06-18 clients).
-fn route_legacy(req: &HttpRequest, pk: &Peek, store: &mut WorkspaceStore) -> HttpReply {
-    if pk.method == "initialize" {
+fn route_legacy(req: &HttpRequest, body: Value, store: &mut WorkspaceStore) -> HttpReply {
+    if body["method"] == "initialize" {
         let id = store.mint();
-        let ctx = CallContext {
-            transport: Transport::Http,
-            implicit_workspace: Some(&id),
-        };
-        let reply = crate::rpc::handle_line(&req.body, store, &ctx);
-        let mut out = match reply {
-            Some(v) => HttpReply::json(200, &v),
-            None => HttpReply::empty(202),
-        };
+        let mut out = dispatch(body, store, Some(&id), |_| 200);
         out.session_id = Some(id);
         return out;
     }
     let Some(id) = req.header("mcp-session-id").filter(|id| store.contains(id)) else {
-        return HttpReply::text(
-            404,
-            "unknown or missing Mcp-Session-Id — send initialize first",
-        );
+        return HttpReply::text(404, NO_SESSION);
     };
     let id = id.to_string();
-    let ctx = CallContext {
-        transport: Transport::Http,
-        implicit_workspace: Some(&id),
-    };
-    match crate::rpc::handle_line(&req.body, store, &ctx) {
-        Some(v) => HttpReply::json(200, &v),
-        None => HttpReply::empty(202),
-    }
+    dispatch(body, store, Some(&id), |_| 200)
 }
 
 /// Modern era (2026-07-28): stateless. The standard request headers must
 /// agree with the body; `Mcp-Session-Id` / `Last-Event-ID` are ignored.
-fn route_modern(req: &HttpRequest, pk: &Peek, store: &mut WorkspaceStore) -> HttpReply {
+fn route_modern(req: &HttpRequest, body: Value, store: &mut WorkspaceStore) -> HttpReply {
+    let method = body["method"].as_str().unwrap_or("").to_string();
     let mut checks: Vec<(&str, Option<String>, String)> = Vec::new();
     // Nothing to compare the header against when the body's version is not a
-    // string: skip this one check and let `handle_line` report the malformed
-    // `_meta` as -32602 (mapped to 400 below), which is the accurate error.
-    if let Some(version) = pk.meta_version.as_deref() {
+    // string: skip this one check and let the protocol layer report the
+    // malformed `_meta` as -32602 (mapped to 400 below), the accurate error.
+    if let Some(version) = body["params"]["_meta"][crate::rpc::META_PROTOCOL_VERSION].as_str() {
         checks.push((
             "MCP-Protocol-Version",
             req.header("mcp-protocol-version").map(str::to_string),
@@ -240,19 +230,25 @@ fn route_modern(req: &HttpRequest, pk: &Peek, store: &mut WorkspaceStore) -> Htt
     checks.push((
         "Mcp-Method",
         req.header("mcp-method").map(str::to_string),
-        pk.method.clone(),
+        method.clone(),
     ));
-    if pk.method == "tools/call" {
+    if method == "tools/call" {
         checks.push((
             "Mcp-Name",
             req.header("mcp-name").and_then(decode_mcp_name),
-            pk.name.clone().unwrap_or_default(),
+            body["params"]["name"].as_str().unwrap_or("").to_string(),
         ));
     }
     for (header, got, expected) in checks {
         if got.as_deref() != Some(expected.as_str()) {
+            // A notification (no `id`) has nowhere to carry a JSON-RPC error:
+            // an error object answering no request would be a protocol
+            // violation, so the mismatch is reported by the status code alone.
+            let Some(id) = body.get("id") else {
+                return HttpReply::empty(400);
+            };
             let err = crate::rpc::rpc_error_data(
-                pk.id.clone(),
+                id.clone(),
                 -32020,
                 &format!("header {header} missing or does not match the request body"),
                 json!({ "header": header, "expected": expected }),
@@ -260,21 +256,11 @@ fn route_modern(req: &HttpRequest, pk: &Peek, store: &mut WorkspaceStore) -> Htt
             return HttpReply::json(400, &err);
         }
     }
-    let ctx = CallContext {
-        transport: Transport::Http,
-        implicit_workspace: None,
-    };
-    match crate::rpc::handle_line(&req.body, store, &ctx) {
-        Some(v) => {
-            let status = match v["error"]["code"].as_i64() {
-                Some(-32601) => 404,
-                Some(-32602 | -32022 | -32020 | -32700) => 400,
-                _ => 200,
-            };
-            HttpReply::json(status, &v)
-        }
-        None => HttpReply::empty(202),
-    }
+    dispatch(body, store, None, |v| match v["error"]["code"].as_i64() {
+        Some(-32601) => 404,
+        Some(-32602 | -32022 | -32020 | -32700) => 400,
+        _ => 200,
+    })
 }
 
 /// `Mcp-Name` is the tool name verbatim, or `=?base64?<b64>?=` when the name
@@ -438,12 +424,11 @@ mod tests {
         }
     }
 
-    const META: &str = r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}"#;
-
     fn modern_body(id: u32, method: &str, params: &str) -> String {
         let sep = if params.is_empty() { "" } else { "," };
+        let meta = crate::rpc::modern_meta_json();
         format!(
-            r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{{params}{sep}{META}}}}}"#
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{{params}{sep}{meta}}}}}"#
         )
     }
 
@@ -725,6 +710,233 @@ mod tests {
         );
         assert_eq!(r.status, 200);
         assert_eq!(json(&r)["result"]["isError"], true);
+    }
+
+    #[test]
+    fn legacy_parse_error_is_200_with_a_session() {
+        // A legacy client that holds its session id gets the JSON-RPC parse
+        // error for a malformed body — HTTP 200, because the failure is at the
+        // protocol layer, not the transport. (This is what the server answered
+        // before it was dual-era, and it stays.)
+        let mut store = WorkspaceStore::new();
+        let init = route(
+            &req(
+                HttpMethod::Post,
+                &[],
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+            ),
+            &mut store,
+        );
+        let sid = init.session_id.clone().expect("initialize mints a session");
+        let r = route(
+            &req(HttpMethod::Post, &[("Mcp-Session-Id", &sid)], "{not json"),
+            &mut store,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(json(&r)["error"]["code"], -32700);
+        assert!(
+            json(&r)["id"].is_null(),
+            "no id is recoverable from garbage"
+        );
+        // A legacy client since 2025-06-18 also sends MCP-Protocol-Version with
+        // its own version; that must not be mistaken for the modern era.
+        let r = route(
+            &req(
+                HttpMethod::Post,
+                &[
+                    ("Mcp-Session-Id", &sid),
+                    ("MCP-Protocol-Version", "2025-06-18"),
+                ],
+                "{not json",
+            ),
+            &mut store,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(json(&r)["error"]["code"], -32700);
+    }
+
+    #[test]
+    fn a_modern_client_with_a_malformed_body_gets_400_not_the_legacy_404() {
+        // A malformed body carries no era, but an `MCP-Protocol-Version`
+        // header naming the modern version does (legacy clients since
+        // 2025-06-18 send the header too, with their own version). So the
+        // client gets the modern answer to a bad request — HTTP 400 with the
+        // `-32700` body — instead of being mistaken for a legacy client and
+        // handed the sessionless 404.
+        let mut store = WorkspaceStore::new();
+        let r = route(
+            &req(
+                HttpMethod::Post,
+                &[
+                    ("MCP-Protocol-Version", "2026-07-28"),
+                    ("Mcp-Method", "ping"),
+                ],
+                "{not json",
+            ),
+            &mut store,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert_eq!(json(&r)["error"]["code"], -32700);
+    }
+
+    #[test]
+    fn legacy_bad_body_without_a_session_is_404() {
+        // Without a known session there is nothing to answer at the protocol
+        // layer: garbage gets the same 404 as any other sessionless legacy
+        // request, so an unparseable body reveals no more than a valid one.
+        let mut store = WorkspaceStore::new();
+        for headers in [vec![], vec![("Mcp-Session-Id", "deadbeef")]] {
+            let r = route(&req(HttpMethod::Post, &headers, "{not json"), &mut store);
+            assert_eq!(r.status, 404, "{headers:?}");
+            assert!(r.body.contains("Mcp-Session-Id"), "{}", r.body);
+        }
+    }
+
+    #[test]
+    fn a_modern_notification_with_bad_headers_is_a_bodyless_400() {
+        // A notification has no `id`, so a JSON-RPC error object would be
+        // answering no request at all: the header mismatch is reported by the
+        // status code alone.
+        let mut store = WorkspaceStore::new();
+        let meta = crate::rpc::modern_meta_json();
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/initialized","params":{{{meta}}}}}"#
+        );
+        let r = route(
+            &req(
+                HttpMethod::Post,
+                &[("MCP-Protocol-Version", "2026-07-28")],
+                &body,
+            ),
+            &mut store,
+        );
+        assert_eq!(r.status, 400);
+        assert!(r.body.is_empty(), "{}", r.body);
+        assert!(!r.json, "no JSON-RPC error rides on a notification");
+        // With the headers it needs, the same notification is simply accepted.
+        let ok = route(
+            &req(
+                HttpMethod::Post,
+                &modern_headers("notifications/initialized", None),
+                &body,
+            ),
+            &mut store,
+        );
+        assert_eq!(ok.status, 202);
+    }
+
+    #[test]
+    fn a_legacy_session_status_does_not_echo_the_session_id() {
+        // The legacy handle IS the `Mcp-Session-Id` bearer token: the client
+        // already holds it, and it must not travel back inside tool output.
+        let mut store = WorkspaceStore::new();
+        let init = route(
+            &req(
+                HttpMethod::Post,
+                &[],
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+            ),
+            &mut store,
+        );
+        let sid = init.session_id.clone().expect("initialize mints a session");
+        let r = route(
+            &req(
+                HttpMethod::Post,
+                &[("Mcp-Session-Id", &sid)],
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"session_status","arguments":{}}}"#,
+            ),
+            &mut store,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v = json(&r);
+        assert!(
+            v["result"]["structuredContent"]["workspace"].is_null(),
+            "{}",
+            v["result"]["structuredContent"]
+        );
+        assert!(!r.body.contains(&sid), "the session id must not leak");
+    }
+
+    /// Send one raw HTTP/1.1 request and read the whole response. The write half
+    /// is closed after the head: tiny_http drains an unread body when it drops
+    /// the request, and the over-cap case below announces a body it never sends.
+    fn raw(addr: std::net::SocketAddr, head: &str) -> String {
+        use std::io::Write as _;
+        let mut sock = std::net::TcpStream::connect(addr).expect("connect to the test server");
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(20)))
+            .expect("a read timeout, so a regression fails instead of hanging");
+        sock.write_all(head.as_bytes()).expect("write the request");
+        sock.shutdown(std::net::Shutdown::Write)
+            .expect("half-close the request");
+        let mut out = Vec::new();
+        sock.read_to_end(&mut out).expect("read the response");
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn serve_over_a_real_socket() {
+        // `route` is pure and covered above; this exercises the adapter around
+        // it — the tiny_http method/path mapping and the body-size guard that
+        // must answer BEFORE reading the body it is refusing.
+        let server = Server::http("127.0.0.1:0").expect("bind an ephemeral port");
+        let addr = server
+            .server_addr()
+            .to_ip()
+            .expect("an ip address, not a unix socket");
+        // The worker reports over a channel rather than being joined: a test
+        // that waits on a server thread must never be able to hang the suite,
+        // so completion is awaited with a timeout (below) instead.
+        let (done, finished) = std::sync::mpsc::channel();
+        let _worker = std::thread::spawn(move || {
+            let store = Mutex::new(WorkspaceStore::new());
+            let mut served = 0usize;
+            for r in server.incoming_requests().take(4) {
+                serve(r, &store);
+                served += 1;
+            }
+            let _ = done.send(served);
+        });
+
+        let head = |req: &str| -> String {
+            let resp = raw(addr, req);
+            resp.split("\r\n\r\n").next().unwrap_or("").to_string()
+        };
+        let status = |resp: &str| resp.lines().next().unwrap_or("").to_string();
+
+        let patch = head(
+            "PATCH /mcp HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert!(status(&patch).starts_with("HTTP/1.1 405"), "{patch}");
+
+        let other = head(
+            "POST /other HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert!(status(&other).starts_with("HTTP/1.1 404"), "{other}");
+
+        // MAX_BODY + 1, announced and never sent: the guard reads the length,
+        // not the stream, so the answer comes back without the body.
+        let huge = head(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 67108865\r\n\r\n",
+        );
+        assert!(status(&huge).starts_with("HTTP/1.1 413"), "{huge}");
+
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#;
+        let ok = head(&format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{init}",
+            init.len()
+        ));
+        assert!(status(&ok).starts_with("HTTP/1.1 200"), "{ok}");
+        let lower = ok.to_ascii_lowercase();
+        assert!(lower.contains("mcp-session-id:"), "{ok}");
+        assert!(lower.contains("content-type: application/json"), "{ok}");
+
+        // The `take(4)` loop can under-run (a connection the server never
+        // yields), so the count comes back with the signal and names itself.
+        let served = finished.recv_timeout(std::time::Duration::from_secs(30));
+        assert!(
+            served == Ok(4),
+            "the server thread should finish having served all 4 requests, got {served:?}"
+        );
     }
 
     #[test]

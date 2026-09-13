@@ -1,16 +1,18 @@
 //! The MCP protocol layer: JSON-RPC 2.0 framing, the `initialize`
 //! handshake and version negotiation. Transport-agnostic — the stdio loop
-//! (`mcp::run`) and the HTTP front end (`http`) both feed lines to
-//! [`handle_line`]. This file never touches a buffer: every buffer-touching
+//! (`mcp::run`) feeds lines to [`handle_line`]; the HTTP front end parses its
+//! own body and calls [`handle_request`]. This file never touches a buffer: every buffer-touching
 //! tool lives in `mcp`. The two exceptions dispatched here are the workspace
 //! tools `open_workspace` and `close_workspace`, because they act on the
 //! [`WorkspaceStore`] itself rather than on any one session map.
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
+use std::sync::LazyLock;
 
 use crate::Workspace;
 use crate::mcp::{
-    ToolOutput, tool_result, tool_text, tool_uses_workspace, tools_call_result, validate_args,
+    Render, ToolOutput, tool_result, tool_text, tool_uses_workspace, tools_call_result,
+    validate_args,
 };
 use serde_json::{Value, json};
 
@@ -91,33 +93,62 @@ fn validate_modern_meta(params: &Value) -> Result<(), (i64, String, Value)> {
 }
 
 /// Who the client is talking to — the same object in `initialize`'s
-/// `serverInfo` and in a modern reply's `_meta`.
+/// `serverInfo` and in a modern reply's `_meta`. Built once: it rides on every
+/// modern reply, and its fields are compile-time constants.
 pub fn server_info() -> Value {
+    static INFO: LazyLock<Value> = LazyLock::new(|| {
+        json!({
+            "name": "mime-rs",
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": env!("CARGO_PKG_DESCRIPTION"),
+        })
+    });
+    INFO.clone()
+}
+
+/// What both handshake-free `server/discover` and the legacy `initialize`
+/// answer say about this server, independently of version negotiation.
+fn server_identity() -> Value {
     json!({
-        "name": "mime-rs",
-        "version": env!("CARGO_PKG_VERSION"),
-        "description": env!("CARGO_PKG_DESCRIPTION"),
+        "capabilities": { "tools": {} },
+        "serverInfo": server_info(),
+        "instructions": crate::mcp::instructions(),
     })
+}
+
+/// Extend an object result with more keys. Output order is unaffected —
+/// serde_json sorts map keys — so the two callers can build theirs in any order.
+fn extend(mut base: Value, more: Value) -> Value {
+    if let (Some(b), Some(m)) = (base.as_object_mut(), more.as_object()) {
+        for (k, v) in m {
+            b.insert(k.clone(), v.clone());
+        }
+    }
+    base
 }
 
 /// `server/discover`: the handshake-free way to learn what this server speaks.
 fn discover_result() -> Value {
-    json!({
-        "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
-        "capabilities": { "tools": {} },
-        "serverInfo": server_info(),
-        "instructions": crate::mcp::instructions(),
-        "ttlMs": LIST_TTL_MS,
-        "cacheScope": "public",
-    })
+    extend(
+        server_identity(),
+        json!({
+            "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
+            "ttlMs": LIST_TTL_MS,
+            "cacheScope": "public",
+        }),
+    )
 }
 
 /// One client's warm-session map: session id -> that session's engine
 /// state (a `Workspace` buffer, not the handle-scoped workspace above).
 pub type Sessions = HashMap<String, Workspace>;
 
-/// Cap on concurrent workspaces; the oldest is FIFO-evicted past it, so an
+/// Soft cap on concurrent workspaces: making room for a new one evicts the
+/// OLDEST workspace that is neither pinned nor holding unsaved edits, so an
 /// open_workspace / initialize flood cannot exhaust memory or file descriptors.
+/// It is a bound, not a ceiling — when every workspace holds unsaved work there
+/// is nothing evictable left, and the store grows past `WORKSPACE_CAP` (saying
+/// so on stderr) rather than dropping an agent's edits to stay under it.
 pub const WORKSPACE_CAP: usize = 256;
 
 /// Bounded set of workspaces keyed by an unguessable handle. A legacy HTTP
@@ -152,27 +183,55 @@ impl WorkspaceStore {
             self.pinned = Some(id.to_string());
         }
     }
-    /// Mint a fresh empty workspace, evicting the oldest UNPINNED one while at
-    /// capacity (skipping the pinned handle rather than dropping it).
-    pub fn mint(&mut self) -> String {
+    /// Make room for one more workspace: drop the OLDEST one that is neither
+    /// pinned nor holding unsaved work. Best effort, the same policy session
+    /// eviction follows (`mcp::evict_for_room`) — when every candidate is
+    /// pinned or dirty the store grows past [`WORKSPACE_CAP`] rather than
+    /// throwing edits away. Boundedness must not cost an agent its work.
+    fn evict_for_room(&mut self) {
         while self.map.len() >= WORKSPACE_CAP {
-            let victim = self
-                .order
-                .iter()
-                .position(|id| Some(id) != self.pinned.as_ref());
+            let victim = self.order.iter().position(|id| {
+                Some(id) != self.pinned.as_ref()
+                    && self
+                        .map
+                        .get(id)
+                        .is_some_and(|s| s.values().all(|ws| !ws.is_modified()))
+            });
             match victim {
                 Some(i) => {
                     if let Some(old) = self.order.remove(i) {
                         self.map.remove(&old);
                     }
                 }
-                // Nothing left but the pinned workspace — grow rather than drop it.
-                None => break,
+                // Only the pinned workspace and workspaces with unsaved edits
+                // are left — grow rather than drop any of them, and say so on
+                // stderr (once per insert that leaves the store over the cap)
+                // so an operator can see the bound give way.
+                None => {
+                    let len = self.map.len() + 1;
+                    eprintln!(
+                        "mime: workspace store holds {len} workspaces, over the cap of \
+                         {WORKSPACE_CAP} — none is evictable (unsaved edits or pinned)"
+                    );
+                    break;
+                }
             }
         }
+    }
+    /// Mint a fresh EMPTY workspace (what `open_workspace` and a legacy
+    /// `initialize` hand out), making room first.
+    pub fn mint(&mut self) -> String {
+        self.insert(Sessions::new())
+    }
+    /// Take an already-populated session map into the store under a freshly
+    /// minted handle. This is how a handle-free modern-HTTP call keeps the warm
+    /// state it created: the map is built outside the store and only lands in
+    /// it — earning a handle — once the call has left something in it.
+    pub fn insert(&mut self, sessions: Sessions) -> String {
+        self.evict_for_room();
         let id = new_handle();
         self.order.push_back(id.clone());
-        self.map.insert(id.clone(), Sessions::new());
+        self.map.insert(id.clone(), sessions);
         id
     }
     pub fn contains(&self, id: &str) -> bool {
@@ -227,16 +286,24 @@ pub struct CallContext<'a> {
 }
 
 /// Parse one JSON-RPC request line and dispatch it. Returns `Some(response)` for
-/// requests (those with an `id`) and `None` for notifications.
+/// requests (those with an `id`) and `None` for notifications. A transport that
+/// has already parsed the body (the HTTP front end reads its era from it) calls
+/// [`handle_request`] directly instead of re-serialising it.
 pub fn handle_line(line: &str, store: &mut WorkspaceStore, ctx: &CallContext) -> Option<Value> {
-    let req: Value = match serde_json::from_str(line) {
-        Ok(v) => v,
-        Err(e) => {
-            // Can't recover an id from unparseable input; report against null.
-            return Some(rpc_error(Value::Null, -32700, &format!("parse error: {e}")));
-        }
-    };
+    match serde_json::from_str(line) {
+        Ok(req) => handle_request(req, store, ctx),
+        Err(e) => Some(parse_error(&e)),
+    }
+}
 
+/// The `-32700` reply for a body that is not JSON. An id cannot be recovered
+/// from unparseable input, so it is reported against null.
+pub fn parse_error(e: &serde_json::Error) -> Value {
+    rpc_error(Value::Null, -32700, &format!("parse error: {e}"))
+}
+
+/// Dispatch one already-parsed JSON-RPC request. See [`handle_line`].
+pub fn handle_request(req: Value, store: &mut WorkspaceStore, ctx: &CallContext) -> Option<Value> {
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
@@ -254,13 +321,13 @@ pub fn handle_line(line: &str, store: &mut WorkspaceStore, ctx: &CallContext) ->
         return (!is_notification).then(|| rpc_error_data(err_id(), code, &message, data));
     }
 
-    let (result, workspace) = match method {
-        "initialize" => (initialize_result(&params), None),
+    let result = match method {
+        "initialize" => initialize_result(&params),
         // Pure notification — nothing to do, no response.
         "notifications/initialized" | "initialized" => return None,
-        "ping" => (json!({}), None),
-        "server/discover" => (discover_result(), None),
-        "tools/list" => (crate::mcp::tools_list_result(), None),
+        "ping" => json!({}),
+        "server/discover" => discover_result(),
+        "tools/list" => crate::mcp::tools_list_result(),
         "tools/call" => tools_call(&params, store, ctx, era),
         other => {
             if is_notification {
@@ -270,101 +337,135 @@ pub fn handle_line(line: &str, store: &mut WorkspaceStore, ctx: &CallContext) ->
             return Some(rpc_error(err_id(), -32601, "method not found"));
         }
     };
-    reply(
-        id,
-        is_notification,
-        shape_result(era, result, workspace.as_deref()),
-    )
+    reply(id, is_notification, shape_result(era, result))
 }
 
 /// Dispatch `tools/call`: the two workspace tools act on the store itself;
 /// everything else runs against one resolved workspace's session map (or a
 /// throwaway map for tools that never touch warm state: git_*, help).
 ///
-/// A workspace minted for this call and left empty by it is reaped again
-/// before returning: a handle-free read-only call (`session_status` on a
-/// fresh modern-HTTP request, say) would otherwise leave a permanently
-/// unreachable workspace behind on every poll, filling the store until the
-/// cap evicted live ones. Nothing is reported for a reaped workspace, since
-/// there is no warm state to come back to.
-fn tools_call(
-    params: &Value,
-    store: &mut WorkspaceStore,
-    ctx: &CallContext,
-    era: Era,
-) -> (Value, Option<String>) {
+/// A handle-free call (modern HTTP, no `workspace` argument) runs against a
+/// fresh session map the store does NOT hold, and that map is inserted — which
+/// is what mints this call's handle — only if the tool left warm state in it. A
+/// read-only poll (`session_status` on a bare modern request, say) therefore
+/// creates nothing: no handle to report, and no unreachable workspace piling up
+/// on every poll until the cap evicted the live ones.
+///
+/// Whenever the call HAS a workspace the handle is reported (to the modern HTTP
+/// client only), on a failure too: a call that failed after auto-opening a file
+/// left warm state, and its own error text tells the client to come back to it.
+/// (The `{}` default that keeps a successful stateful result conforming to its
+/// `outputSchema` is applied by `mcp::default_structured_content`, next to the
+/// schemas that mandate it; no such padding is added to an error. A failing
+/// tool that supplies its own failure JSON — run_program's, say — keeps it, and
+/// gets `workspace` alongside the keys it already wrote.)
+fn tools_call(params: &Value, store: &mut WorkspaceStore, ctx: &CallContext, era: Era) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-    match name {
-        "open_workspace" => {
-            if let Err(m) = validate_args(name, &args) {
-                return (tool_text(m, true), None);
+    // Borrowed, not cloned: the arguments can be a whole buffer's worth of
+    // text, and `mcp::tools_call_result` makes the one copy that is needed
+    // (it rewrites alias spellings in place).
+    let no_args = json!({});
+    let args = params.get("arguments").unwrap_or(&no_args);
+    // The two workspace tools act on the store, not on a session map, so they
+    // never pass through `mcp::tools_call_result` — which is why the `{}`
+    // outputSchema default (close_workspace declares one, like every tool that
+    // takes a `workspace`) is applied to them here instead.
+    if matches!(name, "open_workspace" | "close_workspace") {
+        let mut out = match validate_args(name, args) {
+            Err(m) => ToolOutput::error(m),
+            Ok(()) => {
+                if name == "open_workspace" {
+                    open_workspace(store)
+                } else {
+                    close_workspace(args, store, ctx)
+                }
             }
-            let h = store.mint();
-            // open_workspace's reply IS the handle — nothing to report on top.
-            return (
-                tool_result(ToolOutput::with(
-                    format!("workspace: {h}"),
-                    json!({ "workspace": h }),
-                )),
-                None,
-            );
-        }
-        "close_workspace" => {
-            if let Err(m) = validate_args(name, &args) {
-                return (tool_text(m, true), None);
-            }
-            let Some(h) = args.get("workspace").and_then(Value::as_str) else {
-                return (
-                    tool_text("close_workspace needs `workspace`".into(), true),
-                    None,
-                );
-            };
-            if ctx.transport == Transport::Stdio && ctx.implicit_workspace == Some(h) {
-                return (
-                    tool_text(
-                        "cannot close the stdio default workspace — close_session drops one session"
-                            .into(),
-                        true,
-                    ),
-                    None,
-                );
-            }
-            return if store.remove(h) {
-                (tool_text(format!("workspace {h} closed"), false), None)
-            } else {
-                (tool_text(unknown_workspace(h), true), None)
-            };
-        }
-        _ => {}
+        };
+        crate::mcp::default_structured_content(name, &mut out);
+        return tool_result(out);
     }
     if !tool_uses_workspace(name) {
         let mut scratch = Sessions::new();
-        return (tools_call_result(params, &mut scratch, ""), None);
+        return tool_result(tools_call_result(params, &mut scratch, None));
     }
-    let (handle, minted) =
+    let resolved =
         match resolve_workspace(args.get("workspace").and_then(Value::as_str), store, ctx) {
             Ok(h) => h,
-            Err(m) => return (tool_text(m, true), None),
+            Err(m) => return tool_text(m, true),
         };
     // Only the modern HTTP client is handed its workspace back: it has no
-    // session header and a bare call mints a fresh one, so without the handle
-    // it could never return to these warm buffers. Stdio and the legacy
-    // session header already know where they are.
-    let report = (era == Era::Modern && ctx.transport == Transport::Http).then(|| handle.clone());
-    // Resolution already proved the handle is present; treat a miss as a tool
-    // error anyway, so no reachable panic can take the server down with it.
-    let Some(sessions) = store.get_mut(&handle) else {
-        return (tool_text(unknown_workspace(&handle), true), None);
+    // session header and a bare call runs in a fresh workspace, so without the
+    // handle it could never return to those warm buffers. Stdio and the legacy
+    // session header already know where they are — and the legacy id is a
+    // bearer token, which must not surface in tool output at all.
+    let reports = era == Era::Modern && ctx.transport == Transport::Http;
+    let (mut out, handle) = match resolved {
+        Some(h) => {
+            // Resolution already proved the handle is present; treat a miss as
+            // a tool error anyway, so no reachable panic can take the server
+            // down with it.
+            let Some(sessions) = store.get_mut(&h) else {
+                return tool_text(unknown_workspace(&h), true);
+            };
+            let out = tools_call_result(params, sessions, reports.then_some(h.as_str()));
+            (out, Some(h))
+        }
+        // Lazy insertion: run against a map that is not in the store, and keep
+        // it — minting this call's handle — only if the tool left something warm
+        // in it. A `session_status` poll opens nothing, so nothing is kept.
+        None => {
+            let mut fresh = Sessions::new();
+            let out = tools_call_result(params, &mut fresh, None);
+            let handle = (!fresh.is_empty()).then(|| store.insert(fresh));
+            (out, handle)
+        }
     };
-    let result = tools_call_result(params, sessions, &handle);
-    // Freshly minted and still empty: the call opened no session, so the
-    // handle leads nowhere. Drop it rather than accumulate dead workspaces.
-    if minted && store.get_mut(&handle).is_some_and(|s| s.is_empty()) {
-        store.remove(&handle);
-        return (result, None);
+    let report = if reports { handle.as_deref() } else { None };
+    if let Some(h) = report {
+        // The reported handle is machine-readable too, so a client need not
+        // parse it back out of the text. An error is never padded with `{}` to
+        // carry it: the handle joins whatever the tool itself said — its own
+        // failure JSON when it wrote one, and nothing else when it did not.
+        let structured = out.structured.get_or_insert_with(|| json!({}));
+        if let Some(map) = structured.as_object_mut() {
+            map.insert("workspace".to_string(), json!(h));
+        }
     }
-    (result, report)
+    // Text and structured value must keep saying the same thing: a tool whose
+    // text IS its JSON re-renders it; prose gets the handle as a trailing line.
+    out.rerender();
+    if let (Some(h), Render::Prose) = (report, out.render) {
+        out.text = format!("{}\nworkspace: {h}", out.text);
+    }
+    tool_result(out)
+}
+
+/// The `open_workspace` dispatch: its whole reply IS the handle it minted, so
+/// there is never anything to report on top of it.
+fn open_workspace(store: &mut WorkspaceStore) -> ToolOutput {
+    let h = store.mint();
+    ToolOutput::with(
+        format!("workspace: {h}"),
+        json!({ "workspace": h }),
+        Render::Prose,
+    )
+}
+
+/// The `close_workspace` dispatch: it acts on the store, not on a session map.
+fn close_workspace(args: &Value, store: &mut WorkspaceStore, ctx: &CallContext) -> ToolOutput {
+    let Some(h) = args.get("workspace").and_then(Value::as_str) else {
+        return ToolOutput::error("close_workspace needs `workspace`".into());
+    };
+    if ctx.transport == Transport::Stdio && ctx.implicit_workspace == Some(h) {
+        return ToolOutput::error(
+            "cannot close the stdio default workspace — close_session drops one session".into(),
+        );
+    }
+    if store.remove(h) {
+        ToolOutput::from(format!("workspace {h} closed"))
+    } else {
+        ToolOutput::error(unknown_workspace(h))
+    }
 }
 
 fn unknown_workspace(h: &str) -> String {
@@ -375,25 +476,21 @@ fn unknown_workspace(h: &str) -> String {
     )
 }
 
-/// The spec's resolution table: explicit handle must exist; otherwise the
+/// The spec's resolution table: an explicit handle must exist; otherwise the
 /// transport's implicit workspace (which must also still exist — an unpinned
-/// one can have been evicted); otherwise (modern HTTP) mint one.
+/// one can have been evicted); otherwise (modern HTTP) none at all.
 ///
-/// Returns `(handle, minted)`. `minted` is true only for that last case, and
-/// tells the caller the workspace is this call's own: if the call leaves it
-/// empty, it can be reaped instead of lingering unreachable (see
-/// [`tools_call`]).
+/// `Ok(None)` means "run against a fresh map": the call has no workspace yet,
+/// and gets one only if it leaves warm state behind (see [`tools_call`]).
 fn resolve_workspace(
     explicit: Option<&str>,
-    store: &mut WorkspaceStore,
+    store: &WorkspaceStore,
     ctx: &CallContext,
-) -> Result<(String, bool), String> {
-    match (explicit, ctx.implicit_workspace) {
-        (Some(h), _) if store.contains(h) => Ok((h.to_string(), false)),
-        (Some(h), _) => Err(unknown_workspace(h)),
-        (None, Some(h)) if store.contains(h) => Ok((h.to_string(), false)),
-        (None, Some(h)) => Err(unknown_workspace(h)),
-        (None, None) => Ok((store.mint(), true)),
+) -> Result<Option<String>, String> {
+    match explicit.or(ctx.implicit_workspace) {
+        Some(h) if store.contains(h) => Ok(Some(h.to_string())),
+        Some(h) => Err(unknown_workspace(h)),
+        None => Ok(None),
     }
 }
 
@@ -427,29 +524,28 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     rpc_error_data(id, code, message, Value::Null)
 }
 
+/// The `_meta` object of a well-formed modern request, as the JSON-body
+/// fragment the transport tests splice into a request line. Built from the
+/// real key constants so a renamed key breaks compilation, not assertions.
+#[cfg(test)]
+pub(crate) fn modern_meta_json() -> String {
+    format!(
+        r#""_meta":{{"{META_PROTOCOL_VERSION}":"{MODERN_VERSION}","{META_CLIENT_CAPABILITIES}":{{}}}}"#
+    )
+}
+
 /// The last step for every successful result. Modern requests get the
 /// `resultType` and `serverInfo` envelope; legacy results are returned
-/// untouched (byte-identical to before the dual-era work). `report_workspace`
-/// is the handle a modern HTTP stateful call ran in, surfaced in text and
-/// `structuredContent` so the agent can pass it back.
-fn shape_result(era: Era, mut result: Value, report_workspace: Option<&str>) -> Value {
+/// untouched (byte-identical to before the dual-era work).
+fn shape_result(era: Era, mut result: Value) -> Value {
     if era == Era::Modern {
         result["resultType"] = json!("complete");
         // Index-assignment on a non-object would silently drop the serverInfo,
-        // so make sure `_meta` is one first (as `structuredContent` is below).
+        // so make sure `_meta` is one first.
         if !result["_meta"].is_object() {
             result["_meta"] = json!({});
         }
         result["_meta"][META_SERVER_INFO] = server_info();
-    }
-    if let Some(h) = report_workspace {
-        if let Some(text) = result["content"][0]["text"].as_str().map(str::to_string) {
-            result["content"][0]["text"] = Value::String(format!("{text}\nworkspace: {h}"));
-        }
-        if !result["structuredContent"].is_object() {
-            result["structuredContent"] = json!({});
-        }
-        result["structuredContent"]["workspace"] = json!(h);
     }
     result
 }
@@ -463,12 +559,7 @@ fn initialize_result(params: &Value) -> Value {
         .and_then(Value::as_str)
         .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v) && *v != MODERN_VERSION)
         .unwrap_or(LATEST_LEGACY_VERSION);
-    json!({
-        "protocolVersion": version,
-        "capabilities": { "tools": {} },
-        "serverInfo": server_info(),
-        "instructions": crate::mcp::instructions(),
-    })
+    extend(server_identity(), json!({ "protocolVersion": version }))
 }
 
 #[cfg(test)]
@@ -603,6 +694,53 @@ mod tests {
         assert!(!s.remove(&first));
     }
 
+    /// One session map holding a single buffer with an unsaved edit.
+    fn dirty_sessions() -> Sessions {
+        let mut ws = Workspace::new(Box::new(crate::Buffer::from_string(
+            "d".to_string(),
+            "x\n".to_string(),
+        )));
+        ws.run("(insert \"y\")").expect("the edit runs");
+        assert!(ws.is_modified(), "the buffer must read as modified");
+        let mut sessions = Sessions::new();
+        sessions.insert("c".to_string(), ws);
+        sessions
+    }
+
+    #[test]
+    fn eviction_skips_workspaces_with_unsaved_edits() {
+        // Boundedness must not cost an agent its work: the oldest workspace is
+        // the eviction candidate, but one holding an unsaved edit is passed over
+        // for the oldest CLEAN one.
+        let mut store = WorkspaceStore::new();
+        let dirty = store.insert(dirty_sessions());
+        let clean = store.mint();
+        for _ in 0..WORKSPACE_CAP {
+            store.mint();
+        }
+        assert_eq!(store.len(), WORKSPACE_CAP);
+        assert!(
+            store.contains(&dirty),
+            "a workspace with unsaved edits is never evicted"
+        );
+        assert!(
+            !store.contains(&clean),
+            "the oldest CLEAN workspace goes in its place"
+        );
+
+        // And when nothing qualifies, the store grows past the cap rather than
+        // dropping work — best effort, the policy session eviction follows too.
+        let mut all_dirty = WorkspaceStore::new();
+        for _ in 0..WORKSPACE_CAP + 4 {
+            all_dirty.insert(dirty_sessions());
+        }
+        assert!(
+            all_dirty.len() > WORKSPACE_CAP,
+            "unsaved work outranks the cap: {}",
+            all_dirty.len()
+        );
+    }
+
     #[test]
     fn the_pinned_workspace_survives_eviction() {
         let mut s = WorkspaceStore::new();
@@ -677,7 +815,10 @@ mod tests {
             &ctx,
         );
         let json: Value = serde_json::from_str(&text_of(&status)).unwrap();
-        assert_eq!(json["workspace"], h);
+        // The session landed in the implicit workspace; the handle itself is
+        // NOT echoed on stdio (see
+        // `legacy_and_stdio_session_status_do_not_echo_the_handle`).
+        assert!(json["workspace"].is_null(), "{json}");
         assert_eq!(json["sessions"][0]["id"], "c");
     }
 
@@ -771,8 +912,9 @@ mod tests {
 
     #[test]
     fn a_missing_implicit_workspace_mints_one_per_call() {
-        // The modern-HTTP shape (Task 5 wires the transport): no implicit
-        // workspace, no argument -> a fresh workspace each call.
+        // The modern-HTTP shape: no implicit workspace, no argument -> each
+        // call runs in a fresh map, and each is kept (open_text left a session
+        // in it), so two handle-free calls leave two workspaces.
         let mut store = WorkspaceStore::new();
         let ctx = CallContext {
             transport: Transport::Http,
@@ -793,9 +935,9 @@ mod tests {
 
     #[test]
     fn a_handle_free_read_only_call_leaves_no_workspace_behind() {
-        // A modern-HTTP poll with no handle mints a workspace, opens nothing
-        // in it, and so must not leave it behind — nor report a handle that
-        // leads to no warm state.
+        // A modern-HTTP poll with no handle runs against a fresh map, opens
+        // nothing in it, and so must not leave a workspace behind — nor report
+        // a handle that leads to no warm state.
         let mut store = WorkspaceStore::new();
         let ctx = CallContext {
             transport: Transport::Http,
@@ -807,7 +949,7 @@ mod tests {
             &ctx,
         );
         assert_eq!(r["result"]["isError"], false, "{}", text_of(&r));
-        assert_eq!(store.len(), 0, "the minted-but-empty workspace is reaped");
+        assert_eq!(store.len(), 0, "an empty fresh map is never inserted");
         // Nothing is reported on top of the tool's own output: no trailing
         // `workspace:` line, and no handle merged into structuredContent.
         // (session_status's own JSON names the workspace it ran in — that is
@@ -840,6 +982,285 @@ mod tests {
     }
 
     #[test]
+    fn stateful_calls_always_carry_structured_content() {
+        // Every stateful tool declares an outputSchema, so every stateful call
+        // answers with `structuredContent` — the empty object when the tool has
+        // no data of its own — in every era. help declares none and carries none.
+        let mut store = WorkspaceStore::new();
+        let h = store.mint();
+        let ctx = stdio_ctx(&h);
+        for body in [
+            r#""name":"open_text","arguments":{"text":"hi\n","session":"c"}"#,
+            r#""name":"view","arguments":{"session":"c"}"#,
+            r#""name":"close_session","arguments":{"session":"c"}"#,
+        ] {
+            let req =
+                format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{{body}}}}}"#);
+            let r = call(&req, &mut store, &ctx);
+            assert_eq!(
+                r["result"]["structuredContent"],
+                json!({}),
+                "{body}: {}",
+                text_of(&r)
+            );
+        }
+        // close_workspace takes a handle, so it declares the same schema.
+        let h2 = store.mint();
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"close_workspace","arguments":{{"workspace":"{h2}"}}}}}}"#
+        );
+        let r = call(&req, &mut store, &ctx);
+        assert_eq!(r["result"]["isError"], false, "{}", text_of(&r));
+        assert_eq!(r["result"]["structuredContent"], json!({}));
+
+        let help = call(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"help","arguments":{}}}"#,
+            &mut store,
+            &ctx,
+        );
+        assert!(help["result"].get("structuredContent").is_none());
+    }
+
+    #[test]
+    fn error_results_carry_no_default_structured_content() {
+        // "MUST provide structured results that conform" is about RESULTS: a
+        // tool error has no structured value to give, and forcing `{}` on it
+        // would break the tool's own `required` keys. So an error carries
+        // structuredContent only when the tool itself supplied one — and no
+        // handle is merged either, since there is nothing to come back to.
+        let mut store = WorkspaceStore::new();
+        let h = store.mint();
+        let ctx = stdio_ctx(&h);
+        let miss = call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"view","arguments":{"session":"nope"}}}"#,
+            &mut store,
+            &ctx,
+        );
+        assert_eq!(miss["result"]["isError"], true, "{}", text_of(&miss));
+        assert!(miss["result"].get("structuredContent").is_none());
+
+        // run_program's failure JSON IS its structured value (ok:false) — the
+        // tool supplied it, so it rides.
+        call(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_text","arguments":{"text":"x\n","session":"c"}}}"#,
+            &mut store,
+            &ctx,
+        );
+        let boom = call(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run_program","arguments":{"session":"c","program":"(error \"boom\")"}}}"#,
+            &mut store,
+            &ctx,
+        );
+        assert_eq!(boom["result"]["isError"], true, "{}", text_of(&boom));
+        assert_eq!(boom["result"]["structuredContent"]["ok"], false);
+
+        // Modern HTTP: a failed call on a held workspace still REPORTS it —
+        // the client's warm state is right there — but the report is the only
+        // structured key it gets; the `{}` default stays off an error.
+        let http = CallContext {
+            transport: Transport::Http,
+            implicit_workspace: None,
+        };
+        let opened = call(
+            &modern(
+                4,
+                "tools/call",
+                r#""name":"open_text","arguments":{"text":"x","session":"c"}"#,
+            ),
+            &mut store,
+            &http,
+        );
+        let h = opened["result"]["structuredContent"]["workspace"]
+            .as_str()
+            .expect("handle reported")
+            .to_string();
+        let body = format!(r#""name":"view","arguments":{{"session":"nope","workspace":"{h}"}}"#);
+        let r = call(&modern(5, "tools/call", &body), &mut store, &http);
+        assert_eq!(r["result"]["isError"], true, "{}", text_of(&r));
+        assert_eq!(
+            r["result"]["structuredContent"],
+            json!({ "workspace": h }),
+            "the handle, and nothing padded around it"
+        );
+        assert!(
+            text_of(&r).ends_with(&format!("workspace: {h}")),
+            "{}",
+            text_of(&r)
+        );
+        assert!(store.contains(&h), "the caller's workspace survives");
+    }
+
+    #[test]
+    fn a_failed_handle_free_call_that_opened_a_file_keeps_it_and_reports_the_handle() {
+        // `replace_text {path, …}` auto-opens the file and only then finds no
+        // match: the call failed, but it left a warm buffer the client can
+        // inspect, fix and save — and its own error text tells the client to
+        // come back to it. So the workspace is kept and its handle IS reported;
+        // dropping either would strand an open buffer nobody can reach.
+        let pid = std::process::id();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("mime-lazy-{pid}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "hello\n").unwrap();
+
+        let mut store = WorkspaceStore::new();
+        let ctx = CallContext {
+            transport: Transport::Http,
+            implicit_workspace: None,
+        };
+        let body = format!(
+            r#""name":"replace_text","arguments":{{"path":"{}","pattern":"zzz-no-such-text","replacement":"x"}}"#,
+            file.display()
+        );
+        let r = call(&modern(1, "tools/call", &body), &mut store, &ctx);
+        assert_eq!(r["result"]["isError"], true, "{}", text_of(&r));
+        assert_eq!(store.len(), 1, "the file it opened stays warm");
+        let h = r["result"]["structuredContent"]["workspace"]
+            .as_str()
+            .unwrap_or_else(|| panic!("handle reported: {}", r["result"]))
+            .to_string();
+        assert_eq!(h.len(), 32);
+        assert!(store.contains(&h), "and the reported handle reaches it");
+        // The handle is the only structured key: an error gets no `{}` padding.
+        let keys: Vec<&String> = r["result"]["structuredContent"]
+            .as_object()
+            .expect("an object")
+            .keys()
+            .collect();
+        assert_eq!(keys, ["workspace"]);
+        assert!(
+            text_of(&r).ends_with(&format!("workspace: {h}")),
+            "{}",
+            text_of(&r)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_handle_free_run_program_keeps_its_own_failure_json_beside_the_handle() {
+        // The sibling case: run_program answers a failure with structured JSON
+        // of its own (`ok: false` and the error). The handle joins that JSON
+        // instead of replacing it — an error is never padded with `{}`, but it
+        // is never stripped of what the tool actually said either.
+        let pid = std::process::id();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("mime-lazy-failed-json-{pid}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "hello\n").unwrap();
+
+        let mut store = WorkspaceStore::new();
+        let ctx = CallContext {
+            transport: Transport::Http,
+            implicit_workspace: None,
+        };
+        let before = store.len();
+        let body = format!(
+            r#""name":"run_program","arguments":{{"path":"{}","program":"(error \"boom\")"}}"#,
+            file.display()
+        );
+        let r = call(&modern(1, "tools/call", &body), &mut store, &ctx);
+        assert_eq!(r["result"]["isError"], true, "{}", text_of(&r));
+        let s = &r["result"]["structuredContent"];
+        assert_eq!(s["ok"], false, "the tool's own failure JSON survives: {s}");
+        let h = s["workspace"]
+            .as_str()
+            .unwrap_or_else(|| panic!("handle reported alongside it: {}", r["result"]))
+            .to_string();
+        assert_eq!(h.len(), 32);
+        assert_eq!(store.len(), before + 1, "the file it opened stays warm");
+        assert!(store.contains(&h), "and the reported handle reaches it");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_handle_free_call_that_created_nothing_reports_none() {
+        // The other half: a handle-free call that fails before opening anything
+        // has no workspace at all. Nothing is inserted, so there is no handle to
+        // report — and no unreachable workspace counting against WORKSPACE_CAP.
+        let mut store = WorkspaceStore::new();
+        let ctx = CallContext {
+            transport: Transport::Http,
+            implicit_workspace: None,
+        };
+        let r = call(
+            &modern(
+                1,
+                "tools/call",
+                r#""name":"view","arguments":{"session":"nope"}"#,
+            ),
+            &mut store,
+            &ctx,
+        );
+        assert_eq!(r["result"]["isError"], true, "{}", text_of(&r));
+        assert!(r["result"].get("structuredContent").is_none());
+        assert!(!text_of(&r).contains("workspace:"), "{}", text_of(&r));
+        assert_eq!(store.len(), 0, "nothing warm, nothing kept");
+    }
+
+    #[test]
+    fn a_handle_free_session_status_reports_a_null_workspace() {
+        // The call ran against a fresh map and opened nothing, so it never
+        // earned a handle: the `workspace` session_status names in its own JSON
+        // is null rather than a handle leading nowhere. Its text IS that JSON,
+        // so both say it.
+        let mut store = WorkspaceStore::new();
+        let ctx = CallContext {
+            transport: Transport::Http,
+            implicit_workspace: None,
+        };
+        let r = call(
+            &modern(1, "tools/call", r#""name":"session_status","arguments":{}"#),
+            &mut store,
+            &ctx,
+        );
+        assert_eq!(store.len(), 0, "an empty fresh map is never inserted");
+        assert!(
+            r["result"]["structuredContent"]["workspace"].is_null(),
+            "{}",
+            r["result"]["structuredContent"]
+        );
+        let status: Value = serde_json::from_str(&text_of(&r)).expect("session_status is JSON");
+        assert!(status["workspace"].is_null(), "{status}");
+        assert_eq!(
+            r["result"]["structuredContent"], status,
+            "text and structured value stay equal"
+        );
+    }
+
+    #[test]
+    fn legacy_and_stdio_session_status_do_not_echo_the_handle() {
+        // A stdio client has one implicit workspace and a legacy HTTP client's
+        // handle IS its `Mcp-Session-Id` — a bearer token for its warm state.
+        // Neither needs the handle back, and a bearer token must not travel in
+        // tool output, so session_status reports `workspace: null` off the
+        // modern HTTP path. (The legacy-HTTP half is in `http`'s tests.)
+        let mut store = WorkspaceStore::new();
+        let h = store.mint();
+        let ctx = stdio_ctx(&h);
+        call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"open_text","arguments":{"text":"x\n","session":"c"}}}"#,
+            &mut store,
+            &ctx,
+        );
+        let status = call(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"session_status","arguments":{}}}"#,
+            &mut store,
+            &ctx,
+        );
+        let json: Value = serde_json::from_str(&text_of(&status)).expect("session_status is JSON");
+        assert!(json["workspace"].is_null(), "{json}");
+        assert!(!text_of(&status).contains(&h), "the handle must not leak");
+        assert_eq!(json["sessions"][0]["id"], "c", "but the state is there");
+        assert!(status["result"]["structuredContent"]["workspace"].is_null());
+    }
+
+    #[test]
     fn git_and_help_take_no_workspace_and_mint_none() {
         let mut store = WorkspaceStore::new();
         let ctx = CallContext {
@@ -853,12 +1274,12 @@ mod tests {
         );
         assert_eq!(store.len(), 0);
     }
-    const META: &str = r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}"#;
 
     fn modern(id: u32, method: &str, params_body: &str) -> String {
         let sep = if params_body.is_empty() { "" } else { "," };
+        let meta = modern_meta_json();
         format!(
-            r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{{params_body}{sep}{META}}}}}"#
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{{params_body}{sep}{meta}}}}}"#
         )
     }
 
@@ -1084,7 +1505,8 @@ mod tests {
             &mut store,
             &stdio,
         );
-        assert!(s["result"].get("structuredContent").is_none());
+        // The schema-mandated `{}` is there, but no handle is merged into it.
+        assert_eq!(s["result"]["structuredContent"], json!({}));
         assert!(!text_of(&s).contains("workspace:"));
     }
 

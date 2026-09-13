@@ -113,10 +113,18 @@ pub fn run() {
 
 // ---- tool dispatch ---------------------------------------------------------
 
-/// Dispatch `tools/call`. Always returns a tool *result* envelope
-/// (`{content, isError}`) — even on failure — because at the JSON-RPC layer the
-/// call itself succeeded; the tool-level error rides in `isError` + the text.
-pub(crate) fn tools_call_result(params: &Value, sessions: &mut Sessions, workspace: &str) -> Value {
+/// Dispatch `tools/call` and hand back what the tool said — even on failure,
+/// because at the JSON-RPC layer the call itself succeeded; the tool-level
+/// error rides in `is_error` + the text. The caller ([`crate::rpc::tools_call`])
+/// may still amend the result (merging in the workspace handle) before wrapping
+/// it with [`tool_result`], which is why this returns the [`ToolOutput`] rather
+/// than the envelope. `workspace` is the handle this call resolved to, or
+/// `None` for a tool that touches no warm state.
+pub(crate) fn tools_call_result(
+    params: &Value,
+    sessions: &mut Sessions,
+    workspace: Option<&str>,
+) -> ToolOutput {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let mut args = params.get("arguments").cloned().unwrap_or(json!({}));
 
@@ -124,53 +132,49 @@ pub(crate) fn tools_call_result(params: &Value, sessions: &mut Sessions, workspa
     // insert_text {location}, …) before validation — a first call should not
     // die on a borrowed name when the intent is unambiguous.
     if let Err(message) = normalize_aliases(name, &mut args) {
-        return tool_text(message, true);
+        return ToolOutput::error(message);
     }
     // Reject arguments the tool doesn't declare, instead of silently dropping
     // them (a `view {offset: N}` typo for `pos` would otherwise render the
     // wrong place with no signal). Driven by the same schemas tools/list
     // advertises, so it can never drift from what's accepted.
     if let Err(message) = validate_args(name, &args) {
-        return tool_text(message, true);
+        return ToolOutput::error(message);
     }
 
-    // The tools that also answer as JSON ride `ToolOutput`; the rest still
-    // return prose and are lifted into one via `From<String>`.
+    // The tools that also answer as JSON say so through their `Render`; the
+    // rest answer in prose and are lifted into a `ToolOutput` by `From<String>`.
     let outcome: Result<ToolOutput, String> = match name {
         "run_program" => tool_run_program(&args, sessions, false),
         "rehearse" => tool_run_program(&args, sessions, true),
         "grep" => tool_grep(&args, sessions),
         "outline" => tool_outline(&args, sessions),
         "session_status" => tool_session_status(sessions, workspace),
-        _ => text_tool(name, &args, sessions).map(ToolOutput::from),
+        "open_file" => tool_open_file(&args, sessions).map(Into::into),
+        "open_text" => tool_open_text(&args, sessions).map(Into::into),
+        "read_region" => tool_read_region(&args, sessions).map(Into::into),
+        "view" => tool_view(&args, sessions).map(Into::into),
+        "insert_text" => tool_insert_text(&args, sessions).map(Into::into),
+        "replace_text" => tool_replace_text(&args, sessions).map(Into::into),
+        "replace_in_files" => tool_replace_files(&args, sessions).map(Into::into),
+        "occur" => tool_occur(&args, sessions).map(Into::into),
+        "conflicts" => tool_conflicts(&args, sessions).map(Into::into),
+        "checkpoint" => tool_checkpoint(&args, sessions).map(Into::into),
+        "restore_checkpoint" => tool_restore_checkpoint(&args, sessions).map(Into::into),
+        "undo_last" => tool_undo_last(&args, sessions).map(Into::into),
+        "close_session" => tool_close_session(&args, sessions).map(Into::into),
+        "save_buffer" => tool_save_buffer(&args, sessions).map(Into::into),
+        "unsaved_diff" => tool_unsaved_diff(&args, sessions).map(Into::into),
+        "help" => tool_help(&args).map(Into::into),
+        git if git.starts_with("git_") => dispatch_git(git, &args).map(Into::into),
+        other => Err(format!("unknown tool: {other}")),
     };
     match outcome {
-        Ok(out) => tool_result(out),
-        Err(message) => tool_text(message, true),
-    }
-}
-
-/// The tools that answer in prose only.
-fn text_tool(name: &str, args: &Value, sessions: &mut Sessions) -> Result<String, String> {
-    match name {
-        "open_file" => tool_open_file(args, sessions),
-        "open_text" => tool_open_text(args, sessions),
-        "read_region" => tool_read_region(args, sessions),
-        "view" => tool_view(args, sessions),
-        "insert_text" => tool_insert_text(args, sessions),
-        "replace_text" => tool_replace_text(args, sessions),
-        "replace_in_files" => tool_replace_files(args, sessions),
-        "occur" => tool_occur(args, sessions),
-        "conflicts" => tool_conflicts(args, sessions),
-        "checkpoint" => tool_checkpoint(args, sessions),
-        "restore_checkpoint" => tool_restore_checkpoint(args, sessions),
-        "undo_last" => tool_undo_last(args, sessions),
-        "close_session" => tool_close_session(args, sessions),
-        "save_buffer" => tool_save_buffer(args, sessions),
-        "unsaved_diff" => tool_unsaved_diff(args, sessions),
-        "help" => tool_help(args),
-        git if git.starts_with("git_") => dispatch_git(git, args),
-        other => Err(format!("unknown tool: {other}")),
+        Ok(mut out) => {
+            default_structured_content(name, &mut out);
+            out
+        }
+        Err(message) => ToolOutput::error(message),
     }
 }
 
@@ -379,12 +383,27 @@ fn validate_nested(schema: &Value, value: &Value, path: &str) -> Result<(), Stri
     Ok(())
 }
 
+/// How a tool's `text` is derived from its structured value — so a caller that
+/// changes the structured value (the protocol layer merging in the workspace
+/// handle) can put the text back in step instead of special-casing tool names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Render {
+    /// Prose written for a reader; the structured value is a parallel payload.
+    Prose,
+    /// The text IS the compact JSON of the structured value.
+    Compact,
+    /// The text IS the pretty-printed JSON of the structured value.
+    Pretty,
+}
+
 /// What a tool hands back: readable text, optionally the same information
-/// as JSON for `structuredContent`, and whether it is a tool-level failure.
+/// as JSON for `structuredContent`, how the two relate, and whether it is a
+/// tool-level failure.
 pub(crate) struct ToolOutput {
     pub text: String,
     pub structured: Option<Value>,
     pub is_error: bool,
+    pub render: Render,
 }
 
 impl From<String> for ToolOutput {
@@ -393,23 +412,67 @@ impl From<String> for ToolOutput {
             text,
             structured: None,
             is_error: false,
+            render: Render::Prose,
         }
     }
 }
 
+/// The text a JSON tool's `render` derives from its structured value. `Prose`
+/// derives nothing: its text is written for a reader, not rendered.
+fn render_json(structured: &Value, render: Render) -> Option<String> {
+    match render {
+        Render::Prose => None,
+        Render::Compact => Some(structured.to_string()),
+        Render::Pretty => Some(pretty(structured)),
+    }
+}
+
 impl ToolOutput {
-    pub(crate) fn with(text: String, structured: Value) -> Self {
+    pub(crate) fn with(text: String, structured: Value, render: Render) -> Self {
         Self {
             text,
             structured: Some(structured),
             is_error: false,
+            render,
         }
     }
-    pub(crate) fn failed(text: String, structured: Value) -> Self {
+    /// A tool whose text IS its JSON: the text is derived from the structured
+    /// value rather than passed in beside it, so the two cannot disagree at the
+    /// source any more than they can after [`rerender`](Self::rerender). Pass
+    /// `Compact` or `Pretty` — a hand-written `Prose` text belongs in
+    /// [`with`](Self::with).
+    pub(crate) fn json(structured: Value, render: Render) -> Self {
+        Self {
+            text: render_json(&structured, render).unwrap_or_else(|| structured.to_string()),
+            structured: Some(structured),
+            is_error: false,
+            render,
+        }
+    }
+    /// [`json`](Self::json) for a tool-level failure whose failure JSON is its
+    /// structured value (run_program's).
+    pub(crate) fn json_failed(structured: Value, render: Render) -> Self {
+        Self {
+            is_error: true,
+            ..Self::json(structured, render)
+        }
+    }
+    /// A tool-level failure with nothing structured to say.
+    pub(crate) fn error(text: String) -> Self {
         Self {
             text,
-            structured: Some(structured),
+            structured: None,
             is_error: true,
+            render: Render::Prose,
+        }
+    }
+    /// Put `text` back in step with a structured value that was changed after
+    /// the tool produced it. A no-op for prose (whose text is not derived from
+    /// the JSON) and for a tool that produced no structured value at all.
+    pub(crate) fn rerender(&mut self) {
+        let Some(s) = &self.structured else { return };
+        if let Some(text) = render_json(s, self.render) {
+            self.text = text;
         }
     }
 }
@@ -428,11 +491,28 @@ pub(crate) fn tool_result(out: ToolOutput) -> Value {
 
 /// The text-only shorthand: the same envelope with no `structuredContent`.
 pub(crate) fn tool_text(text: String, is_error: bool) -> Value {
-    tool_result(ToolOutput {
-        text,
-        structured: None,
-        is_error,
+    tool_result(if is_error {
+        ToolOutput::error(text)
+    } else {
+        ToolOutput::from(text)
     })
+}
+
+/// MCP requires a result to conform to the tool's declared `outputSchema`, so
+/// a SUCCESSFUL call to a tool that declares one always answers with a
+/// structured value — the empty object when the tool has none of its own.
+/// A tool ERROR is left alone: the conformance rule is about results, and `{}`
+/// would break the `required` keys of the very schemas this honours (grep's
+/// `matches`, session_status's `sessions`, …). An error keeps a structured
+/// value only when the tool itself supplied one — run_program's failure JSON,
+/// which satisfies its own schema.
+pub(crate) fn default_structured_content(name: &str, out: &mut ToolOutput) {
+    let declares_output = tool_schemas()
+        .iter()
+        .any(|t| t["name"] == name && t["outputSchema"].is_object());
+    if !out.is_error && out.structured.is_none() && declares_output {
+        out.structured = Some(json!({}));
+    }
 }
 
 /// Whether a tool reads or writes the warm-session map — i.e. declares
@@ -854,7 +934,7 @@ fn tool_run_program(
             }
             // A tool-level failure: the same JSON rides both the text and
             // `structuredContent`, so a structured client need not re-parse it.
-            return Ok(ToolOutput::failed(pretty(&json), json));
+            return Ok(ToolOutput::json_failed(json, Render::Pretty));
         }
     };
     // A rehearsal persists nothing, so it audits as a non-mutating event.
@@ -901,7 +981,7 @@ fn tool_run_program(
     if !view.is_empty() {
         json["view"] = Value::String(view.trim_start_matches('\n').to_string());
     }
-    Ok(ToolOutput::with(pretty(&json), json))
+    Ok(ToolOutput::json(json, Render::Pretty))
 }
 
 /// One warning line appended to read-tool output when the visited file has
@@ -2715,6 +2795,7 @@ fn tool_grep(args: &Value, sessions: &HashMap<String, Workspace>) -> Result<Tool
                 exact_regex_hint(args, &pattern)
             ),
             json!({ "matches": matches, "truncated": truncated, "unsaved": unsaved }),
+            Render::Prose,
         ));
     }
     let mut tail = format!(
@@ -2736,6 +2817,7 @@ fn tool_grep(args: &Value, sessions: &HashMap<String, Workspace>) -> Result<Tool
     Ok(ToolOutput::with(
         out,
         json!({ "matches": matches, "truncated": truncated, "unsaved": unsaved }),
+        Render::Prose,
     ))
 }
 
@@ -2787,6 +2869,7 @@ fn tool_outline(
                  overrides detection{note}"
             ),
             structured,
+            Render::Prose,
         ));
     }
     Ok(ToolOutput::with(
@@ -2796,6 +2879,7 @@ fn tool_outline(
             lines.join("\n")
         ),
         structured,
+        Render::Prose,
     ))
 }
 
@@ -2933,7 +3017,7 @@ fn tool_save_buffer(
 /// enforces: the allowed filesystem roots (as display strings) and whether the
 /// audit journal is on. Advertising the roots lets the agent target a writable
 /// path up front instead of discovering the bounds via a rejected save.
-fn tool_session_status(sessions: &Sessions, workspace: &str) -> Result<ToolOutput, String> {
+fn tool_session_status(sessions: &Sessions, workspace: Option<&str>) -> Result<ToolOutput, String> {
     let mut ids: Vec<&String> = sessions.keys().collect();
     ids.sort();
     // Per session: the current buffer, its visited file, and the states a
@@ -2975,7 +3059,7 @@ fn tool_session_status(sessions: &Sessions, workspace: &str) -> Result<ToolOutpu
         "roots": roots,
         "audit": crate::safety::audit_enabled(),
     });
-    Ok(ToolOutput::with(json.to_string(), json))
+    Ok(ToolOutput::json(json, Render::Compact))
 }
 
 /// `help {topic?}` — the canonical reference briefs (regex dialect, treesit
@@ -3992,10 +4076,38 @@ impl ToolDoc {
     fn name(&self) -> &str {
         self.schema["name"].as_str().unwrap_or("")
     }
-    /// The `tools/list` entry: the schema with `annotations` merged in.
+    /// Whether the tool takes a `workspace` argument — read off this doc's own
+    /// schema rather than via `tool_uses_workspace`, which reads the projection
+    /// this method builds.
+    fn takes_workspace(&self) -> bool {
+        self.schema["inputSchema"]["properties"]
+            .get("workspace")
+            .is_some()
+    }
+    /// The `tools/list` entry: the schema with `annotations` merged in, and
+    /// the `workspace` handle declared in the `outputSchema` of every stateful
+    /// tool (generating that schema for the tools that wrote none). On modern
+    /// HTTP `rpc::tools_call` merges the handle into the `structuredContent`
+    /// of EVERY stateful result, and MCP requires a structured result to
+    /// conform to the declared schema — so the handle is declared here once
+    /// instead of in every stateful schema literal. No `required`: the key is
+    /// present only on modern HTTP. A tool that declares the key itself keeps
+    /// its own spelling (`session_status`'s nullable one, which is null off the
+    /// stateless HTTP protocol, and on a handle-free call that holds no
+    /// workspace).
     fn to_list_value(&self) -> Value {
         let mut v = self.schema.clone();
         v["annotations"] = self.annotations.to_json();
+        if self.takes_workspace() {
+            if !v["outputSchema"].is_object() {
+                v["outputSchema"] = json!({ "type": "object", "properties": {} });
+            }
+            if let Some(props) = v["outputSchema"]["properties"].as_object_mut()
+                && !props.contains_key("workspace")
+            {
+                props.insert("workspace".to_string(), json!({ "type": "string" }));
+            }
+        }
         v
     }
 }
@@ -4267,9 +4379,10 @@ pub(crate) fn instructions() -> String {
          file changes on disk auto-reverts on next use; one with unsaved edits is left alone \
          and flagged stale instead. Positions: \
          @N and point are ABSOLUTE (goto-char); line numbers are narrowing-relative \
-         (goto-line). On the stateless HTTP protocol, a stateful result reports a \
-         `workspace` handle; pass it back on every later call (stdio: ignore \
-         workspaces).\n\nTools:\n",
+         (goto-line). On the stateless HTTP protocol, a call that has a workspace \
+         reports its `workspace` handle (inside a JSON tool's text, or as a trailing \
+         line); pass it back on every later call. A call made without `workspace` \
+         reports one only if it created warm state (stdio: ignore workspaces).\n\nTools:\n",
     );
     let cat = catalogue();
     for category in Category::ORDER {
@@ -4325,8 +4438,9 @@ fn build_tool_schemas() -> Vec<Value> {
     });
     // The RunReport shape run_program and rehearse both answer with. Every
     // key either tool can emit is declared: the conditional ones (`stale`,
-    // `saved`, `unsaved`, `view`) ride only when they apply, and `workspace`
-    // is merged in by the stateless-HTTP result shaper.
+    // `saved`, `unsaved`, `view`) ride only when they apply. The `workspace`
+    // handle the stateless-HTTP path merges in is declared by `to_list_value`,
+    // like every other stateful tool's.
     let run_report_output = json!({
         "type": "object",
         "properties": {
@@ -4336,19 +4450,17 @@ fn build_tool_schemas() -> Vec<Value> {
             "diff": { "type": "string" }, "reports": { "type": "object" }, "log": { "type": "array" },
             "value": { "type": "string" }, "error": { "type": "string" }, "rolled_back": { "type": "boolean" },
             "stale": { "type": "boolean" }, "saved": { "type": "string" },
-            "unsaved": { "type": "boolean" }, "view": { "type": "string" },
-            "workspace": { "type": "string" }
+            "unsaved": { "type": "boolean" }, "view": { "type": "string" }
         },
         "required": ["ok"]
     });
-    vec![
+    let mut schemas = vec![
         json!({
             "name": "open_file",
             "description": "Open a file from disk into a warm session (replacing any existing session of that name). The buffer stays resident so later tools need no file re-reads. The path must resolve inside an allowed root (MIME_ROOTS, default cwd). You rarely need this: every tool's `path` argument auto-opens the file the same way — reach for open_file only to attach it read-only (`read_only: true`) or under a specific session id. After EXTERNAL changes to the file (a git checkout, another editor) there is nothing to do: passing `path` re-reads a CLEAN drifted buffer from disk automatically; a buffer with unsaved edits is kept and flagged stale instead — no defensive close_session needed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "path": { "type": "string", "description": "Filesystem path to open." },
                     "read_only": { "type": "boolean", "description": "Attach the buffer unwritable; mutating programs are rejected. Default false." },
                     "session": session,
@@ -4362,7 +4474,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "text": { "type": "string", "description": "Initial buffer contents." },
                     "name": { "type": "string", "description": "Optional buffer name." },
                     "read_only": { "type": "boolean", "description": "Attach the buffer unwritable; mutating programs are rejected. Default false." },
@@ -4377,7 +4488,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "program": { "type": "string", "description": "Emacs-Lisp program, e.g. (while (re-search-forward \"foo\" nil t) (replace-match \"bar\"))." },
                     "full_diff": { "type": "boolean", "description": "Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count." },
                     "keep_partial": { "type": "boolean", "description": "On program error, KEEP the pre-error edits in the warm buffer (dirty:true in the failure JSON; undo_last reverts them) instead of rolling back to the pre-program state. Default false: a failed run is transactional." },
@@ -4396,7 +4506,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "program": { "type": "string", "description": "Emacs-Lisp program to rehearse (run then roll back)." },
                     "full_diff": { "type": "boolean", "description": "Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count." },
                     "view": { "type": ["boolean", "integer"], "description": "Add a rendered viewport around point to the report (true = 4 context lines, or a line count)." },
@@ -4413,7 +4522,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "start": { "type": "integer", "description": "1-based start position (inclusive). Pass start+end OR lines." },
                     "end": { "type": "integer", "description": "1-based end position (exclusive)." },
                     "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based INCLUSIVE line numbers (narrowing-relative, like goto-line), e.g. {lines: [313, 322]} — instead of char positions." },
@@ -4430,7 +4538,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "lines": { "type": "integer", "description": "Context lines on EACH SIDE of the cursor line — a count, not a range (worked example: view {path: \"f.rs\", pos: 3130, lines: 8} renders 17 lines centered on position 3130). For a line RANGE use read_region {lines: [a, b]}." },
                     "pos": { "type": "integer", "description": "1-based CHAR position to center on (default: current point). To center on a line, first find its position via occur, or read_region {lines: [n, n]}." },
                     "session": session,
@@ -4445,7 +4552,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "text": { "type": "string", "description": "The literal text to insert." },
                     "pos": { "type": ["integer", "string"], "description": "1-based position to insert at (default: current point) — or \"eob\" / \"bob\" to append at the end / insert at the beginning of the accessible region (no position arithmetic for the common append)." },
                     "anchor": { "type": "object", "description": "E.g. {\"pattern\": \"fn main() {\", \"where\": \"before\"} — insert relative to the UNIQUE line containing a literal text ({\"before\": \"line text\"} / {\"after\": \"line text\"} are accepted shorthand for the same) — or {\"defun\": \"name\"} to target a named defun. An ambiguous pattern errors, listing the match lines. \"where\": \"after\" (default) puts the text at the end of the defun or the matched line — include separating newlines in the text. \"before\" puts it above the whole decorated defun (Rust #[attributes] / Python decorators included), or at the start of the matched line. Not combinable with pos.", "properties": { "defun": { "type": "string" }, "pattern": { "type": "string" }, "where": { "type": "string", "enum": ["after", "before"] }, "before": { "type": "string", "description": "Shorthand for {\"pattern\": <this text>, \"where\": \"before\"}." }, "after": { "type": "string", "description": "Shorthand for {\"pattern\": <this text>, \"where\": \"after\"}." } } },
@@ -4465,7 +4571,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "pattern": { "type": "string", "description": "The text to find — literal by default; the Emacs regex dialect with mode:\"regex\"." },
                     "replacement": { "type": "string", "description": "The replacement text — literal by default; with mode:\"regex\", \\1..\\9 insert the numbered capture group and \\& the whole match." },
                     "thing": thing_schema("Replace the region named by structure instead of by searching:", ". Pass `replacement` only; the result names the replaced span (`KIND @START-END`) so a wrong pick is visible. Not combinable with pattern/edits/all/mode/expect_unique/scope."),
@@ -4488,7 +4593,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "files": { "type": "array", "items": { "type": "string" }, "description": "The files to edit — each must match the edit spec." },
                     "pattern": { "type": "string", "description": "The text to find — literal by default; the Emacs regex dialect with mode:\"regex\"." },
                     "replacement": { "type": "string", "description": "The replacement text — with mode:\"regex\", \\1..\\9/\\& backrefs expand." },
@@ -4508,7 +4612,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "pattern": { "type": "string", "description": "What to list matches for." },
                     "mode": {
                         "type": "string",
@@ -4531,7 +4634,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "pattern": { "type": "string", "description": "What to search for." },
                     "glob": { "type": "string", "description": "Keep only paths matching this glob, relative to the search dir: * within a segment, ** across directories, ? one char (e.g. **/*.rs). Omit to search every file." },
                     "dir": { "type": "string", "description": "Directory to search (must resolve inside an allowed root). Omit to search every root." },
@@ -4552,8 +4654,7 @@ fn build_tool_schemas() -> Vec<Value> {
                     "matches": { "type": "array", "items": { "type": "object", "properties": {
                         "path": { "type": "string" }, "line": { "type": "integer" }, "text": { "type": "string" } } } },
                     "truncated": { "type": "boolean" },
-                    "unsaved": { "type": "array", "items": { "type": "string" } },
-                    "workspace": { "type": "string" }
+                    "unsaved": { "type": "array", "items": { "type": "string" } }
                 },
                 "required": ["matches", "truncated", "unsaved"]
             },
@@ -4564,7 +4665,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "session": session,
                     "path": path,
                 },
@@ -4575,8 +4675,7 @@ fn build_tool_schemas() -> Vec<Value> {
                 "properties": {
                     "lang": { "type": "string" },
                     "defuns": { "type": "array", "items": { "type": "object", "properties": {
-                        "kind": { "type": "string" }, "start": { "type": "integer" }, "end": { "type": "integer" }, "name": { "type": "string" } } } },
-                    "workspace": { "type": "string" }
+                        "kind": { "type": "string" }, "start": { "type": "integer" }, "end": { "type": "integer" }, "name": { "type": "string" } } } }
                 },
                 "required": ["lang", "defuns"]
             },
@@ -4587,7 +4686,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "session": session,
                     "path": path,
                 },
@@ -4600,7 +4698,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "label": { "type": "string", "description": "Optional label; auto-generated (auto-N) when omitted." },
                     "session": session,
                     "path": path,
@@ -4614,7 +4711,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "session": session,
                     "path": path,
                 },
@@ -4627,7 +4723,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "label": { "type": "string", "description": "Label of the checkpoint to restore." },
                     "session": session,
                     "path": path,
@@ -4641,7 +4736,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "to": { "type": "string", "description": "Optional save-as destination — writes a copy there without rebinding the session. Omitted: write back to the visited file." },
                     "session": session,
                     "path": path,
@@ -4655,7 +4749,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "force": { "type": "boolean", "description": "Discard unsaved edits. Default false: closing an unsaved session is an error." },
                     "session": session,
                     "path": path,
@@ -4681,7 +4774,6 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                     "path": { "type": "string", "description": "The visited file — matches the warm session opened for it." },
                     "session": { "type": "string", "description": "Warm session id; defaults to \"default\" when omitted. Pass path OR session, not both." }
                 },
@@ -4694,14 +4786,15 @@ fn build_tool_schemas() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": workspace.clone(),
                 },
                 "required": [],
             },
             "outputSchema": {
                 "type": "object",
                 "properties": {
-                    "workspace": { "type": "string" },
+                    // null off the stateless HTTP protocol, and on a
+                    // handle-free call that holds no workspace.
+                    "workspace": { "type": ["string", "null"] },
                     "sessions": { "type": "array", "items": { "type": "object", "properties": {
                         "id": { "type": "string" }, "buffer": { "type": "string" }, "file": {},
                         "narrowed": { "type": "boolean" }, "stale": { "type": "boolean" },
@@ -4735,7 +4828,26 @@ fn build_tool_schemas() -> Vec<Value> {
                 "required": ["workspace"],
             },
         }),
-    ]
+    ];
+    // Every tool here is stateful — it reads or writes the warm-session map —
+    // so every one of them takes the handle that names which map, from the one
+    // definition above rather than a literal pasted into each schema. The two
+    // exceptions: `help` touches no warm state, and `open_workspace` RETURNS a
+    // handle rather than taking one. `close_workspace` already declares its own
+    // (required, with its own description), and a present property is kept.
+    // The git tools are a separate catalogue and never see this pass.
+    for schema in &mut schemas {
+        let name = schema["name"].as_str().unwrap_or("");
+        if name == "help" || name == "open_workspace" {
+            continue;
+        }
+        if let Some(props) = schema["inputSchema"]["properties"].as_object_mut()
+            && !props.contains_key("workspace")
+        {
+            props.insert("workspace".to_string(), workspace.clone());
+        }
+    }
+    schemas
 }
 
 #[cfg(test)]
@@ -4746,15 +4858,32 @@ mod git_tool_tests {
     /// recursing through properties/items. Enough to keep an outputSchema
     /// honest without a validator crate.
     fn conforms(schema: &Value, value: &Value, at: &str) -> Result<(), String> {
-        let ty = schema["type"].as_str().unwrap_or("");
+        /// One named JSON type against a value; `Err` for a type this
+        /// validator does not know (a typo in a schema, not a bad value).
+        fn is_type(ty: &str, value: &Value, at: &str) -> Result<bool, String> {
+            Ok(match ty {
+                "object" => value.is_object(),
+                "array" => value.is_array(),
+                "string" => value.is_string(),
+                "integer" => value.is_i64() || value.is_u64(),
+                "boolean" => value.is_boolean(),
+                "null" => value.is_null(),
+                other => return Err(format!("{at}: unknown schema type {other}")),
+            })
+        }
+        let ty = &schema["type"];
+        // A `type` array is a union: conforming to ANY member is enough.
         let ok = match ty {
-            "object" => value.is_object(),
-            "array" => value.is_array(),
-            "string" => value.is_string(),
-            "integer" => value.is_i64() || value.is_u64(),
-            "boolean" => value.is_boolean(),
-            "" => true,
-            other => return Err(format!("{at}: unknown schema type {other}")),
+            Value::String(t) => is_type(t, value, at)?,
+            Value::Array(ts) => {
+                let mut any = false;
+                for t in ts {
+                    any |= is_type(t.as_str().unwrap_or(""), value, at)?;
+                }
+                any
+            }
+            // No `type` at all: anything goes (e.g. a nullable `file`).
+            _ => true,
         };
         if !ok {
             return Err(format!("{at}: expected {ty}, got {value}"));
@@ -4812,11 +4941,25 @@ mod git_tool_tests {
             "text unchanged"
         );
 
-        let status = tool_session_status(&sessions, "abc").unwrap();
+        let status = tool_session_status(&sessions, Some("abc")).unwrap();
         let s = status.structured.unwrap();
         conforms(&output_schema("session_status"), &s, "session_status").unwrap();
         assert_eq!(s["workspace"], "abc");
         assert_eq!(status.text, s.to_string());
+        // `tool_session_status` is handed `None` whenever the call has no
+        // workspace to name — off the stateless HTTP protocol, or on a
+        // handle-free call that holds none — and reports the handle as null.
+        // The schema has to allow it, or that case breaks session_status's
+        // own contract.
+        let no_workspace = tool_session_status(&sessions, None).unwrap();
+        let s = no_workspace.structured.unwrap();
+        assert_eq!(s["workspace"], Value::Null);
+        conforms(
+            &output_schema("session_status"),
+            &s,
+            "session_status(no workspace)",
+        )
+        .unwrap();
 
         let run = tool_run_program(&json!({"path": file.display().to_string(), "program": "(report \"n\" (count-matches \"def\"))"}), &mut sessions, false).unwrap();
         let s = run.structured.unwrap();
@@ -4881,9 +5024,9 @@ mod git_tool_tests {
         conforms(&output_schema("rehearse"), &s, "rehearse").unwrap();
         assert_eq!(s["rehearsed"], true);
 
-        // On the stateless protocol `shape_result` merges the workspace handle
-        // into whatever structuredContent the tool produced — the schema has
-        // to allow it, or the shaped result stops conforming.
+        // On the stateless protocol `rpc::tools_call` merges the workspace
+        // handle into whatever structuredContent the tool produced — the
+        // schema has to allow it, or the merged result stops conforming.
         let mut shaped = tool_outline(&json!({"path": file.display().to_string()}), &mut sessions)
             .unwrap()
             .structured
@@ -4899,10 +5042,15 @@ mod git_tool_tests {
         let plain = tool_result(ToolOutput::from("hi".to_string()));
         assert!(plain.get("structuredContent").is_none());
         assert_eq!(plain["isError"], false);
-        let rich = tool_result(ToolOutput::failed("bad".into(), json!({"ok": false})));
+        // A failure whose JSON IS its text (run_program's shape): the same
+        // value rides both, so a structured client need not re-parse it.
+        let rich = tool_result(ToolOutput::json_failed(
+            json!({"ok": false}),
+            Render::Compact,
+        ));
         assert_eq!(rich["structuredContent"]["ok"], false);
         assert_eq!(rich["isError"], true);
-        assert_eq!(rich["content"][0]["text"], "bad");
+        assert_eq!(rich["content"][0]["text"], r#"{"ok":false}"#);
     }
 
     #[test]
@@ -5443,5 +5591,39 @@ mod git_tool_tests {
                 .iter()
                 .any(|t| t["name"] == "close_workspace")
         );
+    }
+
+    /// MCP: "If an output schema is provided, servers MUST provide structured
+    /// results that conform to this schema." `rpc::tools_call` merges the
+    /// handle into the structuredContent of EVERY stateful call on modern
+    /// HTTP, so every stateful tool has to declare `workspace` in an
+    /// outputSchema — added by `to_list_value`, not written per tool.
+    #[test]
+    fn every_stateful_tool_declares_an_output_schema() {
+        for t in tool_schemas() {
+            let name = t["name"].as_str().unwrap();
+            let out = &t["outputSchema"];
+            if tool_uses_workspace(name) {
+                assert!(out.is_object(), "{name}: no outputSchema");
+                let ty = &out["properties"]["workspace"]["type"];
+                let ok = ty == "string"
+                    || ty
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|t| t == "string"));
+                assert!(ok, "{name}: workspace declared as {ty}");
+                // A GENERATED schema declares the handle and nothing else, so
+                // it declares no `required`: the key rides only on modern HTTP.
+                if out["properties"].as_object().is_some_and(|p| p.len() == 1) {
+                    assert!(
+                        out.get("required").is_none(),
+                        "{name}: a generated schema must not require {}",
+                        out["required"]
+                    );
+                }
+            } else if name == "open_workspace" {
+                // Its reply IS the handle, so there it is required.
+                assert_eq!(out["required"], json!(["workspace"]), "{name}");
+            }
+        }
     }
 }

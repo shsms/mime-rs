@@ -155,13 +155,19 @@ on the same process.
 Warm state lives in **workspaces**: bounded sets of named sessions behind an
 unguessable handle. On stdio there is one implicit workspace and you never
 see the handle. On HTTP a legacy client's `Mcp-Session-Id` *is* its
-workspace; a `2026-07-28` client gets a fresh workspace on any stateful call
-that omits `workspace`, reads the handle back from the result
-(`structuredContent.workspace` and a trailing `workspace:` line), and passes
-it to later calls. `open_workspace` / `close_workspace` manage them explicitly.
+workspace; a `2026-07-28` client that omits `workspace` runs in a fresh
+workspace that is kept only if the call created warm state; the result then
+reports the handle (`structuredContent.workspace`, embedded in a JSON tool's
+text or appended as a trailing `workspace:` line for a prose one) and the
+client passes it to later calls. `open_workspace` / `close_workspace` manage
+them explicitly.
 
-`session_status`, `run_program`, `rehearse`, `grep` and `outline` also return
-`structuredContent` (with an `outputSchema`) beside their text.
+Every tool that takes `workspace` declares an `outputSchema`; a successful call
+returns `structuredContent` (at least `{}`), while a tool error carries it only
+when the tool supplies one. `session_status`, `run_program`, `rehearse`, `grep`
+and `outline` carry real data in it, and `session_status` shows the handle
+only on that protocol (`null` elsewhere, and when the call holds no
+workspace).
 
 Each tool takes a `path` and auto-opens the file into a warm session keyed by its
 canonical path; mutating tools take `save: true` for an atomic, stale-guarded

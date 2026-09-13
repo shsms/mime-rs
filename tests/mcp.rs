@@ -2230,8 +2230,8 @@ fn rehearse_accepts_full_diff_and_view() {
 /// capabilities on every call, in place of the `initialize` handshake.
 fn meta() -> Value {
     json!({
-        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientCapabilities": {},
+        mime_rs::rpc::META_PROTOCOL_VERSION: mime_rs::rpc::PROTOCOL_VERSION,
+        mime_rs::rpc::META_CLIENT_CAPABILITIES: {},
         "io.modelcontextprotocol/clientInfo": {"name": "e2e", "version": "0"},
     })
 }
@@ -2268,9 +2268,10 @@ fn modern_stdio_conversation_needs_no_handshake() {
     );
     assert_eq!(o["result"]["isError"], false);
     assert_eq!(o["result"]["resultType"], "complete");
-    assert!(
-        o["result"].get("structuredContent").is_none(),
-        "stdio reports no handle"
+    assert_eq!(
+        o["result"]["structuredContent"],
+        json!({}),
+        "the schema-mandated object, with no handle merged in: stdio has one"
     );
 
     let v = s.request(
@@ -2419,8 +2420,10 @@ fn normalise(v: &mut Value) {
         inner["audit"] = json!(false);
         touched = true;
     }
-    // The workspace handle is freshly minted per run.
-    if inner.get("workspace").is_some() {
+    // The workspace handle is freshly minted per run. A null one is stable —
+    // and says something (the handle is not echoed off modern HTTP) — so it is
+    // frozen as it stands rather than masked.
+    if inner["workspace"].is_string() {
         inner["workspace"] = json!("<handle>");
         touched = true;
     }
@@ -2432,6 +2435,8 @@ fn normalise(v: &mut Value) {
     if v["result"]["structuredContent"].get("roots").is_some() {
         v["result"]["structuredContent"]["roots"] = json!([]);
         v["result"]["structuredContent"]["audit"] = json!(false);
-        v["result"]["structuredContent"]["workspace"] = json!("<handle>");
+        if v["result"]["structuredContent"]["workspace"].is_string() {
+            v["result"]["structuredContent"]["workspace"] = json!("<handle>");
+        }
     }
 }
