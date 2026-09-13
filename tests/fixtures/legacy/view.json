@@ -1,0 +1,13 @@
+{
+  "id": 8,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "— g  line 1 col 0  point 1/12 —\n    1 > ‸hello\n    2   world\n    3   \n",
+        "type": "text"
+      }
+    ],
+    "isError": false
+  }
+}

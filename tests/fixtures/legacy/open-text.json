@@ -1,0 +1,13 @@
+{
+  "id": 7,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "opened in-memory buffer \"g\" (12 chars) in session \"g\"",
+        "type": "text"
+      }
+    ],
+    "isError": false
+  }
+}

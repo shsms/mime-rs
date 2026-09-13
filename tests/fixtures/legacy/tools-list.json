@@ -1,0 +1,1865 @@
+{
+  "id": 6,
+  "jsonrpc": "2.0",
+  "result": {
+    "tools": [
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Open a file from disk into a warm session (replacing any existing session of that name). The buffer stays resident so later tools need no file re-reads. The path must resolve inside an allowed root (MIME_ROOTS, default cwd). You rarely need this: every tool's `path` argument auto-opens the file the same way — reach for open_file only to attach it read-only (`read_only: true`) or under a specific session id. After EXTERNAL changes to the file (a git checkout, another editor) there is nothing to do: passing `path` re-reads a CLEAN drifted buffer from disk automatically; a buffer with unsaved edits is kept and flagged stale instead — no defensive close_session needed.",
+        "inputSchema": {
+          "properties": {
+            "path": {
+              "description": "Filesystem path to open.",
+              "type": "string"
+            },
+            "read_only": {
+              "description": "Attach the buffer unwritable; mutating programs are rejected. Default false.",
+              "type": "boolean"
+            },
+            "session": {
+              "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        },
+        "name": "open_file"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Open an in-memory text buffer into a warm session (replacing any existing session of that name).",
+        "inputSchema": {
+          "properties": {
+            "name": {
+              "description": "Optional buffer name.",
+              "type": "string"
+            },
+            "read_only": {
+              "description": "Attach the buffer unwritable; mutating programs are rejected. Default false.",
+              "type": "boolean"
+            },
+            "session": {
+              "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            },
+            "text": {
+              "description": "Initial buffer contents.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "type": "object"
+        },
+        "name": "open_text"
+      },
+      {
+        "annotations": {
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and return a structured RunReport (unified diff, point, length before/after, any (report ...)/(message ...) output, and `value`: the final form's result — a string comes back raw (unquoted, unescaped), other types render the way tulisp prints them; present only when non-nil, so a read-only inspector like (conflict-diff N) is readable without wrapping it in (message ...)). Only the FINAL form's value comes back, so wrap any earlier result you need (e.g. a replace-regexp match count) in (report …) or it stays invisible. This is the core, general-purpose editing tool; the buffer and any defined functions persist for the next call. The callable Lisp surface is indexed in help {lisp} (help {regex|treesit|recipes} for syntax and worked examples). Name-like arguments — conflict sides, treesit languages, coding systems, checkpoint labels, report/arg keys — accept a string or a quoted symbol. Everything else (buffer names, defun/field names, free text, paths, regexes) is a string. On failure the error content is a JSON object {ok:false, error, dirty, reports, log} carrying the diagnostics the program emitted before dying; by default a failed run rolls its pre-error edits back (rolled_back:true rides in the failure JSON); dirty=true means they persist — that happens only with keep_partial:true.",
+        "inputSchema": {
+          "properties": {
+            "full_diff": {
+              "description": "Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count.",
+              "type": "boolean"
+            },
+            "keep_partial": {
+              "description": "On program error, KEEP the pre-error edits in the warm buffer (dirty:true in the failure JSON; undo_last reverts them) instead of rolling back to the pre-program state. Default false: a failed run is transactional.",
+              "type": "boolean"
+            },
+            "path": {
+              "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
+              "type": "string"
+            },
+            "program": {
+              "description": "Emacs-Lisp program, e.g. (while (re-search-forward \"foo\" nil t) (replace-match \"bar\")).",
+              "type": "string"
+            },
+            "save": {
+              "description": "After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.",
+              "type": "boolean"
+            },
+            "session": {
+              "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            },
+            "view": {
+              "description": "Add a rendered viewport around point to the report (true = 4 context lines, or a line count).",
+              "type": [
+                "boolean",
+                "integer"
+              ]
+            }
+          },
+          "required": [
+            "program"
+          ],
+          "type": "object"
+        },
+        "name": "run_program"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Dry-run an Emacs-Lisp (tulisp) edit program and return the same RunReport run_program would (unified diff, length before/after, reports), showing what WOULD happen — then roll the session back so nothing persists: the buffer, point/mark/narrowing, kill-ring, and checkpoints are all left exactly as before (the report carries rehearsed=true). The 'try before you commit' preview; follow up with run_program to actually apply it.",
+        "inputSchema": {
+          "properties": {
+            "full_diff": {
+              "description": "Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count.",
+              "type": "boolean"
+            },
+            "path": {
+              "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
+              "type": "string"
+            },
+            "program": {
+              "description": "Emacs-Lisp program to rehearse (run then roll back).",
+              "type": "string"
+            },
+            "session": {
+              "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            },
+            "view": {
+              "description": "Add a rendered viewport around point to the report (true = 4 context lines, or a line count).",
+              "type": [
+                "boolean",
+                "integer"
+              ]
+            }
+          },
+          "required": [
+            "program"
+          ],
+          "type": "object"
+        },
+        "name": "rehearse"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Return the buffer text between two 1-based char positions [start, end) — or a LINE range via lines: [a, b] — or a structural thing via thing: {kind, at | after | before}. Use this to pull context on demand instead of dumping the whole buffer. Char positions are what conflicts/occur output feeds (@N); the lines form fits 'read around this line'.",
+        "inputSchema": {
+          "properties": {
+            "end": {
+              "description": "1-based end position (exclusive).",
+              "type": "integer"
+            },
+            "lines": {
+              "description": "[start, end] 1-based INCLUSIVE line numbers (narrowing-relative, like goto-line), e.g. {lines: [313, 322]} — instead of char positions.",
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "path": {
+              "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
+              "type": "string"
+            },
+            "session": {
+              "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            },
+            "start": {
+              "description": "1-based start position (inclusive). Pass start+end OR lines.",
+              "type": "integer"
+            },
+            "thing": {
+              "description": "Read a region named by structure instead of positions: {\"kind\": \"list\", \"after\": \"fn main() {\"} is the block that line opens. With \"after\", kind `list` takes the LAST list beginning on the line (else the first one after it), while every other kind takes the FIRST thing at or after the line — {\"kind\": \"sexp\", \"after\": \"old(1, 2);\"} is `old`. {\"kind\": \"sexp\", \"at\": 1234} is the expression containing a position; \"before\" the last one ending before the line. kind: sexp | list | string | word | symbol | line | paragraph | defun. \"up\": N widens a sexp/list by N enclosing groups. Balanced brackets, strings and comments follow the file's language; the result starts with `KIND @START-END (lines A-B):` so a wrong pick is visible. Not combinable with start/end/lines.",
+              "properties": {
+                "after": {
+                  "type": "string"
+                },
+                "at": {
+                  "type": "integer"
+                },
+                "before": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "sexp",
+                    "list",
+                    "string",
+                    "word",
+                    "symbol",
+                    "line",
+                    "paragraph",
+                    "defun"
+                  ],
+                  "type": "string"
+                },
+                "up": {
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "read_region"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Render a viewport around the cursor (or a given position): a few lines of context on each side, with a gutter, the current line marked, and a header (flagged 'Narrow' when a restriction is active). Read-only. Coordinate convention everywhere: char positions (@N, point) are ABSOLUTE — feed goto-char; line numbers count from the accessible region's start — feed goto-line.",
+        "inputSchema": {
+          "properties": {
+            "lines": {
+              "description": "Context lines on EACH SIDE of the cursor line — a count, not a range (worked example: view {path: \"f.rs\", pos: 3130, lines: 8} renders 17 lines centered on position 3130). For a line RANGE use read_region {lines: [a, b]}.",
+              "type": "integer"
+            },
+            "path": {
+              "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
+              "type": "string"
+            },
+            "pos": {
+              "description": "1-based CHAR position to center on (default: current point). To center on a line, first find its position via occur, or read_region {lines: [n, n]}.",
+              "type": "integer"
+            },
+            "session": {
+              "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "view"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Insert literal text at point, at `pos` (a char position, or \"eob\" to append at the end of the file), relative to an `anchor` (a named defun, or the unique line containing a literal pattern), or relative to a structural `thing` (the block a line opens, the sexp at a position). Pass the text as a plain string — no Lisp escaping needed, the server handles it. Prefer this over run_program with (insert …) for multi-line or quote-heavy content, and over shell appends for end-of-file additions. Edits the warm buffer; call save_buffer to persist.",
+        "inputSchema": {
+          "properties": {
+            "anchor": {
+              "description": "E.g. {\"pattern\": \"fn main() {\", \"where\": \"before\"} — insert relative to the UNIQUE line containing a literal text ({\"before\": \"line text\"} / {\"after\": \"line text\"} are accepted shorthand for the same) — or {\"defun\": \"name\"} to target a named defun. An ambiguous pattern errors, listing the match lines. \"where\": \"after\" (default) puts the text at the end of the defun or the matched line — include separating newlines in the text. \"before\" puts it above the whole decorated defun (Rust #[attributes] / Python decorators included), or at the start of the matched line. Not combinable with pos.",
+              "properties": {
+                "after": {
+                  "description": "Shorthand for {\"pattern\": <this text>, \"where\": \"after\"}.",
+                  "type": "string"
+                },
+                "before": {
+                  "description": "Shorthand for {\"pattern\": <this text>, \"where\": \"before\"}.",
+                  "type": "string"
+                },
+                "defun": {
+                  "type": "string"
+                },
+                "pattern": {
+                  "type": "string"
+                },
+                "where": {
+                  "enum": [
+                    "after",
+                    "before"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "path": {
+              "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
+              "type": "string"
+            },
+            "pos": {
+              "description": "1-based position to insert at (default: current point) — or \"eob\" / \"bob\" to append at the end / insert at the beginning of the accessible region (no position arithmetic for the common append).",
+              "type": [
+                "integer",
+                "string"
+              ]
+            },
+            "save": {
+              "description": "After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.",
+              "type": "boolean"
+            },
+            "session": {
+              "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            },
+            "text": {
+              "description": "The literal text to insert.",
+              "type": "string"
+            },
+            "thing": {
+              "description": "Insert relative to a structural thing instead of a position: {\"kind\": \"list\", \"after\": \"fn main() {\"} is the block that line opens. With \"after\", kind `list` takes the LAST list beginning on the line (else the first one after it), while every other kind takes the FIRST thing at or after the line — {\"kind\": \"sexp\", \"after\": \"old(1, 2);\"} is `old`. {\"kind\": \"sexp\", \"at\": 1234} is the expression containing a position; \"before\" the last one ending before the line. kind: sexp | list | string | word | symbol | line | paragraph | defun. \"up\": N widens a sexp/list by N enclosing groups. Balanced brackets, strings and comments follow the file's language. `where` picks the end to insert at: \"after\" (default, at its end) or \"before\" (at its start); the result names the span it landed against, so a wrong pick is visible. Not combinable with pos/anchor.",
+              "properties": {
+                "after": {
+                  "type": "string"
+                },
+                "at": {
+                  "type": "integer"
+                },
+                "before": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "sexp",
+                    "list",
+                    "string",
+                    "word",
+                    "symbol",
+                    "line",
+                    "paragraph",
+                    "defun"
+                  ],
+                  "type": "string"
+                },
+                "up": {
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            },
+            "view": {
+              "description": "Append a rendered viewport around point after the edit (true = 4 context lines, or a line count) — confirm the insert landed right without a follow-up view call.",
+              "type": [
+                "boolean",
+                "integer"
+              ]
+            },
+            "where": {
+              "description": "With `thing`: insert at its end (after, default) or its start (before). Applies to `thing` ONLY — the anchor form carries its own `where` inside the anchor object, and a top-level one without a `thing` is an error rather than a silently dropped placement.",
+              "enum": [
+                "after",
+                "before"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "type": "object"
+        },
+        "name": "insert_text"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Replace the FIRST occurrence of a pattern (searching from the top of the accessible region); pass all:true to replace every occurrence, or `thing` to replace a region named by structure instead of by searching. By default both strings are plain literals — no Lisp escaping, no regex (insert_text's counterpart; the fix for quote-heavy edits). mode:\"regex\" switches the pattern to the Emacs regex dialect (as occur/grep) with \\1..\\9 and \\& backrefs expanding in the replacement — the one-call form of the goto-char/while/re-search-forward/replace-match loop. Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Edits the warm buffer; call save_buffer to persist. For position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.",
+        "inputSchema": {
+          "properties": {
+            "all": {
+              "description": "Replace every occurrence (default false: first only).",
+              "type": "boolean"
+            },
+            "edits": {
+              "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?, mode?}, …] applied in order inside ONE transaction — all-or-nothing; a miss (or a failed uniqueness check) rolls everything back and names the failed edit.",
+              "items": {
+                "properties": {
+                  "all": {
+                    "type": "boolean"
+                  },
+                  "expect_unique": {
+                    "type": "boolean"
+                  },
+                  "mode": {
+                    "enum": [
+                      "exact",
+                      "regex"
+                    ],
+                    "type": "string"
+                  },
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "expect_unique": {
+              "description": "Require the pattern to match exactly once: more than one match is an error (listing the match lines) and nothing is replaced. RECOMMENDED whenever the anchor text could plausibly repeat — first-match semantics would silently edit the wrong site. Default false.",
+              "type": "boolean"
+            },
+            "mode": {
+              "description": "exact (default): literal search and replacement. regex: Emacs-dialect pattern with backref expansion in the replacement. With `edits`, acts as the default for entries that don't set their own.",
+              "enum": [
+                "exact",
+                "regex"
+              ],
+              "type": "string"
+            },
+            "path": {
+              "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
+              "type": "string"
+            },
+            "pattern": {
+              "description": "The text to find — literal by default; the Emacs regex dialect with mode:\"regex\".",
+              "type": "string"
+            },
+            "replacement": {
+              "description": "The replacement text — literal by default; with mode:\"regex\", \\1..\\9 insert the numbered capture group and \\& the whole match.",
+              "type": "string"
+            },
+            "save": {
+              "description": "After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.",
+              "type": "boolean"
+            },
+            "scope": {
+              "description": "Restrict this call to one part of the buffer without writing a program. {\"defun\": \"name\"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.",
+              "properties": {
+                "defun": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "session": {
+              "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            },
+            "thing": {
+              "description": "Replace the region named by structure instead of by searching: {\"kind\": \"list\", \"after\": \"fn main() {\"} is the block that line opens. With \"after\", kind `list` takes the LAST list beginning on the line (else the first one after it), while every other kind takes the FIRST thing at or after the line — {\"kind\": \"sexp\", \"after\": \"old(1, 2);\"} is `old`. {\"kind\": \"sexp\", \"at\": 1234} is the expression containing a position; \"before\" the last one ending before the line. kind: sexp | list | string | word | symbol | line | paragraph | defun. \"up\": N widens a sexp/list by N enclosing groups. Balanced brackets, strings and comments follow the file's language. Pass `replacement` only; the result names the replaced span (`KIND @START-END`) so a wrong pick is visible. Not combinable with pattern/edits/all/mode/expect_unique/scope.",
+              "properties": {
+                "after": {
+                  "type": "string"
+                },
+                "at": {
+                  "type": "integer"
+                },
+                "before": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "sexp",
+                    "list",
+                    "string",
+                    "word",
+                    "symbol",
+                    "line",
+                    "paragraph",
+                    "defun"
+                  ],
+                  "type": "string"
+                },
+                "up": {
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            },
+            "view": {
+              "description": "Append a rendered viewport around point after the edit (true = 4 context lines, or a line count).",
+              "type": [
+                "boolean",
+                "integer"
+              ]
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "replace_text"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Apply the SAME edit spec to EVERY listed file in one call — the cross-file rename. Give pattern/replacement (with all/expect_unique, and mode:\"regex\" for the Emacs dialect with backrefs), or `edits` for a transactional batch per file; the absolute paths grep prints feed `files` directly. Atomic ACROSS the set: a failure in any file (a miss, a failed uniqueness check) rolls the already-edited ones back and the error names the file — every listed path must contain the pattern, so list exactly the files you grepped. Edits land in the warm buffers; with save:true the files are saved only after every file's edit succeeded. For a single file use replace_text.",
+        "inputSchema": {
+          "properties": {
+            "all": {
+              "description": "Replace every occurrence per file (default false: first only).",
+              "type": "boolean"
+            },
+            "edits": {
+              "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?, mode?}, …] applied in order inside ONE transaction per file — all-or-nothing across the whole call.",
+              "items": {
+                "properties": {
+                  "all": {
+                    "type": "boolean"
+                  },
+                  "expect_unique": {
+                    "type": "boolean"
+                  },
+                  "mode": {
+                    "enum": [
+                      "exact",
+                      "regex"
+                    ],
+                    "type": "string"
+                  },
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "expect_unique": {
+              "description": "Require the pattern to match exactly once per file — more is an error and nothing is applied anywhere. Default false.",
+              "type": "boolean"
+            },
+            "files": {
+              "description": "The files to edit — each must match the edit spec.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "mode": {
+              "description": "exact (default): literal. regex: Emacs-dialect pattern with backref expansion. With `edits`, acts as the default for entries that don't set their own.",
+              "enum": [
+                "exact",
+                "regex"
+              ],
+              "type": "string"
+            },
+            "pattern": {
+              "description": "The text to find — literal by default; the Emacs regex dialect with mode:\"regex\".",
+              "type": "string"
+            },
+            "replacement": {
+              "description": "The replacement text — with mode:\"regex\", \\1..\\9/\\& backrefs expand.",
+              "type": "string"
+            },
+            "save": {
+              "description": "After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.",
+              "type": "boolean"
+            },
+            "scope": {
+              "description": "Restrict this call to one part of the buffer without writing a program. {\"defun\": \"name\"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.",
+              "properties": {
+                "defun": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "files"
+          ],
+          "type": "object"
+        },
+        "name": "replace_in_files"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Overview of every line matching a pattern in the whole accessible region (composes with narrowing): line number (narrowing-relative, goto-line-able) + char position (absolute, goto-char-able) per hit, optional context lines, long lines clamped. Read-only; point does not move. Your 'grep the buffer' for orientation before editing.",
+        "inputSchema": {
+          "properties": {
+            "case_insensitive": {
+              "description": "Match case-insensitively (both modes). Default false.",
+              "type": "boolean"
+            },
+            "limit": {
+              "description": "Max matching lines rendered (default 100); the rest are summarized in a tail line.",
+              "type": "integer"
+            },
+            "mode": {
+              "description": "exact (literal) or regex (Emacs dialect). Defaults to exact.",
+              "enum": [
+                "exact",
+                "regex"
+              ],
+              "type": "string"
+            },
+            "nlines": {
+              "description": "Context lines around each hit (default 0).",
+              "type": "integer"
+            },
+            "path": {
+              "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
+              "type": "string"
+            },
+            "pattern": {
+              "description": "What to list matches for.",
+              "type": "string"
+            },
+            "scope": {
+              "description": "Restrict this call to one part of the buffer without writing a program. {\"defun\": \"name\"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.",
+              "properties": {
+                "defun": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "session": {
+              "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pattern"
+          ],
+          "type": "object"
+        },
+        "name": "occur"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Read-only cross-file search: which files (and lines) mention a pattern — occur across the filesystem. Walks `dir` (default: every allowed root) recursively, skipping dot-entries (.git …), symlinks, and git-ignored-and-untracked paths (target/ …; tracked files are always searched), keeping paths that match `glob`. Per file: a header + matching lines (line number + absolute char position, long lines clamped, optional context). The file paths it lists feed replace_in_files {files: […]} directly. Caps files scanned (5000) and matches rendered. Needs no session — reads files within MIME_ROOTS. Use occur for one already-open buffer; grep to find which files to touch.",
+        "inputSchema": {
+          "properties": {
+            "case_insensitive": {
+              "description": "Match case-insensitively (both modes). Default false.",
+              "type": "boolean"
+            },
+            "dir": {
+              "description": "Directory to search (must resolve inside an allowed root). Omit to search every root.",
+              "type": "string"
+            },
+            "glob": {
+              "description": "Keep only paths matching this glob, relative to the search dir: * within a segment, ** across directories, ? one char (e.g. **/*.rs). Omit to search every file.",
+              "type": "string"
+            },
+            "limit": {
+              "description": "Max matching lines rendered across all files (default 100); a tail line notes truncation.",
+              "type": "integer"
+            },
+            "mode": {
+              "description": "exact (literal) or regex (Emacs dialect, line-oriented). Defaults to exact.",
+              "enum": [
+                "exact",
+                "regex"
+              ],
+              "type": "string"
+            },
+            "nlines": {
+              "description": "Context lines around each hit (default 0).",
+              "type": "integer"
+            },
+            "pattern": {
+              "description": "What to search for.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pattern"
+          ],
+          "type": "object"
+        },
+        "name": "grep"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "The buffer's structural outline: one 'KIND START END NAME' line per defun (Rust/Python functions, types, impls, mods; Markdown sections), in document order with nested ones included. The natural first move on a code file — survey it without reading it whole; the names feed scope/anchor parameters and treesit-goto-defun.",
+        "inputSchema": {
+          "properties": {
+            "path": {
+              "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
+              "type": "string"
+            },
+            "session": {
+              "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "outline"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Overview of the merge-conflict hunks in the buffer: number, position + line, branch labels, side sizes; warns about marker lines it could not parse (malformed/nested). Read-only, but the resolution entry point — don't hand-edit markers with replace_text/insert_text; resolve via run_program: (conflict-keep SIDE &optional N) with \"ours\"|\"theirs\"|\"both\" (quoted symbols 'ours|'theirs|'both also work), or \"base\"|\"all\" on diff3 hunks only; (conflict-keep-all SIDE) to take one side over every remaining hunk at once; (conflict-replace TEXT &optional N) for a hand-crafted merge; (conflict-resolve-trivial) to sweep the safe ones; (conflict-diff &optional N) to see what differs; (conflict-text SIDE &optional N) to read one side; (conflict-context &optional N LINES) to see one hunk WITH its surrounding code — the decision view; (conflict-goto &optional N) to jump to a hunk; (conflict-count) the remaining count ((conflict-hunks) renders this same overview). Mutating calls return the remaining count — wrap them in (report \"left\" …) to see it in run_program's JSON. N is 1-based and refreshes after each edit; nil N = the hunk at point. @positions are absolute, L labels narrowing-relative; a narrowing that cuts through a hunk hides it entirely — widen before resolving.",
+        "inputSchema": {
+          "properties": {
+            "path": {
+              "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
+              "type": "string"
+            },
+            "session": {
+              "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "conflicts"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Capture a named restore point of the current buffer (cheap — structural sharing for files). ADVANCED: every mutating tool call already captures an automatic restore point, so undo_last is the usual safety net; reach for explicit checkpoints only to mark a spot you'll want to return to by name. Captured labels show up per session in session_status.",
+        "inputSchema": {
+          "properties": {
+            "label": {
+              "description": "Optional label; auto-generated (auto-N) when omitted.",
+              "type": "string"
+            },
+            "path": {
+              "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
+              "type": "string"
+            },
+            "session": {
+              "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "checkpoint"
+      },
+      {
+        "annotations": {
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Rewind the buffer to its state before the most recent mutating call — the automatic safety net for a misfired edit (every mutating tool call captures a restore point first; bounded ring of 8, no redo). Each call steps one mutating call further back. Unlike restore_checkpoint, nothing needs to have been captured up front.",
+        "inputSchema": {
+          "properties": {
+            "path": {
+              "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
+              "type": "string"
+            },
+            "session": {
+              "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "undo_last"
+      },
+      {
+        "annotations": {
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Rewind the buffer to a previously captured checkpoint by label (the labels are listed per session by session_status).",
+        "inputSchema": {
+          "properties": {
+            "label": {
+              "description": "Label of the checkpoint to restore.",
+              "type": "string"
+            },
+            "path": {
+              "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
+              "type": "string"
+            },
+            "session": {
+              "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "label"
+          ],
+          "type": "object"
+        },
+        "name": "restore_checkpoint"
+      },
+      {
+        "annotations": {
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Write the session buffer's text to disk. Without `to`, save back to the session's visited file (atomic write, stale-read guard, parse warning — the same save the edit tools' save:true performs); with `to` pointing elsewhere, write a COPY there and leave the session bound to its original file (a later plain save still targets the original — no silent retarget). NOTE: `path` addresses WHICH session, exactly like on every other tool — the destination parameter is `to`.",
+        "inputSchema": {
+          "properties": {
+            "path": {
+              "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
+              "type": "string"
+            },
+            "session": {
+              "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            },
+            "to": {
+              "description": "Optional save-as destination — writes a copy there without rebinding the session. Omitted: write back to the visited file.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "save_buffer"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Drop a warm session: releases its buffer and the open file handle a file-backed session holds. Refuses while the session has unsaved edits unless force:true discards them. Use it when done with a file, or to force a clean re-open from disk.",
+        "inputSchema": {
+          "properties": {
+            "force": {
+              "description": "Discard unsaved edits. Default false: closing an unsaved session is an error.",
+              "type": "boolean"
+            },
+            "path": {
+              "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
+              "type": "string"
+            },
+            "session": {
+              "description": "Warm session id; defaults to \"default\" when omitted.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "close_session"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Reference briefs served on demand: the callable Lisp-surface index, the regex dialect (Emacs syntax on the RE2 engine), the treesit structural-editing vocabulary, the merge-conflict workflow, the in-process git rebase/cherry-pick/revert workflow, session/saving/undo semantics, and ready-to-adapt edit recipes. Call it with no argument to list the topics; pass `tool` for one tool's full reference (description + annotations). Reach for it BEFORE guessing at syntax or vocabulary.",
+        "inputSchema": {
+          "properties": {
+            "tool": {
+              "description": "A tool name — return that tool's full description + annotations from the registry.",
+              "type": "string"
+            },
+            "topic": {
+              "description": "Which brief to fetch; omit to list them.",
+              "enum": [
+                "lisp",
+                "regex",
+                "treesit",
+                "conflicts",
+                "git",
+                "sessions",
+                "recipes"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "help"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "The unified diff between a warm buffer and its visited file on disk — 'what exactly have I not saved' in one call (what a save would write). Read-only; never auto-opens (a freshly opened buffer trivially matches disk). session_status lists which sessions are unsaved; grep flags files whose warm buffer differs.",
+        "inputSchema": {
+          "properties": {
+            "path": {
+              "description": "The visited file — matches the warm session opened for it.",
+              "type": "string"
+            },
+            "session": {
+              "description": "Warm session id; defaults to \"default\" when omitted. Pass path OR session, not both.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "unsaved_diff"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Report engine status: per live session the current buffer, its visited file, and whether it is narrowed, stale (its file drifted on disk), or unsaved (has edits not yet written to that file — so a forgotten save is visible); plus the allowed filesystem roots that open_file/save_buffer are confined to (MIME_ROOTS, default cwd), and whether the audit journal is on. Check the roots before opening or saving to learn the writable sandbox up front.",
+        "inputSchema": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "name": "session_status"
+      },
+      {
+        "annotations": {
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `plan`, or an `autosquash` fold (a sparse {commit, into} list, or `true` to fold the branch's fixup!/squash! commits into the commits their subjects name). Each plan step picks/rewords/squashes/fixups/edits/drops a commit; reorder by listing in the new order. An `edit` step applies the commit then pauses with it checked out, so you can change its tree (and message) with the editing tools; git_continue then folds your changes in. (Partitioning one commit into several is its own tool: git_split.) The plan-less pick-all drops commits already present in `onto` by patch-id (like `git rebase`, so a stacked branch onto a rewritten base doesn't duplicate them; reported, and overridable with `reapply_cherry_picks`). Stops on a conflict for the conflict tools + git_continue. Unstaged changes to paths the plan does NOT rewrite are autostashed (parked on a backup ref, restored when the operation finishes or aborts; a file you edit again during a pause keeps your later edit, and the parked bytes stay on the ref); staged changes and changes to rewritten paths refuse, naming them. No network or hooks. With commit.gpgsign=true, the configured OpenPGP signer runs only when MIME_EXEC=1; otherwise the operation refuses before mutation.",
+        "inputSchema": {
+          "properties": {
+            "autosquash": {
+              "description": "Sparse autosquash: instead of a full `plan`, list only the relocations. Each {commit, into, action?} moves `commit` to sit right after `into` as a fixup (action: fixup|squash, default fixup); every other commit in onto..HEAD is picked unchanged in order. No need to transcribe untouched commits. OR pass `true` to derive the relocations from commit subjects (git's --autosquash): each fixup!/squash! commit folds into the nearest earlier commit its subject names (subject copy, prefix, or sha; chained fixup-of-fixup markers flatten to the root target, stacking in commit order). A marker whose target can't be found is an ERROR naming it — not a silent no-fold; amend! markers are rejected. rehearse:true previews the derived plan.",
+              "items": {
+                "properties": {
+                  "action": {
+                    "description": "fixup (drop the folded message, default) or squash (keep it).",
+                    "enum": [
+                      "fixup",
+                      "squash"
+                    ],
+                    "type": "string"
+                  },
+                  "commit": {
+                    "description": "The commit to fold (oid/ref/revspec).",
+                    "type": "string"
+                  },
+                  "into": {
+                    "description": "The target it should fold into.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "commit",
+                  "into"
+                ],
+                "type": "object"
+              },
+              "type": [
+                "array",
+                "boolean"
+              ]
+            },
+            "from": {
+              "description": "Three-arg --onto (git's <upstream>): replay only from..HEAD onto `onto`, so a stacked branch transplants its own commits without hand-dropping the ones already in the new base. Defaults to `onto`. Bounds the plan-less and autosquash enumeration; not combinable with an explicit `plan` (which already lists its commits).",
+              "type": "string"
+            },
+            "onto": {
+              "description": "The new base — oid/ref/revspec the commits are replayed onto.",
+              "type": "string"
+            },
+            "plan": {
+              "description": "Explicit steps (omit to pick all of onto..HEAD in order). List order is the new commit order.",
+              "items": {
+                "properties": {
+                  "action": {
+                    "enum": [
+                      "pick",
+                      "reword",
+                      "squash",
+                      "fixup",
+                      "edit",
+                      "drop"
+                    ],
+                    "type": "string"
+                  },
+                  "commit": {
+                    "description": "oid/ref/revspec of the commit.",
+                    "type": "string"
+                  },
+                  "message": {
+                    "description": "New message (reword/edit) or melded message (squash); ignored otherwise.",
+                    "type": "string"
+                  },
+                  "message_edits": {
+                    "description": "Edits applied in order to the message (reword/squash/fixup/edit), keeping the rest (e.g. the sign-off) intact — use instead of retyping the whole message. Each item is {find, replace?} (replace EVERY occurrence of literal `find` — zero-or-all, never a silent partial application; omitting replace — or saying it explicitly with delete: true — deletes the found text; errors if `find` is absent) or {append} (append as a trailing line).",
+                    "items": {
+                      "properties": {
+                        "append": {
+                          "description": "Text to append as a trailing line.",
+                          "type": "string"
+                        },
+                        "delete": {
+                          "description": "Explicit spelling of \"omit replace\": delete the found text. Contradicts a present replace; needs find.",
+                          "type": "boolean"
+                        },
+                        "find": {
+                          "description": "Literal text to find in the existing message.",
+                          "type": "string"
+                        },
+                        "replace": {
+                          "description": "Replacement for `find` (omit = delete).",
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "commit",
+                  "action"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "reapply_cherry_picks": {
+              "description": "Plan-less pick-all only: keep commits already present in `onto` by patch-id instead of dropping them. Default false — like `git rebase`, a commit whose change already sits in the new base (e.g. after the base was reordered/amended below the merge-base) is skipped so a stacked branch isn't duplicated; the skipped commits are reported. Set true to replay them anyway. Ignored when an explicit `plan` or `autosquash` is given.",
+              "type": "boolean"
+            },
+            "rehearse": {
+              "description": "Dry-run: preview the resulting commits and whether the tree is unchanged (a pure reorder/fold), applying nothing. Unlike a real run, the rehearsal does NOT stop at the first conflict: it lists EVERY step that would conflict, each with the commit that last reshaped the conflicted lines (usually the right fold target) — repair the whole plan in one pass. Default false.",
+              "type": "boolean"
+            },
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo",
+            "onto"
+          ],
+          "type": "object"
+        },
+        "name": "git_rebase"
+      },
+      {
+        "annotations": {
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Split ONE commit into several: partition its changes into the commits listed in `into` (in order); every descendant is replayed on top unchanged, so the branch's final tree is untouched — a pure history re-slice with git_rebase's backup ring, autostash, and conflict handling. rehearse:true previews the resulting commits without applying.",
+        "inputSchema": {
+          "properties": {
+            "commit": {
+              "description": "oid/ref/revspec of the commit to split — any non-merge, non-root commit on the current branch.",
+              "type": "string"
+            },
+            "into": {
+              "description": "The output commits, in order. Each is {message, paths?, hunks?}: `paths` takes whole files, `hunks` takes specific hunks of a file by post-commit line range. One part may omit both to be the catch-all collecting every change no other part claims. Every change the commit makes must be covered exactly once; tracked files can be split across parts by hunk.",
+              "items": {
+                "properties": {
+                  "hunks": {
+                    "description": "Specific hunks of a file: each {path, lines: [start, end]} takes every diff-hunk of `path` whose post-commit line range overlaps [start, end] (1-based inclusive). Lets one part take part of a file and another the rest.",
+                    "items": {
+                      "properties": {
+                        "lines": {
+                          "description": "[start, end] 1-based inclusive line span in the POST-commit file.",
+                          "items": {
+                            "type": "integer"
+                          },
+                          "type": "array"
+                        },
+                        "path": {
+                          "description": "File whose hunks to select.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "path",
+                        "lines"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "message": {
+                    "description": "Commit message for this output commit.",
+                    "type": "string"
+                  },
+                  "paths": {
+                    "description": "Whole files whose changes go into this commit.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "message"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "rehearse": {
+              "description": "Preview the resulting commits without applying. Default false.",
+              "type": "boolean"
+            },
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo",
+            "commit",
+            "into"
+          ],
+          "type": "object"
+        },
+        "name": "git_split"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Commit exactly `paths` with `message` on the current branch: each listed file is staged from its worktree content (a listed file missing on disk becomes a deletion). There is deliberately no stage-everything mode — no -A, no \".\", no directories — so stray files can't be swept into history; unlisted worktree changes just stay dirty, and pre-staged index changes outside `paths` refuse, naming them. `after` places the new commit directly after that ancestor instead of at the tip (in-series insertion via the rebase machinery: backup ring, pauses on conflict for the conflict tools + git_continue).",
+        "inputSchema": {
+          "properties": {
+            "after": {
+              "description": "Optional placement: an ancestor commit (oid/ref/revspec) the new commit should sit directly after, instead of at the branch tip.",
+              "type": "string"
+            },
+            "message": {
+              "description": "The commit message.",
+              "type": "string"
+            },
+            "paths": {
+              "description": "The files to commit, each named explicitly — absolute or repo-relative. Required and non-empty; directories are refused.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo",
+            "paths",
+            "message"
+          ],
+          "type": "object"
+        },
+        "name": "git_commit"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Apply `commits` (in order) on top of the current branch tip. Stops on conflict for the conflict tools + git_continue.",
+        "inputSchema": {
+          "properties": {
+            "commits": {
+              "description": "Commits to apply, in order — each an oid, ref, or revspec (e.g. HEAD~2).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo",
+            "commits"
+          ],
+          "type": "object"
+        },
+        "name": "git_cherry_pick"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Apply the inverse of `commits` (in order) on top of the current branch tip. Stops on conflict for the conflict tools + git_continue.",
+        "inputSchema": {
+          "properties": {
+            "commits": {
+              "description": "Commits to apply, in order — each an oid, ref, or revspec (e.g. HEAD~2).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo",
+            "commits"
+          ],
+          "type": "object"
+        },
+        "name": "git_revert"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "After resolving the stopped step's conflicts in the worktree (and saving), commit the resolution and continue the operation. At an `edit` pause, instead amends the paused commit with tracked worktree modifications and deletions, then continues; untracked files are never swept in. Pass exact repo-relative files via `include_untracked` to fold selected untracked, non-ignored files. Errors if a resolved file still contains conflict-marker lines; pass force: true to override (e.g. the resolution legitimately contains marker-like text).",
+        "inputSchema": {
+          "properties": {
+            "force": {
+              "description": "Commit even if a resolved file still has conflict-marker lines. Default false.",
+              "type": "boolean"
+            },
+            "include_untracked": {
+              "description": "Edit-pause only: exact repo-relative untracked files to fold. Ignored files and directories refuse; omitted untracked files stay untracked.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo"
+          ],
+          "type": "object"
+        },
+        "name": "git_continue"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Drop the stopped step and continue the operation as if that commit had been omitted. At an `edit` pause, instead resumes leaving the landed commit unchanged.",
+        "inputSchema": {
+          "properties": {
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo"
+          ],
+          "type": "object"
+        },
+        "name": "git_skip"
+      },
+      {
+        "annotations": {
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Abort the in-progress operation, restoring HEAD/branch/worktree to the pre-operation state.",
+        "inputSchema": {
+          "properties": {
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo"
+          ],
+          "type": "object"
+        },
+        "name": "git_abort"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Porcelain status: branch, upstream and ahead/behind counts, every dirty path with its two-char mark (staged/unstaged/untracked/conflicted; capped), and the in-progress sequencer operation if any (which step of how many, the current tip, unresolved conflict files).",
+        "inputSchema": {
+          "properties": {
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo"
+          ],
+          "type": "object"
+        },
+        "name": "git_status"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "One line per commit (oid + summary), for `range` (e.g. main..HEAD) or from HEAD; capped at 50. Use to build a rebase plan. stat: true adds each commit's changed files with +/- line counts — the review-a-series view (git log --stat) without a git_show per commit.",
+        "inputSchema": {
+          "properties": {
+            "range": {
+              "description": "A revision range like main..HEAD; omit for HEAD's history.",
+              "type": "string"
+            },
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            },
+            "stat": {
+              "description": "Follow each commit with its changed files (mark, path, +/- line counts, vs first parent) and a totals line. Default false.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "repo"
+          ],
+          "type": "object"
+        },
+        "name": "git_log"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "A commit's metadata, message, the files it changed vs its first parent, and the full unified diff.",
+        "inputSchema": {
+          "properties": {
+            "commit": {
+              "description": "oid/ref/revspec of the commit.",
+              "type": "string"
+            },
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo",
+            "commit"
+          ],
+          "type": "object"
+        },
+        "name": "git_show"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Which commit last touched each line of `path` (oid + summary), collapsed into contiguous same-commit hunks. Read-only. The find-the-commit half of a fixup/edit: feed a reported oid into a git_rebase plan {commit, action: fixup|edit}. Pass `lines` to blame just a span; `since` to scope to your own commits; `worktree` to map each UNCOMMITTED change to the commit that owns the lines it touches (absorb-target discovery — feed that oid into git_fixup).",
+        "inputSchema": {
+          "properties": {
+            "group_by": {
+              "description": "Worktree mode only: group the hunks under their owning commit — the natural absorb preview ({commit: [hunks]}).",
+              "enum": [
+                "commit"
+              ],
+              "type": "string"
+            },
+            "lines": {
+              "description": "Optional [start, end] 1-based inclusive line range; omit to blame the whole file.",
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "path": {
+              "description": "File to blame — absolute (as grep/occur return) or relative to the repo root.",
+              "type": "string"
+            },
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            },
+            "since": {
+              "description": "Scope history to `since..` (oid/ref/revspec, e.g. main): lines older than it collapse to the boundary, so the answer is 'which of MY commits owns this'.",
+              "type": "string"
+            },
+            "worktree": {
+              "description": "Instead of blaming committed lines, map each UNCOMMITTED hunk to the commit that last set the lines it changes — the target for a git_fixup/git_move (or git_absorb, which folds them all). Omit `path` to sweep the whole worktree.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "repo"
+          ],
+          "type": "object"
+        },
+        "name": "git_blame"
+      },
+      {
+        "annotations": {
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Relocate a change from commit `from` to the adjacent commit `to` (one the direct parent of the other), then replay the rest of the branch. Select what to move with `paths` (whole files) and/or `hunks` ({path, lines:[start,end]} — post-`from` line ranges). The moved change must be made by `from` and NOT by `to` (else it's ambiguous). The branch's final tree never changes — only which commit introduces the change. Stops on a conflict for the conflict tools + git_continue, like a rebase.",
+        "inputSchema": {
+          "properties": {
+            "from": {
+              "description": "The commit the change currently lives in (oid/ref/revspec).",
+              "type": "string"
+            },
+            "hunks": {
+              "description": "Specific hunks to move: each {path, lines:[start,end]} takes every diff-hunk of `path` whose post-`from` line range overlaps [start,end] (1-based inclusive).",
+              "items": {
+                "properties": {
+                  "lines": {
+                    "description": "[start, end] 1-based inclusive line span in `from`'s post-commit file.",
+                    "items": {
+                      "type": "integer"
+                    },
+                    "type": "array"
+                  },
+                  "path": {
+                    "description": "File whose hunks to move.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "lines"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "paths": {
+              "description": "Whole files to move.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            },
+            "to": {
+              "description": "The adjacent commit to move the change into (oid/ref/revspec).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo",
+            "from",
+            "to"
+          ],
+          "type": "object"
+        },
+        "name": "git_move"
+      },
+      {
+        "annotations": {
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Fold changes into `target`, which keeps its own — already signed-off — message; the rest of the branch is auto-picked. Two sources: a COMMITTED `source` (a one-call autosquash; source and target must be on one line of history), or the UNCOMMITTED worktree — pass `paths`/`hunks` to fold just those working-tree changes (`git add -p` for agents), or `worktree: true` to fold every uncommitted change; the unfolded rest stays in the worktree, byte-identical (also parked on a refs/mime-backup/<branch>-worktree ref). A worktree fold whose tail replay conflicts is aborted whole — branch and worktree come back untouched, and the error names the reshaping commit to target instead (git_blame {worktree: true} finds fold targets). rehearse:true previews either mode. For a full custom plan use git_rebase.",
+        "inputSchema": {
+          "properties": {
+            "hunks": {
+              "description": "Worktree mode: specific uncommitted hunks to fold — each {path, lines: [start, end]} takes every worktree diff-hunk of `path` whose current-file line range overlaps [start, end] (1-based inclusive; the spans git_blame {worktree: true} reports).",
+              "items": {
+                "properties": {
+                  "lines": {
+                    "description": "[start, end] 1-based inclusive line span in the CURRENT worktree file.",
+                    "items": {
+                      "type": "integer"
+                    },
+                    "type": "array"
+                  },
+                  "path": {
+                    "description": "File whose hunks to fold.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "lines"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "paths": {
+              "description": "Worktree mode: whole files whose uncommitted changes to fold (repo-relative). Untracked files must be staged first to be seen.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "rehearse": {
+              "description": "Preview the resulting history without applying.",
+              "type": "boolean"
+            },
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            },
+            "source": {
+              "description": "A COMMITTED commit whose changes to fold in (oid/ref/revspec). Omit to fold from the worktree instead (paths/hunks/worktree).",
+              "type": "string"
+            },
+            "target": {
+              "description": "The commit to fold into — keeps its message (oid/ref/revspec).",
+              "type": "string"
+            },
+            "worktree": {
+              "description": "Fold EVERY uncommitted change into target (no path/hunk selection needed). Default false.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "repo",
+            "target"
+          ],
+          "type": "object"
+        },
+        "name": "git_fixup"
+      },
+      {
+        "annotations": {
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Fold EVERY uncommitted hunk into the commit that owns its lines, automatically — git_blame {worktree: true} + git_fixup {hunks} composed into one call (magit-commit-absorb / git-absorb). Each dirty hunk is blamed, hunks are grouped by their owning commit, and every group folds into its owner in ONE replay; the target commits keep their own messages. Hunks without a single clear owner (new lines, split ownership, owners at the `since` boundary or off the branch line) stay in the worktree and are reported — route those by hand with git_fixup (review fixes sometimes belong with a commit TOPIC, not the blamed lines). rehearse:true previews the grouping and resulting history without touching anything. A replay conflict aborts the whole absorb — branch and worktree come back untouched.",
+        "inputSchema": {
+          "properties": {
+            "rehearse": {
+              "description": "Preview the hunk→commit grouping and the resulting history without applying.",
+              "type": "boolean"
+            },
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            },
+            "since": {
+              "description": "Scope owners to `since..HEAD` (oid/ref/revspec, e.g. main — usually the branch base): hunks owned at or beyond the boundary stay in the worktree instead of rewriting history past it. Recommended on shared-history branches.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo"
+          ],
+          "type": "object"
+        },
+        "name": "git_absorb"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Compare a branch before and after a rewrite, commit by commit — 'did the rewrite change anything it should not have'. Pass two tips (`old`, `new`); their merge base anchors the two ranges, commits pair by patch-id then by summary, and each pair reports whether its patch and message drifted ('=' unchanged, '!' drifted, '-' dropped, '+' added), plus whether the FINAL trees are identical. Natural after any rebase/fixup: old = refs/mime-backup/<branch>/0 (the pre-op tip the backup ring stamps), new = HEAD. Read-only. An approximation of git range-diff (patch-id equality, not a full diff-of-diffs).",
+        "inputSchema": {
+          "properties": {
+            "new": {
+              "description": "The after tip — e.g. HEAD.",
+              "type": "string"
+            },
+            "old": {
+              "description": "The before tip (oid/ref/revspec) — e.g. refs/mime-backup/<branch>/0.",
+              "type": "string"
+            },
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo",
+            "old",
+            "new"
+          ],
+          "type": "object"
+        },
+        "name": "git_range_diff"
+      },
+      {
+        "annotations": {
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Drop selected UNCOMMITTED changes — the destructive sibling of git_fixup's worktree mode, with the same selectors: `paths` (whole files) and/or `hunks` ({path, lines: [start, end]} — the spans git_blame {worktree: true} reports). The chosen hunks reset to HEAD content; everything else stays, unstaged. Always recoverable: the FULL pre-discard worktree is stamped on refs/mime-backup/<branch>-worktree first. A selection is mandatory — no discard-everything shorthand. rehearse:true lists what would go.",
+        "inputSchema": {
+          "properties": {
+            "hunks": {
+              "description": "Specific uncommitted hunks to discard — each {path, lines: [start, end]} takes every worktree diff-hunk of `path` whose current-file line range overlaps [start, end] (1-based inclusive).",
+              "items": {
+                "properties": {
+                  "lines": {
+                    "description": "[start, end] 1-based inclusive line span in the CURRENT worktree file.",
+                    "items": {
+                      "type": "integer"
+                    },
+                    "type": "array"
+                  },
+                  "path": {
+                    "description": "File whose hunks to discard.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "lines"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "paths": {
+              "description": "Whole files whose uncommitted changes to discard (repo-relative).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "rehearse": {
+              "description": "List what would be discarded without touching anything.",
+              "type": "boolean"
+            },
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo"
+          ],
+          "type": "object"
+        },
+        "name": "git_discard"
+      },
+      {
+        "annotations": {
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Change ONE commit's message — `message` replaces it wholesale, `message_edits` tweak it in place ({find, replace?} every occurrence / {append} a trailing line), or both (edits apply to the provided message). A sparse rewrite: the commit and its descendants are re-created with their own trees (byte-identical, nothing can conflict) — no plan to transcribe. rehearse:true previews the new message. For every commit of a range use git_msg_rewrite; to change content too, use git_rebase {action: reword|edit}.",
+        "inputSchema": {
+          "properties": {
+            "commit": {
+              "description": "The commit to reword (oid/ref/revspec); must be on the current branch.",
+              "type": "string"
+            },
+            "message": {
+              "description": "The full replacement message. Omit to edit the commit's own message via message_edits.",
+              "type": "string"
+            },
+            "message_edits": {
+              "description": "Edits applied in order: {find, replace?} replaces every occurrence (omit replace — or say delete: true — to delete); {append} adds a trailing line.",
+              "items": {
+                "properties": {
+                  "append": {
+                    "type": "string"
+                  },
+                  "delete": {
+                    "type": "boolean"
+                  },
+                  "find": {
+                    "type": "string"
+                  },
+                  "replace": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "rehearse": {
+              "description": "Preview the new message without applying.",
+              "type": "boolean"
+            },
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo",
+            "commit"
+          ],
+          "type": "object"
+        },
+        "name": "git_reword"
+      },
+      {
+        "annotations": {
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Apply one message_edits vocabulary to EVERY commit of `range` (which must end at HEAD) — the bulk trailer strip/add, or the s/old-symbol/new/ sweep after a rename. A sparse rewrite touching only messages: each commit is re-created with its OWN tree (byte-identical by construction, nothing can conflict) and re-parented; an untouched prefix keeps its identical oids. The report carries per-commit replacement counts, so zero application in one commit is visible; a `find` matching NOWHERE in the range is an error and nothing changes. rehearse:true previews the counts. For one commit's message use git_reword.",
+        "inputSchema": {
+          "properties": {
+            "message_edits": {
+              "description": "Edits applied in order to EVERY message: {find, replace?} replaces every occurrence (omit replace — or say delete: true — to delete); {append} adds a trailing line.",
+              "items": {
+                "properties": {
+                  "append": {
+                    "type": "string"
+                  },
+                  "delete": {
+                    "type": "boolean"
+                  },
+                  "find": {
+                    "type": "string"
+                  },
+                  "replace": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "range": {
+              "description": "Revision range whose commit messages to rewrite, e.g. main..HEAD; must end at HEAD.",
+              "type": "string"
+            },
+            "rehearse": {
+              "description": "Preview the per-commit replacement counts without applying.",
+              "type": "boolean"
+            },
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo",
+            "range",
+            "message_edits"
+          ],
+          "type": "object"
+        },
+        "name": "git_msg_rewrite"
+      },
+      {
+        "annotations": {
+          "destructiveHint": true,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Run a shell command at EVERY commit of `range`, oldest-first — the pr-prep gate loop (git rebase -x's standalone sibling): each commit is checked out in place (detached), the command runs in the worktree, and the walk stops on the first failure naming the commit and the output tail. HEAD is restored afterwards either way. Refuses on a dirty worktree. DISABLED unless whoever launches the server sets MIME_EXEC=1 (the same launcher gate used for configured commit signing).",
+        "inputSchema": {
+          "properties": {
+            "command": {
+              "description": "Shell command to run at each commit (via sh -c), e.g. \"cargo check -q\".",
+              "type": "string"
+            },
+            "range": {
+              "description": "Revision range whose commits to visit, e.g. main..HEAD.",
+              "type": "string"
+            },
+            "repo": {
+              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo",
+            "range",
+            "command"
+          ],
+          "type": "object"
+        },
+        "name": "git_exec_over"
+      }
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "id": 9,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "{\"audit\":false,\"roots\":[],\"sessions\":[{\"buffer\":\"g\",\"checkpoints\":[],\"file\":null,\"id\":\"g\",\"narrowed\":false,\"stale\":false,\"unsaved\":false}]}",
+        "type": "text"
+      }
+    ],
+    "isError": false
+  }
+}

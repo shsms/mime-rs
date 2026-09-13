@@ -2225,3 +2225,97 @@ fn rehearse_accepts_full_diff_and_view() {
         "full_diff returns the preview: {out}"
     );
 }
+
+/// The legacy (initialize-based) wire format is frozen: every response below
+/// must stay byte-identical (after `normalise`) across the dual-era work.
+/// Regenerate deliberately with `MIME_UPDATE_FIXTURES=1 cargo test --test mcp
+/// legacy_wire_format_is_frozen` and review the diff.
+#[test]
+fn legacy_wire_format_is_frozen() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy");
+    let update = std::env::var_os("MIME_UPDATE_FIXTURES").is_some();
+    let mut s = Server::spawn();
+
+    let script: Vec<(&str, Value)> = vec![
+        (
+            "initialize-2024-11-05",
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"golden","version":"0"}}}),
+        ),
+        (
+            "initialize-2025-03-26",
+            json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"golden","version":"0"}}}),
+        ),
+        (
+            "initialize-2025-06-18",
+            json!({"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"golden","version":"0"}}}),
+        ),
+        (
+            "initialize-2025-11-25",
+            json!({"jsonrpc":"2.0","id":4,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"golden","version":"0"}}}),
+        ),
+        ("ping", json!({"jsonrpc":"2.0","id":5,"method":"ping"})),
+        (
+            "tools-list",
+            json!({"jsonrpc":"2.0","id":6,"method":"tools/list"}),
+        ),
+        (
+            "open-text",
+            json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"open_text","arguments":{"text":"hello\nworld\n","session":"g"}}}),
+        ),
+        (
+            "view",
+            json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"view","arguments":{"session":"g"}}}),
+        ),
+        (
+            "session-status",
+            json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"session_status","arguments":{}}}),
+        ),
+        (
+            "unknown-method",
+            json!({"jsonrpc":"2.0","id":10,"method":"no/such"}),
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (name, req) in script {
+        let mut got = s.request(req);
+        normalise(&mut got);
+        let path = dir.join(format!("{name}.json"));
+        let rendered = serde_json::to_string_pretty(&got).unwrap() + "\n";
+        if update {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, &rendered).unwrap();
+            continue;
+        }
+        let want = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "missing fixture {}: {e} (MIME_UPDATE_FIXTURES=1 to create)",
+                path.display()
+            )
+        });
+        if want != rendered {
+            failures.push(format!(
+                "{name}: fixture differs\n--- want\n{want}\n--- got\n{rendered}"
+            ));
+        }
+    }
+    drop(s); // the Drop impl kills and reaps the child
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// Strip the parts of a response that legitimately vary between machines:
+/// `session_status` reports the allowed roots and audit flag, which depend on
+/// the environment. Everything else is compared verbatim.
+fn normalise(v: &mut Value) {
+    let Some(text) = v["result"]["content"][0]["text"].as_str() else {
+        return;
+    };
+    let Ok(mut inner) = serde_json::from_str::<Value>(text) else {
+        return;
+    };
+    if inner.get("roots").is_some() {
+        inner["roots"] = json!([]);
+        inner["audit"] = json!(false);
+        v["result"]["content"][0]["text"] = Value::String(inner.to_string());
+    }
+}
