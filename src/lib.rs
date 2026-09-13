@@ -23,6 +23,7 @@ pub mod motion;
 pub mod quire;
 pub mod regex_dialect;
 pub mod result;
+pub mod rpc;
 pub mod safety;
 pub mod sequencer;
 pub mod sexp;

@@ -1,6 +1,6 @@
 //! Streamable HTTP transport for the MCP server — a second front end beside
 //! stdio (`--mcp`), for hosted / multi-client harnesses. It reuses the
-//! transport-agnostic [`crate::mcp::handle_line`] dispatch and answers with
+//! transport-agnostic [`crate::rpc::handle_line`] dispatch and answers with
 //! plain JSON: mime never sends a server-initiated message, so there is no SSE
 //! stream to open (a spec-valid choice — a server MAY return `application/json`
 //! for any request).
@@ -76,7 +76,7 @@ pub fn run(addr: &str) {
     };
     eprintln!(
         "mime-http: ready on http://{addr}/mcp (MCP protocol {})",
-        crate::mcp::PROTOCOL_VERSION
+        crate::rpc::PROTOCOL_VERSION
     );
 
     let store = Mutex::new(Store::new());
@@ -151,7 +151,7 @@ fn serve(mut request: Request, store: &Mutex<Store>) {
             let id = new_session_id();
             store.insert(id.clone());
             let sessions = store.map.get_mut(&id).expect("just inserted");
-            (crate::mcp::handle_line(&body, sessions), Some(id))
+            (crate::rpc::handle_line(&body, sessions), Some(id))
         } else {
             match id_header
                 .as_deref()
@@ -159,7 +159,7 @@ fn serve(mut request: Request, store: &Mutex<Store>) {
             {
                 Some(id) => {
                     let sessions = store.map.get_mut(id).expect("checked present");
-                    (crate::mcp::handle_line(&body, sessions), None)
+                    (crate::rpc::handle_line(&body, sessions), None)
                 }
                 None => {
                     drop(store);
