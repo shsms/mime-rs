@@ -3816,7 +3816,7 @@ fn git_tool_schemas() -> Vec<Value> {
                     "commit": { "type": "string", "description": "oid/ref/revspec of the commit to split — any non-merge, non-root commit on the current branch." },
                     "into": {
                         "type": "array",
-                        "description": "The output commits, in order. Each is {message, paths?, hunks?}: `paths` takes whole files, `hunks` takes specific hunks of a file by post-commit line range. One part may omit both to be the catch-all collecting every change no other part claims. Every change the commit makes must be covered exactly once; tracked files can be split across parts by hunk.",
+                        "description": "The output commits, in order. Each is {message, paths?, hunks?}: `paths` takes whole files, `hunks` takes specific hunks of a file by post-commit line range or by a text their changed lines contain. One part may omit both to be the catch-all collecting every change no other part claims. Every change the commit makes must be covered exactly once; tracked files can be split across parts by hunk.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -3824,14 +3824,15 @@ fn git_tool_schemas() -> Vec<Value> {
                                 "paths": { "type": "array", "items": { "type": "string" }, "description": "Whole files whose changes go into this commit." },
                                 "hunks": {
                                     "type": "array",
-                                    "description": "Specific hunks of a file: each {path, lines: [start, end]} takes every diff-hunk of `path` whose post-commit line range overlaps [start, end] (1-based inclusive). Lets one part take part of a file and another the rest.",
+                                    "description": "Specific hunks of a file: each {path, lines: [start, end]} takes every diff-hunk of `path` whose post-commit line range overlaps [start, end] (1-based inclusive); {path, contains: TEXT} takes every hunk one of whose added or removed lines contains TEXT — no line numbers to look up. Lets one part take part of a file and another the rest.",
                                     "items": {
                                         "type": "object",
                                         "properties": {
                                             "path": { "type": "string", "description": "File whose hunks to select." },
-                                            "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based inclusive line span in the POST-commit file." }
+                                            "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based inclusive line span in the POST-commit file." },
+                                            "contains": { "type": "string", "description": "Instead of `lines`: a literal text; takes every hunk one of whose added or removed lines contains it." }
                                         },
-                                        "required": ["path", "lines"]
+                                        "required": ["path"]
                                     }
                                 }
                             },
@@ -3957,14 +3958,15 @@ fn git_tool_schemas() -> Vec<Value> {
                     "paths": { "type": "array", "items": { "type": "string" }, "description": "Whole files to move." },
                     "hunks": {
                         "type": "array",
-                        "description": "Specific hunks to move: each {path, lines:[start,end]} takes every diff-hunk of `path` whose post-`from` line range overlaps [start,end] (1-based inclusive).",
+                        "description": "Specific hunks to move: each {path, lines:[start,end]} takes every diff-hunk of `path` whose post-`from` line range overlaps [start,end] (1-based inclusive); {path, contains: TEXT} takes every hunk one of whose added or removed lines contains TEXT.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "path": { "type": "string", "description": "File whose hunks to move." },
-                                "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based inclusive line span in `from`'s post-commit file." }
+                                "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based inclusive line span in `from`'s post-commit file." },
+                                "contains": { "type": "string", "description": "Instead of `lines`: a literal text; takes every hunk one of whose added or removed lines contains it." }
                             },
-                            "required": ["path", "lines"]
+                            "required": ["path"]
                         }
                     }
                 },
@@ -3983,14 +3985,15 @@ fn git_tool_schemas() -> Vec<Value> {
                     "paths": { "type": "array", "items": { "type": "string" }, "description": "Worktree mode: whole files whose uncommitted changes to fold (repo-relative). Untracked files must be staged first to be seen." },
                     "hunks": {
                         "type": "array",
-                        "description": "Worktree mode: specific uncommitted hunks to fold — each {path, lines: [start, end]} takes every worktree diff-hunk of `path` whose current-file line range overlaps [start, end] (1-based inclusive; the spans git_blame {worktree: true} reports).",
+                        "description": "Worktree mode: specific uncommitted hunks to fold — each {path, lines: [start, end]} takes every worktree diff-hunk of `path` whose current-file line range overlaps [start, end] (1-based inclusive; the spans git_blame {worktree: true} reports); {path, contains: TEXT} takes every hunk one of whose added or removed lines contains TEXT.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "path": { "type": "string", "description": "File whose hunks to fold." },
-                                "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based inclusive line span in the CURRENT worktree file." }
+                                "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based inclusive line span in the CURRENT worktree file." },
+                                "contains": { "type": "string", "description": "Instead of `lines`: a literal text; takes every hunk one of whose added or removed lines contains it." }
                             },
-                            "required": ["path", "lines"]
+                            "required": ["path"]
                         }
                     },
                     "worktree": { "type": "boolean", "description": "Fold EVERY uncommitted change into target (no path/hunk selection needed). Default false." },
@@ -4035,14 +4038,15 @@ fn git_tool_schemas() -> Vec<Value> {
                     "paths": { "type": "array", "items": { "type": "string" }, "description": "Whole files whose uncommitted changes to discard (repo-relative)." },
                     "hunks": {
                         "type": "array",
-                        "description": "Specific uncommitted hunks to discard — each {path, lines: [start, end]} takes every worktree diff-hunk of `path` whose current-file line range overlaps [start, end] (1-based inclusive).",
+                        "description": "Specific uncommitted hunks to discard — each {path, lines: [start, end]} takes every worktree diff-hunk of `path` whose current-file line range overlaps [start, end] (1-based inclusive); {path, contains: TEXT} takes every hunk one of whose added or removed lines contains TEXT.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "path": { "type": "string", "description": "File whose hunks to discard." },
-                                "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based inclusive line span in the CURRENT worktree file." }
+                                "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based inclusive line span in the CURRENT worktree file." },
+                                "contains": { "type": "string", "description": "Instead of `lines`: a literal text; takes every hunk one of whose added or removed lines contains it." }
                             },
-                            "required": ["path", "lines"]
+                            "required": ["path"]
                         }
                     },
                     "rehearse": { "type": "boolean", "description": "List what would be discarded without touching anything." }

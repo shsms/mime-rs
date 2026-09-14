@@ -260,7 +260,7 @@ Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `
 Split ONE commit into several: partition its changes into the commits listed in `into` (in order); every descendant is replayed on top unchanged, so the branch's final tree is untouched — a pure history re-slice with git_rebase's backup ring, autostash, and conflict handling. rehearse:true previews the resulting commits without applying.
 
 - `commit` (required) — oid/ref/revspec of the commit to split — any non-merge, non-root commit on the current branch.
-- `into` (required) — The output commits, in order. Each is {message, paths?, hunks?}: `paths` takes whole files, `hunks` takes specific hunks of a file by post-commit line range. One part may omit both to be the catch-all collecting every change no other part claims. Every change the commit makes must be covered exactly once; tracked files can be split across parts by hunk.
+- `into` (required) — The output commits, in order. Each is {message, paths?, hunks?}: `paths` takes whole files, `hunks` takes specific hunks of a file by post-commit line range or by a text their changed lines contain. One part may omit both to be the catch-all collecting every change no other part claims. Every change the commit makes must be covered exactly once; tracked files can be split across parts by hunk.
 - `rehearse` — Preview the resulting commits without applying. Default false.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 
@@ -344,7 +344,7 @@ Which commit last touched each line of `path` (oid + summary), collapsed into co
 Relocate a change from commit `from` to the adjacent commit `to` (one the direct parent of the other), then replay the rest of the branch. Select what to move with `paths` (whole files) and/or `hunks` ({path, lines:[start,end]} — post-`from` line ranges). The moved change must be made by `from` and NOT by `to` (else it's ambiguous). The branch's final tree never changes — only which commit introduces the change. Stops on a conflict for the conflict tools + git_continue, like a rebase.
 
 - `from` (required) — The commit the change currently lives in (oid/ref/revspec).
-- `hunks` — Specific hunks to move: each {path, lines:[start,end]} takes every diff-hunk of `path` whose post-`from` line range overlaps [start,end] (1-based inclusive).
+- `hunks` — Specific hunks to move: each {path, lines:[start,end]} takes every diff-hunk of `path` whose post-`from` line range overlaps [start,end] (1-based inclusive); {path, contains: TEXT} takes every hunk one of whose added or removed lines contains TEXT.
 - `paths` — Whole files to move.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 - `to` (required) — The adjacent commit to move the change into (oid/ref/revspec).
@@ -353,7 +353,7 @@ Relocate a change from commit `from` to the adjacent commit `to` (one the direct
 
 Fold changes into `target`, which keeps its own — already signed-off — message; the rest of the branch is auto-picked. Two sources: a COMMITTED `source` (a one-call autosquash; source and target must be on one line of history), or the UNCOMMITTED worktree — pass `paths`/`hunks` to fold just those working-tree changes (`git add -p` for agents), or `worktree: true` to fold every uncommitted change; the unfolded rest stays in the worktree, byte-identical (also parked on a refs/mime-backup/<branch>-worktree ref). A worktree fold whose tail replay conflicts is aborted whole — branch and worktree come back untouched, and the error names the reshaping commit to target instead (git_blame {worktree: true} finds fold targets). rehearse:true previews either mode. For a full custom plan use git_rebase.
 
-- `hunks` — Worktree mode: specific uncommitted hunks to fold — each {path, lines: [start, end]} takes every worktree diff-hunk of `path` whose current-file line range overlaps [start, end] (1-based inclusive; the spans git_blame {worktree: true} reports).
+- `hunks` — Worktree mode: specific uncommitted hunks to fold — each {path, lines: [start, end]} takes every worktree diff-hunk of `path` whose current-file line range overlaps [start, end] (1-based inclusive; the spans git_blame {worktree: true} reports); {path, contains: TEXT} takes every hunk one of whose added or removed lines contains TEXT.
 - `paths` — Worktree mode: whole files whose uncommitted changes to fold (repo-relative). Untracked files must be staged first to be seen.
 - `rehearse` — Preview the resulting history without applying.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
@@ -381,7 +381,7 @@ Compare a branch before and after a rewrite, commit by commit — 'did the rewri
 
 Drop selected UNCOMMITTED changes — the destructive sibling of git_fixup's worktree mode, with the same selectors: `paths` (whole files) and/or `hunks` ({path, lines: [start, end]} — the spans git_blame {worktree: true} reports). The chosen hunks reset to HEAD content; everything else stays, unstaged. Always recoverable: the FULL pre-discard worktree is stamped on refs/mime-backup/<branch>-worktree first. A selection is mandatory — no discard-everything shorthand. rehearse:true lists what would go.
 
-- `hunks` — Specific uncommitted hunks to discard — each {path, lines: [start, end]} takes every worktree diff-hunk of `path` whose current-file line range overlaps [start, end] (1-based inclusive).
+- `hunks` — Specific uncommitted hunks to discard — each {path, lines: [start, end]} takes every worktree diff-hunk of `path` whose current-file line range overlaps [start, end] (1-based inclusive); {path, contains: TEXT} takes every hunk one of whose added or removed lines contains TEXT.
 - `paths` — Whole files whose uncommitted changes to discard (repo-relative).
 - `rehearse` — List what would be discarded without touching anything.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
