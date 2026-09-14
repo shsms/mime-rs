@@ -36,18 +36,41 @@ pub fn register(ctx: &mut TulispContext) {
         },
     );
 
-    // (split-string STRING &optional SEPARATORS) — SEP is a regex; default splits
-    // on whitespace runs (dropping empties), like Emacs's default.
+    // (split-string STRING &optional SEPARATORS OMIT-NULLS TRIM) — the Emacs
+    // signature and semantics. SEPARATORS is a regex; nil means whitespace
+    // runs AND forces OMIT-NULLS, as in Emacs. With an explicit SEPARATORS,
+    // empty pieces are kept unless OMIT-NULLS is non-nil. TRIM is a regex
+    // whose match is removed from the start and end of every piece; a piece
+    // that trims to empty counts as a null. An invalid regexp is an error.
     ctx.defun(
         "split-string",
-        |s: String, sep: Option<String>| -> Vec<String> {
-            match sep {
-                Some(re) => match crate::builtins::cached_regex(&re) {
-                    Ok(rx) => rx.split(&s).map(str::to_string).collect(),
-                    Err(_) => vec![s],
-                },
-                None => s.split_whitespace().map(str::to_string).collect(),
-            }
+        |s: String,
+         separators: Option<TulispObject>,
+         omit_nulls: Option<TulispObject>,
+         trim: Option<TulispObject>|
+         -> Result<Vec<String>, Error> {
+            let separators = optional_string(separators)?;
+            let trim = optional_string(trim)?;
+            let keep_nulls = separators.is_some() && !omit_nulls.is_some_and(|v| v.is_truthy());
+            let default_separators = format!("[{EMACS_WHITESPACE}]+");
+            let rx = crate::builtins::cached_regex(
+                separators.as_deref().unwrap_or(&default_separators),
+            )?;
+            let trim = match trim {
+                Some(t) => Some((
+                    crate::builtins::cached_regex(&t)?,
+                    // Appended bare, as Emacs concatenates it: an alternation
+                    // in TRIM binds only its last branch to the end anchor.
+                    crate::builtins::cached_regex(&format!("{t}\\'"))?,
+                )),
+                None => None,
+            };
+            Ok(split_string(
+                &s,
+                &rx,
+                keep_nulls,
+                trim.as_ref().map(|(a, b)| (a, b)),
+            ))
         },
     );
 
@@ -157,10 +180,79 @@ pub fn register(ctx: &mut TulispContext) {
     ctx.defun("string-empty-p", |s: String| -> bool { s.is_empty() });
 }
 
-/// Emacs's default whitespace for `string-trim`: space, tab, newline,
-/// carriage return, form feed, vertical tab.
+/// The characters Emacs's `string-trim` default and
+/// `split-string-default-separators` treat as whitespace: space, tab,
+/// newline, carriage return, form feed, vertical tab. Literal control
+/// characters: inside `[...]` the Emacs regex dialect takes a backslash as a
+/// class member.
+const EMACS_WHITESPACE: &str = " \t\n\r\u{c}\u{b}";
+
+/// An `&optional` string argument: `None` when missing or nil, else the
+/// string (a non-string is a type error).
+fn optional_string(v: Option<TulispObject>) -> Result<Option<String>, Error> {
+    match v {
+        Some(v) if !v.null() => Ok(Some(String::try_from(v)?)),
+        _ => Ok(None),
+    }
+}
+
+/// The body of `split-string`, a direct port of the Emacs `subr.el` loop so
+/// the edge cases (empty matches, leading/trailing separators, a TRIM that
+/// empties a piece) come out identical. `trim` is the (leading, trailing)
+/// regex pair: the leading one is matched unanchored from the piece's start
+/// and only counts when it begins exactly there; the trailing one already
+/// carries the end anchor and is run against the piece alone.
+fn split_string(
+    s: &str,
+    rx: &regex::Regex,
+    keep_nulls: bool,
+    trim: Option<(&regex::Regex, &regex::Regex)>,
+) -> Vec<String> {
+    let len = s.len();
+    let mut out = Vec::new();
+    let push_one = |out: &mut Vec<String>, this_start: usize, this_end: usize| {
+        let mut this_start = this_start;
+        if let Some((lead, _)) = trim
+            && let Some(m) = lead.find_at(&s[..this_end], this_start)
+            && m.start() == this_start
+        {
+            this_start = m.end();
+        }
+        if keep_nulls || this_start < this_end {
+            let mut this = &s[this_start..this_end];
+            if let Some((_, tail)) = trim
+                && let Some(m) = tail.find(this)
+                && m.start() < this.len()
+            {
+                this = &this[..m.start()];
+            }
+            if keep_nulls || !this.is_empty() {
+                out.push(this.to_string());
+            }
+        }
+    };
+    let mut start = 0;
+    let mut prev_empty = false;
+    while start < len {
+        // After an empty match, search from the next char so the loop makes
+        // progress (Emacs's `(1+ start)`).
+        let from = if prev_empty {
+            start + s[start..].chars().next().map_or(1, char::len_utf8)
+        } else {
+            start
+        };
+        let Some(m) = rx.find_at(s, from) else { break };
+        push_one(&mut out, start, m.start());
+        start = m.end();
+        prev_empty = m.start() == m.end();
+    }
+    push_one(&mut out, start, len);
+    out
+}
+
+/// Whether `c` is in [`EMACS_WHITESPACE`].
 fn is_ws(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c' | '\x0b')
+    EMACS_WHITESPACE.contains(c)
 }
 
 /// Upcase the first letter of each alphanumeric run; downcase the rest.
@@ -593,5 +685,50 @@ mod tests {
     fn empty_p() {
         assert!(truthy(r#"(string-empty-p "")"#));
         assert!(!truthy(r#"(string-empty-p "x")"#));
+    }
+
+    /// Eval a program and print its result the way tulisp does.
+    fn p(prog: &str) -> String {
+        ctx().eval_string(prog).unwrap().to_string()
+    }
+
+    #[test]
+    fn split_string_matches_emacs() {
+        // Every expectation here is GNU Emacs 30 output for the same form.
+        // Default separators: whitespace runs, nulls omitted.
+        assert_eq!(p(r#"(split-string "  a  b ")"#), r#"("a" "b")"#);
+        assert_eq!(p("(split-string \"a\tb\nc\")"), r#"("a" "b" "c")"#);
+        assert_eq!(p(r#"(split-string "")"#), "nil");
+        // nil SEPARATORS is the default and forces OMIT-NULLS.
+        assert_eq!(p(r#"(split-string "  a  b " nil nil)"#), r#"("a" "b")"#);
+        // Explicit SEPARATORS keeps nulls unless OMIT-NULLS.
+        assert_eq!(p(r#"(split-string "a,b,,c" ",")"#), r#"("a" "b" "" "c")"#);
+        assert_eq!(p(r#"(split-string "a,b,,c" "," t)"#), r#"("a" "b" "c")"#);
+        assert_eq!(p(r#"(split-string ",a," ",")"#), r#"("" "a" "")"#);
+        assert_eq!(p(r#"(split-string "a  b" " ")"#), r#"("a" "" "b")"#);
+        assert_eq!(p(r#"(split-string "" ",")"#), r#"("")"#);
+        assert_eq!(p(r#"(split-string "" "," t)"#), "nil");
+        // Empty matches advance one char at a time.
+        assert_eq!(p(r#"(split-string "abc" "")"#), r#"("" "a" "b" "c" "")"#);
+        assert_eq!(p(r#"(split-string "ab" "[ ]*")"#), r#"("" "a" "b" "")"#);
+        // TRIM strips both ends of each piece; a piece trimmed to empty is a
+        // null (kept without OMIT-NULLS, dropped with it).
+        assert_eq!(
+            p(r#"(split-string " a , b " "," t "[ ]+")"#),
+            r#"("a" "b")"#
+        );
+        assert_eq!(
+            p(r#"(split-string " a , , b " "," nil "[ ]+")"#),
+            r#"("a" "" "b")"#
+        );
+        assert_eq!(p(r#"(split-string "baaa" "x" nil "a+")"#), r#"("b")"#);
+        // The trailing TRIM is concatenated with the end anchor, so an
+        // alternation binds only its last branch to it: "a" matches anywhere.
+        assert_eq!(p(r#"(split-string "xay" "," nil "a\\|b")"#), r#"("x")"#);
+        // Multi-byte text splits on char boundaries.
+        assert_eq!(p(r#"(split-string "é,ü" ",")"#), r#"("é" "ü")"#);
+        assert_eq!(p(r#"(split-string "éü" "")"#), r#"("" "é" "ü" "")"#);
+        // An invalid regexp is an error, not a silent one-element list.
+        assert!(ctx().eval_string(r#"(split-string "a" "\\(")"#).is_err());
     }
 }
