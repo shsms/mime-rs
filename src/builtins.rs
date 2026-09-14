@@ -790,24 +790,34 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         });
     }
     {
-        // (revert-buffer) — discard the buffer's edits and re-read the visited
-        // file from disk: the recovery path when the stale guard refuses a
-        // save (an external writer landed since open). Point is preserved by
-        // position (clamped to the new content); narrowing and markers are
-        // dropped with the old text. Re-reads only the already-authorized
-        // visited path, so it is safe in the sandboxed tier. There is
-        // deliberately no force-save counterpart — overwriting an external
-        // writer's work stays impossible; revert, re-apply, save.
+        // (revert-buffer &optional IGNORE-AUTO NOCONFIRM PRESERVE-MODES) —
+        // discard the buffer's edits and re-read the visited file from disk:
+        // the recovery path when the stale guard refuses a save (an external
+        // writer landed since open). Point is preserved by position (clamped
+        // to the new content); narrowing and markers are dropped with the old
+        // text. Re-reads only the already-authorized visited path, so it is
+        // safe in the sandboxed tier. There is deliberately no force-save
+        // counterpart — overwriting an external writer's work stays
+        // impossible; revert, re-apply, save. The three Emacs arguments are
+        // accepted for signature compatibility and ignored: there is no
+        // auto-save file, no confirmation prompt, and no major mode here.
         let s = session.clone();
-        ctx.defun("revert-buffer", move || -> Result<bool, Error> {
-            // Keeps the buffer's (possibly uniquified) name, drops the old
-            // content's markers/narrowing, and resets the modified baseline —
-            // see `engine::revert_in_place`, shared with auto-revert.
-            let mut sess = s.borrow_mut();
-            crate::engine::revert_in_place(&mut sess).map_err(|e| err(&e))?;
-            sess.disk_io = true;
-            Ok(true)
-        });
+        ctx.defun(
+            "revert-buffer",
+            move |_ignore_auto: Option<TulispObject>,
+                  _noconfirm: Option<TulispObject>,
+                  _preserve_modes: Option<TulispObject>|
+                  -> Result<bool, Error> {
+                // Keeps the buffer's (possibly uniquified) name, drops the old
+                // content's markers/narrowing, and resets the modified
+                // baseline — see `engine::revert_in_place`, shared with
+                // auto-revert.
+                let mut sess = s.borrow_mut();
+                crate::engine::revert_in_place(&mut sess).map_err(|e| err(&e))?;
+                sess.disk_io = true;
+                Ok(true)
+            },
+        );
     }
 
     // ---- mark & region ----
@@ -4095,7 +4105,7 @@ mod tests {
         let r = ws
             .run(
                 r#"(set-buffer "doc.txt<2>")
-                   (revert-buffer)
+                   (revert-buffer t t)
                    (report "name" (current-buffer))
                    (report "list" (buffer-list))"#,
             )
