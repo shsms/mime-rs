@@ -3357,12 +3357,12 @@ fn plan_arg(args: &Value) -> Result<Option<Vec<crate::sequencer::PlanItem>>, Str
 }
 
 /// The `git_split` `into` array → the output-commit parts.
-fn split_parts(arr: &[Value]) -> Vec<crate::sequencer::SplitPart> {
+fn split_parts(arr: &[Value]) -> Result<Vec<crate::sequencer::SplitPart>, String> {
     arr.iter()
         .map(|p| {
             let paths_key = p.get("paths");
             let hunks_key = p.get("hunks");
-            crate::sequencer::SplitPart {
+            Ok(crate::sequencer::SplitPart {
                 message: p
                     .get("message")
                     .and_then(Value::as_str)
@@ -3378,23 +3378,14 @@ fn split_parts(arr: &[Value]) -> Vec<crate::sequencer::SplitPart> {
                     .unwrap_or_default(),
                 hunks: hunks_key
                     .and_then(Value::as_array)
-                    .map(|hs| {
-                        hs.iter()
-                            .filter_map(|h| {
-                                let path = h.get("path").and_then(Value::as_str)?.to_string();
-                                let lines = h.get("lines").and_then(Value::as_array)?;
-                                let lo = lines.first().and_then(Value::as_u64)? as u32;
-                                let hi = lines.get(1).and_then(Value::as_u64)? as u32;
-                                Some(crate::sequencer::HunkSel { path, lo, hi })
-                            })
-                            .collect()
-                    })
+                    .map(|hs| hs.iter().map(hunk_sel_of).collect::<Result<_, _>>())
+                    .transpose()?
                     .unwrap_or_default(),
                 // The catch-all is the part with NEITHER a `paths` nor a
                 // `hunks` key; a present-but-non-array key stays a
                 // non-catch-all (rejected later, no silent promotion).
                 rest: paths_key.is_none() && hunks_key.is_none(),
-            }
+            })
         })
         .collect()
 }
@@ -3493,23 +3484,62 @@ fn opt_str_list(args: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Parse a `hunks: [{path, lines: [start, end]}]` argument into hunk selectors;
-/// malformed entries are dropped (empty when absent).
-fn hunk_sels_arg(args: &Value, key: &str) -> Vec<crate::sequencer::HunkSel> {
-    args.get(key)
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|h| {
-                    let path = h.get("path").and_then(Value::as_str)?.to_string();
-                    let lines = h.get("lines").and_then(Value::as_array)?;
-                    let lo = lines.first().and_then(Value::as_u64)? as u32;
-                    let hi = lines.get(1).and_then(Value::as_u64)? as u32;
-                    Some(crate::sequencer::HunkSel { path, lo, hi })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// Parse a `hunks` argument — `[{path, lines: [start, end]} | {path, contains:
+/// TEXT}]` — into hunk selectors (empty when absent); a malformed entry is an
+/// error.
+fn hunk_sels_arg(args: &Value, key: &str) -> Result<Vec<crate::sequencer::HunkSel>, String> {
+    match args.get(key) {
+        None => Ok(Vec::new()),
+        Some(v) => v
+            .as_array()
+            .ok_or_else(|| format!("\"{key}\" must be a list of hunk selectors"))?
+            .iter()
+            .map(hunk_sel_of)
+            .collect(),
+    }
+}
+
+/// One hunk selector: `{path, lines: [start, end]}` picks by post-change line
+/// span, `{path, contains: TEXT}` by a literal text a changed line holds. A
+/// malformed entry is an error naming it: a dropped selector would silently
+/// leave its hunks out of the commit, or in the wrong split part.
+fn hunk_sel_of(h: &Value) -> Result<crate::sequencer::HunkSel, String> {
+    let bad = || {
+        format!(
+            "hunk selector {}: expected {{path, lines: [start, end]}} or {{path, contains: TEXT}}",
+            truncate_for_error(&h.to_string())
+        )
+    };
+    let path = h
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(bad)?
+        .to_string();
+    match (h.get("lines"), h.get("contains")) {
+        (None, Some(text)) => Ok(crate::sequencer::HunkSel::contains(
+            path,
+            text.as_str().ok_or_else(bad)?,
+        )),
+        (Some(lines), None) => {
+            let [lo, hi] = lines.as_array().ok_or_else(bad)?.as_slice() else {
+                return Err(bad());
+            };
+            let line = |v: &Value| {
+                v.as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(bad)
+            };
+            let (lo, hi) = (line(lo)?, line(hi)?);
+            if lo > hi {
+                return Err(format!(
+                    "hunk selector {}: `lines` start {lo} is past its end {hi}",
+                    truncate_for_error(&h.to_string())
+                ));
+            }
+            Ok(crate::sequencer::HunkSel::lines(path, lo, hi))
+        }
+        _ => Err(bad()),
+    }
 }
 
 /// A string-list argument that is optional but, when present, must be a list
@@ -3570,7 +3600,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
         }
         "git_fixup" => {
             let paths = opt_str_list(args, "paths");
-            let hunks = hunk_sels_arg(args, "hunks");
+            let hunks = hunk_sels_arg(args, "hunks")?;
             let from_worktree =
                 bool_arg(args, "worktree") || !paths.is_empty() || !hunks.is_empty();
             if from_worktree {
@@ -3605,7 +3635,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
                     .and_then(Value::as_array)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
-            ),
+            )?,
             bool_arg(args, "rehearse"),
         ),
         "git_commit" => {
@@ -3693,7 +3723,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
         "git_discard" => seq::cmd_discard(
             &repo,
             &opt_str_list(args, "paths"),
-            &hunk_sels_arg(args, "hunks"),
+            &hunk_sels_arg(args, "hunks")?,
             bool_arg(args, "rehearse"),
         ),
         "git_range_diff" => {
@@ -3704,7 +3734,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
             &str_arg(args, "from")?,
             &str_arg(args, "to")?,
             &opt_str_list(args, "paths"),
-            &hunk_sels_arg(args, "hunks"),
+            &hunk_sels_arg(args, "hunks")?,
         ),
         other => Err(format!("unknown tool: {other}")),
     }
@@ -5267,13 +5297,54 @@ mod git_tool_tests {
             {"message": "m2", "paths": "not-an-array"},
             {"message": "m3"}
         ]);
-        let parts = split_parts(into.as_array().unwrap());
+        let parts = split_parts(into.as_array().unwrap()).unwrap();
         assert!(!parts[0].rest && parts[0].paths == ["x"], "explicit paths");
         assert!(
             !parts[1].rest && parts[1].paths.is_empty(),
             "malformed paths is NOT silently promoted to the catch-all"
         );
         assert!(parts[2].rest, "an absent paths key IS the catch-all");
+    }
+
+    #[test]
+    fn hunk_selectors_parse_both_forms_and_refuse_malformed_ones() {
+        use crate::sequencer::HunkPick;
+        let ok = hunk_sels_arg(
+            &json!({ "hunks": [
+                { "path": "f", "lines": [3, 9] },
+                { "path": "g", "contains": "fn main" },
+            ] }),
+            "hunks",
+        )
+        .unwrap();
+        assert_eq!(ok[0].path, "f");
+        assert!(matches!(ok[0].pick, HunkPick::Lines { lo: 3, hi: 9 }));
+        assert_eq!(ok[1].path, "g");
+        assert!(matches!(&ok[1].pick, HunkPick::Contains(t) if t == "fn main"));
+        // Absent: no selectors, no error. Present but not a list: an error.
+        assert!(hunk_sels_arg(&json!({}), "hunks").unwrap().is_empty());
+        let err = hunk_sels_arg(&json!({ "hunks": { "path": "f" } }), "hunks").unwrap_err();
+        assert!(err.contains("must be a list"), "{err}");
+        // A malformed entry is an error naming it, never a silently dropped
+        // selector: neither form, both forms, a one-element span, a
+        // non-integer, a value past u32, a non-string text.
+        for bad in [
+            json!({ "path": "f" }),
+            json!({ "path": "f", "lines": [1, 2], "contains": "x" }),
+            json!({ "path": "f", "lines": [5] }),
+            json!({ "path": "f", "lines": [9, 3] }),
+            json!({ "path": "f", "lines": ["5", "9"] }),
+            json!({ "path": "f", "lines": [1, 4294967296u64] }),
+            json!({ "path": "f", "contains": 7 }),
+            json!({ "lines": [1, 2] }),
+        ] {
+            let err = hunk_sels_arg(&json!({ "hunks": [bad.clone()] }), "hunks").unwrap_err();
+            assert!(err.contains("hunk selector"), "{bad}: {err}");
+            // The same parser feeds git_split's parts.
+            let err =
+                split_parts(&[json!({ "message": "m", "hunks": [bad.clone()] })]).unwrap_err();
+            assert!(err.contains("hunk selector"), "{bad}: {err}");
+        }
     }
 
     #[test]

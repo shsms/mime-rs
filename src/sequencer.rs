@@ -420,15 +420,124 @@ pub struct SplitPart {
     pub rest: bool,
 }
 
-/// A new-side line span selecting whole diff-hunks of `path`: a hunk of that
-/// file joins the part when its post-commit line range overlaps `[lo, hi]`
-/// (1-based inclusive) — the line numbers grep/blame hand back. Lets one part
-/// claim some of a file's changes and another the rest.
+/// Selects whole diff-hunks of `path` — by the new-side line span they
+/// overlap (the line numbers grep/blame hand back) or by a literal text one
+/// of their changed lines contains. Lets one part claim some of a file's
+/// changes and another the rest.
 #[derive(Clone, Debug)]
 pub struct HunkSel {
     pub path: String,
-    pub lo: u32,
-    pub hi: u32,
+    pub pick: HunkPick,
+}
+
+/// How a [`HunkSel`] picks its hunks.
+#[derive(Clone, Debug)]
+pub enum HunkPick {
+    /// A hunk joins when its post-change line range overlaps `[lo, hi]`
+    /// (1-based inclusive).
+    Lines { lo: u32, hi: u32 },
+    /// A hunk joins when one of its added or removed lines contains the text.
+    Contains(String),
+}
+
+impl HunkSel {
+    pub fn lines(path: impl Into<String>, lo: u32, hi: u32) -> HunkSel {
+        HunkSel {
+            path: path.into(),
+            pick: HunkPick::Lines { lo, hi },
+        }
+    }
+
+    pub fn contains(path: impl Into<String>, text: impl Into<String>) -> HunkSel {
+        HunkSel {
+            path: path.into(),
+            pick: HunkPick::Contains(text.into()),
+        }
+    }
+
+    /// Whether the selector takes `hunk`.
+    fn takes(&self, hunk: &Hunk) -> bool {
+        match &self.pick {
+            HunkPick::Lines { lo, hi } => {
+                // New-side span [ns, ns+nl-1]; a pure-deletion hunk (nl==0) is
+                // a point at ns.
+                let top = if hunk.nl == 0 {
+                    hunk.ns
+                } else {
+                    hunk.ns + hunk.nl - 1
+                };
+                *lo <= top && hunk.ns <= *hi
+            }
+            HunkPick::Contains(text) => hunk.changed.iter().any(|l| l.contains(text.as_str())),
+        }
+    }
+
+    /// The pick, as an error names it ("no hunk of f …").
+    fn describe(&self) -> String {
+        match &self.pick {
+            HunkPick::Lines { lo, hi } => format!("overlaps lines {lo}-{hi}"),
+            HunkPick::Contains(text) => format!("contains {text:?}"),
+        }
+    }
+}
+
+/// One text hunk of a diff: its new-side span and its changed (added or
+/// removed) lines, one per entry — what a `contains` selector searches.
+struct Hunk {
+    ns: u32,
+    nl: u32,
+    /// One entry per line, so a text can never match across a seam (a last
+    /// line without its newline would otherwise fuse with the next).
+    changed: Vec<String>,
+}
+
+/// Whether a selector reads the changed text of `path`'s hunks.
+fn wants_text(hunks: &[HunkSel], path: &str) -> bool {
+    hunks
+        .iter()
+        .any(|h| h.path == path && matches!(h.pick, HunkPick::Contains(_)))
+}
+
+/// The files a diff changes, each with its text hunks (none for a
+/// rename/mode/binary delta). `want_text(path)` says whether to fill that
+/// file's hunks with their changed lines, what a `contains` selector reads;
+/// otherwise only the hunk headers are read. Paths are keyed the SAME way
+/// apply_subset does (delta_path, lossy) so a non-UTF-8 path matches on both
+/// sides instead of being dropped.
+fn diff_hunks(
+    diff: &git2::Diff,
+    want_text: impl Fn(&str) -> bool,
+) -> Result<Vec<(String, Vec<Hunk>)>, Error> {
+    let mut files = Vec::new();
+    for idx in 0..diff.deltas().len() {
+        let Some(delta) = diff.get_delta(idx) else {
+            continue;
+        };
+        let path = delta_path(Some(delta));
+        let want_text = want_text(&path);
+        let mut hunks = Vec::new();
+        if let Some(patch) = git2::Patch::from_diff(diff, idx)? {
+            for h in 0..patch.num_hunks() {
+                let (dh, lines) = patch.hunk(h)?;
+                let mut changed = Vec::new();
+                if want_text {
+                    for i in 0..lines {
+                        let line = patch.line_in_hunk(h, i)?;
+                        if matches!(line.origin(), '+' | '-') {
+                            changed.push(String::from_utf8_lossy(line.content()).into_owned());
+                        }
+                    }
+                }
+                hunks.push(Hunk {
+                    ns: dh.new_start(),
+                    nl: dh.new_lines(),
+                    changed,
+                });
+            }
+        }
+        files.push((path, hunks));
+    }
+    Ok(files)
 }
 
 /// A raw plan step as the MCP layer extracts it: (commit, action, message,
@@ -653,7 +762,14 @@ fn save_state(repo: &Repository, st: &State) -> Result<(), Error> {
                     let hunks: Vec<_> = p
                         .hunks
                         .iter()
-                        .map(|h| json!({"path": h.path, "lo": h.lo, "hi": h.hi}))
+                        .map(|h| match &h.pick {
+                            HunkPick::Lines { lo, hi } => {
+                                json!({"path": h.path, "lo": lo, "hi": hi})
+                            }
+                            HunkPick::Contains(text) => {
+                                json!({"path": h.path, "contains": text})
+                            }
+                        })
                         .collect();
                     json!({"message": p.message, "paths": p.paths, "hunks": hunks, "rest": p.rest})
                 })
@@ -743,10 +859,14 @@ fn load_state(repo: &Repository) -> Result<State, Error> {
                                     .map(|hs| {
                                         hs.iter()
                                             .filter_map(|h| {
-                                                Some(HunkSel {
-                                                    path: h["path"].as_str()?.to_string(),
-                                                    lo: h["lo"].as_u64()? as u32,
-                                                    hi: h["hi"].as_u64()? as u32,
+                                                let path = h["path"].as_str()?.to_string();
+                                                Some(match h["contains"].as_str() {
+                                                    Some(text) => HunkSel::contains(path, text),
+                                                    None => HunkSel::lines(
+                                                        path,
+                                                        h["lo"].as_u64()? as u32,
+                                                        h["hi"].as_u64()? as u32,
+                                                    ),
                                                 })
                                             })
                                             .collect()
@@ -1987,26 +2107,12 @@ fn hunk_assignment(
         }
     }
 
-    // The commit's changed files, each with its hunks' new-side spans (empty for
-    // a rename/mode/binary delta that carries no text hunk).
+    // The commit's changed files, each with its text hunks (none for a
+    // rename/mode/binary delta).
     let diff = repo.diff_tree_to_tree(Some(base_tree), Some(target), None)?;
-    let mut files: Vec<(String, Vec<(u32, u32)>)> = Vec::new();
-    for idx in 0..diff.deltas().len() {
-        let Some(delta) = diff.get_delta(idx) else {
-            continue;
-        };
-        // Key paths the SAME way apply_subset does (delta_path, lossy) so a
-        // non-UTF-8 path matches on both sides instead of being dropped.
-        let path = delta_path(Some(delta));
-        let mut hunks = Vec::new();
-        if let Some(patch) = git2::Patch::from_diff(&diff, idx)? {
-            for h in 0..patch.num_hunks() {
-                let (dh, _) = patch.hunk(h)?;
-                hunks.push((dh.new_start(), dh.new_lines()));
-            }
-        }
-        files.push((path, hunks));
-    }
+    let files = diff_hunks(&diff, |path| {
+        parts.iter().any(|part| wants_text(&part.hunks, path))
+    })?;
 
     let mut whole: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut per_hunk: std::collections::HashMap<(String, u32, u32), usize> =
@@ -2049,13 +2155,10 @@ fn hunk_assignment(
                 )));
             }
             let mut matched = false;
-            for &(ns, nl) in hunks {
-                // New-side span [ns, ns+nl-1]; a pure-deletion hunk (nl==0) is a
-                // point at ns.
-                let hi = if nl == 0 { ns } else { ns + nl - 1 };
-                if sel.lo <= hi && ns <= sel.hi {
+            for hunk in hunks {
+                if sel.takes(hunk) {
                     matched = true;
-                    match per_hunk.insert((sel.path.clone(), ns, nl), i) {
+                    match per_hunk.insert((sel.path.clone(), hunk.ns, hunk.nl), i) {
                         Some(prev) if prev != i => {
                             return Err(estr(&format!(
                                 "split: a hunk of {} is claimed by more than one part",
@@ -2068,8 +2171,9 @@ fn hunk_assignment(
             }
             if !matched {
                 return Err(estr(&format!(
-                    "split: no hunk of {} overlaps lines {}-{}",
-                    sel.path, sel.lo, sel.hi
+                    "split: no hunk of {} {}",
+                    sel.path,
+                    sel.describe()
                 )));
             }
         }
@@ -2093,7 +2197,8 @@ fn hunk_assignment(
             }
             continue;
         }
-        for &(ns, nl) in hunks {
+        for hunk in hunks {
+            let (ns, nl) = (hunk.ns, hunk.nl);
             if per_hunk.contains_key(&(path.clone(), ns, nl)) {
                 continue;
             }
@@ -2269,21 +2374,7 @@ fn resolve_move_selection(
     hunks: &[HunkSel],
     what: &str,
 ) -> Result<MoveSel, Error> {
-    let mut files: Vec<(String, Vec<(u32, u32)>)> = Vec::new();
-    for idx in 0..from_diff.deltas().len() {
-        let Some(delta) = from_diff.get_delta(idx) else {
-            continue;
-        };
-        let path = delta_path(Some(delta));
-        let mut hs = Vec::new();
-        if let Some(patch) = git2::Patch::from_diff(from_diff, idx)? {
-            for h in 0..patch.num_hunks() {
-                let (dh, _) = patch.hunk(h)?;
-                hs.push((dh.new_start(), dh.new_lines()));
-            }
-        }
-        files.push((path, hs));
-    }
+    let files = diff_hunks(from_diff, |path| wants_text(hunks, path))?;
 
     let mut whole = std::collections::HashSet::new();
     for p in paths {
@@ -2313,17 +2404,17 @@ fn resolve_move_selection(
             )));
         }
         let mut matched = false;
-        for &(ns, nl) in hs {
-            let hi = if nl == 0 { ns } else { ns + nl - 1 };
-            if sel.lo <= hi && ns <= sel.hi {
+        for hunk in hs {
+            if sel.takes(hunk) {
                 matched = true;
-                hunk_keys.insert((sel.path.clone(), ns, nl));
+                hunk_keys.insert((sel.path.clone(), hunk.ns, hunk.nl));
             }
         }
         if !matched {
             return Err(estr(&format!(
-                "{what}: no hunk of {} overlaps lines {}-{}",
-                sel.path, sel.lo, sel.hi
+                "{what}: no hunk of {} {}",
+                sel.path,
+                sel.describe()
             )));
         }
     }
@@ -6728,11 +6819,7 @@ mod tests {
         std::fs::write(repo.workdir().unwrap().join("f"), b"l1\nw1\nl3\nw2\nl5\n").unwrap();
 
         // Rehearse lists, touches nothing.
-        let sel = [HunkSel {
-            path: "f".into(),
-            lo: 2,
-            hi: 2,
-        }];
+        let sel = [HunkSel::lines("f", 2, 2)];
         let out = cmd_discard(&dir, &[], &sel, true).unwrap();
         assert!(
             out.contains("would discard") && out.contains("f L2"),
@@ -7511,11 +7598,7 @@ mod tests {
         on_branch(&repo, "main", t);
 
         // Move only f's TOP hunk (new line 1) from F forward into T.
-        let sel = vec![HunkSel {
-            path: "f".into(),
-            lo: 1,
-            hi: 1,
-        }];
+        let sel = vec![HunkSel::lines("f", 1, 1)];
         let out = cmd_move(&dir, &f.to_string(), &t.to_string(), &[], &sel).unwrap();
         assert!(out.starts_with("done"), "{out}");
 
@@ -8172,11 +8255,7 @@ mod tests {
             &dir,
             &c1.to_string(),
             &[],
-            &[HunkSel {
-                path: "f".to_string(),
-                lo: 1,
-                hi: 1,
-            }],
+            &[HunkSel::lines("f", 1, 1)],
             false,
         )
         .unwrap();
@@ -8304,11 +8383,7 @@ mod tests {
                         SplitPart {
                             message: "p2".into(),
                             paths: Vec::new(),
-                            hunks: vec![HunkSel {
-                                path: "a".into(),
-                                lo: 1,
-                                hi: 2,
-                            }],
+                            hunks: vec![HunkSel::lines("a", 1, 2), HunkSel::contains("b", "x")],
                             rest: false,
                         },
                     ],
@@ -8335,7 +8410,12 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].paths, vec!["a".to_string()]);
         assert_eq!(parts[1].hunks[0].path, "a");
-        assert_eq!((parts[1].hunks[0].lo, parts[1].hunks[0].hi), (1, 2));
+        assert!(matches!(
+            parts[1].hunks[0].pick,
+            HunkPick::Lines { lo: 1, hi: 2 }
+        ));
+        assert_eq!(parts[1].hunks[1].path, "b");
+        assert!(matches!(&parts[1].hunks[1].pick, HunkPick::Contains(t) if t == "x"));
     }
 
     #[test]
@@ -9476,11 +9556,7 @@ mod tests {
         SplitPart {
             message: message.to_string(),
             paths: Vec::new(),
-            hunks: vec![HunkSel {
-                path: path.to_string(),
-                lo,
-                hi,
-            }],
+            hunks: vec![HunkSel::lines(path, lo, hi)],
             rest: false,
         }
     }
@@ -9593,6 +9669,87 @@ mod tests {
             b"X\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n"
         );
         assert!(!state_path(&repo).exists());
+    }
+
+    #[test]
+    fn split_selects_hunks_by_the_text_they_change() {
+        let dir = tmp("split-hunk-text");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(
+            &repo,
+            &[],
+            &[("f", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n")],
+            "base",
+        );
+        let c1 = commit(
+            &repo,
+            &[base],
+            &[("f", "X\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nY\n")],
+            "edit top and bottom",
+        );
+        on_branch(&repo, "topic", c1);
+        let text_part = |message: &str, text: &str| SplitPart {
+            message: message.to_string(),
+            paths: Vec::new(),
+            hunks: vec![HunkSel::contains("f", text)],
+            rest: false,
+        };
+
+        // A context line is not a changed line: "5" matches no hunk, and the
+        // refusal comes before any mutation.
+        let err = start(
+            &repo,
+            Plan {
+                onto: base,
+                steps: vec![split_step(
+                    c1,
+                    vec![text_part("ctx", "5"), split_part("rest", &[], true)],
+                )],
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("no hunk of f contains \"5\""),
+            "{err}"
+        );
+        // The text must sit within ONE changed line: "1\nX" spans two.
+        let err = start(
+            &repo,
+            Plan {
+                onto: base,
+                steps: vec![split_step(
+                    c1,
+                    vec![text_part("span", "1\nX"), split_part("rest", &[], true)],
+                )],
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("no hunk of f contains"), "{err}");
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), c1);
+
+        // The removed line selects the bottom hunk without a line number.
+        let out = start(
+            &repo,
+            Plan {
+                onto: base,
+                steps: vec![split_step(
+                    c1,
+                    vec![text_part("bottom", "12"), split_part("top", &[], true)],
+                )],
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, Outcome::Done { .. }));
+        assert_eq!(read(&repo, "f"), "X\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nY\n");
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        let first = tip.parent(0).unwrap();
+        assert_eq!(first.message().unwrap(), "bottom");
+        assert_eq!(tip.message().unwrap(), "top");
+        let e = first.tree().unwrap().get_path(Path::new("f")).unwrap();
+        assert_eq!(
+            repo.find_blob(e.id()).unwrap().content(),
+            b"1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nY\n"
+        );
     }
 
     #[test]
