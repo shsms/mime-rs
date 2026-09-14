@@ -1599,19 +1599,46 @@
           "openWorldHint": false,
           "readOnlyHint": false
         },
-        "description": "Commit exactly `paths` with `message` on the current branch: each listed file is staged from its worktree content (a listed file missing on disk becomes a deletion). There is deliberately no stage-everything mode — no -A, no \".\", no directories — so stray files can't be swept into history; unlisted worktree changes just stay dirty, and pre-staged index changes outside `paths` refuse, naming them. `after` places the new commit directly after that ancestor instead of at the tip (in-series insertion via the rebase machinery: backup ring, pauses on conflict for the conflict tools + git_continue).",
+        "description": "Commit exactly `paths` with `message` on the current branch: each listed file is staged from its worktree content (a listed file missing on disk becomes a deletion). `hunks` commits PART of a file — {path, lines: [start, end]} or {path, contains: TEXT}, the selectors git_fixup's worktree mode takes — leaving the file's other hunks in the worktree (`git add -p` for agents; a split-by-hunk without the commit-then-git_split detour). Hunk mode covers tracked files (every `paths` entry too), refuses ANY staged change (it commits worktree content and would drop them), and cannot be combined with `after`. There is deliberately no stage-everything mode — no -A, no \".\", no directories — so stray files can't be swept into history; unlisted worktree changes just stay dirty, and pre-staged index changes outside `paths` refuse, naming them. `after` places the new commit directly after that ancestor instead of at the tip (in-series insertion via the rebase machinery: backup ring, pauses on conflict for the conflict tools + git_continue).",
         "inputSchema": {
           "properties": {
             "after": {
-              "description": "Optional placement: an ancestor commit (oid/ref/revspec) the new commit should sit directly after, instead of at the branch tip.",
+              "description": "Optional placement: an ancestor commit (oid/ref/revspec) the new commit should sit directly after, instead of at the branch tip. Not combinable with `hunks`.",
               "type": "string"
+            },
+            "hunks": {
+              "description": "Specific uncommitted hunks to commit — each {path, lines: [start, end]} takes every worktree diff-hunk of `path` whose current-file line range overlaps [start, end] (1-based inclusive); {path, contains: TEXT} takes every hunk one of whose added or removed lines contains TEXT. The file's other hunks stay in the worktree, unstaged. Tracked files only (a new file goes in whole, by a `paths`-only call); nothing may be staged; not combinable with `after`.",
+              "items": {
+                "properties": {
+                  "contains": {
+                    "description": "Instead of `lines`: a literal text; takes every hunk one of whose added or removed lines contains it.",
+                    "type": "string"
+                  },
+                  "lines": {
+                    "description": "[start, end] 1-based inclusive line span in the CURRENT worktree file.",
+                    "items": {
+                      "type": "integer"
+                    },
+                    "type": "array"
+                  },
+                  "path": {
+                    "description": "File whose hunks to commit.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path"
+                ],
+                "type": "object"
+              },
+              "type": "array"
             },
             "message": {
               "description": "The commit message.",
               "type": "string"
             },
             "paths": {
-              "description": "The files to commit, each named explicitly — absolute or repo-relative. Required and non-empty; directories are refused.",
+              "description": "The files to commit whole, each named explicitly — absolute or repo-relative; directories are refused. Required unless `hunks` selects something.",
               "items": {
                 "type": "string"
               },
@@ -1624,7 +1651,6 @@
           },
           "required": [
             "repo",
-            "paths",
             "message"
           ],
           "type": "object"

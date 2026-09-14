@@ -3847,16 +3847,29 @@ fn git_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "git_commit",
-            "description": "Commit exactly `paths` with `message` on the current branch: each listed file is staged from its worktree content (a listed file missing on disk becomes a deletion). There is deliberately no stage-everything mode — no -A, no \".\", no directories — so stray files can't be swept into history; unlisted worktree changes just stay dirty, and pre-staged index changes outside `paths` refuse, naming them. `after` places the new commit directly after that ancestor instead of at the tip (in-series insertion via the rebase machinery: backup ring, pauses on conflict for the conflict tools + git_continue).",
+            "description": "Commit exactly `paths` with `message` on the current branch: each listed file is staged from its worktree content (a listed file missing on disk becomes a deletion). `hunks` commits PART of a file — {path, lines: [start, end]} or {path, contains: TEXT}, the selectors git_fixup's worktree mode takes — leaving the file's other hunks in the worktree (`git add -p` for agents; a split-by-hunk without the commit-then-git_split detour). Hunk mode covers tracked files (every `paths` entry too), refuses ANY staged change (it commits worktree content and would drop them), and cannot be combined with `after`. There is deliberately no stage-everything mode — no -A, no \".\", no directories — so stray files can't be swept into history; unlisted worktree changes just stay dirty, and pre-staged index changes outside `paths` refuse, naming them. `after` places the new commit directly after that ancestor instead of at the tip (in-series insertion via the rebase machinery: backup ring, pauses on conflict for the conflict tools + git_continue).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "repo": repo,
-                    "paths": { "type": "array", "items": { "type": "string" }, "description": "The files to commit, each named explicitly — absolute or repo-relative. Required and non-empty; directories are refused." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "The files to commit whole, each named explicitly — absolute or repo-relative; directories are refused. Required unless `hunks` selects something." },
+                    "hunks": {
+                        "type": "array",
+                        "description": "Specific uncommitted hunks to commit — each {path, lines: [start, end]} takes every worktree diff-hunk of `path` whose current-file line range overlaps [start, end] (1-based inclusive); {path, contains: TEXT} takes every hunk one of whose added or removed lines contains TEXT. The file's other hunks stay in the worktree, unstaged. Tracked files only (a new file goes in whole, by a `paths`-only call); nothing may be staged; not combinable with `after`.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "File whose hunks to commit." },
+                                "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based inclusive line span in the CURRENT worktree file." },
+                                "contains": { "type": "string", "description": "Instead of `lines`: a literal text; takes every hunk one of whose added or removed lines contains it." }
+                            },
+                            "required": ["path"]
+                        }
+                    },
                     "message": { "type": "string", "description": "The commit message." },
-                    "after": { "type": "string", "description": "Optional placement: an ancestor commit (oid/ref/revspec) the new commit should sit directly after, instead of at the branch tip." }
+                    "after": { "type": "string", "description": "Optional placement: an ancestor commit (oid/ref/revspec) the new commit should sit directly after, instead of at the branch tip. Not combinable with `hunks`." }
                 },
-                "required": ["repo", "paths", "message"],
+                "required": ["repo", "message"],
             },
         }),
         json!({
