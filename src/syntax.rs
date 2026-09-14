@@ -473,37 +473,93 @@ impl Syntax {
     }
 
     /// The full extent of a defun INCLUDING its decoration: Rust outer
-    /// `#[attributes]` are preceding siblings of the item node, Python
-    /// decorators live on a wrapping `decorated_definition` — both belong to
-    /// the defun an agent means by "delete / replace / narrow to / anchor on
-    /// this function". Returns byte offsets. Raw node accessors
-    /// (`treesit-node-start` etc.) stay faithful to the tree-sitter node;
-    /// only the defun-level views (outline, goto, narrow, begin/end) use
-    /// this.
+    /// `#[attributes]` and `///` / `/** */` doc comments are preceding
+    /// siblings of the item node, Go and JavaScript/TypeScript doc comments
+    /// are the comment block adjacent above it (and an `export` wrapper is
+    /// part of the item), Python decorators live on a wrapping
+    /// `decorated_definition` — all belong to the defun an agent means by
+    /// "delete / replace / narrow to / anchor on this function". Returns
+    /// byte offsets. Raw node accessors (`treesit-node-start` etc.) stay
+    /// faithful to the tree-sitter node; only the defun-level views (outline,
+    /// goto, narrow, begin/end) use this.
     fn defun_extent(&self, node: Node<'_>) -> (usize, usize) {
-        let mut start = node.start_byte();
         let end = node.end_byte();
-        match self.lang {
-            Lang::Rust => {
-                let mut prev = node.prev_named_sibling();
-                while let Some(p) = prev {
-                    if p.kind() != "attribute_item" {
-                        break;
-                    }
-                    start = p.start_byte();
-                    prev = p.prev_named_sibling();
-                }
+        // The wrapper, when there is one, is the node whose siblings the
+        // decoration sits among.
+        let outer = self.wrapper_of(node).unwrap_or(node);
+        let mut start = outer.start_byte();
+        let mut cur = outer;
+        while let Some(p) = cur.prev_named_sibling() {
+            if !self.decorates_next(p, cur) {
+                break;
             }
-            Lang::Python => {
-                if let Some(parent) = node.parent()
-                    && parent.kind() == "decorated_definition"
-                {
-                    start = parent.start_byte();
-                }
-            }
-            _ => {}
+            start = p.start_byte();
+            cur = p;
         }
         (start, end)
+    }
+
+    /// The node that wraps a defun and belongs to it: Python's
+    /// `decorated_definition`, JavaScript/TypeScript's `export_statement`.
+    fn wrapper_of<'t>(&self, node: Node<'t>) -> Option<Node<'t>> {
+        let parent = node.parent()?;
+        let wraps = match self.lang {
+            Lang::Python => parent.kind() == "decorated_definition",
+            Lang::Javascript | Lang::Typescript | Lang::Tsx => parent.kind() == "export_statement",
+            _ => false,
+        };
+        wraps.then_some(parent)
+    }
+
+    /// `node` itself when it is a defun, or the defun it wraps (see
+    /// [`Self::wrapper_of`]).
+    fn defun_of<'t>(&self, node: Node<'t>, kinds: &[&str]) -> Option<Node<'t>> {
+        if kinds.contains(&node.kind()) {
+            return Some(node);
+        }
+        if !matches!(node.kind(), "decorated_definition" | "export_statement") {
+            return None;
+        }
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|c| kinds.contains(&c.kind()) && self.wrapper_of(*c) == Some(node))
+    }
+
+    /// Whether `node` is decoration belonging to `next`, its following named
+    /// sibling: a Rust outer attribute or outer doc comment (`///` or
+    /// `/** */`; inner `//!` docs and plain `//` comments are not — and no
+    /// adjacency test, since a detached `///` does not compile), or, in Go
+    /// and JavaScript/TypeScript, a comment on its own line with no blank
+    /// line between it and `next` — those languages' doc-comment convention.
+    /// A comment trailing the previous item's code is that item's.
+    fn decorates_next(&self, node: Node<'_>, next: Node<'_>) -> bool {
+        match self.lang {
+            Lang::Rust => match node.kind() {
+                "attribute_item" => true,
+                "line_comment" => {
+                    let text = &self.text[node.byte_range()];
+                    text.starts_with("///") && !text.starts_with("////")
+                }
+                "block_comment" => {
+                    let text = &self.text[node.byte_range()];
+                    text.starts_with("/**") && !text.starts_with("/***") && text != "/**/"
+                }
+                _ => false,
+            },
+            Lang::Go | Lang::Javascript | Lang::Typescript | Lang::Tsx => {
+                node.kind() == "comment"
+                    && node.end_position().row + 1 == next.start_position().row
+                    && self.starts_its_line(node)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether only whitespace precedes `node` on its line.
+    fn starts_its_line(&self, node: Node<'_>) -> bool {
+        let start = node.start_byte();
+        let line_start = self.text[..start].rfind('\n').map_or(0, |i| i + 1);
+        self.text[line_start..start].trim().is_empty()
     }
 
     /// Name of the nearest enclosing defun at `pos` — `None` if there is no
@@ -518,32 +574,22 @@ impl Syntax {
         let kinds = self.lang.defun_kinds();
         let mut node = self.root().descendant_for_byte_range(b, b)?;
         loop {
-            if kinds.contains(&node.kind()) {
-                return Some(node);
-            }
             // Decoration belongs to the defun it decorates: a position on a
-            // Rust outer attribute resolves to the item the attribute chain
-            // ends at, one on a Python decorator to the wrapped definition.
-            if node.kind() == "attribute_item" {
-                let mut next = node.next_named_sibling();
-                while let Some(n) = next {
-                    if kinds.contains(&n.kind()) {
-                        return Some(n);
-                    }
-                    if n.kind() != "attribute_item" {
-                        break;
-                    }
-                    next = n.next_named_sibling();
+            // Rust outer attribute or doc comment, or on a Go / JS / TS doc
+            // comment, resolves to the item the decoration chain ends at; one
+            // on a Python decorator or a JS `export` to the wrapped definition.
+            let mut cur = node;
+            while let Some(n) = cur.next_named_sibling() {
+                if !self.decorates_next(cur, n) {
+                    break;
                 }
+                if let Some(d) = self.defun_of(n, kinds) {
+                    return Some(d);
+                }
+                cur = n;
             }
-            if node.kind() == "decorated_definition" {
-                let mut cursor = node.walk();
-                let inner = node
-                    .named_children(&mut cursor)
-                    .find(|c| kinds.contains(&c.kind()));
-                if let Some(c) = inner {
-                    return Some(c);
-                }
+            if let Some(d) = self.defun_of(node, kinds) {
+                return Some(d);
             }
             node = node.parent()?;
         }
@@ -1100,16 +1146,82 @@ mod tests {
     }
 
     #[test]
-    fn attribute_extent_stops_at_non_attribute_siblings() {
-        // The doc comment above the attribute chain is NOT pulled in, and
-        // the previous item's span is untouched.
+    fn rust_defun_extent_includes_doc_comments_but_not_plain_ones() {
+        // The doc comment above the attribute chain belongs to the item; the
+        // previous item's span is untouched.
         let src = "fn first() {}\n\n/// doc\n#[test]\nfn second() {}\n";
         let syn = Syntax::parse(src, Lang::Rust);
+        let at = |s: &str| src.find(s).unwrap() + 1;
         let first = syn.find_defun("first").expect("first");
         assert_eq!((first.start, first.end), (1, 14));
         let second = syn.find_defun("second").expect("second");
-        // "fn first() {}\n\n/// doc\n" = 13 + 1 + 1 + 8 chars → #[test] at 24.
-        assert_eq!(second.start, 24, "starts at #[test], not the doc comment");
+        assert_eq!(second.start, at("/// doc"), "starts at the doc comment");
+        // From the doc comment, the enclosing defun is the documented item.
+        let span = syn
+            .enclosing_defun(at("doc"))
+            .expect("from the doc comment");
+        assert_eq!(
+            (span.kind.as_str(), span.start),
+            ("function_item", at("/// doc"))
+        );
+        assert_eq!(
+            syn.enclosing_defun_name(at("doc")).as_deref(),
+            Some("second")
+        );
+
+        // A block doc comment counts; a plain `//` comment, a `////` rule and
+        // an inner `//!` doc do not.
+        let src = "/** doc */\nfn a() {}\n\n// note\nfn b() {}\n\n//// rule\nfn c() {}\n\n//! inner\nfn d() {}\n";
+        let syn = Syntax::parse(src, Lang::Rust);
+        let at = |s: &str| src.find(s).unwrap() + 1;
+        assert_eq!(syn.find_defun("a").unwrap().start, 1);
+        assert_eq!(syn.find_defun("b").unwrap().start, at("fn b"));
+        assert_eq!(syn.find_defun("c").unwrap().start, at("fn c"));
+        assert_eq!(syn.find_defun("d").unwrap().start, at("fn d"));
+        // Methods carry their doc comments the same way.
+        let src = "impl T {\n    /// m doc\n    fn m(&self) {}\n}\n";
+        let syn = Syntax::parse(src, Lang::Rust);
+        let at = |s: &str| src.find(s).unwrap() + 1;
+        assert_eq!(syn.find_defun("m").unwrap().start, at("/// m doc"));
+    }
+
+    #[test]
+    fn go_and_ts_defun_extent_includes_the_adjacent_comment_block() {
+        let src =
+            "package p\n\n// A does a.\n// Second line.\nfunc A() {}\n\n// stray\n\nfunc B() {}\n";
+        let syn = Syntax::parse(src, Lang::Go);
+        let at = |s: &str| src.find(s).unwrap() + 1;
+        assert_eq!(syn.find_defun("A").unwrap().start, at("// A does"));
+        assert_eq!(
+            syn.find_defun("B").unwrap().start,
+            at("func B"),
+            "a blank line breaks the attachment"
+        );
+        assert_eq!(syn.enclosing_defun_name(at("Second")).as_deref(), Some("A"));
+        // A comment trailing the previous line's code belongs to that line,
+        // not to the function below it.
+        let src = "package p\n\nconst Max = 3 // tuned\nfunc Retry() {}\n";
+        let syn = Syntax::parse(src, Lang::Go);
+        let at = |s: &str| src.find(s).unwrap() + 1;
+        assert_eq!(syn.find_defun("Retry").unwrap().start, at("func Retry"));
+        assert_eq!(syn.enclosing_defun_name(at("tuned")), None);
+
+        // JSDoc above an exported function: the `export` is part of the item
+        // and the comment attaches through it.
+        let src =
+            "/**\n * JSDoc for f.\n */\nexport function f() {}\n\n// stray\n\nfunction g() {}\n";
+        let syn = Syntax::parse(src, Lang::Typescript);
+        let at = |s: &str| src.find(s).unwrap() + 1;
+        let f = syn.find_defun("f").unwrap();
+        assert_eq!(f.start, 1);
+        assert_eq!(f.end, at("\n\n// stray"));
+        assert_eq!(syn.find_defun("g").unwrap().start, at("function g"));
+        assert_eq!(syn.enclosing_defun_name(at("JSDoc")).as_deref(), Some("f"));
+        assert_eq!(syn.enclosing_defun_name(at("export")).as_deref(), Some("f"));
+        let src = "const x = 1; // tuned\nexport function f() {}\n";
+        let syn = Syntax::parse(src, Lang::Typescript);
+        let at = |s: &str| src.find(s).unwrap() + 1;
+        assert_eq!(syn.find_defun("f").unwrap().start, at("export"));
     }
 
     #[test]
