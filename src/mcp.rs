@@ -3647,7 +3647,8 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
             }
             seq::cmd_commit(
                 &repo,
-                &str_list_arg(args, "paths")?,
+                &present_str_list(args, "paths")?,
+                &hunk_sels_arg(args, "hunks")?,
                 &str_arg(args, "message")?,
                 args.get("after").and_then(Value::as_str),
             )

@@ -4829,7 +4829,7 @@ fn fixup_worktree(
             &head_tree,
             &diff,
             |p| sel.whole.contains(p),
-            |p, ns, nl| sel.whole.contains(p) || sel.hunks.contains(&(p.to_string(), ns, nl)),
+            |p, ns, nl| sel.takes(p, ns, nl),
         )?,
     };
     if fixup_tree_id == head_tree.id() {
@@ -5355,19 +5355,30 @@ pub fn cmd_status(repo_path: &std::path::Path) -> Result<String, String> {
 /// unlisted worktree changes simply stay dirty. With `after`, the new commit
 /// is then relocated to sit directly after that ancestor via the rebase
 /// machinery (backup ring; a conflict pauses for the conflict tools +
-/// git_continue).
+/// git_continue). `hunks` selects part of a tracked file's worktree change
+/// (the tree is HEAD plus the selection and the index follows it); that mode
+/// refuses ANY staged change, untracked paths, and `after`.
 pub fn cmd_commit(
     repo_path: &std::path::Path,
     paths: &[String],
+    hunks: &[HunkSel],
     message: &str,
     after: Option<&str>,
 ) -> Result<String, String> {
     let repo = open(repo_path)?;
     require_signing_ready(&repo).map_err(gerr)?;
-    if paths.is_empty() {
+    if paths.is_empty() && hunks.is_empty() {
         return Err(
             "git_commit: `paths` must name each file to commit explicitly \
-             (there is no stage-everything mode)"
+             (there is no stage-everything mode); `hunks` takes part of a file"
+                .to_string(),
+        );
+    }
+    if !hunks.is_empty() && after.is_some() {
+        return Err(
+            "git_commit: `after` cannot be combined with `hunks` — the file's other \
+             hunks usually stay dirty in the worktree, which the relocation refuses \
+             to replay over; commit at the tip, then relocate with git_rebase"
                 .to_string(),
         );
     }
@@ -5377,8 +5388,7 @@ pub fn cmd_commit(
         .to_path_buf();
     // Absolute (the form grep/occur return) or workdir-relative; a directory
     // is refused — a directory pathspec is a sweep, not an explicit list.
-    let mut rels: Vec<String> = Vec::new();
-    for p in paths {
+    let rel_of = |p: &str| -> Result<String, String> {
         let path = Path::new(p);
         let rel = if path.is_absolute() {
             path.strip_prefix(&workdir)
@@ -5413,10 +5423,21 @@ pub fn cmd_commit(
                 "git_commit: {p} is a directory — list the files explicitly"
             ));
         }
-        rels.push(norm.to_string_lossy().into_owned());
-    }
+        Ok(norm.to_string_lossy().into_owned())
+    };
+    let mut rels: Vec<String> = paths.iter().map(|p| rel_of(p)).collect::<Result<_, _>>()?;
     rels.sort();
     rels.dedup();
+    // A selector's path takes the same spellings as `paths`.
+    let hunks: Vec<HunkSel> = hunks
+        .iter()
+        .map(|h| {
+            Ok(HunkSel {
+                path: rel_of(&h.path)?,
+                pick: h.pick.clone(),
+            })
+        })
+        .collect::<Result<_, String>>()?;
 
     let head_commit = match repo.head() {
         Ok(h) => {
@@ -5457,33 +5478,84 @@ pub fn cmd_commit(
     let staged = repo
         .diff_tree_to_index(head_tree.as_ref(), Some(&index), None)
         .map_err(gerr)?;
-    let outside: Vec<String> = staged
+    // Whole-path mode re-stages each listed file from the worktree, so a
+    // staged change inside `paths` is superseded and one outside would ride
+    // along uninvited. Hunk mode commits worktree content and then sets the
+    // index to the new HEAD, so ANY staged change would be lost: refuse them.
+    let hunk_mode = !hunks.is_empty();
+    let blocking: Vec<String> = staged
         .deltas()
         .map(|d| delta_path(Some(d)))
-        .filter(|p| !rels.iter().any(|r| r == p))
+        .filter(|p| hunk_mode || rels.binary_search(p).is_err())
         .collect();
-    if !outside.is_empty() {
+    if !blocking.is_empty() {
+        let (what, why) = if hunk_mode {
+            (
+                "holds staged changes",
+                "hunk mode commits worktree content and would drop them;",
+            )
+        } else {
+            ("already holds staged changes outside `paths`", "—")
+        };
         return Err(format!(
-            "git_commit: the index already holds staged changes outside `paths` \
-             ({}) — commit or unstage them first",
-            outside.join(", ")
+            "git_commit: the index {what} ({}) {why} commit or unstage them first",
+            blocking.join(", ")
         ));
     }
 
-    for rel in &rels {
-        let rp = Path::new(rel);
-        if workdir.join(rp).symlink_metadata().is_ok() {
-            index.add_path(rp).map_err(gerr)?;
-        } else if index.get_path(rp, 0).is_some()
-            || head_tree.as_ref().is_some_and(|t| t.get_path(rp).is_ok())
-        {
-            // Listed but absent on disk: stage the deletion of a tracked file.
-            index.remove_path(rp).map_err(gerr)?;
-        } else {
-            return Err(format!("git_commit: no such file: {rel}"));
+    let tree_oid = if !hunk_mode {
+        for rel in &rels {
+            let rp = Path::new(rel);
+            if workdir.join(rp).symlink_metadata().is_ok() {
+                index.add_path(rp).map_err(gerr)?;
+            } else if index.get_path(rp, 0).is_some()
+                || head_tree.as_ref().is_some_and(|t| t.get_path(rp).is_ok())
+            {
+                // Listed but absent on disk: stage the deletion of a tracked file.
+                index.remove_path(rp).map_err(gerr)?;
+            } else {
+                return Err(format!("git_commit: no such file: {rel}"));
+            }
         }
-    }
-    let tree_oid = index.write_tree().map_err(gerr)?;
+        index.write_tree().map_err(gerr)?
+    } else {
+        // Hunk mode: the tree is HEAD plus the selected worktree hunks (and
+        // the whole `paths`), built the way git_fixup's worktree mode builds
+        // its fold; the unselected changes simply stay in the worktree.
+        let Some(head_tree) = head_tree.as_ref() else {
+            return Err(
+                "git_commit: `hunks` selects from the diff against HEAD — the root \
+                 commit takes whole `paths`"
+                    .to_string(),
+            );
+        };
+        // The HEAD→worktree diff carries no content for an untracked file, so
+        // hunk mode covers tracked files only; a new file goes in by `paths`.
+        // Only the selection can be kept, so only the selection is diffed.
+        let mut opts = git2::DiffOptions::new();
+        for p in rels.iter().chain(hunks.iter().map(|h| &h.path)) {
+            let rp = Path::new(p);
+            if index.get_path(rp, 0).is_none() && head_tree.get_path(rp).is_err() {
+                return Err(format!(
+                    "git_commit: {p} is untracked — `hunks` selects from tracked files; \
+                     commit a new file whole, with `paths` alone"
+                ));
+            }
+            opts.pathspec(p);
+        }
+        let diff = repo
+            .diff_tree_to_workdir_with_index(Some(head_tree), Some(&mut opts))
+            .map_err(gerr)?;
+        let sel = resolve_move_selection(&diff, &rels, &hunks, "git_commit").map_err(gerr)?;
+        apply_subset(
+            &repo,
+            head_tree,
+            &diff,
+            |p| sel.whole.contains(p),
+            |p, ns, nl| sel.takes(p, ns, nl),
+        )
+        .map_err(gerr)?
+    };
     if head_tree.as_ref().is_some_and(|t| t.id() == tree_oid) {
         return Err("git_commit: nothing to commit — the given paths match HEAD".to_string());
     }
@@ -5503,7 +5575,12 @@ pub fn cmd_commit(
     let new = create_commit(&repo, Some("HEAD"), &sig, &sig, &msg, &tree, &parents, true)
         .map_err(gerr)?;
     // Persist the staged entries only once the commit exists — a failure
-    // above must not leave staged state the caller never asked to keep.
+    // above must not leave staged state the caller never asked to keep. In
+    // hunk mode the index becomes the new HEAD tree, so the committed part
+    // reads clean and the rest of the change shows as unstaged.
+    if hunk_mode {
+        index.read_tree(&tree).map_err(gerr)?;
+    }
     index.write().map_err(gerr)?;
     let out = format!(
         "committed {} {}",
@@ -7395,9 +7472,9 @@ mod tests {
             }
             drop(cfg);
             std::fs::write(repo.workdir().unwrap().join("f.txt"), "one\n").unwrap();
-            cmd_commit(&dir, &["f.txt".to_string()], "root", None).unwrap();
+            cmd_commit(&dir, &["f.txt".to_string()], &[], "root", None).unwrap();
             std::fs::write(repo.workdir().unwrap().join("f.txt"), "two\n").unwrap();
-            cmd_commit(&dir, &["f.txt".to_string()], "more", None).unwrap();
+            cmd_commit(&dir, &["f.txt".to_string()], &[], "more", None).unwrap();
             // Subjects that diverge from the first physical line: a wrapped
             // subject (folded into one line) and a leading blank line
             // (skipped) — git_commit_summary handles both.
@@ -7405,12 +7482,13 @@ mod tests {
             cmd_commit(
                 &dir,
                 &["f.txt".to_string()],
+                &[],
                 "wrapped subject\ncontinued here\n\nbody",
                 None,
             )
             .unwrap();
             std::fs::write(repo.workdir().unwrap().join("f.txt"), "four\n").unwrap();
-            cmd_commit(&dir, &["f.txt".to_string()], "\nleading blank", None).unwrap();
+            cmd_commit(&dir, &["f.txt".to_string()], &[], "\nleading blank", None).unwrap();
             repo
         };
         let signed = mk("reflog-signed", true);
@@ -10128,7 +10206,7 @@ mod tests {
         std::fs::write(wd.join("f.txt"), "changed\n").unwrap();
         std::fs::write(wd.join("stray.txt"), "stray\n").unwrap();
 
-        let out = cmd_commit(&dir, &["f.txt".to_string()], "tweak f", None).unwrap();
+        let out = cmd_commit(&dir, &["f.txt".to_string()], &[], "tweak f", None).unwrap();
         assert!(out.contains("tweak f"), "{out}");
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.summary().unwrap(), "tweak f");
@@ -10146,21 +10224,21 @@ mod tests {
 
         // A listed-but-missing file stages its deletion.
         std::fs::remove_file(wd.join("g.txt")).unwrap();
-        cmd_commit(&dir, &["g.txt".to_string()], "drop g", None).unwrap();
+        cmd_commit(&dir, &["g.txt".to_string()], &[], "drop g", None).unwrap();
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert!(head.tree().unwrap().get_path(Path::new("g.txt")).is_err());
 
         // Refusals: no paths, a typo'd path, nothing to commit, a directory.
-        cmd_commit(&dir, &[], "x", None).unwrap_err();
-        cmd_commit(&dir, &["nope.txt".to_string()], "x", None).unwrap_err();
-        cmd_commit(&dir, &["f.txt".to_string()], "x", None).unwrap_err();
+        cmd_commit(&dir, &[], &[], "x", None).unwrap_err();
+        cmd_commit(&dir, &["nope.txt".to_string()], &[], "x", None).unwrap_err();
+        cmd_commit(&dir, &["f.txt".to_string()], &[], "x", None).unwrap_err();
         std::fs::create_dir(wd.join("sub")).unwrap();
-        let err = cmd_commit(&dir, &["sub".to_string()], "x", None).unwrap_err();
+        let err = cmd_commit(&dir, &["sub".to_string()], &[], "x", None).unwrap_err();
         assert!(err.contains("directory"), "{err}");
 
         // "./f.txt" is the same file as "f.txt" — normalized, not refused.
         std::fs::write(wd.join("f.txt"), "again\n").unwrap();
-        cmd_commit(&dir, &["./f.txt".to_string()], "dot spelled", None).unwrap();
+        cmd_commit(&dir, &["./f.txt".to_string()], &[], "dot spelled", None).unwrap();
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.summary().unwrap(), "dot spelled");
 
@@ -10169,8 +10247,107 @@ mod tests {
         let mut idx = repo.index().unwrap();
         idx.add_path(Path::new("stray.txt")).unwrap();
         idx.write().unwrap();
-        let err = cmd_commit(&dir, &["f.txt".to_string()], "x", None).unwrap_err();
+        let err = cmd_commit(&dir, &["f.txt".to_string()], &[], "x", None).unwrap_err();
         assert!(err.contains("stray.txt"), "{err}");
+    }
+
+    #[test]
+    fn cmd_commit_takes_selected_hunks_and_leaves_the_rest_dirty() {
+        let dir = tmp("commit-hunks");
+        let repo = Repository::init(&dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "test").unwrap();
+        cfg.set_str("user.email", "test@example.invalid").unwrap();
+        cfg.set_bool("commit.gpgsign", false).unwrap();
+        let base = commit(
+            &repo,
+            &[],
+            &[
+                ("f", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n"),
+                ("g", "g\n"),
+                ("h", "a\nb"),
+            ],
+            "base",
+        );
+        on_branch(&repo, "main", base);
+        let wd = repo.workdir().unwrap().to_path_buf();
+        // Two hunks in f (top and bottom), a whole-file change to g, a last
+        // line without its newline replaced in h, and a new file the
+        // selection never names.
+        std::fs::write(wd.join("f"), "X\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nY\n").unwrap();
+        std::fs::write(wd.join("g"), "G\n").unwrap();
+        std::fs::write(wd.join("h"), "a\nc").unwrap();
+        std::fs::write(wd.join("new"), "n\n").unwrap();
+
+        // Refusals, each before anything is created: a selector matching
+        // nothing, `after` (the leftover hunks would block the relocation),
+        // and staged content (hunk mode commits worktree content and would
+        // drop it).
+        let sel = [HunkSel::contains("f", "Y")];
+        let err = cmd_commit(&dir, &[], &[HunkSel::contains("f", "nope")], "x", None).unwrap_err();
+        assert!(err.contains("no hunk of f contains"), "{err}");
+        // h's removed "b" and added "c" carry no newline: still two lines,
+        // never the fused "bc".
+        let err = cmd_commit(&dir, &[], &[HunkSel::contains("h", "bc")], "x", None).unwrap_err();
+        assert!(err.contains("no hunk of h contains"), "{err}");
+        let err = cmd_commit(&dir, &[], &sel, "x", Some("HEAD")).unwrap_err();
+        assert!(err.contains("`after` cannot be combined"), "{err}");
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("g")).unwrap();
+        index.write().unwrap();
+        let err = cmd_commit(&dir, &[], &sel, "x", None).unwrap_err();
+        assert!(err.contains("staged changes (g)"), "{err}");
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), base);
+        index
+            .read_tree(&repo.find_commit(base).unwrap().tree().unwrap())
+            .unwrap();
+        index.write().unwrap();
+
+        // An untracked file has no hunks to select from: it goes in whole,
+        // by `paths` alone.
+        let err = cmd_commit(&dir, &["new".to_string()], &sel, "x", None).unwrap_err();
+        assert!(err.contains("new is untracked"), "{err}");
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), base);
+
+        // A selector's path may be absolute, like `paths`.
+        let abs_f = wd.join("f").to_string_lossy().into_owned();
+        let out = cmd_commit(
+            &dir,
+            &["g".to_string()],
+            &[HunkSel::contains(&abs_f, "Y"), HunkSel::contains("h", "c")],
+            "bottom and g",
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("bottom and g"), "{out}");
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let blob = |p: &str| {
+            let e = head.tree().unwrap().get_path(Path::new(p)).unwrap();
+            String::from_utf8(repo.find_blob(e.id()).unwrap().content().to_vec()).unwrap()
+        };
+        assert_eq!(blob("f"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nY\n");
+        assert_eq!(blob("g"), "G\n");
+        assert_eq!(blob("h"), "a\nc");
+        assert!(head.tree().unwrap().get_path(Path::new("new")).is_err());
+        // The worktree keeps everything; the index equals HEAD, so the top
+        // hunk shows as the one unstaged change to a tracked file.
+        assert_eq!(read(&repo, "f"), "X\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nY\n");
+        let staged = repo
+            .diff_tree_to_index(Some(&head.tree().unwrap()), None, None)
+            .unwrap();
+        assert_eq!(staged.deltas().len(), 0, "nothing left staged");
+        let unstaged = repo.diff_index_to_workdir(None, None).unwrap();
+        let dirty: Vec<String> = unstaged.deltas().map(|d| delta_path(Some(d))).collect();
+        assert_eq!(dirty, vec!["f".to_string()]);
+
+        // The rest goes by line span; the tree is clean afterwards.
+        cmd_commit(&dir, &[], &[HunkSel::lines("f", 1, 1)], "top", None).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary().unwrap(), "top");
+        assert_eq!(head.parent(0).unwrap().summary().unwrap(), "bottom and g");
+        let unstaged = repo.diff_index_to_workdir(None, None).unwrap();
+        assert_eq!(unstaged.deltas().len(), 0, "f is fully committed");
+        assert_eq!(read(&repo, "f"), "X\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nY\n");
     }
 
     #[test]
@@ -10184,21 +10361,21 @@ mod tests {
 
         // Unborn branch: the commit becomes the root.
         std::fs::write(repo.workdir().unwrap().join("f.txt"), "one\n").unwrap();
-        cmd_commit(&dir, &["f.txt".to_string()], "root", None).unwrap();
+        cmd_commit(&dir, &["f.txt".to_string()], &[], "root", None).unwrap();
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.parent_count(), 0);
         assert_eq!(head.summary().unwrap(), "root");
 
         // after = HEAD: the new commit already sits directly after it.
         std::fs::write(repo.workdir().unwrap().join("g.txt"), "g\n").unwrap();
-        let out = cmd_commit(&dir, &["g.txt".to_string()], "add g", Some("HEAD")).unwrap();
+        let out = cmd_commit(&dir, &["g.txt".to_string()], &[], "add g", Some("HEAD")).unwrap();
         assert!(out.contains("already sits directly after"), "{out}");
 
         // Detached HEAD refuses before touching anything.
         let tip = repo.head().unwrap().peel_to_commit().unwrap().id();
         repo.set_head_detached(tip).unwrap();
         std::fs::write(repo.workdir().unwrap().join("h.txt"), "h\n").unwrap();
-        let err = cmd_commit(&dir, &["h.txt".to_string()], "x", None).unwrap_err();
+        let err = cmd_commit(&dir, &["h.txt".to_string()], &[], "x", None).unwrap_err();
         assert!(err.contains("detached"), "{err}");
     }
 
@@ -10219,7 +10396,7 @@ mod tests {
         on_branch(&repo, "main", b);
         std::fs::write(repo.workdir().unwrap().join("h.txt"), "h\n").unwrap();
 
-        let out = cmd_commit(&dir, &["h.txt".to_string()], "add h", Some("HEAD~1")).unwrap();
+        let out = cmd_commit(&dir, &["h.txt".to_string()], &[], "add h", Some("HEAD~1")).unwrap();
         assert!(out.contains("relocated after"), "{out}");
         let log = cmd_log(&dir, None, false).unwrap();
         let lines: Vec<&str> = log.lines().collect();
@@ -10230,8 +10407,14 @@ mod tests {
         // A bad `after` is caught BEFORE the commit is created.
         std::fs::write(repo.workdir().unwrap().join("i.txt"), "i\n").unwrap();
         let other = commit(&repo, &[], &[("z.txt", "z\n")], "unrelated");
-        let err =
-            cmd_commit(&dir, &["i.txt".to_string()], "x", Some(&other.to_string())).unwrap_err();
+        let err = cmd_commit(
+            &dir,
+            &["i.txt".to_string()],
+            &[],
+            "x",
+            Some(&other.to_string()),
+        )
+        .unwrap_err();
         assert!(err.contains("not HEAD or an ancestor"), "{err}");
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert!(
