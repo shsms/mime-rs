@@ -572,7 +572,7 @@ fn resolve_session(
                     ));
                 }
             }
-            let quire = Quire::open(&checked).map_err(|e| format!("cannot open file {p}: {e}"))?;
+            let quire = Quire::open(&checked).map_err(|e| open_error(p, &e))?;
             evict_for_room(sessions);
             sessions.insert(id.clone(), make_workspace(Box::new(quire), false));
             Ok(id)
@@ -893,15 +893,44 @@ fn tool_open_file(
     let path = str_arg(args, "path")?;
     let read_only = bool_arg(args, "read_only");
     let checked = crate::safety::check_path(Path::new(&path))?;
-    let quire = Quire::open(&checked).map_err(|e| format!("cannot open file {path}: {e}"))?;
+    // `create` is find-file's "visit a file that does not exist yet": an
+    // empty buffer bound to the path, written out by the first save. An
+    // existing file opens normally under it.
+    let created = bool_arg(args, "create") && !checked.exists();
+    let quire = if created {
+        Quire::new_file(&checked)
+    } else {
+        Quire::open(&checked).map_err(|e| open_error(&path, &e))?
+    };
     let name = quire.name().to_string();
     let len = quire.char_len();
     evict_for_room(sessions);
     sessions.insert(session.clone(), make_workspace(Box::new(quire), read_only));
-    Ok(format!(
-        "opened file {path} as buffer \"{name}\" ({len} chars{mode}) in session \"{session}\"",
-        mode = if read_only { ", read-only" } else { "" }
-    ))
+    Ok(if created {
+        format!(
+            "opened NEW file {path} as empty buffer \"{name}\"{mode} in session \"{session}\" — \
+             the file is created by the first save",
+            mode = if read_only { " (read-only)" } else { "" }
+        )
+    } else {
+        format!(
+            "opened file {path} as buffer \"{name}\" ({len} chars{mode}) in session \"{session}\"",
+            mode = if read_only { ", read-only" } else { "" }
+        )
+    })
+}
+
+/// The error for a file that would not open; a missing one names the way to
+/// start it, since every other tool's `path` refuses to invent a file.
+fn open_error(path: &str, e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        format!(
+            "cannot open file {path}: {e} — to start a new file, open_file \
+             {{path, create: true}} first"
+        )
+    } else {
+        format!("cannot open file {path}: {e}")
+    }
 }
 
 /// `open_text {text, session?, name?}` — open an in-memory `Buffer`.
@@ -4547,12 +4576,13 @@ fn build_tool_schemas() -> Vec<Value> {
     let mut schemas = vec![
         json!({
             "name": "open_file",
-            "description": "Open a file from disk into a warm session (replacing any existing session of that name). The buffer stays resident so later tools need no file re-reads. The path must resolve inside an allowed root (MIME_ROOTS, default cwd). You rarely need this: every tool's `path` argument auto-opens the file the same way — reach for open_file only to attach it read-only (`read_only: true`) or under a specific session id. After EXTERNAL changes to the file (a git checkout, another editor) there is nothing to do: passing `path` re-reads a CLEAN drifted buffer from disk automatically; a buffer with unsaved edits is kept and flagged stale instead — no defensive close_session needed.",
+            "description": "Open a file from disk into a warm session (replacing any existing session of that name). The buffer stays resident so later tools need no file re-reads. The path must resolve inside an allowed root (MIME_ROOTS, default cwd). You rarely need this: every tool's `path` argument auto-opens the file the same way — reach for open_file only to attach it read-only (`read_only: true`), under a specific session id, or to start a NEW file (`create: true`). After EXTERNAL changes to the file (a git checkout, another editor) there is nothing to do: passing `path` re-reads a CLEAN drifted buffer from disk automatically; a buffer with unsaved edits is kept and flagged stale instead — no defensive close_session needed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Filesystem path to open." },
                     "read_only": { "type": "boolean", "description": "Attach the buffer unwritable; mutating programs are rejected. Default false." },
+                    "create": { "type": "boolean", "description": "Visit a path that does not exist yet as an empty buffer bound to it (find-file semantics): nothing touches the disk until the first save creates the file, and later tools address it by `path` as usual. An existing file opens normally. Default false: a missing file is an error." },
                     "session": session,
                 },
                 "required": ["path"],

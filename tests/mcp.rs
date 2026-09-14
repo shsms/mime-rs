@@ -1692,6 +1692,73 @@ fn save_buffer_writes_inside_root() {
 }
 
 #[test]
+fn open_file_create_visits_a_new_file_written_by_the_first_save() {
+    let root = temp_dir("create");
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", root.as_path())]);
+    s.request(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }));
+    let dest = root.join("new.rs");
+    let p = dest.to_str().unwrap();
+    // Without `create`, a missing file is an error that names the way in —
+    // from open_file and from any tool's auto-opening `path` alike.
+    let err = s.call_err(2, "open_file", json!({ "path": p }));
+    assert!(err.contains("create: true"), "got: {err}");
+    let err = s.call_err(3, "insert_text", json!({ "path": p, "text": "x" }));
+    assert!(err.contains("create: true"), "got: {err}");
+    assert!(!dest.exists(), "a refusal creates nothing");
+
+    let ok = s.call_ok(4, "open_file", json!({ "path": p, "create": true }));
+    assert!(
+        ok.contains("NEW file") && ok.contains("first save"),
+        "got: {ok}"
+    );
+    assert!(!dest.exists(), "opening creates nothing on disk");
+    // Later calls address the buffer by path, and save:true creates the file.
+    let ok = s.call_ok(
+        5,
+        "insert_text",
+        json!({ "path": p, "text": "fn main() {}\n", "save": true }),
+    );
+    assert!(ok.contains("saved"), "got: {ok}");
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "fn main() {}\n");
+    // The buffer now visits a real file: a second save passes the stale guard.
+    let ok = s.call_ok(
+        6,
+        "replace_text",
+        json!({ "path": p, "pattern": "main", "replacement": "run", "save": true }),
+    );
+    assert!(ok.contains("saved"), "got: {ok}");
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "fn run() {}\n");
+    // An existing file opens normally under `create`.
+    let ok = s.call_ok(
+        7,
+        "open_file",
+        json!({ "path": p, "create": true, "session": "again" }),
+    );
+    assert!(ok.contains("12 chars"), "got: {ok}");
+
+    // Another writer creating the file first: the stale guard refuses to
+    // overwrite it, exactly as it refuses a modified one.
+    let dest2 = root.join("raced.txt");
+    let p2 = dest2.to_str().unwrap();
+    s.call_ok(
+        8,
+        "open_file",
+        json!({ "path": p2, "create": true, "session": "raced" }),
+    );
+    s.call_ok(
+        9,
+        "insert_text",
+        json!({ "session": "raced", "text": "mine\n" }),
+    );
+    std::fs::write(&dest2, "theirs\n").unwrap();
+    let err = s.call_err(10, "save_buffer", json!({ "session": "raced" }));
+    assert!(err.contains("created on disk"), "got: {err}");
+    assert_eq!(std::fs::read_to_string(&dest2).unwrap(), "theirs\n");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn read_only_session_rejects_mutation_over_stdio() {
     let mut s = Server::spawn();
     s.request(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }));
