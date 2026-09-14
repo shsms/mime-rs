@@ -89,8 +89,9 @@ narrowing-relative (goto-line). Name-like arguments — conflict sides, treesit
 languages, coding systems, checkpoint labels, report/arg keys — accept a
 string or a quoted symbol: (treesit-set-language 'rust). Everything else
 (buffer names, defun/field names, free text, paths, regexes) is a string.
-A defun node EXCLUDES its leading attribute / decorator / doc-comment —
-extend the region upward to delete the whole item."#;
+A raw treesit NODE excludes its leading attribute / decorator / doc-comment;
+the defun-level views (outline, treesit-goto-defun, narrow-to-defun,
+mark-defun, anchors) include them, so they delete the whole item."#;
 
 const REGEX: &str = r#"— regex dialect —
 PATTERNS are Emacs regexp syntax, translated onto the RE2 engine (Rust regex
@@ -155,9 +156,10 @@ Edit ops: (treesit-replace-node N "text"), (treesit-wrap-node N "pre" "post"),
 (treesit-insert-sibling N "text" BEFORE).
 Query: (treesit-query "(call_expression) @c") — tree-sitter .scm patterns;
 reports "@capture KIND START END" and returns the nodes.
-Defun spans INCLUDE decoration: Rust #[attributes] and Python decorators
-belong to the defun for outline/goto/narrow/anchor purposes (raw node
-accessors like treesit-node-start stay faithful to the bare node).
+Defun spans INCLUDE decoration: Rust #[attributes] and /// docs, Python
+decorators, the comment block adjacent above a Go / JS / TS function and a JS
+`export` belong to the defun for outline/goto/narrow/anchor purposes (raw
+node accessors like treesit-node-start stay faithful to the bare node).
 Gotchas: editing OUTDATES nodes from the old parse (re-fetch after edits);
 treesit positions are whole-document even under narrowing.
 (treesit-has-error) must be nil before saving code (save: true warns
@@ -360,17 +362,12 @@ Edit only lines 100–200:
   (goto-line 100) (narrow-to-region (point) (progn (goto-line 201) (point)))
   … edits … (widen)
 Move a block: (kill-region A B) … (goto-char DEST) (yank)
-Delete a whole defun incl. its leading #[attr]/decorator/// (the defun node
-EXCLUDES those — walk up first):
+Delete a whole defun incl. its leading #[attr]/decorator/// (treesit-goto-defun
+lands on the decorated start; mark-defun spans the same):
   (when (treesit-goto-defun "name")
     (let ((end (treesit-node-end (treesit-defun-at))))
-      (goto-char (treesit-node-start (treesit-defun-at))) (beginning-of-line)
-      ;; (not (bobp)) is essential: at the top of the buffer (forward-line -1)
-      ;; can't advance, so without it a comment/attr on line 1 spins forever.
-      (while (and (not (bobp))
-                  (save-excursion (forward-line -1) (looking-at "[ \t]*(#\\[|//|///)")))
-        (forward-line -1))
-      (delete-region (point) end)))   ; save:true — fmt tidies any leftover blank
+      (beginning-of-line)                                 ; the indentation too
+      (delete-region (point) (min (point-max) (1+ end)))))  ; and the newline
 Replace or wrap a whole defun (structural):
   (treesit-replace-node (treesit-defun-at) "fn name() { todo!() }")
   (treesit-wrap-node (treesit-defun-at) "mod tests {\n" "\n}")

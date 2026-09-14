@@ -49,8 +49,9 @@ front end and the capability tier differ.
   *by name*, scope an edit to a single defun, or run a tree-sitter query —
   across Rust, Python, Markdown, HTML, JavaScript, TypeScript, TSX, Go, CSS,
   TOML, YAML, and Elisp.
-  Defun spans include Rust `#[attributes]` and Python decorators, so "delete
-  this test" is one motion, and a save-time parse check warns before you commit
+  Defun spans include the decoration — Rust `#[attributes]` and `///` docs,
+  Python decorators, the comment block above a Go or JS/TS function and a JS
+  `export` — so "delete this test" is one motion, and a save-time parse check warns before you commit
   a syntactically broken code buffer.
 
 - **Huge files stay cheap.** The file-backed store is a persistent B-tree piece

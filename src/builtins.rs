@@ -924,8 +924,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             },
         );
     }
-    // (mark-defun) — point to the start of the enclosing defun (attributes
-    // and decorators included), mark at its end. Errors when point is in no
+    // (mark-defun) — point to the start of the enclosing defun (attributes,
+    // decorators and doc comments included), mark at its end. Errors when point is in no
     // defun. Returns the mark.
     {
         let s = session.clone();
