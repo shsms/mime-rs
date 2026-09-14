@@ -1003,11 +1003,7 @@ fn tool_run_program(
     if value != "nil" {
         json["value"] = Value::String(unprint_string_value(&value).unwrap_or(value));
     }
-    // A bulk edit's diff can run to megabytes; clamp it for transport unless
-    // the caller asked for everything. 200 lines ≈ a large hand-made edit.
-    if !bool_arg(args, "full_diff") {
-        json["diff"] = Value::String(crate::result::clamp_diff(&report.diff, 200));
-    }
+    json["diff"] = Value::String(clamped_diff(args, &report.diff));
     // Same drift signal the read tools carry (see stale_note), structured:
     // present only when true, so the common case costs no tokens.
     if sessions.get(&session).is_some_and(|ws| ws.is_stale()) {
@@ -1293,7 +1289,7 @@ fn tool_unsaved_diff(
     Ok(format!(
         "disk → buffer for {} (what a save would write):\n{}{}",
         path.display(),
-        crate::result::clamp_diff(&diff, 200),
+        clamped_diff(args, &diff),
         stale_edit_note(sessions, &session)
     ))
 }
@@ -1421,8 +1417,9 @@ fn tool_insert_text(
     let unsaved = unsaved_note(sessions, &session);
     let stale = stale_edit_note(sessions, &session);
     let view = view_echo(args, sessions, &session);
+    let diff = diff_echo(args, &report.diff);
     Ok(format!(
-        "inserted {chars} chars{placed}; point is now {point}{saved}{unsaved}{stale}{view}"
+        "inserted {chars} chars{placed}; point is now {point}{saved}{unsaved}{stale}{view}{diff}"
     ))
 }
 
@@ -1612,17 +1609,18 @@ fn tool_replace_text(
     let unsaved = unsaved_note(sessions, &session);
     let stale = stale_edit_note(sessions, &session);
     let view = view_echo(args, sessions, &session);
+    let diff = diff_echo(args, &report.diff);
     Ok(match (all, more) {
         (true, _) => format!(
-            "replaced {n} occurrence(s), last at line {line}; point is now {point}{saved}{unsaved}{stale}{view}"
+            "replaced {n} occurrence(s), last at line {line}; point is now {point}{saved}{unsaved}{stale}{view}{diff}"
         ),
         (false, 0) => format!(
-            "replaced 1 occurrence at line {line}; point is now {point}{saved}{unsaved}{stale}{view}"
+            "replaced 1 occurrence at line {line}; point is now {point}{saved}{unsaved}{stale}{view}{diff}"
         ),
         (false, more) => format!(
             "replaced 1 occurrence at line {line}; point is now {point}; {more} more \
              match(es) remain (pass all:true to replace every occurrence, or \
-             expect_unique:true to make ambiguity an error){saved}{unsaved}{stale}{view}"
+             expect_unique:true to make ambiguity an error){saved}{unsaved}{stale}{view}{diff}"
         ),
     })
 }
@@ -1880,8 +1878,9 @@ fn replace_thing(
     let unsaved = unsaved_note(sessions, session);
     let stale = stale_edit_note(sessions, session);
     let view = view_echo(args, sessions, session);
+    let diff = diff_echo(args, &report.diff);
     Ok(format!(
-        "replaced the {} @{a}-{b} (line {line}) with {} chars; point is now {point}{saved}{unsaved}{stale}{view}",
+        "replaced the {} @{a}-{b} (line {line}) with {} chars; point is now {point}{saved}{unsaved}{stale}{view}{diff}",
         spec.kind,
         replacement.chars().count()
     ))
@@ -2081,7 +2080,7 @@ fn replace_text_batch(
     // A top-level `mode` is the default for edits that don't name their own.
     let items = with_default_mode(args, items);
     let scope = scope_prelude(args)?;
-    let total = run_batch_edits(sessions, session, &items, &scope)
+    let (total, edit_diff) = run_batch_edits(sessions, session, &items, &scope)
         .map_err(|e| format!("{e}{}", stale_edit_note(sessions, session)))?;
     let saved = if bool_arg(args, "save") {
         save_visited(sessions, session)?
@@ -2091,8 +2090,9 @@ fn replace_text_batch(
     let unsaved = unsaved_note(sessions, session);
     let stale = stale_edit_note(sessions, session);
     let view = view_echo(args, sessions, session);
+    let diff = diff_echo(args, &edit_diff);
     Ok(format!(
-        "applied {} edit(s), {total} replacement(s){saved}{unsaved}{stale}{view}",
+        "applied {} edit(s), {total} replacement(s){saved}{unsaved}{stale}{view}{diff}",
         items.len()
     ))
 }
@@ -2125,7 +2125,7 @@ fn run_batch_edits(
     session: &str,
     items: &[Value],
     scope: &Option<(String, String)>,
-) -> Result<usize, String> {
+) -> Result<(usize, String), String> {
     let mut body = String::new();
     for (i, item) in items.iter().enumerate() {
         let pattern = str_arg(item, "pattern")?;
@@ -2232,7 +2232,7 @@ fn run_batch_edits(
         .filter(|(k, _)| k == "n")
         .filter_map(|(_, v)| v.parse::<usize>().ok())
         .sum();
-    Ok(total)
+    Ok((total, report.diff))
 }
 
 /// `replace_in_files {files, pattern/replacement | edits, …}`: the same edit
@@ -2327,7 +2327,7 @@ fn tool_replace_files(
             }
         };
         match run_batch_edits(sessions, &session, &items, &scope) {
-            Ok(n) => done.push((f.clone(), session, n)),
+            Ok((n, _)) => done.push((f.clone(), session, n)),
             Err(e) => {
                 let stale = stale_edit_note(sessions, &session);
                 let note = rollback_files(sessions, &done);
@@ -3201,6 +3201,31 @@ fn view_echo(args: &Value, sessions: &mut HashMap<String, Workspace>, session: &
         .and_then(|r| r.log.into_iter().next())
         .map(|t| format!("\n— view —\n{t}"))
         .unwrap_or_default()
+}
+
+/// `diff: true` on an edit tool: the unified diff the edit produced (the
+/// engine's own, from its run report), clamped like run_program's and appended
+/// after the result line — what the edit did, visible without a follow-up call
+/// (and unsaved_diff has nothing to show once save:true has written the buffer
+/// out).
+fn diff_echo(args: &Value, diff: &str) -> String {
+    if !bool_arg(args, "diff") {
+        return String::new();
+    }
+    if diff.is_empty() {
+        return "\n— diff —\n(no change)".to_string();
+    }
+    format!("\n— diff —\n{}", clamped_diff(args, diff))
+}
+
+/// A diff for transport: clamped to 200 lines (about a large hand-made edit —
+/// a bulk edit's can run to megabytes) unless the call passed `full_diff`.
+fn clamped_diff(args: &Value, diff: &str) -> String {
+    if bool_arg(args, "full_diff") {
+        diff.to_string()
+    } else {
+        crate::result::clamp_diff(diff, 200)
+    }
 }
 
 /// A pattern echoed into an error message, clamped so a pathological pattern
@@ -4486,6 +4511,16 @@ fn build_tool_schemas() -> Vec<Value> {
         "type": "boolean",
         "description": "After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false."
     });
+    // `full_diff` lifts the 200-line clamp every tool that answers with a
+    // diff applies; `edit_diff` is the edit tools' opt-in diff echo.
+    let full_diff = json!({
+        "type": "boolean",
+        "description": "Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count."
+    });
+    let edit_diff = json!({
+        "type": "boolean",
+        "description": "Append the unified diff of the edit (clamped like run_program's; full_diff lifts the clamp) — see exactly what changed in the same call; unsaved_diff cannot show it once save:true has written the buffer out. Default false."
+    });
     let scope = json!({
         "type": "object",
         "description": "Restrict this call to one part of the buffer without writing a program. {\"defun\": \"name\"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.",
@@ -4544,7 +4579,7 @@ fn build_tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "program": { "type": "string", "description": "Emacs-Lisp program, e.g. (while (re-search-forward \"foo\" nil t) (replace-match \"bar\"))." },
-                    "full_diff": { "type": "boolean", "description": "Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count." },
+                    "full_diff": full_diff,
                     "keep_partial": { "type": "boolean", "description": "On program error, KEEP the pre-error edits in the warm buffer (dirty:true in the failure JSON; undo_last reverts them) instead of rolling back to the pre-program state. Default false: a failed run is transactional." },
                     "view": { "type": ["boolean", "integer"], "description": "Add a rendered viewport around point to the report (true = 4 context lines, or a line count)." },
                     "session": session,
@@ -4562,7 +4597,7 @@ fn build_tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "program": { "type": "string", "description": "Emacs-Lisp program to rehearse (run then roll back)." },
-                    "full_diff": { "type": "boolean", "description": "Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count." },
+                    "full_diff": full_diff,
                     "view": { "type": ["boolean", "integer"], "description": "Add a rendered viewport around point to the report (true = 4 context lines, or a line count)." },
                     "session": session,
                     "path": path,
@@ -4613,6 +4648,8 @@ fn build_tool_schemas() -> Vec<Value> {
                     "thing": thing_schema("Insert relative to a structural thing instead of a position:", ". `where` picks the end to insert at: \"after\" (default, at its end) or \"before\" (at its start); the result names the span it landed against, so a wrong pick is visible. Not combinable with pos/anchor."),
                     "where": { "type": "string", "enum": ["after", "before"], "description": "With `thing`: insert at its end (after, default) or its start (before). Applies to `thing` ONLY — the anchor form carries its own `where` inside the anchor object, and a top-level one without a `thing` is an error rather than a silently dropped placement." },
                     "view": { "type": ["boolean", "integer"], "description": "Append a rendered viewport around point after the edit (true = 4 context lines, or a line count) — confirm the insert landed right without a follow-up view call." },
+                    "diff": edit_diff,
+                    "full_diff": full_diff,
                     "session": session,
                     "path": path,
                     "save": save,
@@ -4634,6 +4671,8 @@ fn build_tool_schemas() -> Vec<Value> {
                     "expect_unique": { "type": "boolean", "description": "Require the pattern to match exactly once: more than one match is an error (listing the match lines) and nothing is replaced. RECOMMENDED whenever the anchor text could plausibly repeat — first-match semantics would silently edit the wrong site. Default false." },
                     "scope": scope,
                     "view": { "type": ["boolean", "integer"], "description": "Append a rendered viewport around point after the edit (true = 4 context lines, or a line count)." },
+                    "diff": edit_diff,
+                    "full_diff": full_diff,
                     "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?, mode?}, …] applied in order inside ONE transaction — all-or-nothing; a miss (or a failed uniqueness check) rolls everything back and names the failed edit.", "items": { "type": "object", "properties": { "pattern": { "type": "string" }, "replacement": { "type": "string" }, "all": { "type": "boolean" }, "expect_unique": { "type": "boolean" }, "mode": { "type": "string", "enum": ["exact", "regex"] } } } },
                     "session": session,
                     "path": path,
@@ -4833,7 +4872,8 @@ fn build_tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "The visited file — matches the warm session opened for it." },
-                    "session": { "type": "string", "description": "Warm session id; defaults to \"default\" when omitted. Pass path OR session, not both." }
+                    "session": { "type": "string", "description": "Warm session id; defaults to \"default\" when omitted. Pass path OR session, not both." },
+                    "full_diff": full_diff,
                 },
                 "required": [],
             },

@@ -2208,6 +2208,80 @@ fn view_echo_appends_a_viewport_to_edit_results() {
 }
 
 #[test]
+fn diff_echo_appends_the_edits_diff_to_edit_results() {
+    let mut s = Server::spawn();
+    s.call_ok(
+        1,
+        "open_text",
+        json!({ "text": "one\ntwo\nthree\nfour\nfive\n" }),
+    );
+    let ok = s.call_ok(
+        2,
+        "replace_text",
+        json!({ "pattern": "three", "replacement": "THREE", "diff": true }),
+    );
+    assert!(ok.contains("— diff —"), "got: {ok}");
+    assert!(
+        ok.contains("-three\n+THREE\n"),
+        "the diff shows the edit: {ok}"
+    );
+    // Every edit path carries it: the batch form, the thing form, insert_text.
+    let ok = s.call_ok(
+        3,
+        "replace_text",
+        json!({ "edits": [{ "pattern": "one", "replacement": "1" }, { "pattern": "two", "replacement": "2" }], "diff": true }),
+    );
+    assert!(
+        ok.contains("-one\n") && ok.contains("+1\n") && ok.contains("+2\n"),
+        "got: {ok}"
+    );
+    let ok = s.call_ok(
+        4,
+        "insert_text",
+        json!({ "text": "six\n", "pos": "eob", "diff": true }),
+    );
+    assert!(ok.contains("+six\n"), "got: {ok}");
+    let ok = s.call_ok(
+        5,
+        "replace_text",
+        json!({ "thing": { "kind": "line", "after": "four" }, "replacement": "FOUR", "diff": true }),
+    );
+    assert!(ok.contains("-four\n") && ok.contains("+FOUR"), "got: {ok}");
+    // Not requested → not present.
+    let ok = s.call_ok(
+        6,
+        "replace_text",
+        json!({ "pattern": "five", "replacement": "FIVE" }),
+    );
+    assert!(!ok.contains("— diff —"), "got: {ok}");
+
+    // A big diff is clamped like run_program's; full_diff:true lifts the clamp.
+    let text: String = (1..=300).map(|i| format!("row {i}\n")).collect();
+    s.call_ok(7, "open_text", json!({ "text": text, "session": "big" }));
+    let ok = s.call_ok(
+        8,
+        "replace_text",
+        json!({ "session": "big", "pattern": "row", "replacement": "ROW", "all": true, "diff": true }),
+    );
+    assert!(
+        ok.contains("lines elided"),
+        "got: {}",
+        &ok[..200.min(ok.len())]
+    );
+    let ok = s.call_ok(
+        9,
+        "replace_text",
+        json!({ "session": "big", "pattern": "ROW", "replacement": "row", "all": true, "diff": true, "full_diff": true }),
+    );
+    assert!(
+        !ok.contains("lines elided"),
+        "got: {}",
+        &ok[..200.min(ok.len())]
+    );
+    assert!(ok.contains("+row 300\n"), "the whole diff is there");
+}
+
+#[test]
 fn help_serves_topics_and_lists_them_on_a_miss() {
     let mut s = Server::spawn();
     let index = s.call_ok(1, "help", json!({}));
