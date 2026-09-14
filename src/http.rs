@@ -553,10 +553,7 @@ mod tests {
         );
         let v = json(&r);
         assert_eq!(v["result"]["resultType"], "complete");
-        let h = v["result"]["structuredContent"]["workspace"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let h = crate::rpc::handle_of(&v);
         assert!(store.contains(&h));
 
         // A stray session header is ignored, not required.

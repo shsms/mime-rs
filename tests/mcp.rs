@@ -2458,10 +2458,10 @@ fn modern_stdio_conversation_needs_no_handshake() {
     );
     assert_eq!(o["result"]["isError"], false);
     assert_eq!(o["result"]["resultType"], "complete");
-    assert_eq!(
-        o["result"]["structuredContent"],
-        json!({}),
-        "the schema-mandated object, with no handle merged in: stdio has one"
+    assert!(
+        o["result"].get("structuredContent").is_none(),
+        "a prose tool carries no structured value: {}",
+        o["result"]
     );
 
     let v = s.request(

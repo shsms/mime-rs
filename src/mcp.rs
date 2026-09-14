@@ -170,10 +170,7 @@ pub(crate) fn tools_call_result(
         other => Err(format!("unknown tool: {other}")),
     };
     match outcome {
-        Ok(mut out) => {
-            default_structured_content(name, &mut out);
-            out
-        }
+        Ok(out) => out,
         Err(message) => ToolOutput::error(message),
     }
 }
@@ -496,23 +493,6 @@ pub(crate) fn tool_text(text: String, is_error: bool) -> Value {
     } else {
         ToolOutput::from(text)
     })
-}
-
-/// MCP requires a result to conform to the tool's declared `outputSchema`, so
-/// a SUCCESSFUL call to a tool that declares one always answers with a
-/// structured value — the empty object when the tool has none of its own.
-/// A tool ERROR is left alone: the conformance rule is about results, and `{}`
-/// would break the `required` keys of the very schemas this honours (grep's
-/// `matches`, session_status's `sessions`, …). An error keeps a structured
-/// value only when the tool itself supplied one — run_program's failure JSON,
-/// which satisfies its own schema.
-pub(crate) fn default_structured_content(name: &str, out: &mut ToolOutput) {
-    let declares_output = tool_schemas()
-        .iter()
-        .any(|t| t["name"] == name && t["outputSchema"].is_object());
-    if !out.is_error && out.structured.is_none() && declares_output {
-        out.structured = Some(json!({}));
-    }
 }
 
 /// Whether a tool reads or writes the warm-session map — i.e. declares
@@ -4160,27 +4140,28 @@ impl ToolDoc {
     }
     /// The `tools/list` entry: the schema with `annotations` merged in, and
     /// the `workspace` handle declared in the `outputSchema` of every stateful
-    /// tool (generating that schema for the tools that wrote none). On modern
-    /// HTTP `rpc::tools_call` merges the handle into the `structuredContent`
-    /// of EVERY stateful result, and MCP requires a structured result to
-    /// conform to the declared schema — so the handle is declared here once
-    /// instead of in every stateful schema literal. No `required`: the key is
-    /// present only on modern HTTP. A tool that declares the key itself keeps
-    /// its own spelling (`session_status`'s nullable one, which is null off the
-    /// stateless HTTP protocol, and on a handle-free call that holds no
-    /// workspace).
+    /// tool that returns a structured value of its own. On modern HTTP
+    /// `rpc::tools_call` merges the handle into the `structuredContent` of
+    /// such a result, and MCP requires a structured result to conform to the
+    /// declared schema — so the handle is declared here once instead of in
+    /// every such schema literal. No `required`: the key is present only on
+    /// modern HTTP. A tool that declares the key itself keeps its own spelling
+    /// (`session_status`'s nullable one, which is null off the stateless HTTP
+    /// protocol, and on a handle-free call that holds no workspace). A
+    /// text-only tool declares NO outputSchema and carries no
+    /// structuredContent: Claude Code renders a structured value in preference
+    /// to the text, so even an empty `{}` would hide the prose the tool wrote.
     fn to_list_value(&self) -> Value {
         let mut v = self.schema.clone();
         v["annotations"] = self.annotations.to_json();
-        if self.takes_workspace() {
-            if !v["outputSchema"].is_object() {
-                v["outputSchema"] = json!({ "type": "object", "properties": {} });
-            }
-            if let Some(props) = v["outputSchema"]["properties"].as_object_mut()
-                && !props.contains_key("workspace")
-            {
-                props.insert("workspace".to_string(), json!({ "type": "string" }));
-            }
+        if self.takes_workspace()
+            && let Some(props) = v
+                .get_mut("outputSchema")
+                .and_then(|s| s.get_mut("properties"))
+                .and_then(Value::as_object_mut)
+            && !props.contains_key("workspace")
+        {
+            props.insert("workspace".to_string(), json!({ "type": "string" }));
         }
         v
     }
@@ -5671,36 +5652,45 @@ mod git_tool_tests {
     }
 
     /// MCP: "If an output schema is provided, servers MUST provide structured
-    /// results that conform to this schema." `rpc::tools_call` merges the
-    /// handle into the structuredContent of EVERY stateful call on modern
-    /// HTTP, so every stateful tool has to declare `workspace` in an
-    /// outputSchema — added by `to_list_value`, not written per tool.
+    /// results that conform to this schema." Only the tools that return a
+    /// structured value of their own declare one, and since
+    /// `rpc::tools_call` merges the handle into their structuredContent on
+    /// modern HTTP, each has to declare `workspace` — added by
+    /// `to_list_value`, not written per tool. A text-only tool declares none:
+    /// Claude Code renders a structured value in preference to the text, so a
+    /// schema-mandated `{}` would hide the prose.
     #[test]
-    fn every_stateful_tool_declares_an_output_schema() {
+    fn only_json_tools_declare_an_output_schema() {
+        let mut declared: Vec<&str> = Vec::new();
         for t in tool_schemas() {
             let name = t["name"].as_str().unwrap();
             let out = &t["outputSchema"];
-            if tool_uses_workspace(name) {
-                assert!(out.is_object(), "{name}: no outputSchema");
-                let ty = &out["properties"]["workspace"]["type"];
-                let ok = ty == "string"
-                    || ty
-                        .as_array()
-                        .is_some_and(|a| a.iter().any(|t| t == "string"));
-                assert!(ok, "{name}: workspace declared as {ty}");
-                // A GENERATED schema declares the handle and nothing else, so
-                // it declares no `required`: the key rides only on modern HTTP.
-                if out["properties"].as_object().is_some_and(|p| p.len() == 1) {
-                    assert!(
-                        out.get("required").is_none(),
-                        "{name}: a generated schema must not require {}",
-                        out["required"]
-                    );
-                }
-            } else if name == "open_workspace" {
+            if !out.is_object() {
+                continue;
+            }
+            declared.push(name);
+            let ty = &out["properties"]["workspace"]["type"];
+            let ok = ty == "string"
+                || ty
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|t| t == "string"));
+            assert!(ok, "{name}: workspace declared as {ty}");
+            if name == "open_workspace" {
                 // Its reply IS the handle, so there it is required.
                 assert_eq!(out["required"], json!(["workspace"]), "{name}");
             }
         }
+        declared.sort_unstable();
+        assert_eq!(
+            declared,
+            [
+                "grep",
+                "open_workspace",
+                "outline",
+                "rehearse",
+                "run_program",
+                "session_status"
+            ]
+        );
     }
 }

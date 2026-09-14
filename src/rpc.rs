@@ -354,11 +354,12 @@ pub fn handle_request(req: Value, store: &mut WorkspaceStore, ctx: &CallContext)
 /// Whenever the call HAS a workspace the handle is reported (to the modern HTTP
 /// client only), on a failure too: a call that failed after auto-opening a file
 /// left warm state, and its own error text tells the client to come back to it.
-/// (The `{}` default that keeps a successful stateful result conforming to its
-/// `outputSchema` is applied by `mcp::default_structured_content`, next to the
-/// schemas that mandate it; no such padding is added to an error. A failing
-/// tool that supplies its own failure JSON — run_program's, say — keeps it, and
-/// gets `workspace` alongside the keys it already wrote.)
+/// (Only a tool with a structured value of its own — run_program, grep,
+/// session_status … — carries the handle in `structuredContent`; a failing one
+/// that supplies its own failure JSON keeps it and gets `workspace` alongside
+/// the keys it already wrote. The text-only tools carry no structured value at
+/// all: Claude Code renders one in preference to the text, so even `{}` would
+/// hide their prose.)
 fn tools_call(params: &Value, store: &mut WorkspaceStore, ctx: &CallContext, era: Era) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     // Borrowed, not cloned: the arguments can be a whole buffer's worth of
@@ -367,11 +368,9 @@ fn tools_call(params: &Value, store: &mut WorkspaceStore, ctx: &CallContext, era
     let no_args = json!({});
     let args = params.get("arguments").unwrap_or(&no_args);
     // The two workspace tools act on the store, not on a session map, so they
-    // never pass through `mcp::tools_call_result` — which is why the `{}`
-    // outputSchema default (close_workspace declares one, like every tool that
-    // takes a `workspace`) is applied to them here instead.
+    // never pass through `mcp::tools_call_result`.
     if matches!(name, "open_workspace" | "close_workspace") {
-        let mut out = match validate_args(name, args) {
+        let out = match validate_args(name, args) {
             Err(m) => ToolOutput::error(m),
             Ok(()) => {
                 if name == "open_workspace" {
@@ -381,7 +380,6 @@ fn tools_call(params: &Value, store: &mut WorkspaceStore, ctx: &CallContext, era
                 }
             }
         };
-        crate::mcp::default_structured_content(name, &mut out);
         return tool_result(out);
     }
     if !tool_uses_workspace(name) {
@@ -421,15 +419,16 @@ fn tools_call(params: &Value, store: &mut WorkspaceStore, ctx: &CallContext, era
         }
     };
     let report = if reports { handle.as_deref() } else { None };
-    if let Some(h) = report {
-        // The reported handle is machine-readable too, so a client need not
-        // parse it back out of the text. An error is never padded with `{}` to
-        // carry it: the handle joins whatever the tool itself said — its own
-        // failure JSON when it wrote one, and nothing else when it did not.
-        let structured = out.structured.get_or_insert_with(|| json!({}));
-        if let Some(map) = structured.as_object_mut() {
-            map.insert("workspace".to_string(), json!(h));
-        }
+    if let Some(h) = report
+        && let Some(map) = out.structured.as_mut().and_then(Value::as_object_mut)
+    {
+        // The handle is machine-readable too, so a client need not parse it
+        // back out of the text. Nothing is padded on to carry it: the handle
+        // joins whatever structured value the tool itself supplied — its result,
+        // or its own failure JSON. A text-only tool has none and reports the
+        // handle on the trailing line below only; a prose-rendered tool with
+        // data (grep, outline) gets both.
+        map.insert("workspace".to_string(), json!(h));
     }
     // Text and structured value must keep saying the same thing: a tool whose
     // text IS its JSON re-renders it; prose gets the handle as a trailing line.
@@ -560,6 +559,18 @@ fn initialize_result(params: &Value) -> Value {
         .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v) && *v != MODERN_VERSION)
         .unwrap_or(LATEST_LEGACY_VERSION);
     extend(server_identity(), json!({ "protocolVersion": version }))
+}
+
+/// The workspace handle a prose tool reports on its trailing line — for the
+/// tests of both transports.
+#[cfg(test)]
+pub(crate) fn handle_of(reply: &Value) -> String {
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap_or("");
+    text.lines()
+        .last()
+        .and_then(|l| l.strip_prefix("workspace: "))
+        .unwrap_or_else(|| panic!("handle reported: {text}"))
+        .to_string()
 }
 
 #[cfg(test)]
@@ -973,19 +984,15 @@ mod tests {
             &ctx,
         );
         assert_eq!(store.len(), 1);
-        assert_eq!(
-            kept["result"]["structuredContent"]["workspace"]
-                .as_str()
-                .map(str::len),
-            Some(32)
-        );
+        assert_eq!(handle_of(&kept).len(), 32);
     }
 
     #[test]
-    fn stateful_calls_always_carry_structured_content() {
-        // Every stateful tool declares an outputSchema, so every stateful call
-        // answers with `structuredContent` — the empty object when the tool has
-        // no data of its own — in every era. help declares none and carries none.
+    fn prose_tools_carry_no_structured_content() {
+        // A prose tool declares no outputSchema and answers with text alone, in
+        // every era: clients render `structuredContent` in preference to the
+        // text, so even an empty `{}` would hide what the tool wrote. help and
+        // close_workspace are prose too.
         let mut store = WorkspaceStore::new();
         let h = store.mint();
         let ctx = stdio_ctx(&h);
@@ -997,21 +1004,20 @@ mod tests {
             let req =
                 format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{{body}}}}}"#);
             let r = call(&req, &mut store, &ctx);
-            assert_eq!(
-                r["result"]["structuredContent"],
-                json!({}),
+            assert!(
+                r["result"].get("structuredContent").is_none(),
                 "{body}: {}",
-                text_of(&r)
+                r["result"]
             );
         }
-        // close_workspace takes a handle, so it declares the same schema.
+        // close_workspace is prose as well.
         let h2 = store.mint();
         let req = format!(
             r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"close_workspace","arguments":{{"workspace":"{h2}"}}}}}}"#
         );
         let r = call(&req, &mut store, &ctx);
         assert_eq!(r["result"]["isError"], false, "{}", text_of(&r));
-        assert_eq!(r["result"]["structuredContent"], json!({}));
+        assert!(r["result"].get("structuredContent").is_none());
 
         let help = call(
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"help","arguments":{}}}"#,
@@ -1070,17 +1076,14 @@ mod tests {
             &mut store,
             &http,
         );
-        let h = opened["result"]["structuredContent"]["workspace"]
-            .as_str()
-            .expect("handle reported")
-            .to_string();
+        let h = handle_of(&opened);
         let body = format!(r#""name":"view","arguments":{{"session":"nope","workspace":"{h}"}}"#);
         let r = call(&modern(5, "tools/call", &body), &mut store, &http);
         assert_eq!(r["result"]["isError"], true, "{}", text_of(&r));
-        assert_eq!(
-            r["result"]["structuredContent"],
-            json!({ "workspace": h }),
-            "the handle, and nothing padded around it"
+        assert!(
+            r["result"].get("structuredContent").is_none(),
+            "a prose tool carries no structured value: {}",
+            r["result"]
         );
         assert!(
             text_of(&r).ends_with(&format!("workspace: {h}")),
@@ -1117,19 +1120,11 @@ mod tests {
         let r = call(&modern(1, "tools/call", &body), &mut store, &ctx);
         assert_eq!(r["result"]["isError"], true, "{}", text_of(&r));
         assert_eq!(store.len(), 1, "the file it opened stays warm");
-        let h = r["result"]["structuredContent"]["workspace"]
-            .as_str()
-            .unwrap_or_else(|| panic!("handle reported: {}", r["result"]))
-            .to_string();
+        let h = handle_of(&r);
         assert_eq!(h.len(), 32);
         assert!(store.contains(&h), "and the reported handle reaches it");
-        // The handle is the only structured key: an error gets no `{}` padding.
-        let keys: Vec<&String> = r["result"]["structuredContent"]
-            .as_object()
-            .expect("an object")
-            .keys()
-            .collect();
-        assert_eq!(keys, ["workspace"]);
+        // A prose tool's error carries no structured value either.
+        assert!(r["result"].get("structuredContent").is_none());
         assert!(
             text_of(&r).ends_with(&format!("workspace: {h}")),
             "{}",
@@ -1471,10 +1466,7 @@ mod tests {
             &mut store,
             &http,
         );
-        let h = r["result"]["structuredContent"]["workspace"]
-            .as_str()
-            .expect("handle reported")
-            .to_string();
+        let h = handle_of(&r);
         assert_eq!(h.len(), 32);
         assert!(
             text_of(&r).ends_with(&format!("workspace: {h}")),
@@ -1505,8 +1497,8 @@ mod tests {
             &mut store,
             &stdio,
         );
-        // The schema-mandated `{}` is there, but no handle is merged into it.
-        assert_eq!(s["result"]["structuredContent"], json!({}));
+        // No structured value, and no handle line either.
+        assert!(s["result"].get("structuredContent").is_none());
         assert!(!text_of(&s).contains("workspace:"));
     }
 

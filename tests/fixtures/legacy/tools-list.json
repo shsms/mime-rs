@@ -36,15 +36,7 @@
           ],
           "type": "object"
         },
-        "name": "open_file",
-        "outputSchema": {
-          "properties": {
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
+        "name": "open_file"
       },
       {
         "annotations": {
@@ -82,15 +74,7 @@
           ],
           "type": "object"
         },
-        "name": "open_text",
-        "outputSchema": {
-          "properties": {
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
+        "name": "open_text"
       },
       {
         "annotations": {
@@ -386,15 +370,7 @@
           "required": [],
           "type": "object"
         },
-        "name": "read_region",
-        "outputSchema": {
-          "properties": {
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
+        "name": "read_region"
       },
       {
         "annotations": {
@@ -430,15 +406,7 @@
           "required": [],
           "type": "object"
         },
-        "name": "view",
-        "outputSchema": {
-          "properties": {
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
+        "name": "view"
       },
       {
         "annotations": {
@@ -556,15 +524,7 @@
           ],
           "type": "object"
         },
-        "name": "insert_text",
-        "outputSchema": {
-          "properties": {
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
+        "name": "insert_text"
       },
       {
         "annotations": {
@@ -695,15 +655,7 @@
           "required": [],
           "type": "object"
         },
-        "name": "replace_text",
-        "outputSchema": {
-          "properties": {
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
+        "name": "replace_text"
       },
       {
         "annotations": {
@@ -797,15 +749,7 @@
           ],
           "type": "object"
         },
-        "name": "replace_in_files",
-        "outputSchema": {
-          "properties": {
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
+        "name": "replace_in_files"
       },
       {
         "annotations": {
@@ -868,15 +812,7 @@
           ],
           "type": "object"
         },
-        "name": "occur",
-        "outputSchema": {
-          "properties": {
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
+        "name": "occur"
       },
       {
         "annotations": {
@@ -1060,15 +996,7 @@
           "required": [],
           "type": "object"
         },
-        "name": "conflicts",
-        "outputSchema": {
-          "properties": {
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
+        "name": "conflicts"
       },
       {
         "annotations": {
@@ -1100,15 +1028,7 @@
           "required": [],
           "type": "object"
         },
-        "name": "checkpoint",
-        "outputSchema": {
-          "properties": {
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
+        "name": "checkpoint"
       },
       {
         "annotations": {
@@ -1136,15 +1056,7 @@
           "required": [],
           "type": "object"
         },
-        "name": "undo_last",
-        "outputSchema": {
-          "properties": {
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
+        "name": "undo_last"
       },
       {
         "annotations": {
@@ -1178,15 +1090,7 @@
           ],
           "type": "object"
         },
-        "name": "restore_checkpoint",
-        "outputSchema": {
-          "properties": {
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
+        "name": "restore_checkpoint"
       },
       {
         "annotations": {
@@ -1218,15 +1122,7 @@
           "required": [],
           "type": "object"
         },
-        "name": "save_buffer",
-        "outputSchema": {
-          "properties": {
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
+        "name": "save_buffer"
       },
       {
         "annotations": {
@@ -1276,15 +1172,7 @@
           "required": [],
           "type": "object"
         },
-        "name": "close_session",
-        "outputSchema": {
-          "properties": {
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
+        "name": "close_session"
       },
       {
         "annotations": {
@@ -1345,15 +1233,7 @@
           "required": [],
           "type": "object"
         },
-        "name": "unsaved_diff",
-        "outputSchema": {
-          "properties": {
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
+        "name": "unsaved_diff"
       },
       {
         "annotations": {
@@ -1476,15 +1356,7 @@
           ],
           "type": "object"
         },
-        "name": "close_workspace",
-        "outputSchema": {
-          "properties": {
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
+        "name": "close_workspace"
       },
       {
         "annotations": {
@@ -1902,7 +1774,7 @@
         "inputSchema": {
           "properties": {
             "range": {
-              "description": "A revision range like main..HEAD; omit for HEAD's history.",
+              "description": "A revision range like main..HEAD, or a bare rev like a branch name for its whole history; omit for HEAD's history.",
               "type": "string"
             },
             "repo": {
@@ -2311,7 +2183,7 @@
           "openWorldHint": false,
           "readOnlyHint": false
         },
-        "description": "Apply one message_edits vocabulary to EVERY commit of `range` (which must end at HEAD) — the bulk trailer strip/add, or the s/old-symbol/new/ sweep after a rename. A sparse rewrite touching only messages: each commit is re-created with its OWN tree (byte-identical by construction, nothing can conflict) and re-parented; an untouched prefix keeps its identical oids. The report carries per-commit replacement counts, so zero application in one commit is visible; a `find` matching NOWHERE in the range is an error and nothing changes. rehearse:true previews the counts. For one commit's message use git_reword.",
+        "description": "Apply one message_edits vocabulary to EVERY commit of `range` (which must end at HEAD) — the bulk trailer strip/add, or the s/old-symbol/new/ sweep after a rename. A sparse rewrite touching only messages: each commit is re-created with its OWN tree (byte-identical by construction, nothing can conflict) and re-parented; an untouched prefix keeps its identical oids. Other branches/tags left on the old history — at a rewritten commit or ahead of one — are named in the report, in a rehearsal too. The report carries per-commit replacement counts, so zero application in one commit is visible; a `find` matching NOWHERE in the range is an error and nothing changes. rehearse:true previews the counts. For one commit's message use git_reword.",
         "inputSchema": {
           "properties": {
             "message_edits": {
@@ -2336,7 +2208,7 @@
               "type": "array"
             },
             "range": {
-              "description": "Revision range whose commit messages to rewrite, e.g. main..HEAD; must end at HEAD.",
+              "description": "Revision range whose commit messages to rewrite, e.g. main..HEAD, or a bare rev like HEAD to cover every commit from the root; must end at HEAD, and the history it covers must be linear (a merge is refused).",
               "type": "string"
             },
             "rehearse": {
@@ -2372,7 +2244,7 @@
               "type": "string"
             },
             "range": {
-              "description": "Revision range whose commits to visit, e.g. main..HEAD.",
+              "description": "Revision range whose commits to visit, e.g. main..HEAD, or a bare HEAD for the whole history from the root (a bare rev must resolve to HEAD).",
               "type": "string"
             },
             "repo": {

@@ -157,17 +157,17 @@ unguessable handle. On stdio there is one implicit workspace and you never
 see the handle. On HTTP a legacy client's `Mcp-Session-Id` *is* its
 workspace; a `2026-07-28` client that omits `workspace` runs in a fresh
 workspace that is kept only if the call created warm state; the result then
-reports the handle (`structuredContent.workspace`, embedded in a JSON tool's
-text or appended as a trailing `workspace:` line for a prose one) and the
-client passes it to later calls. `open_workspace` / `close_workspace` manage
-them explicitly.
+reports the handle (in `structuredContent` for a tool that returns one, and
+as a trailing `workspace:` line of any prose text) and the client passes it
+to later calls. `open_workspace` / `close_workspace` manage them explicitly.
 
-Every tool that takes `workspace` declares an `outputSchema`; a successful call
-returns `structuredContent` (at least `{}`), while a tool error carries it only
-when the tool supplies one. `session_status`, `run_program`, `rehearse`, `grep`
-and `outline` carry real data in it, and `session_status` shows the handle
-only on that protocol (`null` elsewhere, and when the call holds no
-workspace).
+Only the tools that return a structured value of their own —
+`session_status`, `run_program`, `rehearse`, `grep`, `outline` and
+`open_workspace` — declare an `outputSchema`; a tool error carries
+`structuredContent` only when the tool supplies one. The text-only tools
+carry none, since Claude Code renders a structured value in preference to the
+text. `session_status` shows the handle only on that protocol (`null`
+elsewhere, and when the call holds no workspace).
 
 Each tool takes a `path` and auto-opens the file into a warm session keyed by its
 canonical path; mutating tools take `save: true` for an atomic, stale-guarded
