@@ -81,6 +81,7 @@ Conflicts: conflict-keep conflict-keep-all conflict-replace conflict-resolve-tri
 Atomicity/observe: with-transaction checkpoint report message window
 Strings: replace-regexp-in-string split-string string-trim string-replace
   string-join number-to-string string-prefix-p
+Core (subr): push identity delete-dups
 
 Gotchas: only the FINAL form's value is returned — wrap earlier results in
 (report "label" …). @N/point are absolute (goto-char); line numbers are

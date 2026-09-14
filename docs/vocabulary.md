@@ -24,3 +24,4 @@ recipes (`help {topic: "recipes"}`).
 | Observability | `report` `message` `window` `occur` `buffer-file-name` `buffer-stale-p` `revert-buffer` `float-time` `buffer-file-coding-system` `set-buffer-file-coding-system` |
 | Orchestration (trusted tier only) | `find-file` `find-file-noselect` `insert-file-contents` `write-file` `write-region` `directory-files` `generate-new-buffer` `set-buffer` `with-current-buffer` `current-buffer` `buffer-name` `buffer-list` `get-buffer` `kill-buffer` `arg` `args` |
 | String library | `replace-regexp-in-string` `substring` `split-string` `string-trim`(`-left`/`-right`) `string-prefix-p` `string-suffix-p` `string-search` `string-replace` `string-join` `string-empty-p` `number-to-string` `string-to-number` `upcase` `downcase` `capitalize` `char-to-string` `string-to-char` |
+| Core (subr) | `push` `identity` `delete-dups` (Emacs `subr.el` helpers tulisp lacks) |

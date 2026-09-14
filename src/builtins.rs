@@ -5548,17 +5548,18 @@ mod tests {
     fn vocabulary_doc_lists_every_registered_builtin() {
         // docs/vocabulary.md is hand-written (make docs regenerates only
         // mcp-tools.md), so it drifts silently — this is the drift guard, in
-        // the same spirit as meta_covers_every_tool: every `defun`/`defspecial`
-        // registered in the builtin sources must appear in the doc as a
+        // the same spirit as meta_covers_every_tool: every `defun`/`defspecial`/
+        // `defmacro` registered in the builtin sources must appear in the doc as a
         // `name` code token (compound tokens like `string-trim`(`-left`) count
         // via substring).
         let doc = include_str!("../docs/vocabulary.md");
         let sources = [
             include_str!("builtins.rs"),
             include_str!("strings.rs"),
+            include_str!("subr.rs"),
             include_str!("syntax.rs"),
         ];
-        let re = regex::Regex::new(r#"def(?:un|special)\(\s*"([^"]+)""#).unwrap();
+        let re = regex::Regex::new(r#"def(?:un|special|macro)\(\s*"([^"]+)""#).unwrap();
         let mut missing: Vec<&str> = Vec::new();
         for src in sources {
             // Only the non-test half registers real builtins.
@@ -5583,6 +5584,23 @@ mod tests {
             missing.is_empty(),
             "builtins registered but absent from docs/vocabulary.md: {missing:?}"
         );
+    }
+
+    #[test]
+    fn subr_helpers_are_registered_in_the_sandboxed_tier() {
+        // The module's own tests build a bare context; this pins the engine
+        // wiring, so dropping `subr::register` from the workspace fails here.
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("b", "x")));
+        let r = ws
+            .run(
+                r#"(let ((l (list 3 1 3)))
+                     (push 2 l)
+                     (report "dups" (delete-dups l))
+                     (report "id" (identity "same")))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "dups"), "(2 3 1)");
+        assert_eq!(report(&r, "id"), "\"same\"");
     }
 
     #[test]

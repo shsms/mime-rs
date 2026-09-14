@@ -330,6 +330,7 @@ impl Workspace {
         let mut ctx = TulispContext::new();
         crate::builtins::register(&mut ctx, &session);
         crate::strings::register(&mut ctx);
+        crate::subr::register(&mut ctx);
         // The trusted tier additionally gets the orchestration group; the
         // sandboxed agent-facing tier never registers it.
         if capabilities == Capabilities::Trusted {

@@ -29,6 +29,7 @@ pub mod sequencer;
 pub mod sexp;
 pub mod store;
 pub mod strings;
+pub mod subr;
 pub mod syntax;
 #[cfg(feature = "tui")]
 pub mod tui;
