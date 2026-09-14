@@ -158,6 +158,9 @@ pub struct FileStamp {
     dev: u64,
     ino: u64,
     size: u64,
+    /// Whether the file existed when stamped. An absent stamp — a new file
+    /// visited before its first save — drifts when the path APPEARS.
+    exists: bool,
 }
 
 impl FileStamp {
@@ -172,7 +175,22 @@ impl FileStamp {
             dev: meta.dev(),
             ino: meta.ino(),
             size: meta.len(),
+            exists: true,
         })
+    }
+
+    /// The stamp of a path that does NOT exist yet — a new file, visited
+    /// before its first save. Its drift is the file appearing: another writer
+    /// created it, and saving over that would discard their work.
+    pub fn absent(path: &Path) -> FileStamp {
+        FileStamp {
+            path: path.to_path_buf(),
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            dev: 0,
+            ino: 0,
+            size: 0,
+            exists: false,
+        }
     }
 
     /// `None` while the file on disk still matches this stamp; otherwise a
@@ -181,9 +199,10 @@ impl FileStamp {
     pub fn check(&self) -> Option<String> {
         use std::os::unix::fs::MetadataExt;
         let meta = match std::fs::metadata(&self.path) {
+            Ok(_) if !self.exists => return Some("created on disk".to_string()),
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Some("deleted on disk".to_string());
+                return self.exists.then(|| "deleted on disk".to_string());
             }
             Err(e) => return Some(format!("metadata unreadable: {e}")),
         };
@@ -314,6 +333,18 @@ mod tests {
 
         let resolved = check_path(&file).expect("file under root is allowed");
         assert_eq!(resolved, file.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn an_absent_stamp_passes_until_the_file_appears() {
+        let root = temp_root();
+        let file = root.join("new.txt");
+        let stamp = FileStamp::absent(&file);
+        assert_eq!(stamp.check(), None, "still absent: no drift");
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(stamp.check().as_deref(), Some("created on disk"));
+        // Once captured, the stamp tracks the real file.
+        assert_eq!(FileStamp::capture(&file).unwrap().check(), None);
     }
 
     #[test]

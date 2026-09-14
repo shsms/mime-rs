@@ -978,10 +978,7 @@ impl Quire {
                 "Quire::open: file is not valid UTF-8",
             ));
         };
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let name = Quire::buffer_name_of(path);
         // A non-plain file keeps its raw BOM/CRLF bytes on the paged backing (no
         // materialization, so large-file support is preserved); the char/byte
         // scan primitives present a normalized LF view (`strips_crlf`) and the BOM
@@ -1009,6 +1006,24 @@ impl Quire {
     /// [`crate::buffer::Buffer::from_string`] so tests need no file on disk.
     pub fn from_string(name: impl Into<String>, text: impl Into<String>) -> Quire {
         Quire::with_original(name.into(), Original::Owned(text.into()))
+    }
+
+    /// The buffer name a visited `path` gets: its file name, or the whole
+    /// path when it has none.
+    fn buffer_name_of(path: &Path) -> String {
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned())
+    }
+
+    /// An empty buffer VISITING `path`, which does not exist yet: the file is
+    /// created by the first save. The stamp records the absence, so the stale
+    /// guard passes while the path stays absent and refuses if another writer
+    /// creates it first.
+    pub fn new_file(path: &Path) -> Quire {
+        let mut quire = Quire::from_string(Quire::buffer_name_of(path), "");
+        quire.stamp = Some(crate::safety::FileStamp::absent(path));
+        quire
     }
 
     fn with_original(name: String, original: Original) -> Quire {
