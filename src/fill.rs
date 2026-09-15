@@ -1,6 +1,8 @@
 //! Paragraph filling: the pure text reflow behind `fill-paragraph` /
 //! `fill-region` and the `fill_text` tool.
 
+use crate::syntax::{ProseKind, SexpRule};
+
 /// Layout knobs for one fill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fill {
@@ -626,6 +628,134 @@ fn with_crlf(text: String, crlf: bool) -> String {
     }
 }
 
+/// The shared leading whitespace of the non-blank `lines`.
+fn common_indent<'a>(lines: &[&'a str]) -> &'a str {
+    let mut it = lines.iter().filter(|l| !l.trim().is_empty());
+    let Some(first) = it.next() else {
+        return "";
+    };
+    it.fold(split_indent(first).0, |acc, l| {
+        common_prefix(acc, split_indent(l).0)
+    })
+}
+
+/// Where a unit's closer (`*/`, `-->`, `"""`) sits, so it can be put back
+/// after the fill.
+enum Closer<'a> {
+    /// On its own line, copied through as it stands.
+    Line(&'a str),
+    /// At the end of the last text line, after `sep` (its whitespace).
+    Inline { sep: &'a str, closer: &'a str },
+}
+
+/// Refill a prose unit of `kind` — the whole-line text
+/// [`crate::syntax::Syntax::prose_unit_at`] found — framing it by what it
+/// is: a comment run by its adaptive marker, a block comment or docstring
+/// by its opener on the first line and the margin its later lines share,
+/// with the closer kept where it was; a Markdown paragraph has no frame.
+pub fn fill_prose(
+    text: &str,
+    kind: ProseKind,
+    rule: &SexpRule,
+    only_line: Option<usize>,
+    opts: &Fill,
+) -> Result<String, String> {
+    let (text, crlf) = lf_only(text);
+    fill_prose_lf(&text, kind, rule, only_line, opts).map(|out| with_crlf(out, crlf))
+}
+
+/// [`fill_prose`] on text whose line ends are `\n`.
+fn fill_prose_lf(
+    text: &str,
+    kind: ProseKind,
+    rule: &SexpRule,
+    only_line: Option<usize>,
+    opts: &Fill,
+) -> Result<String, String> {
+    match kind {
+        ProseKind::Paragraph => return fill_unit_lf(text, &Frame::default(), only_line, opts),
+        ProseKind::LineComments => {
+            let frame = Frame::uniform(&detect_frame(text, rule.line_comments));
+            return fill_unit_lf(text, &frame, only_line, opts);
+        }
+        ProseKind::BlockComment | ProseKind::TripleString => {}
+    }
+    let had_nl = text.ends_with('\n');
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let mut lines: Vec<&str> = body.split('\n').collect();
+    let (indent, after) = split_indent(lines[0]);
+    let (opener, closer) = if kind == ProseKind::BlockComment {
+        rule.block_comments
+            .iter()
+            .find(|(o, _)| after.starts_with(o))
+            .map(|(o, c)| (*o, *c))
+            .ok_or_else(|| "not a block comment".to_string())?
+    } else {
+        // `r"""` / `b'''`: the string prefix letters lead the quotes.
+        let k = after.chars().take_while(char::is_ascii_alphabetic).count();
+        match after.get(k..k + 3) {
+            Some(q @ ("\"\"\"" | "'''")) => (&after[..k + 3], q),
+            _ => return Err("not a triple-quoted string".to_string()),
+        }
+    };
+    let ws = &after[opener.len()..];
+    let ws = &ws[..ws.len() - ws.trim_start_matches([' ', '\t']).len()];
+    let first = format!("{indent}{opener}{ws}");
+    // Detach the closer: alone on the last line it is copied through;
+    // ending the last text line it goes back after the fill.
+    let last = *lines.last().expect("split yields one line");
+    let closer_at = if lines.len() > 1 && last.trim() == closer {
+        lines.pop();
+        Some(Closer::Line(last))
+    } else if let Some(stripped) = last.trim_end().strip_suffix(closer) {
+        let kept = stripped.trim_end();
+        let n = lines.len() - 1;
+        lines[n] = kept;
+        Some(Closer::Inline {
+            sep: &stripped[kept.len()..],
+            closer,
+        })
+    } else {
+        None
+    };
+    let rest = if lines.len() > 1 {
+        let tail = lines[1..].join("\n");
+        let margin = if kind == ProseKind::BlockComment {
+            detect_frame(&tail, &["*"])
+        } else {
+            String::new()
+        };
+        if margin.is_empty() {
+            common_indent(&lines[1..]).to_string()
+        } else {
+            margin
+        }
+    } else if kind == ProseKind::BlockComment {
+        spaces_as_wide_as(&first)
+    } else {
+        indent.to_string()
+    };
+    // A line on the detached closer fills the paragraph before it.
+    let only_line = only_line.map(|l| l.min(lines.len() - 1));
+    let frame = Frame::new(&first, &rest);
+    let mut out = fill_unit_lf(&lines.join("\n"), &frame, only_line, opts)?;
+    match closer_at {
+        Some(Closer::Line(l)) => {
+            out.push('\n');
+            out.push_str(l);
+        }
+        Some(Closer::Inline { sep, closer }) => {
+            out.push_str(sep);
+            out.push_str(closer);
+        }
+        None => {}
+    }
+    if had_nl {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,6 +1051,16 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_line_in_a_tab_indented_frame_is_empty() {
+        let text = "\t\t\"\"\"aa\n\n\t\tbb\n\t\t\"\"\"\n";
+        assert_eq!(
+            prose(text, ProseKind::TripleString, Lang::Python, None, 80),
+            text
+        );
+        assert_eq!(unit("aa\n\nbb\n", "\t", "\t", None, 80), "\taa\n\n\tbb\n");
+    }
+
+    #[test]
     fn a_blank_line_outside_the_filled_block_keeps_its_ending() {
         assert_eq!(
             unit("aa\nbb\n\r\ncc\r\ndd\n", "", "", Some(0), 80),
@@ -1057,5 +1197,117 @@ mod tests {
     #[test]
     fn a_marker_with_no_space_after_it_stays_bare() {
         assert_eq!(detect_frame("//a\n//b\n", &["//"]), "//");
+    }
+
+    // ---- fill_prose: framing by unit kind ----
+
+    use crate::syntax::{Lang, ProseKind};
+
+    fn prose(
+        text: &str,
+        kind: ProseKind,
+        lang: Lang,
+        only: Option<usize>,
+        column: usize,
+    ) -> String {
+        fill_prose(text, kind, lang.sexp_rule(), only, &opts(column)).unwrap()
+    }
+
+    #[test]
+    fn a_doc_comment_run_keeps_its_marker_and_indent() {
+        let out = prose(
+            "    /// aaa bbb\n    /// ccc\n",
+            ProseKind::LineComments,
+            Lang::Rust,
+            None,
+            80,
+        );
+        assert_eq!(out, "    /// aaa bbb ccc\n");
+    }
+
+    #[test]
+    fn only_line_in_a_comment_run_fills_one_paragraph() {
+        let text = "// aaa\n// bbb\n//\n// ccc\n// ddd\n";
+        let out = prose(text, ProseKind::LineComments, Lang::Rust, Some(4), 80);
+        assert_eq!(out, "// aaa\n// bbb\n//\n// ccc ddd\n");
+    }
+
+    #[test]
+    fn a_docstring_keeps_its_closing_quotes_on_the_text() {
+        let text = "    \"\"\"Summary that\n    wraps here.\"\"\"\n";
+        let out = prose(text, ProseKind::TripleString, Lang::Python, None, 80);
+        assert_eq!(out, "    \"\"\"Summary that wraps here.\"\"\"\n");
+    }
+
+    #[test]
+    fn a_docstring_closer_on_its_own_line_stays_there() {
+        let text = "    \"\"\"Doc\n    more\n    \"\"\"\n";
+        let out = prose(text, ProseKind::TripleString, Lang::Python, None, 80);
+        assert_eq!(out, "    \"\"\"Doc more\n    \"\"\"\n");
+    }
+
+    #[test]
+    fn a_docstring_opener_on_its_own_line_stays_there() {
+        let text = "    \"\"\"\n    aaa\n    bbb\n    \"\"\"\n";
+        let out = prose(text, ProseKind::TripleString, Lang::Python, None, 80);
+        assert_eq!(out, "    \"\"\"\n    aaa bbb\n    \"\"\"\n");
+    }
+
+    #[test]
+    fn a_block_comment_keeps_its_star_margin_and_closer() {
+        let text = "  /* aaa\n   * bbb\n   */\n";
+        let out = prose(text, ProseKind::BlockComment, Lang::Rust, None, 80);
+        assert_eq!(out, "  /* aaa bbb\n   */\n");
+        let out = prose(
+            "  /* aaa bbb ccc\n   * ddd\n   */\n",
+            ProseKind::BlockComment,
+            Lang::Rust,
+            None,
+            12,
+        );
+        assert_eq!(out, "  /* aaa bbb\n   * ccc ddd\n   */\n");
+    }
+
+    #[test]
+    fn a_one_line_block_comment_wraps_under_its_text() {
+        let out = prose(
+            "/* aaa bbb */\n",
+            ProseKind::BlockComment,
+            Lang::Go,
+            None,
+            8,
+        );
+        assert_eq!(out, "/* aaa\n   bbb */\n");
+    }
+
+    #[test]
+    fn an_html_comment_is_a_block_comment() {
+        let out = prose(
+            "<!-- aaa\n     bbb -->\n",
+            ProseKind::BlockComment,
+            Lang::Html,
+            None,
+            80,
+        );
+        assert_eq!(out, "<!-- aaa bbb -->\n");
+    }
+
+    #[test]
+    fn a_crlf_docstring_keeps_its_line_ends() {
+        let text = "    \"\"\"Summary that\r\n    wraps.\"\"\"\r\n";
+        let out = prose(text, ProseKind::TripleString, Lang::Python, None, 80);
+        assert_eq!(out, "    \"\"\"Summary that wraps.\"\"\"\r\n");
+    }
+
+    #[test]
+    fn a_markdown_paragraph_has_no_frame() {
+        let out = prose(
+            "- aaa\n  bbb\n",
+            ProseKind::Paragraph,
+            Lang::Markdown,
+            None,
+            80,
+        );
+        assert_eq!(out, "- aaa bbb\n");
     }
 }
