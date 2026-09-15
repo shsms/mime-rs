@@ -604,7 +604,7 @@ fn read_region_resolves_a_thing_by_position_or_anchor_line() {
 
     // Errors name the problem.
     let err = s.call_err(
-        8,
+        7,
         "read_region",
         json!({ "thing": { "kind": "string", "at": 30 } }),
     );
@@ -2770,4 +2770,147 @@ fn normalise(v: &mut Value) {
             v["result"]["structuredContent"]["workspace"] = json!("<handle>");
         }
     }
+}
+
+/// `fill_text` reflows the prose unit an anchor, a position, a line range
+/// or `all` names, to `column`, and refuses code by naming it.
+#[test]
+fn fill_text_reflows_comments_and_paragraphs_and_refuses_code() {
+    let dir = temp_dir("fill-text");
+    let rs = dir.join("lib.rs");
+    std::fs::write(
+        &rs,
+        "/// aaa bbb\n/// ccc\nfn f() {\n    // ddd\n    // eee\n}\n",
+    )
+    .unwrap();
+    let md = dir.join("README.md");
+    std::fs::write(
+        &md,
+        "aaa bbb ccc ddd\n\n- eee fff ggg\n\n```\ncode  here\n```\n",
+    )
+    .unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let rs_p = rs.to_string_lossy().into_owned();
+    let md_p = md.to_string_lossy().into_owned();
+
+    // The anchor form: the unique line containing the text picks the unit.
+    let out = s.call_ok(
+        1,
+        "fill_text",
+        json!({ "path": rs_p, "anchor": { "pattern": "/// aaa" } }),
+    );
+    assert!(out.contains("filled comment @1-17 (lines 1-1)"), "{out}");
+    let txt = s.call_ok(2, "read_region", json!({ "path": rs_p, "lines": [1, 1] }));
+    assert_eq!(txt, "/// aaa bbb ccc");
+
+    // Code is refused, naming what the position is in.
+    let err = s.call_err(3, "fill_text", json!({ "path": rs_p, "pos": 20 }));
+    assert!(err.contains("function_item"), "{err}");
+
+    // A line range fills every unit it touches and leaves the code alone.
+    let out = s.call_ok(
+        4,
+        "fill_text",
+        json!({ "path": rs_p, "lines": [3, 5], "column": 20 }),
+    );
+    assert!(out.contains("filled 1 of 1"), "{out}");
+    let txt = s.call_ok(5, "read_region", json!({ "path": rs_p, "lines": [2, 4] }));
+    assert_eq!(txt, "fn f() {\n    // ddd eee\n}");
+
+    // `all` over a Markdown file, saved: fences survive, paragraphs wrap.
+    let out = s.call_ok(
+        6,
+        "fill_text",
+        json!({ "path": md_p, "all": true, "column": 9, "save": true }),
+    );
+    assert!(out.contains("filled 2 of 2"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(&md).unwrap(),
+        "aaa bbb\nccc ddd\n\n- eee fff\n  ggg\n\n```\ncode  here\n```\n"
+    );
+
+    // An explicit prefix overrides detection: no grammar calls `;;` a
+    // comment marker in a text file, and the prefix bounds the paragraph
+    // by the lines that carry it.
+    let txt_f = dir.join("notes.txt");
+    std::fs::write(&txt_f, ";; aaa\n;; bbb\nplain\n").unwrap();
+    let txt_p = txt_f.to_string_lossy().into_owned();
+    let out = s.call_ok(
+        7,
+        "fill_text",
+        json!({ "path": txt_p, "pos": 1, "prefix": ";; " }),
+    );
+    assert!(out.contains("filled paragraph @1-12"), "{out}");
+    let txt = s.call_ok(8, "read_region", json!({ "path": txt_p, "lines": [1, 2] }));
+    assert_eq!(txt, ";; aaa bbb\nplain");
+
+    // Two target forms at once is an error, not a guess.
+    let err = s.call_err(
+        9,
+        "fill_text",
+        json!({ "path": md_p, "pos": 1, "all": true }),
+    );
+    assert!(err.contains("one of"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Non-ASCII text through every target form, and `prefix` over a region.
+#[test]
+fn fill_text_survives_non_ascii_and_fills_prefixed_regions() {
+    let dir = temp_dir("fill-text-utf8");
+    let rs = dir.join("lib.rs");
+    std::fs::write(&rs, "// café au\n// lait\nfn f() {}\n").unwrap();
+    let txt = dir.join("notes.txt");
+    std::fs::write(&txt, ";; aaa bbb\n;; ccc\nplain\n;; ddd\n;; eee\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let rs_p = rs.to_string_lossy().into_owned();
+    let txt_p = txt.to_string_lossy().into_owned();
+
+    // A range ending after a multi-byte char must not take the server down.
+    let out = s.call_ok(1, "fill_text", json!({ "path": rs_p, "lines": [1, 1] }));
+    assert!(out.contains("filled 1 of 1"), "{out}");
+    let txt_out = s.call_ok(2, "read_region", json!({ "path": rs_p, "lines": [1, 1] }));
+    assert_eq!(txt_out, "// café au lait");
+
+    let out = s.call_ok(
+        3,
+        "fill_text",
+        json!({ "path": txt_p, "all": true, "prefix": ";; " }),
+    );
+    assert!(out.contains("filled 2 of 2"), "{out}");
+    let txt_out = s.call_ok(4, "read_region", json!({ "path": txt_p, "lines": [1, 3] }));
+    assert_eq!(txt_out, ";; aaa bbb ccc\nplain\n;; ddd eee");
+
+    // `all` must be a boolean: a string is an error, not a silent point fill.
+    let err = s.call_err(5, "fill_text", json!({ "path": txt_p, "all": "yes" }));
+    assert!(err.contains("must be a boolean"), "{err}");
+
+    // An error that merely mentions an anchor sentinel is not an anchor
+    // error when the call had no anchor.
+    let err = s.call_err(
+        6,
+        "fill_text",
+        json!({ "path": txt_p, "pos": 1, "prefix": "__no_anchor__ " }),
+    );
+    assert!(err.contains("does not carry the fill-prefix"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `read_region` names the start/end-vs-lines clash before a bad `lines`.
+#[test]
+fn read_region_reports_the_argument_clash_before_a_bad_line_range() {
+    let mut s = Server::spawn();
+    s.call_ok(
+        1,
+        "open_text",
+        json!({ "text": "aaa\nbbb\n", "session": "r" }),
+    );
+    let err = s.call_err(
+        2,
+        "read_region",
+        json!({ "session": "r", "lines": "2-4", "start": 1 }),
+    );
+    assert!(err.contains("not both"), "{err}");
+    let err = s.call_err(3, "read_region", json!({ "session": "r", "lines": "2-4" }));
+    assert!(err.contains("must be [start, end]"), "{err}");
 }

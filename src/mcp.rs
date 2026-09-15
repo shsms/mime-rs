@@ -157,6 +157,7 @@ pub(crate) fn tools_call_result(
         "insert_text" => tool_insert_text(&args, sessions).map(Into::into),
         "replace_text" => tool_replace_text(&args, sessions).map(Into::into),
         "replace_in_files" => tool_replace_files(&args, sessions).map(Into::into),
+        "fill_text" => tool_fill_text(&args, sessions).map(Into::into),
         "occur" => tool_occur(&args, sessions).map(Into::into),
         "conflicts" => tool_conflicts(&args, sessions).map(Into::into),
         "checkpoint" => tool_checkpoint(&args, sessions).map(Into::into),
@@ -192,6 +193,13 @@ fn alias_table(tool: &str) -> &'static [(&'static str, &'static str)] {
             ("replace", "replacement"),
         ],
         "insert_text" => &[("location", "pos"), ("position", "pos"), ("at", "pos")],
+        "fill_text" => &[
+            ("fill_column", "column"),
+            ("width", "column"),
+            ("fill_prefix", "prefix"),
+            ("position", "pos"),
+            ("at", "pos"),
+        ],
         "read_region" => &[("from", "start"), ("to", "end")],
         "git_rebase" => &[("upstream", "from"), ("path", "repo")],
         // `path` names a FILE in git_blame, and git_commit's explicit `paths`
@@ -1429,6 +1437,188 @@ fn tool_insert_text(
         "inserted {chars} chars{placed}; point is now {point}{saved}{unsaved}{stale}{view}{diff}"
     ))
 }
+
+/// `fill_text {path|session, pos? | anchor? | lines? | all?, column?, prefix?,
+/// save?, diff?, view?}` — the one-call form of `fill-paragraph` /
+/// `fill-region`: reflow the comment run, docstring or Markdown paragraph
+/// at a position (point, `pos`, or the unique line an `anchor` pattern
+/// names) or every one a line range or the whole buffer touches, to
+/// `column` (default `fill-column`, 80). Code is never reflowed: a
+/// position in code is an error naming the node. `prefix` sets
+/// `fill-prefix` for the call.
+fn tool_fill_text(
+    args: &Value,
+    sessions: &mut HashMap<String, Workspace>,
+) -> Result<String, String> {
+    let session = resolve_session(args, sessions)?;
+    let target = fill_target(args)?;
+    let mut bindings = String::new();
+    if let Some(v) = args.get("column") {
+        match v.as_i64() {
+            Some(n) if n >= 1 => bindings.push_str(&format!("(fill-column {n}) ")),
+            _ => {
+                return Err(format!(
+                    "fill_text: `column` must be a positive integer, got {v}"
+                ));
+            }
+        }
+    }
+    if let Some(v) = args.get("prefix") {
+        match v.as_str() {
+            Some(p) if !p.is_empty() => {
+                bindings.push_str(&format!("(fill-prefix \"{}\") ", lisp_literal(p)));
+            }
+            _ => {
+                return Err(format!(
+                    "fill_text: `prefix` must be a non-empty string, got {v}"
+                ));
+            }
+        }
+    }
+    let region_form = |bounds: &str| {
+        format!(
+            "(let ((r (fill-region {bounds}))) \
+               (report \"seen\" (car r)) (report \"changed\" (cdr r)))"
+        )
+    };
+    let body = match &target {
+        FillTarget::All => region_form("(point-min) (point-max)"),
+        FillTarget::Lines(a, b) => region_form(&format!(
+            "(save-excursion (goto-line {a}) (line-beginning-position)) \
+             (save-excursion (goto-line {b}) (line-end-position))"
+        )),
+        FillTarget::Anchor(_, find) => format!("(progn {find} {FILL_PARAGRAPH_FORM})"),
+        FillTarget::Pos(p) => format!("(progn (goto-char {p}) {FILL_PARAGRAPH_FORM})"),
+        FillTarget::Point => FILL_PARAGRAPH_FORM.to_string(),
+    };
+    let program = if bindings.is_empty() {
+        body
+    } else {
+        format!("(let ({bindings}) {body})")
+    };
+    let report = match run_in_session_expecting(sessions, &session, &program, None) {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(anchor_abort(
+                sessions,
+                &session,
+                target.anchor(),
+                "nothing was filled",
+                e,
+            ));
+        }
+    };
+    audit_tool(&session, &program, &report);
+    let summary = if matches!(target, FillTarget::All | FillTarget::Lines(..)) {
+        let seen = report_value(&report, "seen").unwrap_or_default();
+        let changed = report_value(&report, "changed").unwrap_or_default();
+        let what = if seen == "1" {
+            "paragraph"
+        } else {
+            "paragraphs"
+        };
+        if seen == "0" {
+            "no comment, docstring or paragraph in that range".to_string()
+        } else {
+            format!("filled {changed} of {seen} {what}")
+        }
+    } else {
+        // The kind reports as a printed lisp string, quotes included.
+        let kind = report_value(&report, "kind").unwrap_or_default();
+        let kind = kind.trim_matches('"');
+        let a = report_value(&report, "start").unwrap_or_default();
+        let b = report_value(&report, "end").unwrap_or_default();
+        let la = report_value(&report, "la").unwrap_or_default();
+        let lb = report_value(&report, "lb").unwrap_or_default();
+        if report.dirty {
+            format!("filled {kind} @{a}-{b} (lines {la}-{lb})")
+        } else {
+            format!("{kind} @{a}-{b} (lines {la}-{lb}) already fits")
+        }
+    };
+    let saved = if bool_arg(args, "save") {
+        save_visited(sessions, &session)?
+    } else {
+        String::new()
+    };
+    let unsaved = unsaved_note(sessions, &session);
+    let stale = stale_edit_note(sessions, &session);
+    let view = view_echo(args, sessions, &session);
+    let diff = diff_echo(args, &report.diff);
+    Ok(format!("{summary}{saved}{unsaved}{stale}{view}{diff}"))
+}
+
+/// What `fill_text` fills, parsed once from its target arguments.
+enum FillTarget {
+    /// The unit at point.
+    Point,
+    /// The unit at a char position.
+    Pos(i64),
+    /// The unit holding the unique line a pattern names: the pattern, and
+    /// the program that finds the line.
+    Anchor(String, String),
+    /// Every unit a 1-based inclusive line range touches.
+    Lines(i64, i64),
+    /// Every unit in the accessible region.
+    All,
+}
+
+impl FillTarget {
+    /// The anchor pattern, when the target is one.
+    fn anchor(&self) -> Option<&str> {
+        match self {
+            FillTarget::Anchor(pat, _) => Some(pat),
+            FillTarget::Point | FillTarget::Pos(_) | FillTarget::Lines(..) | FillTarget::All => {
+                None
+            }
+        }
+    }
+}
+
+/// The one target `fill_text`'s arguments name; two at once is an error,
+/// not a guess.
+fn fill_target(args: &Value) -> Result<FillTarget, String> {
+    let mut given = Vec::new();
+    let mut target = FillTarget::Point;
+    if let Some(v) = args.get("pos") {
+        given.push("pos");
+        target = FillTarget::Pos(
+            v.as_i64()
+                .ok_or("fill_text: `pos` must be a 1-based char position (an integer)")?,
+        );
+    }
+    if let Some(v) = args.get("anchor") {
+        given.push("anchor");
+        let pattern = v
+            .get("pattern")
+            .and_then(Value::as_str)
+            .ok_or("fill_text: anchor takes {\"pattern\": \"literal line text\"}")?;
+        let (pattern, find) = pattern_anchor(pattern, "(end-of-line)")?;
+        target = FillTarget::Anchor(pattern, find);
+    }
+    if let Some((a, b)) = line_range_arg(args, "fill_text")? {
+        given.push("lines");
+        target = FillTarget::Lines(a, b);
+    }
+    if strict_bool_arg(args, "all")? {
+        given.push("all");
+        target = FillTarget::All;
+    }
+    if given.len() > 1 {
+        return Err(format!(
+            "fill_text: pass one of pos / anchor / lines / all, not {}",
+            given.join(" + ")
+        ));
+    }
+    Ok(target)
+}
+
+/// `(fill-paragraph)` with its `(KIND START END)` result and the unit's
+/// line numbers reported, for the tool's summary line.
+const FILL_PARAGRAPH_FORM: &str = "(let* ((u (fill-paragraph)) (a (car (cdr u))) (b (car (cdr (cdr u))))) \
+       (report \"kind\" (car u)) (report \"start\" a) (report \"end\" b) \
+       (report \"la\" (line-number-at-pos a)) \
+       (report \"lb\" (line-number-at-pos (max a (- b 1)))))";
 
 /// The `lines: [start, end]` argument — 1-based inclusive line numbers,
 /// narrowing-relative — checked for shape and order; `None` when absent.
@@ -4395,6 +4585,11 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             A::append(),
             "apply one literal edit spec across many files, atomically",
         ),
+        "fill_text" => (
+            Editing,
+            A::append(),
+            "reflow a comment, docstring or paragraph to a column; code untouched",
+        ),
 
         "outline" => (
             Structural,
@@ -4796,6 +4991,28 @@ fn build_tool_schemas() -> Vec<Value> {
                     "diff": edit_diff,
                     "full_diff": full_diff,
                     "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?, mode?}, …] applied in order inside ONE transaction — all-or-nothing; a miss (or a failed uniqueness check) rolls everything back and names the failed edit.", "items": { "type": "object", "properties": { "pattern": { "type": "string" }, "replacement": { "type": "string" }, "all": { "type": "boolean" }, "expect_unique": { "type": "boolean" }, "mode": { "type": "string", "enum": ["exact", "regex"] } } } },
+                    "session": session,
+                    "path": path,
+                    "save": save,
+                },
+                "required": [],
+            },
+        }),
+        json!({
+            "name": "fill_text",
+            "description": "Reflow prose to a column — Emacs fill-paragraph as one call. The unit is the comment run, block comment, Python docstring or Markdown paragraph at a position (point by default; `pos`; or the unique line an `anchor` pattern names), found through the tree-sitter parse: the comment marker (`//`, `///`, `#`, ` * `), list hanging indents, block quotes, fenced code, headings and tables all survive, and CODE IS NEVER REFLOWED — a position in code errors naming the node, a comment or docstring that shares a line with code is skipped by a range fill and refused at a position, a Python string outside docstring position is data, and a file type mime has no grammar for is refused (an explicit `prefix` fills by the lines that carry it instead). `lines: [a, b]` or `all: true` instead fills every unit the range touches (every comment in a file, every paragraph of a README) and leaves the code between alone. Default column is 80; a sentence end the source marks with a line break or two spaces keeps two spaces. Edits the warm buffer; save:true persists.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pos": { "type": "integer", "description": "1-based char position inside the unit to fill (default: current point). One of pos / anchor / lines / all." },
+                    "anchor": { "type": "object", "description": "{\"pattern\": \"literal line text\"}: fill the unit holding the UNIQUE line containing that text — the natural form when you know the comment's words but not its position. An ambiguous pattern errors, listing the match lines.", "properties": { "pattern": { "type": "string" } } },
+                    "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based INCLUSIVE line numbers (narrowing-relative): fill every unit these lines touch." },
+                    "all": { "type": "boolean", "description": "Fill every unit in the accessible region — the whole-file pass after writing a README or a batch of doc comments." },
+                    "column": { "type": "integer", "description": "The last column a line may reach, prefix included (default: fill-column, 80)." },
+                    "prefix": { "type": "string", "description": "Explicit fill-prefix: the exact text every line of the paragraph starts with (e.g. \"// \"). Overrides the detected marker, and bounds the paragraph by the lines that carry it instead of by the parse — the way through when detection refuses." },
+                    "view": { "type": ["boolean", "integer"], "description": "Append a rendered viewport around point after the edit (true = 4 context lines, or a line count)." },
+                    "diff": edit_diff,
+                    "full_diff": full_diff,
                     "session": session,
                     "path": path,
                     "save": save,
