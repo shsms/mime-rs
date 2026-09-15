@@ -105,6 +105,24 @@ Replace the FIRST occurrence of a pattern (searching from the top of the accessi
 - `view` — Append a rendered viewport around point after the edit (true = 4 context lines, or a line count).
 - `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
+## fill_text
+
+Reflow prose to a column — Emacs fill-paragraph as one call. The unit is the comment run, block comment, Python docstring or Markdown paragraph at a position (point by default; `pos`; or the unique line an `anchor` pattern names), found through the tree-sitter parse: the comment marker (`//`, `///`, `#`, ` * `), list hanging indents, block quotes, fenced code, headings and tables all survive, and CODE IS NEVER REFLOWED — a position in code errors naming the node, a comment or docstring that shares a line with code is skipped by a range fill and refused at a position, a Python string outside docstring position is data, and a file type mime has no grammar for is refused (an explicit `prefix` fills by the lines that carry it instead). `lines: [a, b]` or `all: true` instead fills every unit the range touches (every comment in a file, every paragraph of a README) and leaves the code between alone. Default column is 80; a sentence end the source marks with a line break or two spaces keeps two spaces. Edits the warm buffer; save:true persists.
+
+- `all` — Fill every unit in the accessible region — the whole-file pass after writing a README or a batch of doc comments.
+- `anchor` — {"pattern": "literal line text"}: fill the unit holding the UNIQUE line containing that text — the natural form when you know the comment's words but not its position. An ambiguous pattern errors, listing the match lines.
+- `column` — The last column a line may reach, prefix included (default: fill-column, 80).
+- `diff` — Append the unified diff of the edit (clamped like run_program's; full_diff lifts the clamp) — see exactly what changed in the same call; unsaved_diff cannot show it once save:true has written the buffer out. Default false.
+- `full_diff` — Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count.
+- `lines` — [start, end] 1-based INCLUSIVE line numbers (narrowing-relative): fill every unit these lines touch.
+- `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
+- `pos` — 1-based char position inside the unit to fill (default: current point). One of pos / anchor / lines / all.
+- `prefix` — Explicit fill-prefix: the exact text every line of the paragraph starts with (e.g. "// "). Overrides the detected marker, and bounds the paragraph by the lines that carry it instead of by the parse — the way through when detection refuses.
+- `save` — After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.
+- `session` — Warm session id; defaults to "default" when omitted.
+- `view` — Append a rendered viewport around point after the edit (true = 4 context lines, or a line count).
+- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
+
 ## replace_in_files
 
 Apply the SAME edit spec to EVERY listed file in one call — the cross-file rename. Give pattern/replacement (with all/expect_unique, and mode:"regex" for the Emacs dialect with backrefs), or `edits` for a transactional batch per file; the absolute paths grep prints feed `files` directly. Atomic ACROSS the set: a failure in any file (a miss, a failed uniqueness check) rolls the already-edited ones back and the error names the file — every listed path must contain the pattern, so list exactly the files you grepped. Edits land in the warm buffers; with save:true the files are saved only after every file's edit succeeded. For a single file use replace_text.

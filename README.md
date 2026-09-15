@@ -184,6 +184,7 @@ replace_text {path, pattern, replacement, expect_unique: true, save: true}
 replace_in_files {files: [a, b, c], pattern, replacement, all: true, save: true}
 insert_text  {path, text, anchor: {defun: "parse_args", where: "after"}}
 read_region  {path, thing: {kind: "list", after: "fn main() {"}}   // the block after a line
+fill_text    {path, anchor: {pattern: "/// Returns the"}}   // reflow a comment or README paragraph
 outline      {path}            // KIND START END NAME, per defun
 rehearse     {path, program}   // dry-run any lisp program; inspect the diff
 undo_last    {path}            // rewind the last mutating call
