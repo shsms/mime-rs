@@ -530,6 +530,16 @@ fn bool_arg(args: &Value, key: &str) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// `bool_arg`, but strict: a non-boolean value is an error, for a flag
+/// that read as false would change what the call does.
+fn strict_bool_arg(args: &Value, key: &str) -> Result<bool, String> {
+    match args.get(key) {
+        None => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(v) => Err(format!("\"{key}\" must be a boolean, got {v}")),
+    }
+}
+
 /// Resolve which session a tool call addresses. With `path`, the file is
 /// auto-opened (`check_path`-confined) into a session KEYED BY ITS CANONICAL
 /// PATH unless already warm — the one-call alternative to a separate
@@ -767,13 +777,8 @@ fn tool_close_session(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
-    // Strict, unlike `bool_arg`: a non-boolean `all` is an error, not false
-    // (which would close "default").
-    let all = match args.get("all") {
-        None => false,
-        Some(Value::Bool(b)) => *b,
-        Some(v) => return Err(format!("\"all\" must be a boolean, got {v}")),
-    };
+    // A non-boolean `all` read as false would close "default".
+    let all = strict_bool_arg(args, "all")?;
     let singular = args.get("path").is_some() || args.get("session").is_some();
     let plural = args.get("paths").is_some() || args.get("sessions").is_some();
     let mut targets: Vec<String> = if all {
@@ -1190,29 +1195,10 @@ fn tool_read_region(
     // The line-based form: `lines: [a, b]` (1-based inclusive, narrowing-
     // relative like goto-line) — the natural shape for "read around this
     // line"; start/end stay the char-position form conflicts output feeds.
-    if let Some(v) = args.get("lines") {
-        if args.get("start").is_some() || args.get("end").is_some() {
-            return Err("read_region: pass start/end (char positions) OR lines, not both".into());
-        }
-        let range = v.as_array().and_then(|a| {
-            if a.len() == 2 {
-                Some((a[0].as_i64()?, a[1].as_i64()?))
-            } else {
-                None
-            }
-        });
-        let Some((a, b)) = range else {
-            return Err(
-                "read_region: `lines` must be [start, end] — 1-based inclusive line \
-                 numbers, e.g. {lines: [313, 322]}"
-                    .to_string(),
-            );
-        };
-        if a < 1 || b < a {
-            return Err(format!(
-                "read_region: bad line range [{a}, {b}] — need 1 <= start <= end"
-            ));
-        }
+    if args.get("lines").is_some() && (args.get("start").is_some() || args.get("end").is_some()) {
+        return Err("read_region: pass start/end (char positions) OR lines, not both".into());
+    }
+    if let Some((a, b)) = line_range_arg(args, "read_region")? {
         return run_message(
             sessions,
             &session,
@@ -1416,24 +1402,16 @@ fn tool_insert_text(
                 no_defun_error(sessions, &session, &name)
             ));
         }
-        Err(e) if e.contains("__no_anchor__") => {
-            let pat = anchor.map(|(n, _)| n).unwrap_or_default();
-            return Err(format!(
-                "anchor: no line matches the pattern {:?}{}",
-                truncate_for_error(&pat),
-                stale_edit_note(sessions, &session)
+        Err(e) => {
+            let pat = anchor.as_ref().map(|(p, _)| p.as_str());
+            return Err(anchor_abort(
+                sessions,
+                &session,
+                pat,
+                "nothing was inserted",
+                e,
             ));
         }
-        Err(e) if e.contains("__ambiguous_anchor__") => {
-            let pat = anchor.map(|(n, _)| n).unwrap_or_default();
-            let lines = match_lines(sessions, &session, &lisp_literal(&pat), false);
-            return Err(format!(
-                "anchor: the pattern {:?} matches at lines {lines} — an anchor must \
-                 be unique; nothing was inserted (occur shows every match in context)",
-                truncate_for_error(&pat)
-            ));
-        }
-        Err(e) => return Err(e),
     };
     audit_tool(&session, &program, &report);
     let chars = text.chars().count();
@@ -1450,6 +1428,66 @@ fn tool_insert_text(
     Ok(format!(
         "inserted {chars} chars{placed}; point is now {point}{saved}{unsaved}{stale}{view}{diff}"
     ))
+}
+
+/// The `lines: [start, end]` argument — 1-based inclusive line numbers,
+/// narrowing-relative — checked for shape and order; `None` when absent.
+fn line_range_arg(args: &Value, tool: &str) -> Result<Option<(i64, i64)>, String> {
+    let Some(v) = args.get("lines") else {
+        return Ok(None);
+    };
+    let range = v.as_array().and_then(|a| {
+        if a.len() == 2 {
+            Some((a[0].as_i64()?, a[1].as_i64()?))
+        } else {
+            None
+        }
+    });
+    let Some((a, b)) = range else {
+        return Err(format!(
+            "{tool}: `lines` must be [start, end] — 1-based inclusive line \
+             numbers, e.g. {{lines: [313, 322]}}"
+        ));
+    };
+    if a < 1 || b < a {
+        return Err(format!(
+            "{tool}: bad line range [{a}, {b}] — need 1 <= start <= end"
+        ));
+    }
+    Ok(Some((a, b)))
+}
+
+/// The error for an anchor abort from [`unique_line_program`] — `e`
+/// naming `__no_anchor__` or `__ambiguous_anchor__` — on the pattern
+/// `pat`, with `not_done` saying what the tool therefore left undone.
+/// Any other error, and every error of a call without an anchor, comes
+/// back as it is.
+fn anchor_abort(
+    sessions: &mut HashMap<String, Workspace>,
+    session: &str,
+    pat: Option<&str>,
+    not_done: &str,
+    e: String,
+) -> String {
+    let Some(pat) = pat else {
+        return e;
+    };
+    if e.contains("__no_anchor__") {
+        format!(
+            "anchor: no line matches the pattern {:?}{}",
+            truncate_for_error(pat),
+            stale_edit_note(sessions, session)
+        )
+    } else if e.contains("__ambiguous_anchor__") {
+        let lines = match_lines(sessions, session, &lisp_literal(pat), false);
+        format!(
+            "anchor: the pattern {:?} matches at lines {lines} — an anchor must \
+             be unique; {not_done} (occur shows every match in context)",
+            truncate_for_error(pat)
+        )
+    } else {
+        e
+    }
 }
 
 /// `replace_text {session?, pattern, replacement, all?}` — replace the first
@@ -1956,19 +1994,25 @@ fn anchor_prelude(args: &Value) -> Result<Option<(String, String)>, String> {
             )))
         }
         (None, Some(pattern)) => {
-            if pattern.is_empty() {
-                return Err("anchor: pattern must not be empty".to_string());
-            }
             let motion = match where_ {
                 "after" => "(end-of-line)",
                 _ => "(goto-char (match-beginning 0)) (beginning-of-line)",
             };
-            Ok(Some((
-                pattern.to_string(),
-                unique_line_program(&lisp_literal(pattern), motion),
-            )))
+            Ok(Some(pattern_anchor(pattern, motion)?))
         }
     }
+}
+
+/// The `{pattern}` anchor: the literal line text, checked non-empty, and
+/// the program that finds its unique line and runs `motion` there.
+fn pattern_anchor(pattern: &str, motion: &str) -> Result<(String, String), String> {
+    if pattern.is_empty() {
+        return Err("anchor: pattern must not be empty".to_string());
+    }
+    Ok((
+        pattern.to_string(),
+        unique_line_program(&lisp_literal(pattern), motion),
+    ))
 }
 
 /// A program that finds the UNIQUE line containing `lp` (an escaped literal)
