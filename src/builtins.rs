@@ -3,9 +3,11 @@
 //! `Session`). M0 subset: navigation, edit, regex search/replace, reporting.
 //! Subagents extend this with region/mark, kill-ring, markers, and narrowing.
 use crate::engine::{Checkpoint, SharedSession};
+use crate::fill::{Fill, fill_prose};
 use crate::motion::{is_word_char, move_paragraphs, move_units};
 use crate::sexp::{Kind, ScanError, Scanner, Sexp, SexpKind, TokenKind};
-use crate::syntax::{Lang, NodeRef, Syntax};
+use crate::store::TextStore;
+use crate::syntax::{Lang, NodeRef, ProseUnit, Syntax};
 use tulisp::{Error, Shared, TulispContext, TulispConvertible, TulispObject, TulispValue};
 
 fn bad_regex(e: regex::Error) -> Error {
@@ -2958,6 +2960,43 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             },
         );
     }
+    // ---- filling ----
+    // The Emacs variables the filler reads. `defvar` marks them special, so
+    // a `let` rebinding is seen from Rust as `setq` is.
+    ctx.eval_string("(progn (defvar fill-column 80) (defvar sentence-end-double-space t))")
+        .expect("the fill variables define");
+    let fill_column = ctx.intern("fill-column");
+    let double_space = ctx.intern("sentence-end-double-space");
+    {
+        let s = session.clone();
+        let (col, dbl) = (fill_column.clone(), double_space.clone());
+        // (fill-paragraph) — refill the prose unit at point (a run of line
+        // comments, a block comment, a Python docstring, a Markdown
+        // paragraph; the tree-sitter parse says which) to `fill-column`,
+        // keeping the comment marker, list hanging indents, fences and
+        // tables. Point keeps its position, clamped to the end of the
+        // refilled unit.
+        // Returns (KIND START END) for the unit after the fill; errors
+        // naming what point is in when it is not prose.
+        ctx.defun("fill-paragraph", move || -> Result<TulispObject, Error> {
+            let opts = fill_opts(&col, &dbl)?;
+            let mut sess = s.borrow_mut();
+            let p = sess.buffer.point();
+            let lang = fill_lang(&sess)?;
+            let u = prose_unit_at(&mut sess, p)?;
+            let text = sess.buffer.substring(u.start, u.end);
+            let line = line_within(&text, p - u.start);
+            let new = fill_prose(&text, u.kind, lang.sexp_rule(), Some(line), &opts)
+                .map_err(|e| err(&e))?;
+            let end = replace_span(sess.buffer.as_mut(), u.start, u.end, &text, &new);
+            sess.buffer.goto_char(p.min(end));
+            Ok(TulispObject::from(vec![
+                TulispValue::from(u.kind.name()).into_ref(None),
+                TulispValue::from(u.start as i64).into_ref(None),
+                TulispValue::from(end as i64).into_ref(None),
+            ]))
+        });
+    }
 }
 
 /// Shared body of `find-file` / `find-file-noselect`: a buffer already
@@ -3043,13 +3082,31 @@ fn apply_window_edits(
 /// buffer name, else Markdown (mime-rs's home turf — and the scaffold's
 /// historical behavior for nameless buffers).
 fn lang_of(sess: &crate::engine::Session) -> Lang {
+    detected_lang(sess).unwrap_or(Lang::Markdown)
+}
+
+/// The language the buffer is known to be: a `treesit-set-language`
+/// override, else what its name's extension says.
+fn detected_lang(sess: &crate::engine::Session) -> Option<Lang> {
     let name = sess.buffer.name();
     sess.lang_overrides
         .iter()
         .find(|(n, _)| n == name)
         .map(|(_, l)| *l)
-        .or_else(|| Lang::from_buffer_name(name))
-        .unwrap_or(Lang::Markdown)
+        .or_else(|| Lang::from_buffer_name(file_name(name)))
+}
+
+/// The buffer name without the `<N>` a colliding basename gets, so
+/// `lib.rs<2>` is still a Rust file.
+fn file_name(name: &str) -> &str {
+    if let Some((base, rest)) = name.rsplit_once('<')
+        && let Some(n) = rest.strip_suffix('>')
+        && n.parse::<u32>().is_ok()
+    {
+        base
+    } else {
+        name
+    }
 }
 
 /// `skip-chars-forward` (`forward`) and `skip-chars-backward`: move point
@@ -3427,6 +3484,88 @@ fn narrow_to_defun(sess: &mut crate::engine::Session, pos: Option<i64>) -> bool 
         }
         None => false,
     }
+}
+
+// ---- filling: the buffer side of `crate::fill` ----
+
+/// `fill-column` and `sentence-end-double-space` as the filler's options.
+fn fill_opts(column: &TulispObject, double_space: &TulispObject) -> Result<Fill, Error> {
+    let column = column.get()?.as_int()?;
+    if column < 1 {
+        return Err(err(&format!("fill-column must be positive, got {column}")));
+    }
+    Ok(Fill {
+        column: column as usize,
+        double_space: double_space.get()?.is_truthy(),
+    })
+}
+
+/// The prose unit at `p`, or the error `fill-paragraph` reports: what
+/// point is in instead.
+fn prose_unit_at(sess: &mut crate::engine::Session, p: usize) -> Result<ProseUnit, Error> {
+    let u = syntax_of(sess).prose_unit_at(p).map_err(|e| err(&e))?;
+    let crosses = format!(
+        "the {} at @{}-{} extends beyond the narrowing",
+        u.kind.name(),
+        u.start,
+        u.end
+    );
+    let (min, max) = (sess.buffer.point_min(), sess.buffer.point_max());
+    clip_to_narrowing(u, min, max).ok_or_else(|| err(&crosses))
+}
+
+/// `u` clipped to the narrowing `[min, max)`, or `None` when it crosses
+/// it. A unit may end with the newline at `max`; beyond that it is
+/// outside.
+fn clip_to_narrowing(u: ProseUnit, min: usize, max: usize) -> Option<ProseUnit> {
+    (u.start >= min && u.end <= max + 1).then(|| ProseUnit {
+        end: u.end.min(max),
+        ..u
+    })
+}
+
+/// The language the filler parses the buffer as: the buffer's, or
+/// Markdown for a name with no extension or a `.txt` one. A file type
+/// mime has no grammar for is refused, since its comments cannot be told
+/// from its code.
+fn fill_lang(sess: &crate::engine::Session) -> Result<Lang, Error> {
+    if let Some(lang) = detected_lang(sess) {
+        return Ok(lang);
+    }
+    let name = file_name(sess.buffer.name());
+    match std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
+        None | Some("txt") => Ok(Lang::Markdown),
+        Some(ext) => Err(err(&format!(
+            "mime has no grammar for .{ext}, so it cannot tell {name}'s comments from \
+             its code; set fill-prefix to fill by the lines that carry it"
+        ))),
+    }
+}
+
+/// The 0-based line of the char `offset` chars into `text`; the end of
+/// the text counts as on its last line.
+fn line_within(text: &str, offset: usize) -> usize {
+    let n = text.chars().count();
+    let offset = if offset >= n && text.ends_with('\n') {
+        n - 1
+    } else {
+        offset
+    };
+    text.chars().take(offset).filter(|c| *c == '\n').count()
+}
+
+/// Replace `[start, end)`, whose text is `old`, with `new` and return the
+/// new end. Leaves the buffer untouched when nothing changes.
+fn replace_span(b: &mut dyn TextStore, start: usize, end: usize, old: &str, new: &str) -> usize {
+    if new != old {
+        b.delete_region(start, end);
+        b.goto_char(start);
+        b.insert(new);
+    }
+    start + new.chars().count()
 }
 
 /// The current buffer's parse for the `treesit-*` builtins — cached on the
