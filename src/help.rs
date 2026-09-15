@@ -71,7 +71,7 @@ Search/replace: re-search-forward re-search-backward search-forward
 Edit/delete: insert delete-region delete-char flush-lines keep-lines
   kill-region kill-whole-line yank sort-lines delete-trailing-whitespace
   kill-sexp backward-kill-sexp
-Fill: fill-paragraph (fill-column 80, fill-prefix,
+Fill: fill-paragraph fill-region (fill-column 80, fill-prefix,
   sentence-end-double-space t; comments, docstrings and Markdown
   paragraphs only — code is never reflowed)
 Narrowing: narrow-to-region narrow-to-defun widen save-restriction save-excursion

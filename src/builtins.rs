@@ -7,7 +7,7 @@ use crate::fill::{Fill, Frame, fill_prose, fill_unit};
 use crate::motion::{is_word_char, move_paragraphs, move_units};
 use crate::sexp::{Kind, ScanError, Scanner, Sexp, SexpKind, TokenKind};
 use crate::store::TextStore;
-use crate::syntax::{Lang, NodeRef, ProseUnit, Syntax};
+use crate::syntax::{Lang, NodeRef, ProseKind, ProseUnit, Syntax};
 use tulisp::{Error, Shared, TulispContext, TulispConvertible, TulispObject, TulispValue};
 
 fn bad_regex(e: regex::Error) -> Error {
@@ -3020,6 +3020,83 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             ]))
         });
     }
+    {
+        let s = session.clone();
+        let (col, pfx, dbl) = (
+            fill_column.clone(),
+            fill_prefix.clone(),
+            double_space.clone(),
+        );
+        // (fill-region START END) — refill every prose unit whose lines the
+        // region touches, each paragraph of each unit, and leave the code
+        // between them alone: over the whole buffer it reflows every
+        // comment, or every paragraph of a README. With `fill-prefix` set,
+        // the units are the runs of prefixed lines in the region. Returns
+        // (SEEN . CHANGED): units found, and how many the fill changed.
+        ctx.defun(
+            "fill-region",
+            move |a: i64, b: i64| -> Result<TulispObject, Error> {
+                let opts = fill_opts(&col, &dbl)?;
+                let prefix = fill_prefix_of(&pfx)?;
+                let mut sess = s.borrow_mut();
+                let (min, max) = (sess.buffer.point_min(), sess.buffer.point_max());
+                let (a, b) = (a.max(1) as usize, b.max(1) as usize);
+                let (a, b) = (a.min(b).clamp(min, max), a.max(b).clamp(min, max));
+                let p = sess.buffer.point();
+                // The units, and the filler for them: by the prefix, or by
+                // the parse.
+                type Filler<'a> = Box<dyn Fn(&str, ProseKind) -> Result<String, String> + 'a>;
+                let (units, fill): (Vec<ProseUnit>, Filler<'_>) = match &prefix {
+                    Some(pre) => {
+                        let frame = Frame::uniform(pre);
+                        let units = prefixed_paragraphs(sess.buffer.as_mut(), a, b, pre)
+                            .into_iter()
+                            .map(|(start, end)| ProseUnit {
+                                kind: ProseKind::Paragraph,
+                                start,
+                                end,
+                            })
+                            .collect();
+                        (
+                            units,
+                            Box::new(move |t, _| fill_unit(t, &frame, None, &opts)),
+                        )
+                    }
+                    None => {
+                        let rule = fill_lang(&sess)?.sexp_rule();
+                        let units = syntax_of(&mut sess)
+                            .prose_units_in(a, b)
+                            .into_iter()
+                            // A unit that crosses the narrowing is left alone.
+                            .filter_map(|u| clip_to_narrowing(u, min, max))
+                            .collect();
+                        (
+                            units,
+                            Box::new(move |t, k| fill_prose(t, k, rule, None, &opts)),
+                        )
+                    }
+                };
+                let mut changed = 0i64;
+                // Bottom-up, so the units still to fill keep their positions.
+                for u in units.iter().rev() {
+                    let text = sess.buffer.substring(u.start, u.end);
+                    let new = fill(&text, u.kind).map_err(|e| {
+                        err(&format!("{} at @{}-{}: {e}", u.kind.name(), u.start, u.end))
+                    })?;
+                    if new != text {
+                        replace_span(sess.buffer.as_mut(), u.start, u.end, &text, &new);
+                        changed += 1;
+                    }
+                }
+                let max = sess.buffer.point_max();
+                sess.buffer.goto_char(p.min(max));
+                Ok(TulispObject::cons(
+                    TulispValue::from(units.len() as i64).into_ref(None),
+                    TulispValue::from(changed).into_ref(None),
+                ))
+            },
+        );
+    }
 }
 
 /// Shared body of `find-file` / `find-file-noselect`: a buffer already
@@ -3534,11 +3611,12 @@ fn fill_prefix_of(prefix: &TulispObject) -> Result<Option<String>, Error> {
 }
 
 /// The prose unit at `p`, or the error `fill-paragraph` reports: what
-/// point is in instead, and the way round it.
+/// point is in instead, and the two ways round it.
 fn prose_unit_at(sess: &mut crate::engine::Session, p: usize) -> Result<ProseUnit, Error> {
     let u = syntax_of(sess).prose_unit_at(p).map_err(|e| {
         err(&format!(
-            "{e} — a fill-prefix bounds the paragraph by the lines that carry it"
+            "{e} — fill-region reflows the prose in an explicit region, and a \
+             fill-prefix bounds the paragraph by the lines that carry it"
         ))
     })?;
     let crosses = format!(
@@ -3644,6 +3722,29 @@ fn prefixed_paragraph(
             "the line at point does not carry the fill-prefix {prefix:?}"
         ))
     })
+}
+
+/// With a `fill-prefix`, the paragraphs in `[a, b)`: each run of lines
+/// carrying the prefix that the range touches, as whole lines.
+fn prefixed_paragraphs(
+    store: &mut dyn TextStore,
+    a: usize,
+    b: usize,
+    prefix: &str,
+) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let max = store.point_max();
+    let mut p = a;
+    while p < b && p < max {
+        p = match prefixed_run(store, p, prefix) {
+            Some(run) => {
+                out.push(run);
+                run.1
+            }
+            None => line_at(store, p).1,
+        };
+    }
+    out
 }
 
 /// The 0-based line of the char `offset` chars into `text`; the end of

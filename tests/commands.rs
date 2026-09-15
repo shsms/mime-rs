@@ -100,6 +100,16 @@ fn fill_paragraph_refuses_code_and_names_it() {
 }
 
 #[test]
+fn fill_region_fills_every_comment_and_leaves_code_alone() {
+    let text =
+        "// aaa\n// bbb\nfn f() {\n    let x   = 1; // trailing\n    // ccc\n    // ddd\n}\n";
+    assert_eq!(
+        run_as("t.rs", text, "(fill-region (point-min) (point-max))"),
+        "// aaa bbb\nfn f() {\n    let x   = 1; // trailing\n    // ccc ddd\n}\n"
+    );
+}
+
+#[test]
 fn fill_paragraph_fills_a_python_docstring() {
     let text = "def f():\n    \"\"\"Summary that\n    wraps.\"\"\"\n";
     assert_eq!(
@@ -162,6 +172,35 @@ fn fill_paragraph_returns_the_unit_it_filled() {
 }
 
 #[test]
+fn fill_region_returns_units_seen_and_changed() {
+    let (value, _) = reported(
+        "t.rs",
+        "// aaa\n// bbb\nfn f() {}\n// ok\n",
+        "(report \"r\" (fill-region (point-min) (point-max)))",
+        "r",
+    );
+    assert_eq!(value, "(2 . 1)");
+}
+
+#[test]
+fn fill_paragraph_refuses_a_unit_the_narrowing_cuts_and_fill_region_skips_it() {
+    let text = "// aaa\n// bbb\nfn f() {}\n";
+    let err = fails_as(
+        "t.rs",
+        text,
+        "(narrow-to-region 8 24) (goto-char 9) (fill-paragraph)",
+    );
+    assert!(err.contains("beyond the narrowing"), "{err}");
+    let (value, _) = reported(
+        "t.rs",
+        text,
+        "(narrow-to-region 8 24) (report \"r\" (fill-region (point-min) (point-max)))",
+        "r",
+    );
+    assert_eq!(value, "(0 . 0)");
+}
+
+#[test]
 fn a_unit_ending_at_point_max_still_fills() {
     // The narrowing ends on the run's last newline.
     assert_eq!(
@@ -171,6 +210,31 @@ fn a_unit_ending_at_point_max_still_fills() {
             "(narrow-to-region 3 16) (goto-char 4) (fill-paragraph)"
         ),
         "x\n// aaa bbb\n"
+    );
+}
+
+#[test]
+fn a_shebang_and_a_doc_run_with_another_marker_are_left_alone() {
+    let text = "#!/usr/bin/env python\n# coding: utf-8\n# more\nimport os\n";
+    let (value, final_text) = reported(
+        "t.py",
+        text,
+        "(report \"r\" (fill-region (point-min) (point-max)))",
+        "r",
+    );
+    // One unit: the shebang is not one.
+    assert_eq!(value, "(1 . 1)");
+    assert_eq!(
+        final_text.as_deref(),
+        Some("#!/usr/bin/env python\n# coding: utf-8 more\nimport os\n")
+    );
+    assert_eq!(
+        run_as(
+            "t.rs",
+            "/// Doc line.\n// TODO: fix\n",
+            "(fill-region (point-min) (point-max))"
+        ),
+        "/// Doc line.\n// TODO: fix\n"
     );
 }
 
