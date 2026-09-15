@@ -387,6 +387,11 @@ Mixed per-hunk: (conflict-keep "ours"|"theirs"|"both" N) or a hand-merge
 (conflict-replace "merged\n" N); inspect first with (conflict-diff N). N
 renumbers after every resolve, so resolve the HIGHEST N first. Then check
 (treesit-has-error) and save.
+Reflow prose you just wrote — never wrap by hand (code is left alone):
+  fill_text {path, all: true, save: true}                 ; every README paragraph
+  fill_text {path, anchor: {pattern: "/// Returns the"}}  ; the doc comment holding that line
+  fill_text {path, lines: [40, 60], column: 72}           ; every comment those lines touch
+  (let ((fill-column 72)) (fill-paragraph))               ; the lisp form, at point
 Preview anything non-trivial first: rehearse {program}, inspect the diff,
 then run_program the same program (with save:true when done)."#;
 
