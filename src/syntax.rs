@@ -1115,6 +1115,56 @@ impl Syntax {
         Ok(self.prose_unit_of(node, kind))
     }
 
+    /// Every prose unit whose lines overlap the char range `[a, b)`, in
+    /// buffer order, each once (a run of line comments is one unit however many
+    /// of its lines the range touches). A comment or string that shares a
+    /// line with code is skipped.
+    pub fn prose_units_in(&self, a: usize, b: usize) -> Vec<ProseUnit> {
+        let (a, b) = (self.byte_of(a), self.byte_of(b));
+        // Units are whole lines, so the range is too: the indentation
+        // before a comment selects it.
+        let a = self.bol_byte(a);
+        let b = if b > a && !self.text[..b].ends_with('\n') {
+            self.eol_byte(b)
+        } else {
+            b
+        };
+        let mut units = Vec::new();
+        // Byte end of the last unit found: the walk runs in document order,
+        // so a node before it is a later line of that unit.
+        let mut covered = 0;
+        let mut stack = vec![self.root()];
+        while let Some(n) = stack.pop() {
+            if n.end_byte() <= a || n.start_byte() >= b {
+                continue;
+            }
+            match self.prose_kind(n) {
+                Some(kind) => {
+                    if n.start_byte() < covered || !self.owns_its_lines(n, kind) {
+                        continue;
+                    }
+                    let (bol, eol) = self.prose_unit_bytes(n, kind);
+                    units.push(ProseUnit {
+                        kind,
+                        start: self.char_of(bol),
+                        end: self.char_of(eol),
+                    });
+                    covered = eol;
+                }
+                None => {
+                    // Push named children in reverse so the stack pops them
+                    // in document order.
+                    for i in (0..n.named_child_count() as u32).rev() {
+                        if let Some(child) = n.named_child(i) {
+                            stack.push(child);
+                        }
+                    }
+                }
+            }
+        }
+        units
+    }
+
     /// The smallest *named* node covering char position `pos`, as a handle.
     pub fn node_at(&self, pos: usize) -> Option<NodeRef> {
         let b = self.byte_of(pos);
@@ -2071,9 +2121,14 @@ mod tests {
         assert!(err.contains("shares its line"), "{err}");
         let err = unit_at("/* a */ fn f() {}\n", Lang::Rust, 3).unwrap_err();
         assert!(err.contains("shares its line"), "{err}");
-        let text = "q = \"\"\"\nselect a\n\"\"\"\n";
-        let err = unit_at(text, Lang::Python, 12).unwrap_err();
+        let text = "\"\"\"Doc\nmore\"\"\"; x = 1\n";
+        let err = unit_at(text, Lang::Python, 3).unwrap_err();
         assert!(err.contains("shares its line"), "{err}");
+        assert!(
+            Syntax::parse(text, Lang::Python)
+                .prose_units_in(1, 20)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2093,6 +2148,46 @@ mod tests {
         assert_eq!(
             span(text, Lang::Markdown, 43),
             (ProseKind::Paragraph, 42, 47)
+        );
+    }
+
+    #[test]
+    fn a_range_ending_after_a_multibyte_char_does_not_panic() {
+        let text = "// café\n// more\nfn f() {}\n";
+        let syn = Syntax::parse(text, Lang::Rust);
+        assert_eq!(syn.prose_units_in(1, 8).len(), 1);
+        assert_eq!(syn.prose_units_in(1, 9).len(), 1);
+        let syn = Syntax::parse("Hello world—", Lang::Markdown);
+        assert_eq!(syn.prose_units_in(1, 13).len(), 1);
+    }
+
+    #[test]
+    fn prose_units_in_a_range_come_in_order_and_skip_code() {
+        let text = "// a\n// b\nfn f() {\n    // c\n}\n/* d */\n";
+        let syn = Syntax::parse(text, Lang::Rust);
+        let units: Vec<(ProseKind, usize, usize)> = syn
+            .prose_units_in(1, text.chars().count() + 1)
+            .into_iter()
+            .map(|u| (u.kind, u.start, u.end))
+            .collect();
+        assert_eq!(
+            units,
+            vec![
+                (ProseKind::LineComments, 1, 11),
+                (ProseKind::LineComments, 20, 29),
+                (ProseKind::BlockComment, 31, 39),
+            ]
+        );
+        // Only units whose lines the range touches: a range on the
+        // indentation before a comment still selects it.
+        assert_eq!(syn.prose_units_in(20, 22).len(), 1);
+        assert_eq!(syn.prose_units_in(12, 15).len(), 0);
+        // A triple-quoted string outside docstring position is not a unit.
+        let data = "rows = run(\n    \"\"\"\n    select a\n    \"\"\"\n)\n";
+        assert!(
+            Syntax::parse(data, Lang::Python)
+                .prose_units_in(1, 40)
+                .is_empty()
         );
     }
 }
