@@ -339,6 +339,40 @@ pub struct Defun {
     pub end: usize,
 }
 
+/// What the paragraph filler may reflow; see [`Syntax::prose_unit_at`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProseKind {
+    /// Consecutive line comments, each starting its line.
+    LineComments,
+    /// One `/* … */`-style comment.
+    BlockComment,
+    /// A Python docstring: a triple-quoted string that is the first
+    /// statement of a module, class or function.
+    TripleString,
+    /// A Markdown paragraph (a list item's or block quote's included).
+    Paragraph,
+}
+
+impl ProseKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            ProseKind::LineComments => "comment",
+            ProseKind::BlockComment => "block comment",
+            ProseKind::TripleString => "docstring",
+            ProseKind::Paragraph => "paragraph",
+        }
+    }
+}
+
+/// A prose unit as whole lines: the 1-based char span `[start, end)` from
+/// the start of its first line through its last line's newline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProseUnit {
+    pub kind: ProseKind,
+    pub start: usize,
+    pub end: usize,
+}
+
 /// A durable reference to one node of THIS parse — the data a first-class
 /// lisp node value carries. tree-sitter nodes borrow their tree, so they
 /// cannot be stored; a `NodeRef` re-finds the node instead: the byte range
@@ -747,6 +781,338 @@ impl Syntax {
             None
         }
         descend(self.root(), h)
+    }
+
+    /// What a node is to the paragraph filler, if it is prose at all. A
+    /// comment is a block comment when its text opens with one of the
+    /// language's block openers and a line comment otherwise (Go, JS and
+    /// Python have one `comment` kind for both); a Python `string` is
+    /// prose when it is a triple-quoted docstring; a Markdown `paragraph`
+    /// always.
+    fn prose_kind(&self, n: Node<'_>) -> Option<ProseKind> {
+        match n.kind() {
+            "line_comment" | "block_comment" | "comment" => {
+                let t = self.text_of(n);
+                // A shebang is the loader's, not prose.
+                if n.start_byte() == 0 && t.starts_with("#!") {
+                    return None;
+                }
+                let rule = self.lang.sexp_rule();
+                if rule.block_comments.iter().any(|(o, _)| t.starts_with(o)) {
+                    Some(ProseKind::BlockComment)
+                } else {
+                    Some(ProseKind::LineComments)
+                }
+            }
+            "string" if self.lang == Lang::Python => {
+                let open = n.named_child(0)?;
+                let quotes = self.text_of(open);
+                // A docstring may be raw or unicode-prefixed; an f-string
+                // or bytes literal is a value with code inside.
+                let plain = quotes
+                    .trim_end_matches(['"', '\''])
+                    .chars()
+                    .all(|c| matches!(c, 'r' | 'R' | 'u' | 'U'));
+                (open.kind() == "string_start"
+                    && plain
+                    && (quotes.ends_with("\"\"\"") || quotes.ends_with("'''"))
+                    && self.is_docstring(n))
+                .then_some(ProseKind::TripleString)
+            }
+            // A setext heading's title is a paragraph node; wrapping it
+            // would leave a paragraph and a shorter heading.
+            "paragraph" if self.lang == Lang::Markdown => n
+                .parent()
+                .is_none_or(|p| p.kind() != "setext_heading")
+                .then_some(ProseKind::Paragraph),
+            _ => None,
+        }
+    }
+
+    /// Whether line comments `a` then `b` sit on consecutive lines: exactly
+    /// one newline and otherwise whitespace between the end of `a`'s text
+    /// and the start of `b` (a Rust `line_comment` owns its newline; a
+    /// Python `comment` does not).
+    fn consecutive(&self, a: Node<'_>, b: Node<'_>) -> bool {
+        let gap = &self.text[self.text_end(a)..b.start_byte()];
+        gap.trim().is_empty() && gap.matches('\n').count() == 1
+    }
+
+    /// Byte offset of the start of the line holding byte `b`.
+    fn bol_byte(&self, b: usize) -> usize {
+        self.text[..b].rfind('\n').map_or(0, |i| i + 1)
+    }
+
+    /// Byte offset just past the newline ending the line holding byte `b`,
+    /// or the end of the text.
+    fn eol_byte(&self, b: usize) -> usize {
+        self.text[b..]
+            .find('\n')
+            .map_or(self.text.len(), |i| b + i + 1)
+    }
+
+    /// The end of `n`'s text: its end byte, less the newline some grammars
+    /// put inside a comment node (a Rust doc comment) and others leave out
+    /// (a Python `comment`).
+    fn text_end(&self, n: Node<'_>) -> usize {
+        let end = n.end_byte();
+        if self.text[..end].ends_with('\n') {
+            end - 1
+        } else {
+            end
+        }
+    }
+
+    /// Whether a Python string sits in docstring position: the whole first
+    /// statement of a module, class or function body (comments before it
+    /// do not count). Stricter than PEP 257 in two ways, since neither is
+    /// reflowed: a parenthesised docstring, and one made of concatenated
+    /// literals. Looser in one: a prefixed literal (an f-string, bytes)
+    /// there counts, so the refusal can name the prefix as the reason.
+    fn is_docstring(&self, n: Node<'_>) -> bool {
+        let Some(stmt) = n.parent() else {
+            return false;
+        };
+        if stmt.kind() != "expression_statement" || stmt.named_child_count() != 1 {
+            return false;
+        }
+        let Some(body) = stmt.parent() else {
+            return false;
+        };
+        let mut cursor = body.walk();
+        let first = body
+            .named_children(&mut cursor)
+            .find(|c| c.kind() != "comment")
+            .map(|c| c.id());
+        first == Some(stmt.id())
+            && (body.kind() == "module"
+                || (body.kind() == "block"
+                    && body.parent().is_some_and(|p| {
+                        matches!(p.kind(), "function_definition" | "class_definition")
+                    })))
+    }
+
+    /// The Python triple-quoted string `n` is, or is inside — or the
+    /// concatenation or parentheses holding one, when point is between
+    /// members, on a single-quoted member, or on a bracket. A position
+    /// inside an f-string's `{…}` is code, however many strings nest
+    /// there, so it is not in any string.
+    fn python_string_around<'t>(&self, n: Node<'t>) -> Option<Node<'t>> {
+        if self.lang != Lang::Python {
+            return None;
+        }
+        let triple = |x: Node<'_>| {
+            let quotes = x.named_child(0).map(|c| self.text_of(c)).unwrap_or("");
+            quotes.ends_with("\"\"\"") || quotes.ends_with("'''")
+        };
+        let mut found = None;
+        let mut up = Some(n);
+        while let Some(x) = up {
+            if x.kind() == "interpolation" {
+                return None;
+            }
+            if found.is_none() {
+                if (x.kind() == "string" && triple(x)) || x.kind() == "concatenated_string" {
+                    found = Some(x);
+                } else if x.kind() == "parenthesized_expression" {
+                    // Only parentheses around a string are a string's: the
+                    // string may sit behind comments and further parentheses.
+                    let mut inner = x;
+                    while inner.kind() == "parenthesized_expression" {
+                        let mut cursor = inner.walk();
+                        inner = inner
+                            .named_children(&mut cursor)
+                            .find(|c| c.kind() != "comment")?;
+                    }
+                    let holds = inner.kind() == "concatenated_string"
+                        || (inner.kind() == "string" && triple(inner));
+                    if !holds {
+                        return None;
+                    }
+                    found = Some(x);
+                }
+            }
+            up = x.parent();
+        }
+        found
+    }
+
+    /// The expression a Python string is part of once the concatenation
+    /// and parentheses around it are climbed, if any.
+    fn string_holder<'t>(&self, string: Node<'t>) -> Node<'t> {
+        let mut holder = string;
+        while let Some(p) = holder.parent()
+            && matches!(p.kind(), "concatenated_string" | "parenthesized_expression")
+        {
+            holder = p;
+        }
+        holder
+    }
+
+    /// Why a Python string expression that is not prose is not: out of
+    /// docstring position it is data; in position it is a prefixed literal
+    /// (an f-string or bytes), a concatenation, or parenthesised.
+    fn string_refusal(&self, holder: Node<'_>) -> &'static str {
+        if self.is_docstring(holder) {
+            "is in docstring position but not a plain docstring (an f-string, bytes, \
+             concatenated literals, or parentheses around it), so it is not reflowed"
+        } else {
+            "is not in docstring position, so it is data, not prose"
+        }
+    }
+
+    /// Whether only whitespace follows `n` on its line.
+    fn ends_its_line(&self, n: Node<'_>) -> bool {
+        let end = self.text_end(n);
+        self.text[end..self.eol_byte(end)].trim().is_empty()
+    }
+
+    /// Whether a prose node owns its lines: nothing but whitespace beside
+    /// it on its first and last line, so the whole-line unit holds no
+    /// code. A Markdown paragraph always does; its list marker or `>` is
+    /// part of the frame.
+    fn owns_its_lines(&self, n: Node<'_>, kind: ProseKind) -> bool {
+        kind == ProseKind::Paragraph || (self.starts_its_line(n) && self.ends_its_line(n))
+    }
+
+    /// The indent and marker run (`//`, `///`, `//!`, `;;`) leading `n`'s
+    /// line: what two line comments must share to be one run.
+    fn line_lead(&self, n: Node<'_>) -> (&str, &str) {
+        let indent = &self.text[self.bol_byte(n.start_byte())..n.start_byte()];
+        let openers = self.lang.sexp_rule().line_comments;
+        let text = self.text_of(n);
+        let marker = text
+            .chars()
+            .take_while(|c| *c == '!' || openers.iter().any(|o| o.contains(*c)))
+            .map(char::len_utf8)
+            .sum();
+        (indent, &text[..marker])
+    }
+
+    /// The unit `n` (a prose node) belongs to, as whole lines: a line
+    /// comment's run of consecutive comment siblings with the same indent
+    /// and marker, any other prose node on its own.
+    fn prose_unit_of(&self, n: Node<'_>, kind: ProseKind) -> ProseUnit {
+        let (bol, eol) = self.prose_unit_bytes(n, kind);
+        ProseUnit {
+            kind,
+            start: self.char_of(bol),
+            end: self.char_of(eol),
+        }
+    }
+
+    /// [`Self::prose_unit_of`] as a byte span.
+    fn prose_unit_bytes(&self, n: Node<'_>, kind: ProseKind) -> (usize, usize) {
+        let (mut first, mut last) = (n, n);
+        if kind == ProseKind::LineComments {
+            // `n` owns its line, so a sibling with the same lead does too.
+            let lead = self.line_lead(n);
+            let is_line = |m: Node<'_>| {
+                self.prose_kind(m) == Some(ProseKind::LineComments) && self.line_lead(m) == lead
+            };
+            while let Some(p) = first.prev_named_sibling() {
+                if !is_line(p) || !self.consecutive(p, first) {
+                    break;
+                }
+                first = p;
+            }
+            while let Some(q) = last.next_named_sibling() {
+                if !is_line(q) || !self.consecutive(last, q) {
+                    break;
+                }
+                last = q;
+            }
+        }
+        let bol = self.bol_byte(first.start_byte());
+        // The line holding the unit's last text char, through its newline.
+        let eol = self.eol_byte(self.text_end(last).max(first.start_byte()));
+        (bol, eol)
+    }
+
+    /// The nearest prose node at or above byte `b`, with its kind.
+    fn prose_node_at_byte(&self, b: usize) -> Option<(Node<'_>, ProseKind)> {
+        let mut node = self.root().named_descendant_for_byte_range(b, b)?;
+        loop {
+            if let Some(k) = self.prose_kind(node) {
+                return Some((node, k));
+            }
+            node = node.parent()?;
+        }
+    }
+
+    /// The prose unit — a run of line comments, a block comment, a
+    /// Python docstring, a Markdown paragraph — holding char
+    /// position `pos`, as a whole-line span. A position at the end of a
+    /// line counts as on its last char, and the end of the text as on the
+    /// last char before it. `Err` names what the position is
+    /// in instead, or the comment or string that shares its line with
+    /// code.
+    pub fn prose_unit_at(&self, pos: usize) -> Result<ProseUnit, String> {
+        let b = self.byte_of(pos);
+        // The end of a line counts as its last char; the end of the text as
+        // the last char before it. That is the byte the refusal names too.
+        let at_eol = self.text[b..].starts_with('\n') || b == self.text.len();
+        let probe = if at_eol {
+            let from = if b == self.text.len() {
+                0
+            } else {
+                self.bol_byte(b)
+            };
+            self.text[from..b]
+                .trim_end()
+                .char_indices()
+                .last()
+                .map_or(b, |(i, _)| from + i)
+        } else {
+            b
+        };
+        let found = self.prose_node_at_byte(b).or_else(|| {
+            (probe != b)
+                .then(|| self.prose_node_at_byte(probe))
+                .flatten()
+        });
+        let Some((node, kind)) = found else {
+            let what = match self.root().named_descendant_for_byte_range(probe, probe) {
+                Some(n) if let Some(string) = self.python_string_around(n) => {
+                    let holder = self.string_holder(string);
+                    return Err(format!(
+                        "the string at @{} {}",
+                        self.char_of(holder.start_byte()),
+                        self.string_refusal(holder)
+                    ));
+                }
+                Some(n) => {
+                    // The nearest node that says something: past the inline
+                    // and paragraph nodes of a Markdown heading.
+                    let mut up = n;
+                    while matches!(up.kind(), "inline" | "paragraph")
+                        && let Some(p) = up.parent()
+                    {
+                        up = p;
+                    }
+                    if up.id() != n.id() {
+                        up.kind().to_string()
+                    } else {
+                        match n.parent().filter(|p| p.parent().is_some()) {
+                            Some(p) => format!("{} (inside {})", n.kind(), p.kind()),
+                            None => n.kind().to_string(),
+                        }
+                    }
+                }
+                None => "an empty buffer".to_string(),
+            };
+            return Err(format!(
+                "@{pos} is in {what}, not in a comment, a docstring or a paragraph"
+            ));
+        };
+        if !self.owns_its_lines(node, kind) {
+            return Err(format!(
+                "the {} at @{} shares its line with code",
+                kind.name(),
+                self.char_of(node.start_byte())
+            ));
+        }
+        Ok(self.prose_unit_of(node, kind))
     }
 
     /// The smallest *named* node covering char position `pos`, as a handle.
@@ -1479,5 +1845,254 @@ mod tests {
         assert_eq!(Lang::Html.sexp_rule().block_comments, &[("<!--", "-->")]);
         assert_eq!(Lang::Markdown.sexp_rule().quotes, &['"']);
         assert!(Lang::Css.sexp_rule().line_comments.is_empty());
+    }
+    // ---- prose units: what fill-paragraph / fill-region may reflow ----
+
+    fn unit_at(text: &str, lang: Lang, pos: usize) -> Result<ProseUnit, String> {
+        Syntax::parse(text, lang).prose_unit_at(pos)
+    }
+
+    fn span(text: &str, lang: Lang, pos: usize) -> (ProseKind, usize, usize) {
+        let u = unit_at(text, lang, pos).unwrap();
+        (u.kind, u.start, u.end)
+    }
+
+    #[test]
+    fn prose_unit_is_the_run_of_adjacent_line_comments_as_whole_lines() {
+        let text = "/// a\n/// b\nfn f() {}\n";
+        assert_eq!(span(text, Lang::Rust, 3), (ProseKind::LineComments, 1, 13));
+        assert_eq!(span(text, Lang::Rust, 9), (ProseKind::LineComments, 1, 13));
+    }
+
+    #[test]
+    fn a_blank_line_splits_comment_runs() {
+        let text = "// a\n\n// b\n";
+        assert_eq!(span(text, Lang::Rust, 1), (ProseKind::LineComments, 1, 6));
+        assert_eq!(span(text, Lang::Rust, 8), (ProseKind::LineComments, 7, 12));
+    }
+
+    #[test]
+    fn comment_kind_is_classified_by_text_where_the_grammar_has_one_kind() {
+        let text = "package p\n// a\n// b\nfunc f() {}\n";
+        assert_eq!(span(text, Lang::Go, 12), (ProseKind::LineComments, 11, 21));
+        let text = "/* a\n * b\n */\nfunc f() {}\n";
+        assert_eq!(span(text, Lang::Go, 2), (ProseKind::BlockComment, 1, 15));
+    }
+
+    #[test]
+    fn a_rust_block_comment_is_one_unit() {
+        let text = "fn f() {\n    /* a\n     * b */\n}\n";
+        assert_eq!(
+            span(text, Lang::Rust, 16),
+            (ProseKind::BlockComment, 10, 31)
+        );
+    }
+
+    #[test]
+    fn a_python_function_docstring_is_prose() {
+        let text = "def f():\n    \"\"\"Doc\n    more\"\"\"\n    x = 'no'\n";
+        assert_eq!(
+            span(text, Lang::Python, 18),
+            (ProseKind::TripleString, 10, 33)
+        );
+        let err = unit_at(text, Lang::Python, 39).unwrap_err();
+        assert!(err.contains("string"), "{err}");
+    }
+
+    #[test]
+    fn only_a_string_in_docstring_position_is_prose() {
+        // Module and class docstrings, comments before them allowed.
+        let text =
+            "# c\n\"\"\"Doc\nmore\"\"\"\n\nclass C:\n    \"\"\"Cls\n    doc\"\"\"\n    x = 1\n";
+        assert_eq!(
+            span(text, Lang::Python, 6),
+            (ProseKind::TripleString, 5, 20)
+        );
+        assert_eq!(
+            span(text, Lang::Python, 35),
+            (ProseKind::TripleString, 30, 52)
+        );
+        // A string after an assignment is not a docstring (PEP 257), so a
+        // block commented out with quotes is never reflowed.
+        let text = "X = 1\n\"\"\"Docs\nfor X\"\"\"\n";
+        let err = unit_at(text, Lang::Python, 8).unwrap_err();
+        assert!(err.contains("@7 is not in docstring position"), "{err}");
+        // A triple-quoted string anywhere else is data, not prose.
+        let text = "rows = run(\n    \"\"\"\n    select a\n    \"\"\"\n)\n";
+        let err = unit_at(text, Lang::Python, 22).unwrap_err();
+        assert!(err.contains("not in docstring position"), "{err}");
+        let text = "def f():\n    x = 1\n    \"\"\"not\n    doc\"\"\"\n";
+        assert!(unit_at(text, Lang::Python, 26).is_err());
+        let text = "def f():\n    print(1)\n    \"\"\"not\n    doc\"\"\"\n";
+        assert!(unit_at(text, Lang::Python, 30).is_err());
+        // A tuple continued onto the string's line is not a lone string.
+        let text = "1, \\\n\"\"\"Doc\nmore\"\"\"\n";
+        assert!(unit_at(text, Lang::Python, 8).is_err());
+        // An f-string or bytes literal is a value; a raw or unicode
+        // docstring is prose.
+        let text = "def f(x):\n    f\"\"\"Totals {x}\n    done\"\"\"\n";
+        let err = unit_at(text, Lang::Python, 20).unwrap_err();
+        assert!(
+            err.contains("@15 is in docstring position but not a plain docstring"),
+            "{err}"
+        );
+        // Inside the f-string's braces the position is in code, even in a
+        // string nested there.
+        let err = unit_at(text, Lang::Python, 27).unwrap_err();
+        assert!(err.contains("identifier"), "{err}");
+        let text = "def f():\n    f\"\"\"{ '''x''' }\"\"\"\n";
+        let err = unit_at(text, Lang::Python, 22).unwrap_err();
+        assert!(!err.contains("docstring position"), "{err}");
+        let text = "def f():\n    b\"\"\"raw\n    bytes\"\"\"\n";
+        assert!(unit_at(text, Lang::Python, 20).is_err());
+        // Concatenated or parenthesised literals are a docstring to Python,
+        // but not reflowed; the message names the whole expression from
+        // any member, the space between members, or a plain member.
+        let text = "def f():\n    \"\"\"one\"\"\" \"\"\"two\n    lines\"\"\"\n";
+        for pos in [26, 23] {
+            let err = unit_at(text, Lang::Python, pos).unwrap_err();
+            assert!(
+                err.contains("@14 is in docstring position but not a plain"),
+                "{err}"
+            );
+        }
+        let text = "def f():\n    \"\"\"one\"\"\" 'two'\n";
+        let err = unit_at(text, Lang::Python, 25).unwrap_err();
+        assert!(
+            err.contains("@14 is in docstring position but not a plain"),
+            "{err}"
+        );
+        let text = "def f():\n    (\"\"\"one\n    two\"\"\")\n";
+        // On the text, on either bracket, at the end of the line and of the
+        // text; with a comment or more parentheses inside.
+        for pos in [20, 14, 32, 33, 34] {
+            let err = unit_at(text, Lang::Python, pos).unwrap_err();
+            assert!(
+                err.contains("@14 is in docstring position but not a plain"),
+                "{err}"
+            );
+        }
+        let text = "def f():\n    (  # c\n    (\"\"\"one\n    two\"\"\"))\n";
+        // On the outer brackets and past the end of the closing line.
+        for pos in [14, 41, 44, 45] {
+            let err = unit_at(text, Lang::Python, pos).unwrap_err();
+            assert!(
+                err.contains("@14 is in docstring position but not a plain"),
+                "{err}"
+            );
+        }
+        let text = "def f():\n    (  # c\n    \"\"\"one\n    two\"\"\")\n";
+        let err = unit_at(text, Lang::Python, 14).unwrap_err();
+        assert!(
+            err.contains("@14 is in docstring position but not a plain"),
+            "{err}"
+        );
+        // Parentheses around code, or around a plain string, are code.
+        for text in ["def f():\n    (1 + 2)\n", "def f():\n    ('a')\n"] {
+            let err = unit_at(text, Lang::Python, 14).unwrap_err();
+            assert!(!err.contains("docstring position"), "{err}");
+        }
+        // A blank line does not reach back to the comment above it.
+        let err = unit_at("# c\n\nx = 1\n", Lang::Python, 5).unwrap_err();
+        assert!(err.contains("is in module"), "{err}");
+        // A concatenation out of position is data.
+        let text = "x = \"\"\"one\"\"\" \"\"\"two\n\"\"\"\n";
+        let err = unit_at(text, Lang::Python, 17).unwrap_err();
+        assert!(err.contains("@5 is not in docstring position"), "{err}");
+        // A body other than a module, class or function has no docstring.
+        assert!(unit_at("if True:\n    \"\"\"not\n    doc\"\"\"\n", Lang::Python, 15).is_err());
+        let text = "def f():\n    u\"\"\"Doc\n    more\"\"\"\n";
+        assert_eq!(
+            span(text, Lang::Python, 20),
+            (ProseKind::TripleString, 10, 34)
+        );
+        let text = "def f():\n    r\"\"\"Doc \\d\n    more\"\"\"\n";
+        assert_eq!(
+            span(text, Lang::Python, 20),
+            (ProseKind::TripleString, 10, 37)
+        );
+    }
+
+    #[test]
+    fn point_in_code_is_refused_naming_the_node() {
+        let err = unit_at("fn f() {}\n", Lang::Rust, 4).unwrap_err();
+        assert!(err.contains("function_item"), "{err}");
+    }
+
+    #[test]
+    fn a_comment_after_code_on_its_line_is_refused() {
+        let err = unit_at("x = 1  # c\n", Lang::Python, 9).unwrap_err();
+        assert!(err.contains("shares its line"), "{err}");
+    }
+
+    #[test]
+    fn point_on_the_newline_after_a_comment_still_finds_it() {
+        assert_eq!(
+            span("# c\nx = 1\n", Lang::Python, 4),
+            (ProseKind::LineComments, 1, 5)
+        );
+    }
+
+    #[test]
+    fn a_markdown_paragraph_is_a_unit_of_whole_lines() {
+        let text = "Para\nmore\n\n- item\n  two\n\n```\ncode\n```\n";
+        assert_eq!(span(text, Lang::Markdown, 1), (ProseKind::Paragraph, 1, 11));
+        assert_eq!(
+            span(text, Lang::Markdown, 15),
+            (ProseKind::Paragraph, 12, 25)
+        );
+        let err = unit_at(text, Lang::Markdown, 30).unwrap_err();
+        assert!(err.contains("fenced_code_block"), "{err}");
+    }
+
+    #[test]
+    fn a_run_needs_one_marker_and_indent() {
+        // `///` docs and a `//` remark are two units; so are two indents.
+        let text = "/// a\n// b\n";
+        assert_eq!(span(text, Lang::Rust, 1), (ProseKind::LineComments, 1, 7));
+        assert_eq!(span(text, Lang::Rust, 8), (ProseKind::LineComments, 7, 12));
+        let text = "  // a\n   // b\n";
+        assert_eq!(span(text, Lang::Rust, 3), (ProseKind::LineComments, 1, 8));
+    }
+
+    #[test]
+    fn a_shebang_is_not_prose() {
+        let text = "#!/usr/bin/env python\n# a\n";
+        assert!(unit_at(text, Lang::Python, 1).is_err());
+        assert_eq!(
+            span(text, Lang::Python, 24),
+            (ProseKind::LineComments, 23, 27)
+        );
+    }
+
+    #[test]
+    fn a_block_comment_or_string_sharing_its_line_with_code_is_refused() {
+        let err = unit_at("fn f() { /* a */ let x = 1; }\n", Lang::Rust, 12).unwrap_err();
+        assert!(err.contains("shares its line"), "{err}");
+        let err = unit_at("/* a */ fn f() {}\n", Lang::Rust, 3).unwrap_err();
+        assert!(err.contains("shares its line"), "{err}");
+        let text = "q = \"\"\"\nselect a\n\"\"\"\n";
+        let err = unit_at(text, Lang::Python, 12).unwrap_err();
+        assert!(err.contains("shares its line"), "{err}");
+    }
+
+    #[test]
+    fn a_position_at_the_end_of_a_line_or_the_text_finds_that_line() {
+        let text = "// aa\n// bb\n";
+        assert_eq!(span(text, Lang::Rust, 6), (ProseKind::LineComments, 1, 13));
+        assert_eq!(span(text, Lang::Rust, 13), (ProseKind::LineComments, 1, 13));
+    }
+
+    #[test]
+    fn a_setext_heading_title_is_not_a_paragraph() {
+        let text = "A Fairly Long Title\n===================\n\nbody\n";
+        let err = unit_at(text, Lang::Markdown, 3).unwrap_err();
+        assert!(err.contains("in setext_heading"), "{err}");
+        let err = unit_at("# Title\n\nbody\n", Lang::Markdown, 3).unwrap_err();
+        assert!(err.contains("in atx_heading"), "{err}");
+        assert_eq!(
+            span(text, Lang::Markdown, 43),
+            (ProseKind::Paragraph, 42, 47)
+        );
     }
 }
