@@ -89,7 +89,9 @@ front end and the capability tier differ.
   network** — the git tools included (they work in-process, so they never
   breach that boundary). The one exception is `git_exec_over`, which runs a
   build command at each commit — it stays disabled unless the host sets
-  `MIME_EXEC=1`.
+  `MIME_EXEC=1` (the same grant lets `commit.gpgsign` run the configured
+  signer). `make claude` registers the server without it; `make claude-exec`
+  registers it with that grant.
 
 ## Install
 
@@ -140,7 +142,8 @@ client onboards its model straight from the protocol — no per-client setup fil
 (and the HTTP endpoint); for Claude Code there's a shortcut:
 
 ```sh
-make claude   # cargo install + register `mime --mcp` (MIME_ROOTS) with Claude Code
+make claude        # cargo install + register `mime --mcp` (MIME_ROOTS) with Claude Code
+make claude-exec   # the same, with MIME_EXEC=1 granted (git_exec_over, gpg signing)
 ```
 
 ### Protocol

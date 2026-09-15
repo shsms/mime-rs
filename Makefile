@@ -7,7 +7,7 @@ CARGO_BIN ?= $(HOME)/.cargo/bin
 # each Claude Code session to its own working directory.
 MIME_ROOTS ?= $(abspath ..)
 
-.PHONY: build test install claude claude-mcp uninstall-mcp docs inspector
+.PHONY: build test install claude claude-exec claude-mcp uninstall-mcp docs inspector
 
 build:
 	cargo build --release
@@ -32,12 +32,19 @@ docs:
 # Install + register: the one-shot Claude Code integration.
 claude: install claude-mcp
 
+# The same, with the exec capability granted: git_exec_over, and the
+# configured OpenPGP signer when commit.gpgsign is on.
+claude-exec: MIME_EXEC = 1
+claude-exec: claude
+
 # Register mime as a user-scope MCP server so every Claude Code session picks
 # its tools up automatically. Idempotent: re-registration replaces the entry.
+# MIME_EXEC (empty by default; `make claude-exec` sets it) is passed through.
 claude-mcp:
 	-claude mcp remove --scope user mime >/dev/null 2>&1
 	claude mcp add --scope user mime \
 		$(if $(MIME_ROOTS),--env 'MIME_ROOTS=$(MIME_ROOTS)') \
+		$(if $(MIME_EXEC),--env 'MIME_EXEC=$(MIME_EXEC)') \
 		-- '$(CARGO_BIN)/mime' --mcp
 
 uninstall-mcp:
