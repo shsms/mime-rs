@@ -96,6 +96,7 @@ fn fill_column_can_be_let_bound() {
 fn fill_paragraph_refuses_code_and_names_it() {
     let err = fails_as("t.rs", "fn f() {}\n", "(goto-char 4) (fill-paragraph)");
     assert!(err.contains("function_item"), "{err}");
+    assert!(err.contains("fill-prefix"), "{err}");
 }
 
 #[test]
@@ -116,6 +117,19 @@ fn fill_paragraph_fills_a_markdown_list_item() {
             "(goto-char 4) (fill-paragraph)"
         ),
         "- aaa bbb\n\ncc\n"
+    );
+}
+
+#[test]
+fn fill_prefix_overrides_detection_and_bounds_the_paragraph() {
+    let text = ";; aaa\n;; bbb\nplain\n";
+    assert_eq!(
+        run_as(
+            "t.md",
+            text,
+            "(setq fill-prefix \";; \") (goto-char 1) (fill-paragraph)"
+        ),
+        ";; aaa bbb\nplain\n"
     );
 }
 

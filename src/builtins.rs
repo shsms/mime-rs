@@ -3,7 +3,7 @@
 //! `Session`). M0 subset: navigation, edit, regex search/replace, reporting.
 //! Subagents extend this with region/mark, kill-ring, markers, and narrowing.
 use crate::engine::{Checkpoint, SharedSession};
-use crate::fill::{Fill, fill_prose};
+use crate::fill::{Fill, Frame, fill_prose, fill_unit};
 use crate::motion::{is_word_char, move_paragraphs, move_units};
 use crate::sexp::{Kind, ScanError, Scanner, Sexp, SexpKind, TokenKind};
 use crate::store::TextStore;
@@ -2963,36 +2963,59 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     // ---- filling ----
     // The Emacs variables the filler reads. `defvar` marks them special, so
     // a `let` rebinding is seen from Rust as `setq` is.
-    ctx.eval_string("(progn (defvar fill-column 80) (defvar sentence-end-double-space t))")
-        .expect("the fill variables define");
+    ctx.eval_string(
+        "(progn (defvar fill-column 80) (defvar fill-prefix nil) \
+                (defvar sentence-end-double-space t))",
+    )
+    .expect("the fill variables define");
     let fill_column = ctx.intern("fill-column");
+    let fill_prefix = ctx.intern("fill-prefix");
     let double_space = ctx.intern("sentence-end-double-space");
     {
         let s = session.clone();
-        let (col, dbl) = (fill_column.clone(), double_space.clone());
+        let (col, pfx, dbl) = (
+            fill_column.clone(),
+            fill_prefix.clone(),
+            double_space.clone(),
+        );
         // (fill-paragraph) — refill the prose unit at point (a run of line
         // comments, a block comment, a Python docstring, a Markdown
         // paragraph; the tree-sitter parse says which) to `fill-column`,
         // keeping the comment marker, list hanging indents, fences and
-        // tables. Point keeps its position, clamped to the end of the
-        // refilled unit.
+        // tables; with `fill-prefix` set, the paragraph is instead the run
+        // of lines around point carrying that prefix. Point keeps its
+        // position, clamped to the end of the refilled unit.
         // Returns (KIND START END) for the unit after the fill; errors
         // naming what point is in when it is not prose.
         ctx.defun("fill-paragraph", move || -> Result<TulispObject, Error> {
             let opts = fill_opts(&col, &dbl)?;
+            let prefix = fill_prefix_of(&pfx)?;
             let mut sess = s.borrow_mut();
             let p = sess.buffer.point();
-            let lang = fill_lang(&sess)?;
-            let u = prose_unit_at(&mut sess, p)?;
-            let text = sess.buffer.substring(u.start, u.end);
-            let line = line_within(&text, p - u.start);
-            let new = fill_prose(&text, u.kind, lang.sexp_rule(), Some(line), &opts)
-                .map_err(|e| err(&e))?;
-            let end = replace_span(sess.buffer.as_mut(), u.start, u.end, &text, &new);
+            let (kind, start, end, text, new) = match prefix {
+                Some(pre) => {
+                    let (start, end) = prefixed_paragraph(sess.buffer.as_mut(), p, &pre)?;
+                    let text = sess.buffer.substring(start, end);
+                    let line = line_within(&text, p - start);
+                    let new = fill_unit(&text, &Frame::uniform(&pre), Some(line), &opts)
+                        .map_err(|e| err(&e))?;
+                    ("paragraph", start, end, text, new)
+                }
+                None => {
+                    let lang = fill_lang(&sess)?;
+                    let u = prose_unit_at(&mut sess, p)?;
+                    let text = sess.buffer.substring(u.start, u.end);
+                    let line = line_within(&text, p - u.start);
+                    let new = fill_prose(&text, u.kind, lang.sexp_rule(), Some(line), &opts)
+                        .map_err(|e| err(&e))?;
+                    (u.kind.name(), u.start, u.end, text, new)
+                }
+            };
+            let end = replace_span(sess.buffer.as_mut(), start, end, &text, &new);
             sess.buffer.goto_char(p.min(end));
             Ok(TulispObject::from(vec![
-                TulispValue::from(u.kind.name()).into_ref(None),
-                TulispValue::from(u.start as i64).into_ref(None),
+                TulispValue::from(kind).into_ref(None),
+                TulispValue::from(start as i64).into_ref(None),
                 TulispValue::from(end as i64).into_ref(None),
             ]))
         });
@@ -3500,10 +3523,24 @@ fn fill_opts(column: &TulispObject, double_space: &TulispObject) -> Result<Fill,
     })
 }
 
+/// `fill-prefix`: `None` when nil, else the string.
+fn fill_prefix_of(prefix: &TulispObject) -> Result<Option<String>, Error> {
+    let v = prefix.get()?;
+    if v.is_truthy() {
+        Ok(Some(v.as_string()?))
+    } else {
+        Ok(None)
+    }
+}
+
 /// The prose unit at `p`, or the error `fill-paragraph` reports: what
-/// point is in instead.
+/// point is in instead, and the way round it.
 fn prose_unit_at(sess: &mut crate::engine::Session, p: usize) -> Result<ProseUnit, Error> {
-    let u = syntax_of(sess).prose_unit_at(p).map_err(|e| err(&e))?;
+    let u = syntax_of(sess).prose_unit_at(p).map_err(|e| {
+        err(&format!(
+            "{e} — a fill-prefix bounds the paragraph by the lines that carry it"
+        ))
+    })?;
     let crosses = format!(
         "the {} at @{}-{} extends beyond the narrowing",
         u.kind.name(),
@@ -3543,6 +3580,70 @@ fn fill_lang(sess: &crate::engine::Session) -> Result<Lang, Error> {
              its code; set fill-prefix to fill by the lines that carry it"
         ))),
     }
+}
+
+/// The line holding `p`: its char span through the newline, and its text
+/// without it. Line motion is the store's, so point moves and comes back.
+fn line_at(store: &mut dyn TextStore, p: usize) -> (usize, usize, String) {
+    let saved = store.point();
+    store.goto_char(p);
+    store.beginning_of_line();
+    let start = store.point();
+    store.end_of_line();
+    let eol = store.point();
+    store.goto_char(saved);
+    let end = if eol < store.point_max() && store.char_after(eol) == Some('\n') {
+        eol + 1
+    } else {
+        eol
+    };
+    (start, end, store.substring(start, eol))
+}
+
+/// Whether a line belongs to a `fill-prefix` paragraph: it carries the
+/// prefix and has text after it (Emacs: a prefixed blank line still
+/// separates paragraphs).
+fn carries(line: &str, prefix: &str) -> bool {
+    line.strip_prefix(prefix)
+        .is_some_and(|rest| !rest.trim().is_empty())
+}
+
+/// With a `fill-prefix`, the paragraph holding `p`: the run of lines
+/// around it that carry the prefix, or `None` when `p`'s own line does not.
+fn prefixed_run(store: &mut dyn TextStore, p: usize, prefix: &str) -> Option<(usize, usize)> {
+    let (mut start, mut end, line) = line_at(store, p);
+    if !carries(&line, prefix) {
+        return None;
+    }
+    let (min, max) = (store.point_min(), store.point_max());
+    while start > min {
+        let (s, _, line) = line_at(store, start - 1);
+        if !carries(&line, prefix) {
+            break;
+        }
+        start = s;
+    }
+    while end < max {
+        let (_, e, line) = line_at(store, end);
+        if !carries(&line, prefix) {
+            break;
+        }
+        end = e;
+    }
+    Some((start, end))
+}
+
+/// [`prefixed_run`] at point, as `fill-paragraph` reports its absence.
+fn prefixed_paragraph(
+    store: &mut dyn TextStore,
+    p: usize,
+    prefix: &str,
+) -> Result<(usize, usize), Error> {
+    prefixed_run(store, p, prefix).ok_or_else(|| {
+        err(&format!(
+            "the line at point does not carry the fill-prefix {prefix:?}"
+        ))
+    })
 }
 
 /// The 0-based line of the char `offset` chars into `text`; the end of
