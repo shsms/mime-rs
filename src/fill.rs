@@ -137,6 +137,62 @@ impl Frame {
     }
 }
 
+/// The Emacs `adaptive-fill` guess for a run of comment lines: the shared
+/// indentation plus the shared run of marker punctuation (`//`, `///`,
+/// `//!`, `#`, `;;`), and one space when the first line has one after it.
+/// The marker must begin with one of the language's comment `openers`, so
+/// a Markdown `#` heading or `-` bullet is never taken for a comment
+/// marker. Lines that do not share the first line's marker shrink it to
+/// what every line has; an empty string means "no comment marker".
+pub fn detect_frame(text: &str, openers: &[&str]) -> String {
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let Some(line0) = lines.next() else {
+        return String::new();
+    };
+    let marker_chars: Vec<char> = openers
+        .iter()
+        .flat_map(|o| o.chars())
+        .chain(['!'])
+        .collect();
+    let (indent, after) = split_indent(line0);
+    // A marker run stops at the first non-marker char; the run of the
+    // first line seeds it and every later line can only shorten it.
+    let run_of = |s: &str| -> usize {
+        s.chars()
+            .take_while(|c| marker_chars.contains(c))
+            .map(char::len_utf8)
+            .sum()
+    };
+    let mut marker = &after[..run_of(after)];
+    let mut indent = indent;
+    for line in lines {
+        let (ind, aft) = split_indent(line);
+        indent = common_prefix(indent, ind);
+        marker = common_prefix(marker, &aft[..run_of(aft)]);
+    }
+    if !openers.iter().any(|o| marker.starts_with(o)) {
+        return String::new();
+    }
+    // One space after the marker unless every line runs straight on from
+    // it (`//a`), so a `/// a` + `// b` pair still frames as `// `.
+    let bare = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .all(|l| !split_indent(l).1[marker.len()..].starts_with([' ', '\t']));
+    format!("{indent}{marker}{}", if bare { "" } else { " " })
+}
+
+fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
+    let n = a
+        .char_indices()
+        .zip(b.chars())
+        .take_while(|((_, x), y)| x == y)
+        .last()
+        .map(|((i, x), _)| i + x.len_utf8())
+        .unwrap_or(0);
+    &a[..n]
+}
+
 /// `line` as (leading whitespace, the rest).
 fn split_indent(line: &str) -> (&str, &str) {
     let n = line.len() - line.trim_start_matches([' ', '\t']).len();
@@ -969,5 +1025,37 @@ mod tests {
             80,
         );
         assert_eq!(out, "    \"\"\"Summary line that wraps.\n");
+    }
+
+    // ---- detect_frame: the adaptive comment prefix ----
+
+    #[test]
+    fn detects_a_line_comment_prefix_with_its_indent() {
+        assert_eq!(detect_frame("  // a\n  // b\n", &["//"]), "  // ");
+    }
+
+    #[test]
+    fn detects_doc_comment_markers() {
+        assert_eq!(detect_frame("/// a\n/// b\n", &["//"]), "/// ");
+        assert_eq!(detect_frame("//! a\n//! b\n", &["//"]), "//! ");
+        assert_eq!(detect_frame("# a\n# b\n", &["#"]), "# ");
+        assert_eq!(detect_frame(";; a\n;; b\n", &[";"]), ";; ");
+    }
+
+    #[test]
+    fn a_marker_not_shared_by_every_line_shrinks_to_what_is() {
+        assert_eq!(detect_frame("/// a\n// b\n", &["//"]), "// ");
+    }
+
+    #[test]
+    fn a_marker_must_start_with_an_opener() {
+        // Markdown: `#` and `-` are structure, not comment markers.
+        assert_eq!(detect_frame("# a\n# b\n", &["<!--"]), "");
+        assert_eq!(detect_frame("- a\n- b\n", &["<!--"]), "");
+    }
+
+    #[test]
+    fn a_marker_with_no_space_after_it_stays_bare() {
+        assert_eq!(detect_frame("//a\n//b\n", &["//"]), "//");
     }
 }
