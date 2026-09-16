@@ -20,12 +20,12 @@
 //! reports them as stray opener lines so they are never silent. A *nested*
 //! conflict of the same marker size surfaces innermost-first: the outer parse
 //! is rejected (its separator/closer would be ambiguous), the inner hunk is
-//! well-formed in isolation, and once it is resolved a re-scan sees the
-//! outer. CRLF lines are tolerated (the `\r` stays inside the side spans,
+//! well-formed in isolation, and once it is resolved a re-scan sees the outer.
+//! CRLF lines are tolerated (the `\r` stays inside the side spans,
 //! content-faithful). A narrowing that cuts through a hunk hides it: only
 //! opener lines inside the accessible region are seen at all (a visible
-//! separator/closer whose opener lies outside is plain text, and not counted
-//! as a stray) — widen before resolving if the overview looks short.
+//! separator/closer whose opener lies outside is plain text, and not counted as
+//! a stray) — widen before resolving if the overview looks short.
 
 use crate::store::TextStore;
 
@@ -106,9 +106,9 @@ fn run_len(line: &str, marker: char) -> usize {
     line.chars().take_while(|&c| c == marker).count()
 }
 
-/// For a candidate marker line: `Some(label)` if, after a run of exactly
-/// `mlen` `marker` chars, the line is empty or carries a space-separated
-/// label; `None` otherwise (not a marker line). CR-tolerant.
+/// For a candidate marker line: `Some(label)` if, after a run of exactly `mlen`
+/// `marker` chars, the line is empty or carries a space-separated label; `None`
+/// otherwise (not a marker line). CR-tolerant.
 fn marker_label(line: &str, marker: char, mlen: usize) -> Option<String> {
     let line = line.strip_suffix('\r').unwrap_or(line);
     if run_len(line, marker) != mlen {
@@ -187,9 +187,9 @@ fn parse_hunk_at(b: &mut dyn TextStore, start: usize) -> Option<Hunk> {
     None // unterminated
 }
 
-/// The hunk a program addressed: 1-based index `n`, or — with `None` — the
-/// hunk containing `point` (how `smerge-keep-current` addresses). The `Err`
-/// is a ready error message.
+/// The hunk a program addressed: 1-based index `n`, or — with `None` — the hunk
+/// containing `point` (how `smerge-keep-current` addresses). The `Err` is a
+/// ready error message.
 pub fn pick(hunks: &[Hunk], n: Option<i64>, point: usize) -> Result<&Hunk, String> {
     match n {
         Some(n) => usize::try_from(n)
@@ -245,15 +245,16 @@ fn joined_spans(h: &Hunk, side: &str) -> Option<Vec<(usize, usize)>> {
 /// The materialized sections a multi-side keep concatenates — `joined_spans`
 /// read out of the buffer once. `None` for the single-section sides. The single
 /// source both `side_text` (joins them) and `side_text_with_warning` (joins +
-/// counts danglers) draw from, so a `both`/`all` keep reads the sides only once.
+/// counts danglers) draw from, so a `both`/`all` keep reads the sides only
+/// once.
 fn joined_parts(b: &dyn TextStore, h: &Hunk, side: &str) -> Option<Vec<String>> {
     joined_spans(h, side).map(|spans| spans.iter().map(|&(s, e)| b.substring(s, e)).collect())
 }
 
 /// True when `s` leaves any bracket class — `{}`, `()`, `[]` — unclosed (more
 /// openers than closers of that kind). Per-class so a `{` and a `)` don't
-/// cancel. Strings and comments are NOT parsed (a `{` in a string counts);
-/// this is a cheap heuristic for a warning, never a hard syntax check.
+/// cancel. Strings and comments are NOT parsed (a `{` in a string counts); this
+/// is a cheap heuristic for a warning, never a hard syntax check.
 fn leaves_bracket_open(s: &str) -> bool {
     let (mut curly, mut round, mut square) = (0i32, 0i32, 0i32);
     for c in s.chars() {
@@ -400,8 +401,8 @@ mod tests {
 
     #[test]
     fn multiple_hunks_longer_markers_crlf_and_no_trailing_newline() {
-        // Two hunks; the second uses git's longer markers (size 9), CRLF
-        // line endings, and the file ends without a newline.
+        // Two hunks; the second uses git's longer markers (size 9), CRLF line
+        // endings, and the file ends without a newline.
         let text = "<<<<<<< A\no1\n=======\nt1\n>>>>>>> B\nmid\n<<<<<<<<< A\r\no2\r\n=========\r\nt2\r\n>>>>>>>>> B";
         let (hunks, b) = hunks_of(text);
         assert_eq!(hunks.len(), 2);

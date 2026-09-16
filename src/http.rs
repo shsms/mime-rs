@@ -3,17 +3,16 @@
 //! legacy client initializes and carries an `Mcp-Session-Id` on every later
 //! request, while a 2026-07-28 client is stateless — no session header at all,
 //! each request self-describing through its standard headers, with the
-//! `workspace` handle it wants to reuse passed as a tool argument in the
-//! body. Both eras share the transport-agnostic
-//! [`crate::rpc::handle_request`] dispatch (stdio enters through
-//! [`crate::rpc::handle_line`], which parses a line and calls it) and answer
-//! with plain JSON: mime never sends a server-initiated message, so there is no SSE
-//! stream to open (a spec-valid choice — a server MAY return `application/json`
-//! for any request).
+//! `workspace` handle it wants to reuse passed as a tool argument in the body.
+//! Both eras share the transport-agnostic [`crate::rpc::handle_request`]
+//! dispatch (stdio enters through [`crate::rpc::handle_line`], which parses a
+//! line and calls it) and answer with plain JSON: mime never sends a
+//! server-initiated message, so there is no SSE stream to open (a spec-valid
+//! choice — a server MAY return `application/json` for any request).
 //!
 //! Security, per the MCP guidance: bind localhost by default and reject a
-//! non-local browser `Origin` (anti-DNS-rebinding). Legacy `initialize` mints an
-//! unguessable, random `Mcp-Session-Id` and isolates that client's warm
+//! non-local browser `Origin` (anti-DNS-rebinding). Legacy `initialize` mints
+//! an unguessable, random `Mcp-Session-Id` and isolates that client's warm
 //! sessions under it; the id is the client's bearer token, so every later
 //! request MUST carry it (an absent/unknown one is a 404 — re-initialize). A
 //! modern request instead names its workspace handle, which is equally
@@ -29,7 +28,8 @@ use std::io::Read;
 use std::sync::Mutex;
 use tiny_http::{Header, Method, Request, Response, Server};
 
-/// Cap on a request body — programs and buffers can be large, but not unbounded.
+/// Cap on a request body — programs and buffers can be large, but not
+/// unbounded.
 const MAX_BODY: u64 = 64 * 1024 * 1024;
 
 /// Serve the MCP protocol over Streamable HTTP at `addr` until killed.
@@ -136,7 +136,8 @@ fn dispatch(
 
 fn route(req: &HttpRequest, store: &mut WorkspaceStore) -> HttpReply {
     // Anti-DNS-rebinding: a browser-set Origin must be localhost. A missing
-    // Origin (curl, an SDK, a CLI harness) is allowed — the attack is browser-only.
+    // Origin (curl, an SDK, a CLI harness) is allowed — the attack is
+    // browser-only.
     if let Some(origin) = req.header("origin")
         && !is_local_origin(origin)
     {
@@ -147,8 +148,8 @@ fn route(req: &HttpRequest, store: &mut WorkspaceStore) -> HttpReply {
     }
     match req.method {
         HttpMethod::Post => {}
-        // Ending a legacy session needs its id — the id is the bearer token,
-        // so this can only drop a session the caller already holds.
+        // Ending a legacy session needs its id — the id is the bearer token, so
+        // this can only drop a session the caller already holds.
         HttpMethod::Delete => {
             let dropped = req
                 .header("mcp-session-id")
@@ -160,20 +161,20 @@ fn route(req: &HttpRequest, store: &mut WorkspaceStore) -> HttpReply {
         HttpMethod::Other => return HttpReply::empty(405),
     }
 
-    // Parsed once, here: the era comes off the parsed value, and the same
-    // value is handed to the protocol layer instead of being re-parsed.
+    // Parsed once, here: the era comes off the parsed value, and the same value
+    // is handed to the protocol layer instead of being re-parsed.
     let body: Value = match serde_json::from_str(&req.body) {
         Ok(v) => v,
         // An unparseable body names no era — the era lives inside it — so the
         // client's own headers have to say which answer it can understand. An
         // `MCP-Protocol-Version` header naming the modern version can only come
         // from a modern client (legacy clients since 2025-06-18 send the header
-        // too, with their own version), so that client gets the modern shape for
-        // a bad request: HTTP 400 carrying the `-32700` JSON-RPC body. A legacy
-        // version, or no header, is answered the way the
-        // legacy path answers everything else, which is also how this server
-        // answered before it was dual-era: a client holding a known session gets
-        // the `-32700` body at HTTP 200 (the error is at the protocol layer, not
+        // too, with their own version), so that client gets the modern shape
+        // for a bad request: HTTP 400 carrying the `-32700` JSON-RPC body. A
+        // legacy version, or no header, is answered the way the legacy path
+        // answers everything else, which is also how this server answered
+        // before it was dual-era: a client holding a known session gets the
+        // `-32700` body at HTTP 200 (the error is at the protocol layer, not
         // the transport), and one without gets the same 404 as any other
         // sessionless legacy request. Garbage must not reveal more about the
         // server than well-formed JSON does.
@@ -195,9 +196,9 @@ fn route(req: &HttpRequest, store: &mut WorkspaceStore) -> HttpReply {
     }
 }
 
-/// Legacy era: `initialize` mints a session; every other request must carry
-/// a known `Mcp-Session-Id`. A missing `MCP-Protocol-Version` header is
-/// tolerated (the spec allows it for servers supporting pre-2025-06-18 clients).
+/// Legacy era: `initialize` mints a session; every other request must carry a
+/// known `Mcp-Session-Id`. A missing `MCP-Protocol-Version` header is tolerated
+/// (the spec allows it for servers supporting pre-2025-06-18 clients).
 fn route_legacy(req: &HttpRequest, body: Value, store: &mut WorkspaceStore) -> HttpReply {
     if body["method"] == "initialize" {
         let id = store.mint();
@@ -212,8 +213,8 @@ fn route_legacy(req: &HttpRequest, body: Value, store: &mut WorkspaceStore) -> H
     dispatch(body, store, Some(&id), |_| 200)
 }
 
-/// Modern era (2026-07-28): stateless. The standard request headers must
-/// agree with the body; `Mcp-Session-Id` / `Last-Event-ID` are ignored.
+/// Modern era (2026-07-28): stateless. The standard request headers must agree
+/// with the body; `Mcp-Session-Id` / `Last-Event-ID` are ignored.
 fn route_modern(req: &HttpRequest, body: Value, store: &mut WorkspaceStore) -> HttpReply {
     let method = body["method"].as_str().unwrap_or("").to_string();
     let mut checks: Vec<(&str, Option<String>, String)> = Vec::new();
@@ -263,8 +264,8 @@ fn route_modern(req: &HttpRequest, body: Value, store: &mut WorkspaceStore) -> H
     })
 }
 
-/// `Mcp-Name` is the tool name verbatim, or `=?base64?<b64>?=` when the name
-/// is not header-safe. Undecodable input is `None` (a mismatch).
+/// `Mcp-Name` is the tool name verbatim, or `=?base64?<b64>?=` when the name is
+/// not header-safe. Undecodable input is `None` (a mismatch).
 fn decode_mcp_name(raw: &str) -> Option<String> {
     match raw
         .strip_prefix("=?base64?")
@@ -754,12 +755,12 @@ mod tests {
 
     #[test]
     fn a_modern_client_with_a_malformed_body_gets_400_not_the_legacy_404() {
-        // A malformed body carries no era, but an `MCP-Protocol-Version`
-        // header naming the modern version does (legacy clients since
-        // 2025-06-18 send the header too, with their own version). So the
-        // client gets the modern answer to a bad request — HTTP 400 with the
-        // `-32700` body — instead of being mistaken for a legacy client and
-        // handed the sessionless 404.
+        // A malformed body carries no era, but an `MCP-Protocol-Version` header
+        // naming the modern version does (legacy clients since 2025-06-18 send
+        // the header too, with their own version). So the client gets the
+        // modern answer to a bad request — HTTP 400 with the `-32700` body —
+        // instead of being mistaken for a legacy client and handed the
+        // sessionless 404.
         let mut store = WorkspaceStore::new();
         let r = route(
             &req(
@@ -854,9 +855,10 @@ mod tests {
         assert!(!r.body.contains(&sid), "the session id must not leak");
     }
 
-    /// Send one raw HTTP/1.1 request and read the whole response. The write half
-    /// is closed after the head: tiny_http drains an unread body when it drops
-    /// the request, and the over-cap case below announces a body it never sends.
+    /// Send one raw HTTP/1.1 request and read the whole response. The write
+    /// half is closed after the head: tiny_http drains an unread body when it
+    /// drops the request, and the over-cap case below announces a body it never
+    /// sends.
     fn raw(addr: std::net::SocketAddr, head: &str) -> String {
         use std::io::Write as _;
         let mut sock = std::net::TcpStream::connect(addr).expect("connect to the test server");

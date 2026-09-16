@@ -1,10 +1,10 @@
 # The editing vocabulary
 
-Programs are Emacs Lisp on [`tulisp`](https://github.com/shsms/tulisp)
-(control flow, `let`, `lambda`, `dolist`, `condition-case`, …) plus these
-editor builtins. At runtime, the MCP `help` tool serves topic briefs on the
-regex dialect, the treesit layer, conflicts, session semantics, and worked
-recipes (`help {topic: "recipes"}`).
+Programs are Emacs Lisp on [`tulisp`](https://github.com/shsms/tulisp) (control
+flow, `let`, `lambda`, `dolist`, `condition-case`, …) plus these editor
+builtins. At runtime, the MCP `help` tool serves topic briefs on the regex
+dialect, the treesit layer, conflicts, session semantics, and worked recipes
+(`help {topic: "recipes"}`).
 
 | Group | Primitives |
 |---|---|

@@ -7,9 +7,9 @@
 //! from `lib.rs` parses as Rust while a piped stdin buffer defaults to
 //! Markdown. For Markdown the *block* tree (`MarkdownTree::block_tree`) is
 //! used: `document` → `section` → `atx_heading` / `paragraph` / `list` …, so a
-//! `section` is the natural top-level "defun" analog for prose. Rust and
-//! Python parse with plain [`tree_sitter::Parser`]; their "defun" kinds are
-//! the function/type definition nodes ([`Lang::defun_kinds`]).
+//! `section` is the natural top-level "defun" analog for prose. Rust and Python
+//! parse with plain [`tree_sitter::Parser`]; their "defun" kinds are the
+//! function/type definition nodes ([`Lang::defun_kinds`]).
 //!
 //! The parse persists on the `Session` keyed by content version (see
 //! `syntax_of` in builtins.rs); a fresh `Syntax::parse` runs only after an
@@ -21,14 +21,14 @@
 //! multibyte content (em dashes, accents) maps correctly.
 //!
 //! TODO (future M7 work):
-//!   - Incremental re-parse: feed `InputEdit`s from buffer mutations instead
-//!     of a full re-parse per edit (needs edit logging in the stores, lazily
+//!   - Incremental re-parse: feed `InputEdit`s from buffer mutations instead of
+//!     a full re-parse per edit (needs edit logging in the stores, lazily
 //!     enabled so non-treesit workloads pay nothing).
 //!   - More languages (JS/TS, Go, …) — adding one is a `Lang` variant, an
 //!     extension mapping, and a `defun_kinds` row.
 //!   - AST-edit ops over the current node: `replace-node`, `wrap-node`,
-//!     `raise-node`, `kill-node` — thin wrappers now that nodes are
-//!     first-class values.
+//!     `raise-node`, `kill-node` — thin wrappers now that nodes are first-class
+//!     values.
 //!   - Surface a few of these as MCP tools once the builtin surface settles.
 
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
@@ -60,8 +60,8 @@ impl Lang {
         Lang::from_token(&ext.to_ascii_lowercase())
     }
 
-    /// Parse a language token the way `treesit-set-language` accepts it:
-    /// a language name or its conventional extension.
+    /// Parse a language token the way `treesit-set-language` accepts it: a
+    /// language name or its conventional extension.
     pub fn from_token(token: &str) -> Option<Lang> {
         match token {
             "markdown" | "md" => Some(Lang::Markdown),
@@ -171,11 +171,11 @@ impl Lang {
         }
     }
 
-    /// Whether `c` is a symbol constituent: an alphanumeric or `_`
-    /// everywhere, plus the per-mode syntax-table extras `forward-symbol`
-    /// cares about — in Emacs Lisp `string-trim-left` is one symbol and
-    /// `:foo` is a keyword; in CSS `font-size` is one identifier. A quote or
-    /// backquote is never part of a symbol, matching Emacs.
+    /// Whether `c` is a symbol constituent: an alphanumeric or `_` everywhere,
+    /// plus the per-mode syntax-table extras `forward-symbol` cares about — in
+    /// Emacs Lisp `string-trim-left` is one symbol and `:foo` is a keyword; in
+    /// CSS `font-size` is one identifier. A quote or backquote is never part of
+    /// a symbol, matching Emacs.
     pub fn is_symbol_char(&self, c: char) -> bool {
         let extra = match self {
             Lang::Elisp => "-+*/<>=!?:%&$~^",
@@ -187,10 +187,10 @@ impl Lang {
 
     /// The syntax the sexp scanner (`crate::sexp`) needs for this language.
     /// Brackets are `()` `[]` `{}` everywhere; this names the string quotes,
-    /// the comment openers and the expression-prefix characters. Not an
-    /// Emacs syntax table: Rust char literals and lifetimes, Python f-strings
-    /// and JS regex literals are read as plain strings or symbols, and the
-    /// backslashes in Rust and Python raw strings still escape.
+    /// the comment openers and the expression-prefix characters. Not an Emacs
+    /// syntax table: Rust char literals and lifetimes, Python f-strings and JS
+    /// regex literals are read as plain strings or symbols, and the backslashes
+    /// in Rust and Python raw strings still escape.
     pub fn sexp_rule(&self) -> &'static SexpRule {
         match self {
             Lang::Rust => &C_LIKE_RULE,
@@ -222,8 +222,8 @@ pub struct SexpRule {
     pub line_comments: &'static [&'static str],
     /// Block comment opener and closer pairs.
     pub block_comments: &'static [(&'static str, &'static str)],
-    /// Expression prefixes: characters that belong to the sexp after them,
-    /// as `'` in `'(a b)` (Emacs's prefix syntax flag).
+    /// Expression prefixes: characters that belong to the sexp after them, as
+    /// `'` in `'(a b)` (Emacs's prefix syntax flag).
     pub prefixes: &'static [char],
 }
 
@@ -296,10 +296,10 @@ pub struct Syntax {
     lang: Lang,
     tree: ParseTree,
     /// Byte↔char checkpoints, one per ~[`CHECKPOINT_BYTES`] of text (always
-    /// starting with `(0, 0)`), each `(byte_offset, chars_before_it)` on a
-    /// char boundary. Position conversions binary-search here and scan only
-    /// the residue, so they are O(log n + K) instead of the O(text) prefix
-    /// scan that made mapping a big query's captures O(captures × file).
+    /// starting with `(0, 0)`), each `(byte_offset, chars_before_it)` on a char
+    /// boundary. Position conversions binary-search here and scan only the
+    /// residue, so they are O(log n + K) instead of the O(text) prefix scan
+    /// that made mapping a big query's captures O(captures × file).
     checkpoints: Vec<(usize, usize)>,
 }
 
@@ -328,9 +328,9 @@ pub struct NodeSpan {
     pub end: usize,
 }
 
-/// A defun (top-level construct) found by [`Syntax::defuns`]: its span plus
-/// the name tree-sitter gives it (`""` if anonymous — e.g. a Markdown section
-/// whose heading is empty).
+/// A defun (top-level construct) found by [`Syntax::defuns`]: its span plus the
+/// name tree-sitter gives it (`""` if anonymous — e.g. a Markdown section whose
+/// heading is empty).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Defun {
     pub kind: String,
@@ -346,8 +346,8 @@ pub enum ProseKind {
     LineComments,
     /// One `/* … */`-style comment.
     BlockComment,
-    /// A Python docstring: a triple-quoted string that is the first
-    /// statement of a module, class or function.
+    /// A Python docstring: a triple-quoted string that is the first statement
+    /// of a module, class or function.
     TripleString,
     /// A Markdown paragraph (a list item's or block quote's included).
     Paragraph,
@@ -364,8 +364,8 @@ impl ProseKind {
     }
 }
 
-/// A prose unit as whole lines: the 1-based char span `[start, end)` from
-/// the start of its first line through its last line's newline.
+/// A prose unit as whole lines: the 1-based char span `[start, end)` from the
+/// start of its first line through its last line's newline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProseUnit {
     pub kind: ProseKind,
@@ -373,13 +373,13 @@ pub struct ProseUnit {
     pub end: usize,
 }
 
-/// A durable reference to one node of THIS parse — the data a first-class
-/// lisp node value carries. tree-sitter nodes borrow their tree, so they
-/// cannot be stored; a `NodeRef` re-finds the node instead: the byte range
-/// narrows the search ([`Node::descendant_for_byte_range`] lands on the
-/// smallest node in it) and the id — stable for the tree's lifetime — picks
-/// the right ancestor when several nodes share the range. Only meaningful
-/// against the `Syntax` it came from.
+/// A durable reference to one node of THIS parse — the data a first-class lisp
+/// node value carries. tree-sitter nodes borrow their tree, so they cannot be
+/// stored; a `NodeRef` re-finds the node instead: the byte range narrows the
+/// search ([`Node::descendant_for_byte_range`] lands on the smallest node in
+/// it) and the id — stable for the tree's lifetime — picks the right ancestor
+/// when several nodes share the range. Only meaningful against the `Syntax` it
+/// came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeRef {
     id: usize,
@@ -441,8 +441,8 @@ impl Syntax {
     }
 
     /// `true` if the parse tree contains any `ERROR` / missing node — i.e. the
-    /// buffer is not syntactically well-formed for its language. The cheap
-    /// "did my edit break the file?" check.
+    /// buffer is not syntactically well-formed for its language. The cheap "did
+    /// my edit break the file?" check.
     pub fn has_error(&self) -> bool {
         self.root().has_error()
     }
@@ -463,8 +463,9 @@ impl Syntax {
         byte
     }
 
-    /// 1-based char position of byte offset `byte` (clamped, and snapped down to
-    /// a char boundary so a mid-char byte still maps to that char's position).
+    /// 1-based char position of byte offset `byte` (clamped, and snapped down
+    /// to a char boundary so a mid-char byte still maps to that char's
+    /// position).
     fn char_of(&self, byte: usize) -> usize {
         let mut byte = byte.min(self.text.len());
         while byte > 0 && !self.text.is_char_boundary(byte) {
@@ -476,7 +477,8 @@ impl Syntax {
         cp_chars + self.text[cp_byte..byte].chars().count() + 1
     }
 
-    /// Project a tree-sitter node into a [`NodeSpan`] (kind + 1-based char span).
+    /// Project a tree-sitter node into a [`NodeSpan`] (kind + 1-based char
+    /// span).
     fn span_of(&self, node: Node<'_>) -> NodeSpan {
         NodeSpan {
             kind: node.kind().to_string(),
@@ -507,15 +509,14 @@ impl Syntax {
     }
 
     /// The full extent of a defun INCLUDING its decoration: Rust outer
-    /// `#[attributes]` and `///` / `/** */` doc comments are preceding
-    /// siblings of the item node, Go and JavaScript/TypeScript doc comments
-    /// are the comment block adjacent above it (and an `export` wrapper is
-    /// part of the item), Python decorators live on a wrapping
-    /// `decorated_definition` — all belong to the defun an agent means by
-    /// "delete / replace / narrow to / anchor on this function". Returns
-    /// byte offsets. Raw node accessors (`treesit-node-start` etc.) stay
-    /// faithful to the tree-sitter node; only the defun-level views (outline,
-    /// goto, narrow, begin/end) use this.
+    /// `#[attributes]` and `///` / `/** */` doc comments are preceding siblings
+    /// of the item node, Go and JavaScript/TypeScript doc comments are the
+    /// comment block adjacent above it (and an `export` wrapper is part of the
+    /// item), Python decorators live on a wrapping `decorated_definition` — all
+    /// belong to the defun an agent means by "delete / replace / narrow to /
+    /// anchor on this function". Returns byte offsets. Raw node accessors
+    /// (`treesit-node-start` etc.) stay faithful to the tree-sitter node; only
+    /// the defun-level views (outline, goto, narrow, begin/end) use this.
     fn defun_extent(&self, node: Node<'_>) -> (usize, usize) {
         let end = node.end_byte();
         // The wrapper, when there is one, is the node whose siblings the
@@ -560,12 +561,12 @@ impl Syntax {
     }
 
     /// Whether `node` is decoration belonging to `next`, its following named
-    /// sibling: a Rust outer attribute or outer doc comment (`///` or
-    /// `/** */`; inner `//!` docs and plain `//` comments are not — and no
-    /// adjacency test, since a detached `///` does not compile), or, in Go
-    /// and JavaScript/TypeScript, a comment on its own line with no blank
-    /// line between it and `next` — those languages' doc-comment convention.
-    /// A comment trailing the previous item's code is that item's.
+    /// sibling: a Rust outer attribute or outer doc comment (`///` or `/** */`;
+    /// inner `//!` docs and plain `//` comments are not — and no adjacency
+    /// test, since a detached `///` does not compile), or, in Go and
+    /// JavaScript/TypeScript, a comment on its own line with no blank line
+    /// between it and `next` — those languages' doc-comment convention.  A
+    /// comment trailing the previous item's code is that item's.
     fn decorates_next(&self, node: Node<'_>, next: Node<'_>) -> bool {
         match self.lang {
             Lang::Rust => match node.kind() {
@@ -646,8 +647,8 @@ impl Syntax {
                     end: self.char_of(end_b),
                 });
             }
-            // Push named children in reverse so the stack pops them in
-            // document order.
+            // Push named children in reverse so the stack pops them in document
+            // order.
             for i in (0..node.named_child_count() as u32).rev() {
                 if let Some(child) = node.named_child(i) {
                     stack.push(child);
@@ -670,7 +671,8 @@ impl Syntax {
     fn name_of(&self, node: Node<'_>) -> String {
         match self.lang {
             Lang::Markdown => {
-                // section → atx_heading/setext_heading → inline (the heading text).
+                // section → atx_heading/setext_heading → inline (the heading
+                // text).
                 let mut cursor = node.walk();
                 let heading = node
                     .named_children(&mut cursor)
@@ -720,8 +722,8 @@ impl Syntax {
                     .unwrap_or_default()
             }
             Lang::Css => {
-                // rule_set → selectors text; @media → its query; @keyframes
-                // → its name — i.e. everything before the block, joined.
+                // rule_set → selectors text; @media → its query; @keyframes →
+                // its name — i.e. everything before the block, joined.
                 let mut c = node.walk();
                 let head: Vec<String> = node
                     .named_children(&mut c)
@@ -759,9 +761,9 @@ impl Syntax {
     /// from the root, comparing ids. (`descendant_for_byte_range` is NOT
     /// enough: a ZERO-WIDTH node — a missing `block` in `def f():`, a missing
     /// closer — is skipped by it in favor of an adjacent token whose ancestor
-    /// chain never reaches the target, so the descent recurses into every
-    /// child whose range contains the handle's instead.) `None` only if the
-    /// handle is not from this parse — a caller bug surfaced gently.
+    /// chain never reaches the target, so the descent recurses into every child
+    /// whose range contains the handle's instead.) `None` only if the handle is
+    /// not from this parse — a caller bug surfaced gently.
     fn locate(&self, h: NodeRef) -> Option<Node<'_>> {
         fn descend<'t>(node: Node<'t>, h: NodeRef) -> Option<Node<'t>> {
             if node.id() == h.id {
@@ -783,12 +785,11 @@ impl Syntax {
         descend(self.root(), h)
     }
 
-    /// What a node is to the paragraph filler, if it is prose at all. A
-    /// comment is a block comment when its text opens with one of the
-    /// language's block openers and a line comment otherwise (Go, JS and
-    /// Python have one `comment` kind for both); a Python `string` is
-    /// prose when it is a triple-quoted docstring; a Markdown `paragraph`
-    /// always.
+    /// What a node is to the paragraph filler, if it is prose at all. A comment
+    /// is a block comment when its text opens with one of the language's block
+    /// openers and a line comment otherwise (Go, JS and Python have one
+    /// `comment` kind for both); a Python `string` is prose when it is a
+    /// triple-quoted docstring; a Markdown `paragraph` always.
     fn prose_kind(&self, n: Node<'_>) -> Option<ProseKind> {
         match n.kind() {
             "line_comment" | "block_comment" | "comment" => {
@@ -807,8 +808,8 @@ impl Syntax {
             "string" if self.lang == Lang::Python => {
                 let open = n.named_child(0)?;
                 let quotes = self.text_of(open);
-                // A docstring may be raw or unicode-prefixed; an f-string
-                // or bytes literal is a value with code inside.
+                // A docstring may be raw or unicode-prefixed; an f-string or
+                // bytes literal is a value with code inside.
                 let plain = quotes
                     .trim_end_matches(['"', '\''])
                     .chars()
@@ -819,8 +820,8 @@ impl Syntax {
                     && self.is_docstring(n))
                 .then_some(ProseKind::TripleString)
             }
-            // A setext heading's title is a paragraph node; wrapping it
-            // would leave a paragraph and a shorter heading.
+            // A setext heading's title is a paragraph node; wrapping it would
+            // leave a paragraph and a shorter heading.
             "paragraph" if self.lang == Lang::Markdown => n
                 .parent()
                 .is_none_or(|p| p.kind() != "setext_heading")
@@ -829,10 +830,10 @@ impl Syntax {
         }
     }
 
-    /// Whether line comments `a` then `b` sit on consecutive lines: exactly
-    /// one newline and otherwise whitespace between the end of `a`'s text
-    /// and the start of `b` (a Rust `line_comment` owns its newline; a
-    /// Python `comment` does not).
+    /// Whether line comments `a` then `b` sit on consecutive lines: exactly one
+    /// newline and otherwise whitespace between the end of `a`'s text and the
+    /// start of `b` (a Rust `line_comment` owns its newline; a Python `comment`
+    /// does not).
     fn consecutive(&self, a: Node<'_>, b: Node<'_>) -> bool {
         let gap = &self.text[self.text_end(a)..b.start_byte()];
         gap.trim().is_empty() && gap.matches('\n').count() == 1
@@ -843,17 +844,17 @@ impl Syntax {
         self.text[..b].rfind('\n').map_or(0, |i| i + 1)
     }
 
-    /// Byte offset just past the newline ending the line holding byte `b`,
-    /// or the end of the text.
+    /// Byte offset just past the newline ending the line holding byte `b`, or
+    /// the end of the text.
     fn eol_byte(&self, b: usize) -> usize {
         self.text[b..]
             .find('\n')
             .map_or(self.text.len(), |i| b + i + 1)
     }
 
-    /// The end of `n`'s text: its end byte, less the newline some grammars
-    /// put inside a comment node (a Rust doc comment) and others leave out
-    /// (a Python `comment`).
+    /// The end of `n`'s text: its end byte, less the newline some grammars put
+    /// inside a comment node (a Rust doc comment) and others leave out (a
+    /// Python `comment`).
     fn text_end(&self, n: Node<'_>) -> usize {
         let end = n.end_byte();
         if self.text[..end].ends_with('\n') {
@@ -864,11 +865,11 @@ impl Syntax {
     }
 
     /// Whether a Python string sits in docstring position: the whole first
-    /// statement of a module, class or function body (comments before it
-    /// do not count). Stricter than PEP 257 in two ways, since neither is
-    /// reflowed: a parenthesised docstring, and one made of concatenated
-    /// literals. Looser in one: a prefixed literal (an f-string, bytes)
-    /// there counts, so the refusal can name the prefix as the reason.
+    /// statement of a module, class or function body (comments before it do not
+    /// count). Stricter than PEP 257 in two ways, since neither is reflowed: a
+    /// parenthesised docstring, and one made of concatenated literals. Looser
+    /// in one: a prefixed literal (an f-string, bytes) there counts, so the
+    /// refusal can name the prefix as the reason.
     fn is_docstring(&self, n: Node<'_>) -> bool {
         let Some(stmt) = n.parent() else {
             return false;
@@ -893,10 +894,10 @@ impl Syntax {
     }
 
     /// The Python triple-quoted string `n` is, or is inside — or the
-    /// concatenation or parentheses holding one, when point is between
-    /// members, on a single-quoted member, or on a bracket. A position
-    /// inside an f-string's `{…}` is code, however many strings nest
-    /// there, so it is not in any string.
+    /// concatenation or parentheses holding one, when point is between members,
+    /// on a single-quoted member, or on a bracket. A position inside an
+    /// f-string's `{…}` is code, however many strings nest there, so it is not
+    /// in any string.
     fn python_string_around<'t>(&self, n: Node<'t>) -> Option<Node<'t>> {
         if self.lang != Lang::Python {
             return None;
@@ -937,8 +938,8 @@ impl Syntax {
         found
     }
 
-    /// The expression a Python string is part of once the concatenation
-    /// and parentheses around it are climbed, if any.
+    /// The expression a Python string is part of once the concatenation and
+    /// parentheses around it are climbed, if any.
     fn string_holder<'t>(&self, string: Node<'t>) -> Node<'t> {
         let mut holder = string;
         while let Some(p) = holder.parent()
@@ -950,8 +951,8 @@ impl Syntax {
     }
 
     /// Why a Python string expression that is not prose is not: out of
-    /// docstring position it is data; in position it is a prefixed literal
-    /// (an f-string or bytes), a concatenation, or parenthesised.
+    /// docstring position it is data; in position it is a prefixed literal (an
+    /// f-string or bytes), a concatenation, or parenthesised.
     fn string_refusal(&self, holder: Node<'_>) -> &'static str {
         if self.is_docstring(holder) {
             "is in docstring position but not a plain docstring (an f-string, bytes, \
@@ -967,16 +968,16 @@ impl Syntax {
         self.text[end..self.eol_byte(end)].trim().is_empty()
     }
 
-    /// Whether a prose node owns its lines: nothing but whitespace beside
-    /// it on its first and last line, so the whole-line unit holds no
-    /// code. A Markdown paragraph always does; its list marker or `>` is
-    /// part of the frame.
+    /// Whether a prose node owns its lines: nothing but whitespace beside it on
+    /// its first and last line, so the whole-line unit holds no code. A
+    /// Markdown paragraph always does; its list marker or `>` is part of the
+    /// frame.
     fn owns_its_lines(&self, n: Node<'_>, kind: ProseKind) -> bool {
         kind == ProseKind::Paragraph || (self.starts_its_line(n) && self.ends_its_line(n))
     }
 
-    /// The indent and marker run (`//`, `///`, `//!`, `;;`) leading `n`'s
-    /// line: what two line comments must share to be one run.
+    /// The indent and marker run (`//`, `///`, `//!`, `;;`) leading `n`'s line:
+    /// what two line comments must share to be one run.
     fn line_lead(&self, n: Node<'_>) -> (&str, &str) {
         let indent = &self.text[self.bol_byte(n.start_byte())..n.start_byte()];
         let openers = self.lang.sexp_rule().line_comments;
@@ -989,9 +990,9 @@ impl Syntax {
         (indent, &text[..marker])
     }
 
-    /// The unit `n` (a prose node) belongs to, as whole lines: a line
-    /// comment's run of consecutive comment siblings with the same indent
-    /// and marker, any other prose node on its own.
+    /// The unit `n` (a prose node) belongs to, as whole lines: a line comment's
+    /// run of consecutive comment siblings with the same indent and marker, any
+    /// other prose node on its own.
     fn prose_unit_of(&self, n: Node<'_>, kind: ProseKind) -> ProseUnit {
         let (bol, eol) = self.prose_unit_bytes(n, kind);
         ProseUnit {
@@ -1040,17 +1041,16 @@ impl Syntax {
         }
     }
 
-    /// The prose unit — a run of line comments, a block comment, a
-    /// Python docstring, a Markdown paragraph — holding char
-    /// position `pos`, as a whole-line span. A position at the end of a
-    /// line counts as on its last char, and the end of the text as on the
-    /// last char before it. `Err` names what the position is
-    /// in instead, or the comment or string that shares its line with
-    /// code.
+    /// The prose unit — a run of line comments, a block comment, a Python
+    /// docstring, a Markdown paragraph — holding char position `pos`, as a
+    /// whole-line span. A position at the end of a line counts as on its last
+    /// char, and the end of the text as on the last char before it. `Err` names
+    /// what the position is in instead, or the comment or string that shares
+    /// its line with code.
     pub fn prose_unit_at(&self, pos: usize) -> Result<ProseUnit, String> {
         let b = self.byte_of(pos);
-        // The end of a line counts as its last char; the end of the text as
-        // the last char before it. That is the byte the refusal names too.
+        // The end of a line counts as its last char; the end of the text as the
+        // last char before it. That is the byte the refusal names too.
         let at_eol = self.text[b..].starts_with('\n') || b == self.text.len();
         let probe = if at_eol {
             let from = if b == self.text.len() {
@@ -1082,8 +1082,8 @@ impl Syntax {
                     ));
                 }
                 Some(n) => {
-                    // The nearest node that says something: past the inline
-                    // and paragraph nodes of a Markdown heading.
+                    // The nearest node that says something: past the inline and
+                    // paragraph nodes of a Markdown heading.
                     let mut up = n;
                     while matches!(up.kind(), "inline" | "paragraph")
                         && let Some(p) = up.parent()
@@ -1115,14 +1115,14 @@ impl Syntax {
         Ok(self.prose_unit_of(node, kind))
     }
 
-    /// Every prose unit whose lines overlap the char range `[a, b)`, in
-    /// buffer order, each once (a run of line comments is one unit however many
-    /// of its lines the range touches). A comment or string that shares a
-    /// line with code is skipped.
+    /// Every prose unit whose lines overlap the char range `[a, b)`, in buffer
+    /// order, each once (a run of line comments is one unit however many of its
+    /// lines the range touches). A comment or string that shares a line with
+    /// code is skipped.
     pub fn prose_units_in(&self, a: usize, b: usize) -> Vec<ProseUnit> {
         let (a, b) = (self.byte_of(a), self.byte_of(b));
-        // Units are whole lines, so the range is too: the indentation
-        // before a comment selects it.
+        // Units are whole lines, so the range is too: the indentation before a
+        // comment selects it.
         let a = self.bol_byte(a);
         let b = if b > a && !self.text[..b].ends_with('\n') {
             self.eol_byte(b)
@@ -1130,8 +1130,8 @@ impl Syntax {
             b
         };
         let mut units = Vec::new();
-        // Byte end of the last unit found: the walk runs in document order,
-        // so a node before it is a later line of that unit.
+        // Byte end of the last unit found: the walk runs in document order, so
+        // a node before it is a later line of that unit.
         let mut covered = 0;
         let mut stack = vec![self.root()];
         while let Some(n) = stack.pop() {
@@ -1152,8 +1152,8 @@ impl Syntax {
                     covered = eol;
                 }
                 None => {
-                    // Push named children in reverse so the stack pops them
-                    // in document order.
+                    // Push named children in reverse so the stack pops them in
+                    // document order.
                     for i in (0..n.named_child_count() as u32).rev() {
                         if let Some(child) = n.named_child(i) {
                             stack.push(child);
@@ -1189,8 +1189,8 @@ impl Syntax {
     }
 
     /// Relational navigation. Each returns a handle in this same parse, or
-    /// `None` where the tree ends. `named` skips anonymous tokens
-    /// (punctuation, keywords), which is almost always what an agent wants.
+    /// `None` where the tree ends. `named` skips anonymous tokens (punctuation,
+    /// keywords), which is almost always what an agent wants.
     pub fn parent_of(&self, h: NodeRef) -> Option<NodeRef> {
         self.locate(h)?.parent().map(Self::handle)
     }
@@ -1238,8 +1238,8 @@ impl Syntax {
 
     /// Run a tree-sitter query (`.scm` pattern syntax) over the whole buffer
     /// and return every capture as `(capture_name, handle)`, in match order —
-    /// structural search: "every `function_item`", "calls to `foo`", … .
-    /// `Err` is the query compile error (pattern syntax / unknown node kind).
+    /// structural search: "every `function_item`", "calls to `foo`", … .  `Err`
+    /// is the query compile error (pattern syntax / unknown node kind).
     pub fn query(&self, pattern: &str) -> Result<Vec<(String, NodeRef)>, String> {
         let query = Query::new(&self.lang.grammar(), pattern).map_err(|e| e.to_string())?;
         let names = query.capture_names();
@@ -1305,8 +1305,8 @@ mod tests {
     #[test]
     fn named_node_at_a_heading_word() {
         let syn = Syntax::parse(DOC, Lang::Markdown);
-        // Char position inside "Title" — the smallest named node is the heading's
-        // inline content.
+        // Char position inside "Title" — the smallest named node is the
+        // heading's inline content.
         let span = syn
             .node_at(4)
             .and_then(|h| syn.describe(h))
@@ -1344,8 +1344,8 @@ mod tests {
     #[test]
     fn enclosing_defun_under_h1() {
         let syn = Syntax::parse(DOC, Lang::Markdown);
-        // Point in the H1 paragraph → the outer H1 section, which spans the whole
-        // document (the H2 section nests inside it).
+        // Point in the H1 paragraph → the outer H1 section, which spans the
+        // whole document (the H2 section nests inside it).
         let p = DOC.find("Hello").unwrap() + 1;
         let sec = syn.enclosing_defun(p).expect("a section");
         assert_eq!(sec.start, 1);
@@ -1484,8 +1484,8 @@ mod tests {
             "prev inverts next"
         );
 
-        // Unnamed children are visible when asked for: fn main's body block
-        // has `{` as child 0 in the unnamed view.
+        // Unnamed children are visible when asked for: fn main's body block has
+        // `{` as child 0 in the unnamed view.
         let main = syn.find_defun("main").unwrap();
         let main_h = syn.defun_at(main.start).expect("main handle");
         let body = syn.child_by_field_of(main_h, "body").expect("body field");
@@ -1495,10 +1495,10 @@ mod tests {
 
     #[test]
     fn zero_width_nodes_locate_and_navigate() {
-        // Incomplete code produces real ZERO-WIDTH nodes (a missing `block`
-        // in `def f():`); descendant_for_byte_range skips them, so locate's
-        // containment descent must find them — a panic here took down the
-        // whole process when a query captured one.
+        // Incomplete code produces real ZERO-WIDTH nodes (a missing `block` in
+        // `def f():`); descendant_for_byte_range skips them, so locate's
+        // containment descent must find them — a panic here took down the whole
+        // process when a query captured one.
         let syn = Syntax::parse("def f():", Lang::Python);
         let caps = syn.query("(block) @b").expect("valid query");
         assert_eq!(caps.len(), 1, "the zero-width block is captured");
@@ -1517,7 +1517,8 @@ mod tests {
 
     #[test]
     fn char_positions_handle_multibyte() {
-        // Em dash (3 bytes) before the heading word shifts byte vs. char offsets.
+        // Em dash (3 bytes) before the heading word shifts byte vs. char
+        // offsets.
         let doc = "# Tëa — pot\n\nbody\n";
         let syn = Syntax::parse(doc, Lang::Markdown);
         let p = doc.chars().position(|c| c == 'b').unwrap() + 1; // char index of "body"
@@ -1526,8 +1527,8 @@ mod tests {
             .and_then(|h| syn.describe(h))
             .expect("a node at point");
         assert_eq!(span.kind, "inline");
-        // The span must be addressable as chars: substring by char span recovers
-        // the original word.
+        // The span must be addressable as chars: substring by char span
+        // recovers the original word.
         let chars: Vec<char> = doc.chars().collect();
         let got: String = chars[span.start - 1..span.end - 1].iter().collect();
         assert_eq!(got, "body");
@@ -1537,12 +1538,12 @@ mod tests {
     fn rust_defun_extent_includes_preceding_attributes() {
         let src = "#[cfg(test)]\n#[test]\nfn check() {\n    assert!(true);\n}\n";
         let syn = Syntax::parse(src, Lang::Rust);
-        // The outline span starts at the first attribute, so "delete this
-        // test" is the defun span with no manual hop to the #[…] lines.
+        // The outline span starts at the first attribute, so "delete this test"
+        // is the defun span with no manual hop to the #[…] lines.
         let d = syn.find_defun("check").expect("check");
         assert_eq!(d.start, 1, "span starts at #[cfg(test)]");
-        // A position ON an attribute resolves to the decorated defun:
-        // narrowing / defun-at from the attribute line works.
+        // A position ON an attribute resolves to the decorated defun: narrowing
+        // / defun-at from the attribute line works.
         let span = syn.enclosing_defun(3).expect("from the attribute line");
         assert_eq!(span.kind, "function_item");
         assert_eq!(span.start, 1);
@@ -1614,8 +1615,8 @@ mod tests {
             "a blank line breaks the attachment"
         );
         assert_eq!(syn.enclosing_defun_name(at("Second")).as_deref(), Some("A"));
-        // A comment trailing the previous line's code belongs to that line,
-        // not to the function below it.
+        // A comment trailing the previous line's code belongs to that line, not
+        // to the function below it.
         let src = "package p\n\nconst Max = 3 // tuned\nfunc Retry() {}\n";
         let syn = Syntax::parse(src, Lang::Go);
         let at = |s: &str| src.find(s).unwrap() + 1;
@@ -1741,8 +1742,8 @@ mod tests {
 
     #[test]
     fn typescript_and_tsx_grammars_accept_their_own_dialects() {
-        // An angle-bracket type assertion is valid TS but invalid TSX
-        // (it parses as JSX there) — .ts must not use the TSX grammar.
+        // An angle-bracket type assertion is valid TS but invalid TSX (it
+        // parses as JSX there) — .ts must not use the TSX grammar.
         let ts = "const x = <Foo>bar;\n";
         assert!(!Syntax::parse(ts, Lang::Typescript).has_error());
         assert!(Syntax::parse(ts, Lang::Tsx).has_error());
@@ -1813,8 +1814,8 @@ mod tests {
 
     #[test]
     fn checkpointed_conversions_match_the_naive_scan() {
-        // Multibyte text long enough to span several 4 KiB checkpoints, so
-        // both the residue walks and the checkpoint hops are exercised.
+        // Multibyte text long enough to span several 4 KiB checkpoints, so both
+        // the residue walks and the checkpoint hops are exercised.
         let mut text = String::new();
         for i in 0..600 {
             text.push_str(&format!("line {i:04} — naïve café ‸körner\n"));
@@ -1962,8 +1963,8 @@ mod tests {
             span(text, Lang::Python, 35),
             (ProseKind::TripleString, 30, 52)
         );
-        // A string after an assignment is not a docstring (PEP 257), so a
-        // block commented out with quotes is never reflowed.
+        // A string after an assignment is not a docstring (PEP 257), so a block
+        // commented out with quotes is never reflowed.
         let text = "X = 1\n\"\"\"Docs\nfor X\"\"\"\n";
         let err = unit_at(text, Lang::Python, 8).unwrap_err();
         assert!(err.contains("@7 is not in docstring position"), "{err}");
@@ -1978,8 +1979,8 @@ mod tests {
         // A tuple continued onto the string's line is not a lone string.
         let text = "1, \\\n\"\"\"Doc\nmore\"\"\"\n";
         assert!(unit_at(text, Lang::Python, 8).is_err());
-        // An f-string or bytes literal is a value; a raw or unicode
-        // docstring is prose.
+        // An f-string or bytes literal is a value; a raw or unicode docstring
+        // is prose.
         let text = "def f(x):\n    f\"\"\"Totals {x}\n    done\"\"\"\n";
         let err = unit_at(text, Lang::Python, 20).unwrap_err();
         assert!(
@@ -1995,9 +1996,9 @@ mod tests {
         assert!(!err.contains("docstring position"), "{err}");
         let text = "def f():\n    b\"\"\"raw\n    bytes\"\"\"\n";
         assert!(unit_at(text, Lang::Python, 20).is_err());
-        // Concatenated or parenthesised literals are a docstring to Python,
-        // but not reflowed; the message names the whole expression from
-        // any member, the space between members, or a plain member.
+        // Concatenated or parenthesised literals are a docstring to Python, but
+        // not reflowed; the message names the whole expression from any member,
+        // the space between members, or a plain member.
         let text = "def f():\n    \"\"\"one\"\"\" \"\"\"two\n    lines\"\"\"\n";
         for pos in [26, 23] {
             let err = unit_at(text, Lang::Python, pos).unwrap_err();
@@ -2178,8 +2179,8 @@ mod tests {
                 (ProseKind::BlockComment, 31, 39),
             ]
         );
-        // Only units whose lines the range touches: a range on the
-        // indentation before a comment still selects it.
+        // Only units whose lines the range touches: a range on the indentation
+        // before a comment still selects it.
         assert_eq!(syn.prose_units_in(20, 22).len(), 1);
         assert_eq!(syn.prose_units_in(12, 15).len(), 0);
         // A triple-quoted string outside docstring position is not a unit.

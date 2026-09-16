@@ -28,11 +28,11 @@ mime-rs is built for two kinds of caller, sharing one engine:
   `sed`, or a one-off script — but with real buffers, structural (tree-sitter)
   edits, multi-file orchestration, dry-runs, and rollback.
 - **AI agents**, over [MCP](https://modelcontextprotocol.io): a *bounded*
-  editing surface designed for models. The common edit is one call; an
-  ambiguous edit is an **error**, not a silent mistake; and recovering from a
-  misfire is a single `undo_last`. The hard parts of agent editing — "did that
-  land where I meant?", "is this still the file I read?" — are answered by the
-  tool, not guessed by the model.
+  editing surface designed for models. The common edit is one call; an ambiguous
+  edit is an **error**, not a silent mistake; and recovering from a misfire is a
+  single `undo_last`. The hard parts of agent editing — "did that land where I
+  meant?", "is this still the file I read?" — are answered by the tool, not
+  guessed by the model.
 
 The same buffers, vocabulary, and transactional guarantees back both; only the
 front end and the capability tier differ.
@@ -41,18 +41,19 @@ front end and the capability tier differ.
 
 - **Transactional everywhere.** `rehearse` dry-runs any program and returns the
   diff it *would* make, changing nothing. `(with-transaction …)` makes a
-  multi-step program all-or-nothing. Checkpoints and an undo ring let you rewind.
-  Saves are atomic and **refuse to clobber** a file an external writer changed
-  since you opened it — the edit stays warm in the session instead of vanishing.
+  multi-step program all-or-nothing. Checkpoints and an undo ring let you
+  rewind.  Saves are atomic and **refuse to clobber** a file an external writer
+  changed since you opened it — the edit stays warm in the session instead of
+  vanishing.
 
 - **Structural editing, twelve languages.** Outline a file, jump to a function
   *by name*, scope an edit to a single defun, or run a tree-sitter query —
   across Rust, Python, Markdown, HTML, JavaScript, TypeScript, TSX, Go, CSS,
-  TOML, YAML, and Elisp.
-  Defun spans include the decoration — Rust `#[attributes]` and `///` docs,
-  Python decorators, the comment block above a Go or JS/TS function and a JS
-  `export` — so "delete this test" is one motion, and a save-time parse check warns before you commit
-  a syntactically broken code buffer.
+  TOML, YAML, and Elisp.  Defun spans include the decoration — Rust
+  `#[attributes]` and `///` docs, Python decorators, the comment block above a
+  Go or JS/TS function and a JS `export` — so "delete this test" is one motion,
+  and a save-time parse check warns before you commit a syntactically broken
+  code buffer.
 
 - **Huge files stay cheap.** The file-backed store is a persistent B-tree piece
   table over a paged, read-on-demand original: O(log n) piece lookup with
@@ -63,35 +64,34 @@ front end and the capability tier differ.
 - **In-process git history editing.** A `git_*` tool group drives rebase,
   cherry-pick, and revert as a sequencer (on `git2` / vendored libgit2): the
   plan is *data*, a conflicted step surfaces through the very same
-  merge-conflict vocabulary you'd use by hand, and `git_rebase` can `rehearse`
-  a plan before running it. `autosquash` folds commits without a full plan:
-  a sparse `{commit, into}` list, or `true` to fold the branch's
+  merge-conflict vocabulary you'd use by hand, and `git_rebase` can `rehearse` a
+  plan before running it. `autosquash` folds commits without a full plan: a
+  sparse `{commit, into}` list, or `true` to fold the branch's
   `fixup!`/`squash!` commits into the commits their subjects name (git's
-  `--autosquash`). One-call helpers sit on top: `git_fixup` and
-  `git_absorb` fold worktree changes into the commits that own them,
-  `git_reword` / `git_msg_rewrite` edit messages, and `git_range_diff` checks
-  a rewrite after the fact. There is no `git` subprocess, network access or
-  hook execution. `commit.gpgsign=true` is honoured via the configured
-  OpenPGP signer when the launcher grants `MIME_EXEC=1`; otherwise
-  write operations refuse instead of silently creating unsigned history.
-  `MIME_EXEC=1` also enables the explicit `git_exec_over` tool. Every
-  destructive op first stamps a `refs/mime-backup/<branch>` recovery ref.
+  `--autosquash`). One-call helpers sit on top: `git_fixup` and `git_absorb`
+  fold worktree changes into the commits that own them, `git_reword` /
+  `git_msg_rewrite` edit messages, and `git_range_diff` checks a rewrite after
+  the fact. There is no `git` subprocess, network access or hook execution.
+  `commit.gpgsign=true` is honoured via the configured OpenPGP signer when the
+  launcher grants `MIME_EXEC=1`; otherwise write operations refuse instead of
+  silently creating unsigned history.  `MIME_EXEC=1` also enables the explicit
+  `git_exec_over` tool. Every destructive op first stamps a
+  `refs/mime-backup/<branch>` recovery ref.
 
 - **Honest results.** Diffs are token-frugal (clamped with an elision marker
   when huge), every call returns structured reports, `stale`/`unsaved` flags
   appear only when actually true, and errors name the session so a misfire is
   recoverable rather than lost.
 
-- **Two capability tiers, fixed by the host.** The local CLI is *trusted* —
-  full orchestration, unrestricted filesystem, like `emacs --batch`. The
-  MCP/daemon tier is *sandboxed*: the filesystem is confined to `$MIME_ROOTS`,
-  every run is audited, and there is **no shell, no process spawn, and no
-  network** — the git tools included (they work in-process, so they never
-  breach that boundary). The one exception is `git_exec_over`, which runs a
-  build command at each commit — it stays disabled unless the host sets
-  `MIME_EXEC=1` (the same grant lets `commit.gpgsign` run the configured
-  signer). `make claude` registers the server without it; `make claude-exec`
-  registers it with that grant.
+- **Two capability tiers, fixed by the host.** The local CLI is *trusted* — full
+  orchestration, unrestricted filesystem, like `emacs --batch`. The MCP/daemon
+  tier is *sandboxed*: the filesystem is confined to `$MIME_ROOTS`, every run is
+  audited, and there is **no shell, no process spawn, and no network** — the git
+  tools included (they work in-process, so they never breach that boundary). The
+  one exception is `git_exec_over`, which runs a build command at each commit —
+  it stays disabled unless the host sets `MIME_EXEC=1` (the same grant lets
+  `commit.gpgsign` run the configured signer). `make claude` registers the
+  server without it; `make claude-exec` registers it with that grant.
 
 ## Install
 
@@ -127,19 +127,18 @@ The vocabulary is Emacs Lisp (via [tulisp](https://crates.io/crates/tulisp)):
 kill-ring, `occur`, merge-conflict resolution, the `treesit-*` family, and the
 `replace-regexp` streaming bulk pass. Regex is Emacs syntax (`\(...\)`, `\|`,
 `\{n,m\}`) on the RE2 engine — linear-time, no backreferences in patterns. The
-full table lives in
-[docs/vocabulary.md](docs/vocabulary.md).
+full table lives in [docs/vocabulary.md](docs/vocabulary.md).
 
 ## Using it from an agent (MCP)
 
 mime is a standard MCP server — `mime --mcp` over **stdio** or `mime --http` for
 **Streamable HTTP** — so any MCP client drives it the same way: Claude Code,
 Cursor, Cline, Continue, VS Code, the Gemini/Codex CLIs, or your own harness.
-It's self-describing: `initialize` returns how-to-drive `instructions` and a tool
-index, and every tool carries MCP `annotations` (read-only vs destructive), so a
-client onboards its model straight from the protocol — no per-client setup file.
-[docs/clients.md](docs/clients.md) has copy-paste registration for each client
-(and the HTTP endpoint); for Claude Code there's a shortcut:
+It's self-describing: `initialize` returns how-to-drive `instructions` and a
+tool index, and every tool carries MCP `annotations` (read-only vs destructive),
+so a client onboards its model straight from the protocol — no per-client setup
+file.  [docs/clients.md](docs/clients.md) has copy-paste registration for each
+client (and the HTTP endpoint); for Claude Code there's a shortcut:
 
 ```sh
 make claude        # cargo install + register `mime --mcp` (MIME_ROOTS) with Claude Code
@@ -148,36 +147,35 @@ make claude-exec   # the same, with MIME_EXEC=1 granted (git_exec_over, gpg sign
 
 ### Protocol
 
-mime is a *dual-era* MCP server. It speaks the stateless `2026-07-28`
-revision (every request carries its protocol version and client capabilities
-in `_meta`; `server/discover` advertises the server; no handshake) and the
-`initialize`-based legacy revisions `2025-11-25`, `2025-06-18`, `2025-03-26`
-and `2024-11-05`. Both work on stdio and on Streamable HTTP, and a dual-era
-client may probe with `server/discover` and then fall back to `initialize`
-on the same process.
+mime is a *dual-era* MCP server. It speaks the stateless `2026-07-28` revision
+(every request carries its protocol version and client capabilities in `_meta`;
+`server/discover` advertises the server; no handshake) and the
+`initialize`-based legacy revisions `2025-11-25`, `2025-06-18`, `2025-03-26` and
+`2024-11-05`. Both work on stdio and on Streamable HTTP, and a dual-era client
+may probe with `server/discover` and then fall back to `initialize` on the same
+process.
 
 Warm state lives in **workspaces**: bounded sets of named sessions behind an
-unguessable handle. On stdio there is one implicit workspace and you never
-see the handle. On HTTP a legacy client's `Mcp-Session-Id` *is* its
-workspace; a `2026-07-28` client that omits `workspace` runs in a fresh
-workspace that is kept only if the call created warm state; the result then
-reports the handle (in `structuredContent` for a tool that returns one, and
-as a trailing `workspace:` line of any prose text) and the client passes it
-to later calls. `open_workspace` / `close_workspace` manage them explicitly.
+unguessable handle. On stdio there is one implicit workspace and you never see
+the handle. On HTTP a legacy client's `Mcp-Session-Id` *is* its workspace; a
+`2026-07-28` client that omits `workspace` runs in a fresh workspace that is
+kept only if the call created warm state; the result then reports the handle (in
+`structuredContent` for a tool that returns one, and as a trailing `workspace:`
+line of any prose text) and the client passes it to later calls.
+`open_workspace` / `close_workspace` manage them explicitly.
 
-Only the tools that return a structured value of their own —
-`session_status`, `run_program`, `rehearse`, `grep`, `outline` and
-`open_workspace` — declare an `outputSchema`; a tool error carries
-`structuredContent` only when the tool supplies one. The text-only tools
-carry none, since Claude Code renders a structured value in preference to the
-text. `session_status` shows the handle only on that protocol (`null`
-elsewhere, and when the call holds no workspace).
+Only the tools that return a structured value of their own — `session_status`,
+`run_program`, `rehearse`, `grep`, `outline` and `open_workspace` — declare an
+`outputSchema`; a tool error carries `structuredContent` only when the tool
+supplies one. The text-only tools carry none, since Claude Code renders a
+structured value in preference to the text. `session_status` shows the handle
+only on that protocol (`null` elsewhere, and when the call holds no workspace).
 
-Each tool takes a `path` and auto-opens the file into a warm session keyed by its
-canonical path; mutating tools take `save: true` for an atomic, stale-guarded
-write-back. The catalogue is generated from the live schemas into
-[docs/mcp-tools.md](docs/mcp-tools.md) (`make docs`), so the docs can't drift from
-the code. The edits that matter:
+Each tool takes a `path` and auto-opens the file into a warm session keyed by
+its canonical path; mutating tools take `save: true` for an atomic,
+stale-guarded write-back. The catalogue is generated from the live schemas into
+[docs/mcp-tools.md](docs/mcp-tools.md) (`make docs`), so the docs can't drift
+from the code. The edits that matter:
 
 ```json
 replace_text {path, pattern, replacement, expect_unique: true, save: true}
@@ -199,23 +197,23 @@ all-or-nothing; and warm sessions are bounded but never evicted while they hold
 unsaved work.
 
 A `git_*` group adds history editing. The core is the sequencer: `git_rebase`
-(with a `rehearse` dry-run), `git_cherry_pick`, `git_revert`, and
-`git_continue` / `git_skip` / `git_abort`, plus the read-only `git_status`
-(branch, upstream ahead/behind, dirty paths, in-progress operation),
-`git_log` (`stat: true` adds per-commit files and line counts), `git_show`,
-and `git_blame` (whose worktree mode maps each uncommitted hunk to the
-commit that owns it). On top sit one-call helpers: `git_commit` creates a
-commit from explicitly listed files only (no `-A`/`.` sweep; `after` places
-it mid-series), `git_split` partitions one commit into several with the
-descendants replayed unchanged, `git_fixup` and `git_absorb` fold
-uncommitted changes into the commits that own them, `git_move` relocates a
-change between two adjacent commits, `git_reword` and `git_msg_rewrite`
-edit commit messages (one commit / a whole range), `git_discard` drops
-selected uncommitted hunks (recoverably), and `git_range_diff` compares a
-branch before and after a rewrite. A conflicted
-step stops with diff3 markers in the worktree; resolve them with the
-conflict tools above, then `git_continue` (or `git_skip` / `git_abort`). Repos are confined to `$MIME_ROOTS`, and each op
-stamps a `refs/mime-backup/<branch>` ref so the pre-op state is recoverable.
+(with a `rehearse` dry-run), `git_cherry_pick`, `git_revert`, and `git_continue`
+/ `git_skip` / `git_abort`, plus the read-only `git_status` (branch, upstream
+ahead/behind, dirty paths, in-progress operation), `git_log` (`stat: true` adds
+per-commit files and line counts), `git_show`, and `git_blame` (whose worktree
+mode maps each uncommitted hunk to the commit that owns it). On top sit one-call
+helpers: `git_commit` creates a commit from explicitly listed files only (no
+`-A`/`.` sweep; `after` places it mid-series), `git_split` partitions one commit
+into several with the descendants replayed unchanged, `git_fixup` and
+`git_absorb` fold uncommitted changes into the commits that own them, `git_move`
+relocates a change between two adjacent commits, `git_reword` and
+`git_msg_rewrite` edit commit messages (one commit / a whole range),
+`git_discard` drops selected uncommitted hunks (recoverably), and
+`git_range_diff` compares a branch before and after a rewrite. A conflicted step
+stops with diff3 markers in the worktree; resolve them with the conflict tools
+above, then `git_continue` (or `git_skip` / `git_abort`). Repos are confined to
+`$MIME_ROOTS`, and each op stamps a `refs/mime-backup/<branch>` ref so the
+pre-op state is recoverable.
 
 ## How it works
 
@@ -249,14 +247,14 @@ stamps a `refs/mime-backup/<branch>` ref so the pre-op state is recoverable.
   **`conflict.rs`** (merge-conflict parsing/resolution), **`syntax.rs`**
   (tree-sitter integration), and **`sequencer.rs`** (the git rebase/cherry-pick/
   revert state machine, persisted to `.git/mime-sequencer.json`).
-- **`safety.rs`** is the single filesystem chokepoint: `$MIME_ROOTS` enforcement,
-  atomic writes, and the audit log.
+- **`safety.rs`** is the single filesystem chokepoint: `$MIME_ROOTS`
+  enforcement, atomic writes, and the audit log.
 - **`cli.rs`**, **`mcp.rs`**, **`http.rs`**, and **`daemon.rs`** are the four
   front ends — one-shot/REPL, stdio MCP, MCP over Streamable HTTP, and a
   long-lived unix-socket daemon. The two MCP transports share one dispatch core.
   An optional fifth front end, `tui.rs` (behind the `tui` feature), steps a
-  script form by form in a terminal UI, with playback controls (auto-play,
-  step back, restart).
+  script form by form in a terminal UI, with playback controls (auto-play, step
+  back, restart).
 
 ## Building & testing
 
@@ -273,8 +271,8 @@ diverge from the obvious one. Pending work is tracked in [`todo.org`](todo.org).
 
 ## Contributing & dogfooding
 
-mime-rs is largely developed *through* mime-rs — by an agent driving it over
-MCP to edit its own source. That feedback loop is the point: if you are an agent
+mime-rs is largely developed *through* mime-rs — by an agent driving it over MCP
+to edit its own source. That feedback loop is the point: if you are an agent
 using it and something slows you down — a missing builtin, a confusing report,
 an inexpressible query, a tool that should exist — say so and propose the fix.
 Much of the agent-facing surface exists because an agent hit the gap and said

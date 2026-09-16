@@ -14,8 +14,8 @@ pub struct RunReport {
     pub log: Vec<String>,
     /// True when this report came from a *rehearsal* — the program ran and the
     /// diff/reports below describe what *would* have happened, but the live
-    /// buffer (and kill-ring/checkpoints) were rolled back, so nothing persisted.
-    /// `false` for a normal `run`.
+    /// buffer (and kill-ring/checkpoints) were rolled back, so nothing
+    /// persisted.  `false` for a normal `run`.
     pub rehearsed: bool,
     /// Final buffer text — not serialized into the JSON; used by `--write`.
     /// `Some` only when the run actually changed the text (`dirty`): a clean
@@ -68,9 +68,9 @@ pub fn reports_to_json(reports: &[(String, String)]) -> Value {
 /// accumulated before it died — the diagnostics callers used to pack into the
 /// error message itself — and `dirty`, whether the dying program's edits
 /// persist (true only for a warm writable run; read-only and rehearse roll
-/// back). Additive: `ok` stays the discriminator, and there is deliberately
-/// no `diff` (what a failed run left behind is the *next* run's concern, not
-/// a result).
+/// back). Additive: `ok` stays the discriminator, and there is deliberately no
+/// `diff` (what a failed run left behind is the *next* run's concern, not a
+/// result).
 pub fn failure_json(
     error: &str,
     reports: &[(String, String)],
@@ -86,10 +86,10 @@ pub fn failure_json(
     })
 }
 
-/// Clamp a unified diff for transport: a bulk edit (replace-regexp over a
-/// big file) produces a diff proportional to the whole change — megabytes
-/// straight into an agent's context. Beyond `max_lines`, keep the head and
-/// tail halves around an elision line that says how much was suppressed.
+/// Clamp a unified diff for transport: a bulk edit (replace-regexp over a big
+/// file) produces a diff proportional to the whole change — megabytes straight
+/// into an agent's context. Beyond `max_lines`, keep the head and tail halves
+/// around an elision line that says how much was suppressed.
 pub fn clamp_diff(diff: &str, max_lines: usize) -> String {
     let total = diff.lines().count();
     if total <= max_lines.max(2) {

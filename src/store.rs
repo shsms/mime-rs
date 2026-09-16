@@ -1,22 +1,22 @@
 //! `TextStore` — the editing surface the engine drives, and the seam between
-//! the M0 in-memory [`crate::buffer::Buffer`] (the differential-test oracle) and
-//! `Quire`, the piece-tree-over-mmap store (M1). All positions are 1-based char
-//! positions, Emacs-style; `point_min`/`point_max` honor the narrowing.
+//! the M0 in-memory [`crate::buffer::Buffer`] (the differential-test oracle)
+//! and `Quire`, the piece-tree-over-mmap store (M1). All positions are 1-based
+//! char positions, Emacs-style; `point_min`/`point_max` honor the narrowing.
 pub trait TextStore {
     fn name(&self) -> &str;
     /// Rename the buffer — `find-file` uniquifies a colliding basename
     /// (`doc.txt<2>`) before installing the store.
     fn set_name(&mut self, name: &str);
-    /// Content version: a globally unique stamp (see [`next_version`]) taken
-    /// at creation and again on every text mutation. Equal versions imply
-    /// equal text (a snapshot keeps its source's version; divergent edits get
-    /// fresh stamps), so caches keyed on it — the per-session tree-sitter
-    /// parse — invalidate exactly when the text changes.
+    /// Content version: a globally unique stamp (see [`next_version`]) taken at
+    /// creation and again on every text mutation. Equal versions imply equal
+    /// text (a snapshot keeps its source's version; divergent edits get fresh
+    /// stamps), so caches keyed on it — the per-session tree-sitter parse —
+    /// invalidate exactly when the text changes.
     fn version(&self) -> u64;
     /// The most recent search's match data (whole-match span + group texts).
     fn last_match(&self) -> Option<&crate::buffer::MatchData>;
-    /// A cheap, independent copy of this store (structural sharing for Quire,
-    /// a full clone for the in-memory Buffer). Backs checkpoints/transactions.
+    /// A cheap, independent copy of this store (structural sharing for Quire, a
+    /// full clone for the in-memory Buffer). Backs checkpoints/transactions.
     fn snapshot(&self) -> Box<dyn TextStore>;
     fn text(&self) -> &str;
     fn char_len(&self) -> usize;
@@ -42,8 +42,8 @@ pub trait TextStore {
     fn looking_at(&self, re: &regex::Regex) -> bool;
 
     // Line motion honors the narrowing, like Emacs: results clamp into
-    // [point_min, point_max], so point never escapes the accessible region
-    // even when the restriction starts or ends mid-line.
+    // [point_min, point_max], so point never escapes the accessible region even
+    // when the restriction starts or ends mid-line.
     /// Move point to the first char of its line, raised to `point_min`.
     fn beginning_of_line(&mut self);
     /// Move point to the end of its line, lowered to `point_max`.
@@ -79,9 +79,10 @@ pub trait TextStore {
     fn marker_set(&mut self, id: usize, pos: Option<usize>);
 
     /// After the buffer has been saved to `path`, re-base the store onto that
-    /// file — for `Quire`, re-mmap the new file as one fresh original and drop the
-    /// pre-save backing (the pinned old mmap inode) and the add buffer; a no-op for
-    /// the in-memory `Buffer`. Content and point/mark/narrowing are unchanged.
+    /// file — for `Quire`, re-mmap the new file as one fresh original and drop
+    /// the pre-save backing (the pinned old mmap inode) and the add buffer; a
+    /// no-op for the in-memory `Buffer`. Content and point/mark/narrowing are
+    /// unchanged.
     fn rebase_to_file(&mut self, path: &std::path::Path) -> std::io::Result<()>;
 
     /// The identity stamp of the visited file, captured at open/rebase time —
@@ -99,10 +100,11 @@ pub trait TextStore {
         false
     }
 
-    /// Stream the buffer's bytes into `w` and return the byte count written. The
-    /// streaming atomic save uses this so a multi-GB `Quire` is written piece by
-    /// piece, never materialized into one allocation; `Buffer` writes its string.
-    /// File-backed stores re-apply their [`coding`](Self::coding) (BOM/EOL) here.
+    /// Stream the buffer's bytes into `w` and return the byte count written.
+    /// The streaming atomic save uses this so a multi-GB `Quire` is written
+    /// piece by piece, never materialized into one allocation; `Buffer` writes
+    /// its string.  File-backed stores re-apply their [`coding`](Self::coding)
+    /// (BOM/EOL) here.
     fn write_to(&self, w: &mut dyn std::io::Write) -> std::io::Result<usize>;
 
     /// The visited file's BOM/EOL convention, restored by `write_to` on save.
@@ -146,10 +148,10 @@ fn meta_twin(re: &regex::Regex) -> Option<std::rc::Rc<regex_automata::meta::Rege
 }
 
 /// Leftmost match of `re` confined to `span` of `hay`, with `^`/`$`/`\b`
-/// consulting the context OUTSIDE the span — the Emacs bounded-search
-/// semantics (a match must fit the bound, assertions read the real buffer
-/// past it). Byte offsets into `hay`, plus the capture-group texts. Like
-/// `captures_at`, the match may start anywhere at or after `span.start`.
+/// consulting the context OUTSIDE the span — the Emacs bounded-search semantics
+/// (a match must fit the bound, assertions read the real buffer past it). Byte
+/// offsets into `hay`, plus the capture-group texts. Like `captures_at`, the
+/// match may start anywhere at or after `span.start`.
 pub(crate) fn span_captures(
     re: &regex::Regex,
     hay: &str,
@@ -165,8 +167,8 @@ pub(crate) fn span_captures(
                 .collect();
             Some((whole.start(), whole.end(), groups))
         }
-        // Fallback: search a haystack hard-cut at the span end (assertions
-        // see the cut, not the buffer).
+        // Fallback: search a haystack hard-cut at the span end (assertions see
+        // the cut, not the buffer).
         None => {
             let caps = re.captures_at(&hay[..span.end], span.start)?;
             let whole = caps.get(0)?;
@@ -197,8 +199,8 @@ fn span_find(re: &regex::Regex, hay: &str, span: std::ops::Range<usize>) -> Opti
 /// (see [`span_captures`]). Implemented the way Emacs does it, as repeated
 /// forward probes from successively later starts, so with OVERLAPPING matches
 /// the latest start wins where a plain `find_iter`-take-last would be
-/// leftmost-biased ("aa" in "aaa" must yield the match at 2, not 1). Each
-/// probe strictly advances, so the sweep terminates; an empty-pattern match
+/// leftmost-biased ("aa" in "aaa" must yield the match at 2, not 1). Each probe
+/// strictly advances, so the sweep terminates; an empty-pattern match
 /// degenerates to the span end, like Emacs.
 pub(crate) fn latest_match_in_span(
     re: &regex::Regex,
@@ -243,7 +245,8 @@ pub(crate) fn markers_after_insert(markers: &mut [Option<usize>], at: usize, len
 }
 
 /// Shift markers after deleting the absolute region `[start, end)`: positions
-/// inside collapse to `start`, positions at or beyond `end` shift down by its width.
+/// inside collapse to `start`, positions at or beyond `end` shift down by its
+/// width.
 pub(crate) fn markers_after_delete(markers: &mut [Option<usize>], start: usize, end: usize) {
     for m in markers.iter_mut().flatten() {
         if *m >= end {

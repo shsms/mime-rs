@@ -254,12 +254,13 @@ fn rehearse_previews_an_edit_then_rolls_back_over_stdio() {
     );
     assert_eq!(report["reports"]["done"], "1");
 
-    // But the live buffer is untouched: a follow-up read still sees "hello world".
+    // But the live buffer is untouched: a follow-up read still sees "hello
+    // world".
     let region = s.call_ok(4, "read_region", json!({ "start": 1, "end": 12 }));
     assert_eq!(region, "hello world");
 
-    // And a real run_program afterwards persists normally, proving rehearse left
-    // the session fully usable.
+    // And a real run_program afterwards persists normally, proving rehearse
+    // left the session fully usable.
     let applied = s.call_ok(
         5,
         "run_program",
@@ -281,8 +282,8 @@ fn unknown_method_is_jsonrpc_error_and_tool_error_sets_is_error() {
     assert_eq!(resp["error"]["code"], -32601);
     assert!(resp.get("result").is_none());
 
-    // A tool-level failure (running against a session that was never opened)
-    // is a *successful* JSON-RPC call with isError=true.
+    // A tool-level failure (running against a session that was never opened) is
+    // a *successful* JSON-RPC call with isError=true.
     let resp = s.request(json!({
         "jsonrpc": "2.0", "id": 2, "method": "tools/call",
         "params": { "name": "run_program", "arguments": { "program": "(insert \"x\")", "session": "ghost" } },
@@ -308,7 +309,8 @@ fn sessions_are_isolated_and_warm() {
     s.call_ok(2, "open_text", json!({ "text": "aaa", "session": "one" }));
     s.call_ok(3, "open_text", json!({ "text": "bbb", "session": "two" }));
 
-    // A defun defined in session "one" persists (warmth) and only affects "one".
+    // A defun defined in session "one" persists (warmth) and only affects
+    // "one".
     s.call_ok(
         4,
         "run_program",
@@ -435,8 +437,8 @@ fn replace_text_is_literal_counted_and_quote_safe() {
     );
     assert_eq!(text, "write!(w, \"\\u{2026} occur \\1\")");
 
-    // No match is a proper error that names the pattern — and a true no-op:
-    // the buffer and point are exactly as before.
+    // No match is a proper error that names the pattern — and a true no-op: the
+    // buffer and point are exactly as before.
     let report = s.call_ok(
         8,
         "run_program",
@@ -657,8 +659,8 @@ fn read_region_resolves_a_thing_by_position_or_anchor_line() {
 #[test]
 fn a_sexp_after_a_line_is_the_first_one_a_list_the_last_the_line_opens() {
     let mut s = Server::spawn();
-    // 1-8 "fn f() {", 9 newline, 10-13 the indent, 14-16 "old", 17 "(",
-    // 18 "1", 19 ",", 20 " ", 21 "2", 22 ")", 23 ";", 24 newline, 25 "}".
+    // 1-8 "fn f() {", 9 newline, 10-13 the indent, 14-16 "old", 17 "(", 18 "1",
+    // 19 ",", 20 " ", 21 "2", 22 ")", 23 ";", 24 newline, 25 "}".
     s.call_ok(
         1,
         "open_text",
@@ -705,8 +707,8 @@ fn read_region_thing_after_with_nothing_left_to_find_is_an_error() {
         json!({ "text": "zz\n---\n", "name": "n.md" }),
     );
 
-    // Nothing follows the anchor line, so there is no word to read — the
-    // lookup must say so, not hand back an empty span.
+    // Nothing follows the anchor line, so there is no word to read — the lookup
+    // must say so, not hand back an empty span.
     let err = s.call_err(
         2,
         "read_region",
@@ -801,8 +803,8 @@ fn replace_text_and_insert_text_take_a_thing() {
     assert!(err.contains("no string at 3"), "{err}");
 
     // A top-level `where` with no `thing` names nothing: the anchor form keeps
-    // its own `where` inside the anchor object, so this is an error rather
-    // than an insert silently landing at the other end.
+    // its own `where` inside the anchor object, so this is an error rather than
+    // an insert silently landing at the other end.
     let err = s.call_err(
         13,
         "insert_text",
@@ -810,8 +812,8 @@ fn replace_text_and_insert_text_take_a_thing() {
     );
     assert!(err.contains("anchor") && err.contains("where"), "{err}");
 
-    // A non-string `where` is a mistyped argument, not a silent default:
-    // schema validation checks key names, not value types.
+    // A non-string `where` is a mistyped argument, not a silent default: schema
+    // validation checks key names, not value types.
     let err = s.call_err(
         14,
         "insert_text",
@@ -828,9 +830,9 @@ fn replace_text_and_insert_text_take_a_thing() {
     );
     assert!(err.contains("got true"), "{err}");
 
-    // An `at` past the end of the buffer clamps inside the scanner, which
-    // would name the LAST thing in the file and splice over it. It is an
-    // error instead — but point-max itself stays a valid probe point.
+    // An `at` past the end of the buffer clamps inside the scanner, which would
+    // name the LAST thing in the file and splice over it. It is an error
+    // instead — but point-max itself stays a valid probe point.
     let err = s.call_err(
         16,
         "replace_text",
@@ -846,8 +848,8 @@ fn replace_text_and_insert_text_take_a_thing() {
         json!({ "thing": { "kind": "sexp", "at": 999999 } }),
     );
     assert!(err.contains("outside the accessible region"), "{err}");
-    // "fn f() {\n    pre();\n    new(3) // done;\n}\n" is 42 chars, so
-    // point-max is 43 and the thing there is the last one in the buffer.
+    // "fn f() {\n pre();\n new(3) // done;\n}\n" is 42 chars, so point-max is
+    // 43 and the thing there is the last one in the buffer.
     let out = s.call_ok(
         18,
         "read_region",
@@ -901,8 +903,8 @@ fn replace_text_regex_mode_expands_backrefs() {
     );
     assert_eq!(text, "yx1 x2 x3");
 
-    // expect_unique keeps its semantics per pattern: an ambiguous regex is
-    // an error listing the match lines, and nothing is replaced.
+    // expect_unique keeps its semantics per pattern: an ambiguous regex is an
+    // error listing the match lines, and nothing is replaced.
     let err = s.call_err(
         7,
         "replace_text",
@@ -960,12 +962,12 @@ fn replace_text_regex_mode_expands_backrefs() {
     assert!(err.contains("mode"), "got: {err}");
 }
 
-/// Every literal-taking tool escapes user strings into generated tulisp on
-/// the server (lisp_literal; occur adds regexp-quote / regex_dialect::quote
+/// Every literal-taking tool escapes user strings into generated tulisp on the
+/// server (lisp_literal; occur adds regexp-quote / regex_dialect::quote
 /// underneath); one missed path is a silent wrong edit or a false miss.
-/// Round-trip a gauntlet of hostile strings through insert_text →
-/// read_region, occur, replace_text, and the edits batch, requiring
-/// byte-exact results everywhere.
+/// Round-trip a gauntlet of hostile strings through insert_text → read_region,
+/// occur, replace_text, and the edits batch, requiring byte-exact results
+/// everywhere.
 #[test]
 fn literal_tools_round_trip_hostile_strings() {
     let mut s = Server::spawn();
@@ -1055,9 +1057,9 @@ fn literal_tools_round_trip_hostile_strings() {
     assert_eq!(txt, "x\t\n\"Q\\S\" y", "batch round trip");
 }
 
-/// grep compiles the exact-mode pattern with RE2 escaping (a separate path
-/// from occur's in-engine regexp-quote) — hostile literals must match there
-/// too, and the file's rendered line must survive clamping intact.
+/// grep compiles the exact-mode pattern with RE2 escaping (a separate path from
+/// occur's in-engine regexp-quote) — hostile literals must match there too, and
+/// the file's rendered line must survive clamping intact.
 #[test]
 fn grep_exact_matches_hostile_literals() {
     let dir = temp_dir("grep-hostile");
@@ -1115,8 +1117,8 @@ fn failed_run_carries_the_programs_reports_and_log() {
     let text = s.call_ok(4, "read_region", json!({ "start": 1, "end": 6 }));
     assert_eq!(text, "hello", "the pre-error edit was rolled back");
 
-    // keep_partial:true opts out: the edit persists and the error says how
-    // to revert it.
+    // keep_partial:true opts out: the edit persists and the error says how to
+    // revert it.
     let err = s.call_err(
         5,
         "run_program",
@@ -1274,8 +1276,9 @@ fn auto_revert_refreshes_clean_reads_while_modified_reads_warn() {
         "no drift flag after auto-revert: {out}"
     );
 
-    // Now MODIFY the buffer, then drift the file again. A modified buffer is the
-    // genuine conflict — it is NOT auto-reverted, so reads carry the warning.
+    // Now MODIFY the buffer, then drift the file again. A modified buffer is
+    // the genuine conflict — it is NOT auto-reverted, so reads carry the
+    // warning.
     s.call_ok(
         6,
         "run_program",
@@ -1360,8 +1363,8 @@ fn edit_tools_flag_a_stale_dirty_buffer_on_results_and_misses() {
 fn rehearse_auto_reverts_a_clean_drifted_buffer_like_a_run_would() {
     // A clean drifted buffer auto-reverts BEFORE the rehearse snapshot: the
     // revert discards nothing, and without it the preview would run against
-    // bytes the committing run — which does revert — won't use, so preview
-    // and commit could legitimately disagree.
+    // bytes the committing run — which does revert — won't use, so preview and
+    // commit could legitimately disagree.
     let dir = temp_dir("rehearse-revert");
     let file = dir.join("doc.txt");
     std::fs::write(&file, "original\n").unwrap();
@@ -1381,8 +1384,8 @@ fn rehearse_auto_reverts_a_clean_drifted_buffer_like_a_run_would() {
         "the preview sees the CURRENT file: {preview}"
     );
 
-    // The rehearsal's rollback lands on the reverted (fresh) state: not
-    // stale, text matching the disk.
+    // The rehearsal's rollback lands on the reverted (fresh) state: not stale,
+    // text matching the disk.
     let status = s.call_ok(3, "session_status", json!({}));
     let status: Value = serde_json::from_str(&status).unwrap();
     assert!(
@@ -1698,8 +1701,8 @@ fn open_file_create_visits_a_new_file_written_by_the_first_save() {
     s.request(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }));
     let dest = root.join("new.rs");
     let p = dest.to_str().unwrap();
-    // Without `create`, a missing file is an error that names the way in —
-    // from open_file and from any tool's auto-opening `path` alike.
+    // Without `create`, a missing file is an error that names the way in — from
+    // open_file and from any tool's auto-opening `path` alike.
     let err = s.call_err(2, "open_file", json!({ "path": p }));
     assert!(err.contains("create: true"), "got: {err}");
     let err = s.call_err(3, "insert_text", json!({ "path": p, "text": "x" }));
@@ -1841,8 +1844,8 @@ fn uniform_path_addressing_on_checkpoint_and_save_tools() {
     let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
     let p = file.to_string_lossy().into_owned();
 
-    // checkpoint / list / restore address the file by path, like every
-    // other tool — no need to know the canonical-path session id.
+    // checkpoint / list / restore address the file by path, like every other
+    // tool — no need to know the canonical-path session id.
     let cp = s.call_ok(1, "checkpoint", json!({ "path": p, "label": "cp" }));
     assert!(cp.contains("cp"), "checkpoint said: {cp}");
     s.call_ok(
@@ -1894,8 +1897,8 @@ fn undo_last_rewinds_one_mutating_call_at_a_time() {
     let mut s = Server::spawn();
     s.call_ok(1, "open_text", json!({ "text": "v0" }));
 
-    // Two separate mutating calls, then a read (which must not consume
-    // an undo step).
+    // Two separate mutating calls, then a read (which must not consume an undo
+    // step).
     s.call_ok(
         2,
         "replace_text",
@@ -1930,8 +1933,8 @@ fn expect_unique_makes_ambiguous_anchors_an_error() {
         json!({ "text": "use a;\nuse b;\nuse a;\n" }),
     );
 
-    // Two occurrences: the unique replace refuses and lists the lines,
-    // and nothing changes.
+    // Two occurrences: the unique replace refuses and lists the lines, and
+    // nothing changes.
     let err = s.call_err(
         2,
         "replace_text",
@@ -2112,8 +2115,8 @@ fn close_session_plural_forms_never_touch_the_default_session() {
     let closed = s.call_ok(5, "close_session", json!({ "sessions": [] }));
     assert!(closed.contains("closed 0 sessions"), "got: {closed}");
 
-    // A mistyped `all` or a malformed list is an error, not a fallback;
-    // `all` refuses even an empty explicit list.
+    // A mistyped `all` or a malformed list is an error, not a fallback; `all`
+    // refuses even an empty explicit list.
     let err = s.call_err(6, "close_session", json!({ "all": "true" }));
     assert!(err.contains("\"all\" must be a boolean"), "got: {err}");
     let err = s.call_err(7, "close_session", json!({ "paths": [1] }));
@@ -2399,8 +2402,8 @@ fn multi_file_replace_is_atomic_across_the_set() {
         "calls new_name twice: new_name\n"
     );
 
-    // A miss in the SECOND file rolls the first back: nothing changes
-    // anywhere (warm buffers included).
+    // A miss in the SECOND file rolls the first back: nothing changes anywhere
+    // (warm buffers included).
     let err = s.call_err(
         2,
         "replace_in_files",
@@ -2472,17 +2475,17 @@ fn warm_sessions_are_bounded_with_clean_lru_eviction() {
 }
 
 /// A program's final form value is surfaced as `value` — a string RAW
-/// (unquoted, unescaped), other types tulisp-printed — so a read-only
-/// inspector like `(conflict-diff N)` is readable without wrapping it in
-/// `(message …)`; a `nil` value is omitted, like `stale`/`unsaved`.
+/// (unquoted, unescaped), other types tulisp-printed — so a read-only inspector
+/// like `(conflict-diff N)` is readable without wrapping it in `(message …)`; a
+/// `nil` value is omitted, like `stale`/`unsaved`.
 #[test]
 fn run_program_surfaces_the_final_form_value() {
     let mut s = Server::spawn();
     s.request(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }));
     s.call_ok(2, "open_text", json!({ "text": "hello" }));
 
-    // A non-nil string value comes back raw (no quotes, escapes undone),
-    // riding alongside an empty read-only `diff`.
+    // A non-nil string value comes back raw (no quotes, escapes undone), riding
+    // alongside an empty read-only `diff`.
     let out: Value = serde_json::from_str(&s.call_ok(
         3,
         "run_program",
@@ -2557,8 +2560,8 @@ fn rehearse_accepts_full_diff_and_view() {
     );
 }
 
-/// The modern era's per-request `_meta`: protocol version + client
-/// capabilities on every call, in place of the `initialize` handshake.
+/// The modern era's per-request `_meta`: protocol version + client capabilities
+/// on every call, in place of the `initialize` handshake.
 fn meta() -> Value {
     json!({
         mime_rs::rpc::META_PROTOCOL_VERSION: mime_rs::rpc::PROTOCOL_VERSION,
@@ -2632,8 +2635,8 @@ fn modern_stdio_conversation_needs_no_handshake() {
     assert_eq!(unsupported["error"]["code"], -32022);
 }
 
-/// One process serves both eras at once: a dual-era client can probe the
-/// modern way, fall back to the handshake, and keep using either shape.
+/// One process serves both eras at once: a dual-era client can probe the modern
+/// way, fall back to the handshake, and keep using either shape.
 #[test]
 fn both_eras_interleave_on_one_process() {
     let mut s = Server::spawn();
@@ -2772,8 +2775,8 @@ fn normalise(v: &mut Value) {
     }
 }
 
-/// `fill_text` reflows the prose unit an anchor, a position, a line range
-/// or `all` names, to `column`, and refuses code by naming it.
+/// `fill_text` reflows the prose unit an anchor, a position, a line range or
+/// `all` names, to `column`, and refuses code by naming it.
 #[test]
 fn fill_text_reflows_comments_and_paragraphs_and_refuses_code() {
     let dir = temp_dir("fill-text");
@@ -2829,9 +2832,9 @@ fn fill_text_reflows_comments_and_paragraphs_and_refuses_code() {
         "aaa bbb\nccc ddd\n\n- eee fff\n  ggg\n\n```\ncode  here\n```\n"
     );
 
-    // An explicit prefix overrides detection: no grammar calls `;;` a
-    // comment marker in a text file, and the prefix bounds the paragraph
-    // by the lines that carry it.
+    // An explicit prefix overrides detection: no grammar calls `;;` a comment
+    // marker in a text file, and the prefix bounds the paragraph by the lines
+    // that carry it.
     let txt_f = dir.join("notes.txt");
     std::fs::write(&txt_f, ";; aaa\n;; bbb\nplain\n").unwrap();
     let txt_p = txt_f.to_string_lossy().into_owned();
@@ -2885,8 +2888,8 @@ fn fill_text_survives_non_ascii_and_fills_prefixed_regions() {
     let err = s.call_err(5, "fill_text", json!({ "path": txt_p, "all": "yes" }));
     assert!(err.contains("must be a boolean"), "{err}");
 
-    // An error that merely mentions an anchor sentinel is not an anchor
-    // error when the call had no anchor.
+    // An error that merely mentions an anchor sentinel is not an anchor error
+    // when the call had no anchor.
     let err = s.call_err(
         6,
         "fill_text",

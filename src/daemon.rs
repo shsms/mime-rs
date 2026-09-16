@@ -1,23 +1,23 @@
 //! mimed — the long-lived editing daemon.
 //!
-//! It owns a map of `session-id -> Workspace` (each a *warm* workspace: buffers,
-//! checkpoints, kill-ring, and agent-defined tulisp `defun`s that persist across
-//! programs) and serves a JSON-lines control API over a unix socket. One JSON
-//! request per line in, one JSON response per line out.
+//! It owns a map of `session-id -> Workspace` (each a *warm* workspace:
+//! buffers, checkpoints, kill-ring, and agent-defined tulisp `defun`s that
+//! persist across programs) and serves a JSON-lines control API over a unix
+//! socket. One JSON request per line in, one JSON response per line out.
 //!
 //! Concurrency / threading model: a [`Workspace`] embeds a `TulispContext`,
-//! which is `Rc`-based and therefore `!Send` — it cannot cross threads. So mimed
-//! runs a single-threaded blocking accept loop: connections are served one at a
-//! time, each request to completion before the next. This *is* the design intent
-//! — a session is a single writer and programs are serialized — and it sidesteps
-//! `Send` entirely. (A future multi-session-parallel daemon would shard
-//! workspaces onto per-session threads, each owning its own `Rc` graph; the
-//! map-of-workspaces shape here is the seam for that.) The session map is still
-//! held behind a `Mutex` so the model is explicit and the lock is the obvious
-//! place to add cross-session coordination later.
+//! which is `Rc`-based and therefore `!Send` — it cannot cross threads. So
+//! mimed runs a single-threaded blocking accept loop: connections are served
+//! one at a time, each request to completion before the next. This *is* the
+//! design intent — a session is a single writer and programs are serialized —
+//! and it sidesteps `Send` entirely. (A future multi-session-parallel daemon
+//! would shard workspaces onto per-session threads, each owning its own `Rc`
+//! graph; the map-of-workspaces shape here is the seam for that.) The session
+//! map is still held behind a `Mutex` so the model is explicit and the lock is
+//! the obvious place to add cross-session coordination later.
 //!
-//! Socket path: `$MIME_SOCKET` or `/tmp/mimed.sock`. A stale socket file at that
-//! path is removed on startup.
+//! Socket path: `$MIME_SOCKET` or `/tmp/mimed.sock`. A stale socket file at
+//! that path is removed on startup.
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -49,8 +49,8 @@ pub fn run() {
     };
     eprintln!("mimed: listening on {path}");
 
-    // The single source of truth. `Mutex` guards it so the single-writer model is
-    // explicit; with the single-threaded accept loop it is never contended.
+    // The single source of truth. `Mutex` guards it so the single-writer model
+    // is explicit; with the single-threaded accept loop it is never contended.
     let sessions: Mutex<HashMap<String, Workspace>> = Mutex::new(HashMap::new());
 
     for conn in listener.incoming() {
@@ -114,10 +114,10 @@ fn handle_line(line: &str, sessions: &Mutex<HashMap<String, Workspace>>) -> Valu
     }
 }
 
-/// `{"op":"open","session":"S","file":"PATH"}` or `{"op":"open","session":"S","text":"..."}`
-/// — create or replace session `S` with a fresh warm workspace. An optional
-/// `"read_only": true` attaches the buffer unwritable (mutating programs are
-/// rejected).
+/// `{"op":"open","session":"S","file":"PATH"}` or
+/// `{"op":"open","session":"S","text":"..."}` — create or replace session `S`
+/// with a fresh warm workspace. An optional `"read_only": true` attaches the
+/// buffer unwritable (mutating programs are rejected).
 fn op_open(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
     let session = match str_field(req, "session") {
         Ok(s) => s,
@@ -151,8 +151,8 @@ fn op_open(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     // Sandboxed (agent-facing) tier: core editing vocabulary only — the daemon
-    // never registers the orchestration group. (A local daemon could opt up with
-    // a future --trusted flag.)
+    // never registers the orchestration group. (A local daemon could opt up
+    // with a future --trusted flag.)
     let workspace = if read_only {
         Workspace::new_read_only(store)
     } else {
@@ -221,8 +221,9 @@ fn op_run(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>, rehearse: b
 }
 
 /// `{"op":"status"}` — the live session ids plus the sandbox the engine
-/// enforces: the allowed filesystem roots (display strings) and whether auditing
-/// is on, so a client learns the writable bounds without a rejected save.
+/// enforces: the allowed filesystem roots (display strings) and whether
+/// auditing is on, so a client learns the writable bounds without a rejected
+/// save.
 fn op_status(sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
     let map = sessions.lock().unwrap();
     let mut ids: Vec<&String> = map.keys().collect();

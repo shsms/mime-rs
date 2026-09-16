@@ -25,8 +25,8 @@ pub struct Buffer {
     point: usize,
     /// Mark: the other end of the region, if set (1-based char position).
     mark: Option<usize>,
-    /// Narrowing restriction `(lo, hi)` in 1-based char positions; the accessible
-    /// region is `[lo, hi)`. `None` = whole buffer.
+    /// Narrowing restriction `(lo, hi)` in 1-based char positions; the
+    /// accessible region is `[lo, hi)`. `None` = whole buffer.
     narrowing: Option<(usize, usize)>,
     /// Live markers, indexed by id; `None` = detached. Absolute 1-based
     /// positions that auto-adjust across edits (Emacs markers).
@@ -83,10 +83,10 @@ impl Buffer {
         self.byte_hint.set((p.min(self.char_len + 1), byte));
     }
 
-    /// Byte offset of 1-based char position `p` (clamped into the buffer). Seeds
-    /// from `byte_hint` so sequential conversions cost O(distance), not O(p).
-    /// Boundary answers (start/end) are O(1) and deliberately leave the hint
-    /// untouched, so a `point_max` lookup mid-search doesn't reset it.
+    /// Byte offset of 1-based char position `p` (clamped into the buffer).
+    /// Seeds from `byte_hint` so sequential conversions cost O(distance), not
+    /// O(p).  Boundary answers (start/end) are O(1) and deliberately leave the
+    /// hint untouched, so a `point_max` lookup mid-search doesn't reset it.
     fn byte_of(&self, p: usize) -> usize {
         let p = p.clamp(1, self.char_len + 1);
         if p == 1 {
@@ -104,9 +104,9 @@ impl Buffer {
         } else if hc - p < p - 1 {
             // Behind the hint but nearer to it than to the buffer start: seek
             // backward from the hint. `text[..hb]` holds chars 1..=hc-1, so
-            // reversed its nth(0) is char hc-1 and char `p` is nth(hc-p-1).
-            // So a backward walk (a motion, a reverse search) stays
-            // O(distance) from the hint instead of rescanning from byte 0.
+            // reversed its nth(0) is char hc-1 and char `p` is nth(hc-p-1).  So
+            // a backward walk (a motion, a reverse search) stays O(distance)
+            // from the hint instead of rescanning from byte 0.
             self.text[..hb]
                 .char_indices()
                 .rev()
@@ -192,13 +192,12 @@ impl Buffer {
     /// accessible region's beginning counts as a real line/word boundary, so
     /// `^` matches there) and the pre-point text stays in as context, so a
     /// mid-line point doesn't pass for a line beginning. The RIGHT edge is
-    /// span-bounded: the match is confined to end at or before the bound,
-    /// while `$`/`\b` at an explicit mid-line BOUND consult the real buffer
-    /// past it up to point-max — Emacs semantics (`regex-automata`'s
-    /// `Input::span`; the high-level regex API could not both backtrack a
-    /// quantifier to fit the bound and evaluate assertions past it). At
-    /// point-max the cut stays a boundary: Emacs's `$` matches at the end of
-    /// the accessible region.
+    /// span-bounded: the match is confined to end at or before the bound, while
+    /// `$`/`\b` at an explicit mid-line BOUND consult the real buffer past it
+    /// up to point-max — Emacs semantics (`regex-automata`'s `Input::span`; the
+    /// high-level regex API could not both backtrack a quantifier to fit the
+    /// bound and evaluate assertions past it). At point-max the cut stays a
+    /// boundary: Emacs's `$` matches at the end of the accessible region.
     pub fn re_search_forward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize> {
         let start_b = self.byte_of(self.point);
         let end_b = self.byte_of(bound.unwrap_or_else(|| self.point_max()));
@@ -223,12 +222,12 @@ impl Buffer {
     }
 
     /// Regex search backward from point (bounded below by `bound` or
-    /// point-min): the latest-starting match wholly inside the window
-    /// `[bound, point)`. On a hit: record match-data, move point to the match
-    /// START, return it — Emacs `re-search-backward` semantics. The window is
-    /// a span over the accessible region, so `^`/`$`/`\b` at either edge
-    /// consult the real buffer beyond it (see `re_search_forward`), while the
-    /// match itself stays confined to the window.
+    /// point-min): the latest-starting match wholly inside the window `[bound,
+    /// point)`. On a hit: record match-data, move point to the match START,
+    /// return it — Emacs `re-search-backward` semantics. The window is a span
+    /// over the accessible region, so `^`/`$`/`\b` at either edge consult the
+    /// real buffer beyond it (see `re_search_forward`), while the match itself
+    /// stays confined to the window.
     pub fn re_search_backward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize> {
         let lo = bound.unwrap_or_else(|| self.point_min()).min(self.point);
         let lo_b = self.byte_of(lo);
@@ -263,8 +262,9 @@ impl Buffer {
         self.char_len = self.char_len + new_len - old_len;
         self.set_hint(self.point, lb + expanded.len());
         // The narrowing's upper bound must track the net length change (the
-        // replaced span lies inside the region), exactly as insert/delete_region
-        // do — otherwise a length-changing replace leaves a stale restriction.
+        // replaced span lies inside the region), exactly as
+        // insert/delete_region do — otherwise a length-changing replace leaves
+        // a stale restriction.
         if let Some((nlo, nhi)) = self.narrowing.as_mut() {
             if new_len >= old_len {
                 *nhi += new_len - old_len;
@@ -272,7 +272,8 @@ impl Buffer {
                 *nhi = nhi.saturating_sub(old_len - new_len).max(*nlo);
             }
         }
-        // A replace is a delete of the match span followed by an insert at its start.
+        // A replace is a delete of the match span followed by an insert at its
+        // start.
         crate::store::markers_after_delete(&mut self.markers, md.start, md.end);
         crate::store::markers_after_insert(&mut self.markers, md.start, new_len);
         self.version = crate::store::next_version();
@@ -281,10 +282,10 @@ impl Buffer {
 
     pub fn looking_at(&self, re: &regex::Regex) -> bool {
         // `find_at` keeps the pre-point text back to point-min as boundary
-        // context for `^`/`\b` (see re_search_forward — the restriction's
-        // start is a real line beginning); a match counts only if it starts
-        // AT point. The right side deliberately runs to the document end,
-        // matching the Quire scan window.
+        // context for `^`/`\b` (see re_search_forward — the restriction's start
+        // is a real line beginning); a match counts only if it starts AT point.
+        // The right side deliberately runs to the document end, matching the
+        // Quire scan window.
         let b = self.byte_of(self.point);
         let min_b = self.byte_of(self.point_min()).min(b);
         re.find_at(&self.text[min_b..], b - min_b)
@@ -329,15 +330,15 @@ impl Buffer {
         self.point = self.point.clamp(lo, hi);
     }
 
-    // ---- line navigation ----
-    // Line motion honors the narrowing, like Emacs: the RESULT is clamped into
-    // [point_min, point_max] so point never escapes the accessible region even
-    // when the restriction starts or ends mid-line. The newline scan itself
-    // runs over the raw text and the clamp happens in CHAR space — deliberately
-    // not byte space, because `byte_of(point_min/point_max)` misses the hint's
-    // boundary fast paths on a narrowed buffer and would drag the byte hint to
-    // the region edge on every call, degrading line-walking loops (occur,
-    // window, conflict scans) to O(region²) conversions.
+    // ---- line navigation ---- Line motion honors the narrowing, like Emacs:
+    // the RESULT is clamped into [point_min, point_max] so point never escapes
+    // the accessible region even when the restriction starts or ends mid-line.
+    // The newline scan itself runs over the raw text and the clamp happens in
+    // CHAR space — deliberately not byte space, because
+    // `byte_of(point_min/point_max)` misses the hint's boundary fast paths on a
+    // narrowed buffer and would drag the byte hint to the region edge on every
+    // call, degrading line-walking loops (occur, window, conflict scans) to
+    // O(region²) conversions.
     /// Move point to the first char of its line (just after the previous
     /// newline), clamped to `point_min`.
     pub fn beginning_of_line(&mut self) {
@@ -381,9 +382,9 @@ impl Buffer {
                 }
             } else {
                 // Exclude the previous line's terminator: cut just before the
-                // char preceding point. `byte_of(point - 1)` keeps the cut on
-                // a char boundary even when the clamped line start sits after
-                // a multibyte char (a `b - 1` byte cut would split it).
+                // char preceding point. `byte_of(point - 1)` keeps the cut on a
+                // char boundary even when the clamped line start sits after a
+                // multibyte char (a `b - 1` byte cut would split it).
                 let cut = self.byte_of(self.point.saturating_sub(1).max(1));
                 let target = match self.text[..cut].rfind('\n') {
                     Some(i) => self.char_of(i + 1),
@@ -395,11 +396,11 @@ impl Buffer {
                     self.point = clamped;
                     // Reaching a GENUINE line beginning that coincides with
                     // point-min — the buffer start, or a restriction starting
-                    // just after a newline — is a complete move (Emacs
-                    // reports 0). Clamping to a mid-line restriction start,
-                    // or not moving at all, stays short. The check peeks the
-                    // RAW text (char_before is narrowing-clamped and would
-                    // hide the newline just outside the restriction).
+                    // just after a newline — is a complete move (Emacs reports
+                    // 0). Clamping to a mid-line restriction start, or not
+                    // moving at all, stays short. The check peeks the RAW text
+                    // (char_before is narrowing-clamped and would hide the
+                    // newline just outside the restriction).
                     let genuine = target == clamped
                         && (clamped == 1 || self.text[..self.byte_of(clamped)].ends_with('\n'));
                     if genuine && moved {
@@ -416,15 +417,16 @@ impl Buffer {
     }
     /// 1-based line number containing 1-based char position `p`, counted from
     /// the start of the accessible region — Emacs's `line-number-at-pos`
-    /// default, so the numbers that `window`/`occur`/conflict overviews
-    /// display round-trip through `goto-line` under narrowing.
+    /// default, so the numbers that `window`/`occur`/conflict overviews display
+    /// round-trip through `goto-line` under narrowing.
     pub fn line_number_at_pos(&self, p: usize) -> usize {
         let b = self.byte_of(p);
         let min_b = self.byte_of(self.point_min()).min(b);
         self.text[min_b..b].matches('\n').count() + 1
     }
 
-    // ---- char access (returns Unicode code points, like Emacs characters) ----
+    // ---- char access (returns Unicode code points, like Emacs characters)
+    // ----
     pub fn char_after(&self, p: usize) -> Option<char> {
         if p < self.point_max() {
             self.text[self.byte_of(p)..].chars().next()
@@ -691,8 +693,8 @@ mod tests {
 
     #[test]
     fn char_access_stops_at_the_narrowing_boundaries() {
-        // char-after(point_max) and char-before(point_min) are None — the
-        // chars just outside a mid-line narrowing never leak through.
+        // char-after(point_max) and char-before(point_min) are None — the chars
+        // just outside a mid-line narrowing never leak through.
         let mut b = Buffer::from_string("t", "abcdef");
         b.narrow_to_region(3, 5); // "cd"
         assert_eq!(b.char_after(3), Some('c'));
@@ -705,10 +707,10 @@ mod tests {
     #[test]
     fn decreasing_char_access_matches_a_hintless_buffer() {
         // `byte_of` seeds from its byte hint in both directions; a walk that
-        // asks for strictly decreasing positions must still answer exactly
-        // what a fresh, unhinted buffer answers — the oracle for the oracle.
-        // Multibyte throughout, so an off-by-one in the backward seek lands
-        // on a non-boundary byte instead of merely a wrong char.
+        // asks for strictly decreasing positions must still answer exactly what
+        // a fresh, unhinted buffer answers — the oracle for the oracle.
+        // Multibyte throughout, so an off-by-one in the backward seek lands on
+        // a non-boundary byte instead of merely a wrong char.
         let text = "aéb✓c—dñe😀f".repeat(40);
         let warm = Buffer::from_string("t", &text);
         let max = warm.point_max();
@@ -808,8 +810,8 @@ mod tests {
     #[test]
     fn bounded_search_assertions_consult_past_the_bound() {
         // Span-bounded search: the match must END at or before the bound, but
-        // `$`/`\b` AT the bound judge the real buffer past it, like Emacs —
-        // not the cut.
+        // `$`/`\b` AT the bound judge the real buffer past it, like Emacs — not
+        // the cut.
         let foo_eol = regex::RegexBuilder::new("foo$")
             .multi_line(true)
             .build()
@@ -839,8 +841,8 @@ mod tests {
 
     #[test]
     fn backward_search_edges_consult_the_real_buffer() {
-        // Right edge (point): the match ends at or before point, but `$`
-        // there reads the real buffer.
+        // Right edge (point): the match ends at or before point, but `$` there
+        // reads the real buffer.
         let foo_eol = regex::RegexBuilder::new("foo$")
             .multi_line(true)
             .build()
@@ -855,8 +857,8 @@ mod tests {
         let mut b = Buffer::from_string("t", "foo\nbar");
         b.goto_char(4);
         assert_eq!(b.re_search_backward(&foo_eol, None), Some(1));
-        // Left edge (an explicit BOUND): `\b` at the bound must not fake a
-        // word boundary out of the cut.
+        // Left edge (an explicit BOUND): `\b` at the bound must not fake a word
+        // boundary out of the cut.
         let word = regex::Regex::new(r"\boo").unwrap();
         let mut b = Buffer::from_string("t", "xoo bar");
         b.goto_char(4);
@@ -884,7 +886,8 @@ mod tests {
         assert_eq!(n, 3);
         assert_eq!(b.text(), "café - náïve - déjà - fin");
         assert_eq!(b.char_len(), b.text().chars().count());
-        // substring forward, near the end, then a backward jump (hint was at end)
+        // substring forward, near the end, then a backward jump (hint was at
+        // end)
         let cl = b.char_len();
         assert_eq!(b.substring(1, 5), "café");
         assert_eq!(b.substring(cl - 2, cl + 1), "fin");

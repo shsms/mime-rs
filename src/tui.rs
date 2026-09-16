@@ -3,11 +3,11 @@
 //! buffer viewport (around point), the program (top-level forms, next one
 //! highlighted), the last step's report (diff + reports/log, or the error) —
 //! plus a status bar. Playback: SPACE/n = one form, p = auto-play (\[/\] =
-//! slower/faster), b = back one form, r = restart, f = run to the end —
-//! b/r are refused once a form has done file I/O (a replay would re-run it
-//! against changed files). Quitting: w = write the finished PRIMARY buffer
-//! (the one the tui opened) and quit; q = quit discarding (unless `--write`
-//! was given AND the script ran to completion).
+//! slower/faster), b = back one form, r = restart, f = run to the end — b/r are
+//! refused once a form has done file I/O (a replay would re-run it against
+//! changed files). Quitting: w = write the finished PRIMARY buffer (the one the
+//! tui opened) and quit; q = quit discarding (unless `--write` was given AND
+//! the script ran to completion).
 
 use std::io::Write as _;
 use std::time::Duration;
@@ -44,8 +44,8 @@ pub fn run(
 
     if write_back || quit == Quit::Write {
         if stepper.finished() {
-            // The PRIMARY buffer — a script ending on another buffer must
-            // not clobber `file` with that buffer's content.
+            // The PRIMARY buffer — a script ending on another buffer must not
+            // clobber `file` with that buffer's content.
             let text = stepper.primary_text();
             crate::safety::write_atomic(&path, text.as_bytes())
                 .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
@@ -72,9 +72,9 @@ enum Quit {
     Discard,
 }
 
-/// Auto-play state: whether the script is playing, the delay per form, and
-/// a transient notice (a refused replay) shown in the status bar until the
-/// next action.
+/// Auto-play state: whether the script is playing, the delay per form, and a
+/// transient notice (a refused replay) shown in the status bar until the next
+/// action.
 struct Playback {
     playing: bool,
     delay: Duration,
@@ -190,8 +190,8 @@ fn draw_status(frame: &mut ratatui::Frame, area: Rect, stepper: &Stepper, pb: &P
     } else {
         " SPACE step · p play/pause · [/] speed · b back · r restart · f finish · q quit"
     };
-    // A refused action replaces the key hints until the next action — the
-    // same line, so the layout never jumps.
+    // A refused action replaces the key hints until the next action — the same
+    // line, so the layout never jumps.
     let second = match pb.notice {
         Some(n) => Line::from(Span::styled(
             format!(" ⚠ {n}"),

@@ -1,11 +1,11 @@
 //! On-demand reference text for the `help` MCP tool — the canonical
-//! cheat-sheets an agent would otherwise need carried in its prompt. Each
-//! topic is a small, self-contained brief; the always-loaded tool schemas can
-//! stay terse and point here. Keep these in sync with the engine: they ARE
-//! the contract an agent acts on, fetched only when needed.
+//! cheat-sheets an agent would otherwise need carried in its prompt. Each topic
+//! is a small, self-contained brief; the always-loaded tool schemas can stay
+//! terse and point here. Keep these in sync with the engine: they ARE the
+//! contract an agent acts on, fetched only when needed.
 
-/// The topics `help` serves, with one-line summaries — also the "unknown
-/// topic" help text.
+/// The topics `help` serves, with one-line summaries — also the "unknown topic"
+/// help text.
 pub const TOPICS: &[(&str, &str)] = &[
     (
         "lisp",

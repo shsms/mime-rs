@@ -58,11 +58,12 @@ impl FileCoding {
         }
     }
 
-    /// Parse a coding-system name as accepted by `set-buffer-file-coding-system`,
-    /// matched against a known set so a typo or an unsupported charset (e.g.
-    /// `latin-1`, or the unsupported `…-mac`) is `None` — an error — rather than
-    /// a silent fallback that would quietly rewrite the file on save. The bare
-    /// EOL names (`unix`/`dos`) change only the EOL, keeping the current BOM.
+    /// Parse a coding-system name as accepted by
+    /// `set-buffer-file-coding-system`, matched against a known set so a typo
+    /// or an unsupported charset (e.g.  `latin-1`, or the unsupported `…-mac`)
+    /// is `None` — an error — rather than a silent fallback that would quietly
+    /// rewrite the file on save. The bare EOL names (`unix`/`dos`) change only
+    /// the EOL, keeping the current BOM.
     pub fn parse(name: &str, base: FileCoding) -> Option<FileCoding> {
         let coding = |had_bom, eol| Some(FileCoding { had_bom, eol });
         match name {
@@ -100,11 +101,11 @@ pub fn decode(text: &str, coding: FileCoding) -> String {
 /// The shared DOS encoder for both [`CodingWriter`] and Quire's byte-exact save
 /// of inserted text.
 ///
-/// A `\r` already present passes through as content, so inserted text containing
-/// a literal `\r\n` is written `\r\r\n` (the `\r` is a CR char, the `\n` becomes
-/// the line ending) — Emacs-faithful and round-tripping (the buffer keeps the
-/// inserted CR as a lone-CR char). Plain text insertion has no `\r` and is
-/// unaffected.
+/// A `\r` already present passes through as content, so inserted text
+/// containing a literal `\r\n` is written `\r\r\n` (the `\r` is a CR char, the
+/// `\n` becomes the line ending) — Emacs-faithful and round-tripping (the
+/// buffer keeps the inserted CR as a lone-CR char). Plain text insertion has no
+/// `\r` and is unaffected.
 pub(crate) fn write_lf_as_crlf(w: &mut dyn std::io::Write, buf: &[u8]) -> std::io::Result<usize> {
     let mut written = 0;
     let mut start = 0;
@@ -158,8 +159,8 @@ impl<'a> CodingWriter<'a> {
         Ok(())
     }
 
-    /// Emit the BOM if nothing was written — so a BOM-only empty file still gets
-    /// its signature — and return the on-disk byte count.
+    /// Emit the BOM if nothing was written — so a BOM-only empty file still
+    /// gets its signature — and return the on-disk byte count.
     pub fn finish(&mut self) -> std::io::Result<usize> {
         self.emit_bom()?;
         Ok(self.written)

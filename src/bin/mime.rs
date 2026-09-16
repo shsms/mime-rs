@@ -11,7 +11,8 @@
 //!
 //! This binary only peeks for the mode flag and dispatches into the matching
 //! library front-end (`mime_rs::{cli,daemon,mcp,http}`), which re-reads `argv`
-//! itself. The mode flags are consumed by the peek; each front-end ignores them.
+//! itself. The mode flags are consumed by the peek; each front-end ignores
+//! them.
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--mcp") {

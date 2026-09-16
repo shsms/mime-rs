@@ -24,10 +24,11 @@ fn build_regex(re: &str) -> Result<regex::Regex, Error> {
         .map_err(bad_regex)
 }
 
-/// Look `key` up in a thread-local pattern cache, building + inserting on a miss.
-/// The search builtins are called many times with a small set of repeated
-/// patterns, where compiling each time would dominate; `Regex` is `Arc`-backed,
-/// so a cached clone is cheap. The map is bounded for long-lived daemons.
+/// Look `key` up in a thread-local pattern cache, building + inserting on a
+/// miss.  The search builtins are called many times with a small set of
+/// repeated patterns, where compiling each time would dominate; `Regex` is
+/// `Arc`-backed, so a cached clone is cheap. The map is bounded for long-lived
+/// daemons.
 fn cached<F>(cache: &'static std::thread::LocalKey<CacheCell>, key: &str, build: F) -> RegexResult
 where
     F: FnOnce() -> RegexResult,
@@ -65,12 +66,13 @@ fn looking_back_regex(re: &str) -> RegexResult {
 }
 
 /// Compile a user-supplied pattern written in Emacs regexp dialect: groups are
-/// `\(...\)`, alternation `\|`, intervals `\{n,m\}`, and a bare `(`/`|`/`{` is a
-/// literal. We translate to the engine's RE2 syntax ([`crate::regex_dialect`])
-/// rather than swap engines, keeping RE2's linear-time guarantee.
+/// `\(...\)`, alternation `\|`, intervals `\{n,m\}`, and a bare `(`/`|`/`{` is
+/// a literal. We translate to the engine's RE2 syntax
+/// ([`crate::regex_dialect`]) rather than swap engines, keeping RE2's
+/// linear-time guarantee.
 ///
-/// Cached on the Emacs INPUT (not the translated form), so a repeated pattern on
-/// a search hot loop skips both the translate pass and the compile.
+/// Cached on the Emacs INPUT (not the translated form), so a repeated pattern
+/// on a search hot loop skips both the translate pass and the compile.
 pub(crate) fn cached_regex(re: &str) -> RegexResult {
     cached(&EMACS_CACHE, re, || {
         let rust = crate::regex_dialect::translate(re)
@@ -108,9 +110,9 @@ fn name_arg(what: &str, v: &TulispObject) -> Result<String, Error> {
 
 /// A buffer marker: a durable position handle. The `id` indexes the store's
 /// marker registry (`TextStore::marker_*`), where the live position lives and
-/// auto-adjusts across edits. A first-class tulisp value (via `TulispConvertible`)
-/// so `markerp` can tell it apart from a plain integer position, and `goto-char`
-/// accepts either.
+/// auto-adjusts across edits. A first-class tulisp value (via
+/// `TulispConvertible`) so `markerp` can tell it apart from a plain integer
+/// position, and `goto-char` accepts either.
 #[derive(Clone, Copy)]
 struct Marker {
     id: usize,
@@ -136,11 +138,11 @@ impl TulispConvertible for Marker {
 }
 
 /// A first-class parse-tree node: a [`NodeRef`] paired with the `Rc`'d
-/// [`Syntax`] it came from and the buffer content version that parse
-/// reflects. Accessors refuse an OUTDATED node (the buffer was edited since
-/// the parse) instead of serving positions from a stale tree — Emacs's
-/// `treesit-node-outdated` discipline. Cheap to clone; the `Rc` keeps the
-/// parse alive even after the session cache moves on.
+/// [`Syntax`] it came from and the buffer content version that parse reflects.
+/// Accessors refuse an OUTDATED node (the buffer was edited since the parse)
+/// instead of serving positions from a stale tree — Emacs's
+/// `treesit-node-outdated` discipline. Cheap to clone; the `Rc` keeps the parse
+/// alive even after the session cache moves on.
 #[derive(Clone)]
 struct TsNode {
     syn: std::rc::Rc<Syntax>,
@@ -163,9 +165,9 @@ impl TsNode {
     }
 
     /// The node's kind + char span, or an error for a handle the parse can't
-    /// relocate (impossible for handles minted by this module — surfaced as
-    /// an error rather than a panic or a sentinel, so a bug can't take the
-    /// process down or feed position 0 onward).
+    /// relocate (impossible for handles minted by this module — surfaced as an
+    /// error rather than a panic or a sentinel, so a bug can't take the process
+    /// down or feed position 0 onward).
     fn described(&self) -> Result<crate::syntax::NodeSpan, Error> {
         self.syn
             .describe(self.h)
@@ -175,8 +177,8 @@ impl TsNode {
 
 impl std::fmt::Display for TsNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Rendered lazily — queries mint hundreds of nodes and most are
-        // never printed.
+        // Rendered lazily — queries mint hundreds of nodes and most are never
+        // printed.
         match self.syn.describe(self.h) {
             Some(s) => write!(f, "#<node {} @{}..{}>", s.kind, s.start, s.end),
             None => write!(f, "#<node ?>"),
@@ -212,14 +214,13 @@ fn truthy(v: &Option<TulispObject>) -> bool {
     v.as_ref().is_some_and(|v| !v.null())
 }
 
-/// Guard every node accessor: the node's parse must reflect the CURRENT
-/// content of one of the session's buffers (versions are globally unique per
-/// text state, so a version match IS a content match). The node's own buffer
-/// need not be the current one — accessors read the node's own `Rc<Syntax>`,
-/// and its positions address the buffer it came from. Note:
-/// `treesit-set-language` re-parses but does not retire old nodes (the text
-/// is unchanged, so their positions stay right); nodes simply keep the
-/// grammar they were minted under.
+/// Guard every node accessor: the node's parse must reflect the CURRENT content
+/// of one of the session's buffers (versions are globally unique per text
+/// state, so a version match IS a content match). The node's own buffer need
+/// not be the current one — accessors read the node's own `Rc<Syntax>`, and its
+/// positions address the buffer it came from. Note: `treesit-set-language`
+/// re-parses but does not retire old nodes (the text is unchanged, so their
+/// positions stay right); nodes simply keep the grammar they were minted under.
 fn live_node(sess: &crate::engine::Session, n: &TsNode) -> Result<(), Error> {
     if n.version == sess.buffer.version() || sess.inactive.iter().any(|b| b.version() == n.version)
     {
@@ -231,9 +232,9 @@ fn live_node(sess: &crate::engine::Session, n: &TsNode) -> Result<(), Error> {
     ))
 }
 
-/// Clamp one occur output line to ~240 chars, keeping a window around the
-/// match column (`col`, 0-based chars from line start); `…` marks elision.
-/// Keeps a single minified/log line from flooding an occur result.
+/// Clamp one occur output line to ~240 chars, keeping a window around the match
+/// column (`col`, 0-based chars from line start); `…` marks elision.  Keeps a
+/// single minified/log line from flooding an occur result.
 fn clamp_occur_line(text: &str, col: usize) -> String {
     const MAX: usize = 240;
     let len = text.chars().count();
@@ -255,14 +256,14 @@ fn clamp_occur_line(text: &str, col: usize) -> String {
 /// the REMAINING conflict count. The re-scan keeps that count honest even when
 /// a replacement itself contains marker-shaped lines. When `produce` returns a
 /// warning it's pushed to the run log (the `(message …)` channel) — used to
-/// flag a fused "keep both" join, computed from the same section materialization
-/// as the splice text so the sides aren't read out of the buffer twice.
-/// Shared core of `keep-lines` / `flush-lines`: rewrite the region from the
-/// start of point's line to point-max, keeping (or dropping) the lines the
-/// regex matches; returns the number of lines deleted. Operates "from point",
-/// like Emacs; point lands at the region start. One delete + one insert, so
-/// markers in the rewritten region collapse to its start — coarse, but the
-/// classic bulk filter is rarely mixed with marker bookkeeping.
+/// flag a fused "keep both" join, computed from the same section
+/// materialization as the splice text so the sides aren't read out of the
+/// buffer twice.  Shared core of `keep-lines` / `flush-lines`: rewrite the
+/// region from the start of point's line to point-max, keeping (or dropping)
+/// the lines the regex matches; returns the number of lines deleted. Operates
+/// "from point", like Emacs; point lands at the region start. One delete + one
+/// insert, so markers in the rewritten region collapse to its start — coarse,
+/// but the classic bulk filter is rarely mixed with marker bookkeeping.
 fn filter_lines(s: &SharedSession, rx: &regex::Regex, keep_matching: bool) -> Result<i64, Error> {
     let mut sess = s.borrow_mut();
     sess.buffer.beginning_of_line();
@@ -306,8 +307,9 @@ where
         let (start, end) = (h.start, h.end);
         // A conflict hunk is line-oriented (`end` sits just past the trailing
         // newline), so a non-empty replacement must stay newline-terminated or
-        // it fuses onto the line below. Left alone when it's a removal (empty) or
-        // the hunk was the buffer's final, newline-less line (nothing follows).
+        // it fuses onto the line below. Left alone when it's a removal (empty)
+        // or the hunk was the buffer's final, newline-less line (nothing
+        // follows).
         let text = if !text.is_empty() && !text.ends_with('\n') && b.char_before(end) == Some('\n')
         {
             format!("{text}\n")
@@ -326,9 +328,10 @@ where
 }
 
 /// Apply a whole-buffer set of `(start, end, replacement)` splices bottom-up so
-/// earlier spans stay valid as later ones shrink/grow, then return the remaining
-/// conflict count. The multi-hunk counterpart of [`conflict_splice`], shared by
-/// the buffer-wide resolvers (`conflict-keep-all`, `conflict-resolve-trivial`).
+/// earlier spans stay valid as later ones shrink/grow, then return the
+/// remaining conflict count. The multi-hunk counterpart of [`conflict_splice`],
+/// shared by the buffer-wide resolvers (`conflict-keep-all`,
+/// `conflict-resolve-trivial`).
 fn conflict_splice_all(
     b: &mut dyn crate::store::TextStore,
     plan: Vec<(usize, usize, String)>,
@@ -476,8 +479,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         // (re-search-backward REGEXP &optional BOUND NOERROR) — the mirror of
-        // re-search-forward: BOUND is the LOWER limit, point lands on the
-        // match start, and with overlapping candidates the latest start wins.
+        // re-search-forward: BOUND is the LOWER limit, point lands on the match
+        // start, and with overlapping candidates the latest start wins.
         let s = session.clone();
         ctx.defun(
             "re-search-backward",
@@ -523,12 +526,12 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         );
     }
     {
-        // (looking-back REGEXP &optional LIMIT) — t when text ending exactly
-        // at point matches. Anchored with \z against the [LIMIT|point-min,
-        // point) window, so the leftmost (longest) qualifying match decides,
-        // like Emacs's greedy backward match. Like looking-at, records no
-        // match data; boundary context left of LIMIT is cut (the documented
-        // bound divergence).
+        // (looking-back REGEXP &optional LIMIT) — t when text ending exactly at
+        // point matches. Anchored with \z against the [LIMIT|point-min, point)
+        // window, so the leftmost (longest) qualifying match decides, like
+        // Emacs's greedy backward match. Like looking-at, records no match
+        // data; boundary context left of LIMIT is cut (the documented bound
+        // divergence).
         let s = session.clone();
         ctx.defun(
             "looking-back",
@@ -583,10 +586,11 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         });
     }
     {
-        // (window &optional N POS) — a text viewport: N lines (default 4) before and
-        // after POS (default point), the focus line marked with '‸' at the column,
-        // plus line numbers and a header. The agent's eyes. POS lets you "look" at
-        // any position (e.g. a saved marker) — several calls = several viewports.
+        // (window &optional N POS) — a text viewport: N lines (default 4)
+        // before and after POS (default point), the focus line marked with '‸'
+        // at the column, plus line numbers and a header. The agent's eyes. POS
+        // lets you "look" at any position (e.g. a saved marker) — several calls
+        // = several viewports.
         let s = session.clone();
         ctx.defun(
             "window",
@@ -765,8 +769,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         );
     }
     {
-        // (buffer-file-name) — the visited file's path as recorded at open/rebase
-        // time, or nil for a buffer with no backing file (Emacs parity).
+        // (buffer-file-name) — the visited file's path as recorded at
+        // open/rebase time, or nil for a buffer with no backing file (Emacs
+        // parity).
         let s = session.clone();
         ctx.defun("buffer-file-name", move || -> TulispObject {
             s.borrow()
@@ -777,11 +782,12 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         });
     }
     {
-        // (buffer-stale-p) — non-nil if the visited file changed on disk since it
-        // was opened/saved (external writer: modified, replaced, or deleted); nil
-        // for a clean stamp or a buffer with no backing file. The value is the
-        // drift description string. Lets a program detect the stale-read race
-        // up front instead of discovering it when the save is refused.
+        // (buffer-stale-p) — non-nil if the visited file changed on disk since
+        // it was opened/saved (external writer: modified, replaced, or
+        // deleted); nil for a clean stamp or a buffer with no backing file. The
+        // value is the drift description string. Lets a program detect the
+        // stale-read race up front instead of discovering it when the save is
+        // refused.
         let s = session.clone();
         ctx.defun("buffer-stale-p", move || -> TulispObject {
             s.borrow()
@@ -795,14 +801,14 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // (revert-buffer &optional IGNORE-AUTO NOCONFIRM PRESERVE-MODES) —
         // discard the buffer's edits and re-read the visited file from disk:
         // the recovery path when the stale guard refuses a save (an external
-        // writer landed since open). Point is preserved by position (clamped
-        // to the new content); narrowing and markers are dropped with the old
+        // writer landed since open). Point is preserved by position (clamped to
+        // the new content); narrowing and markers are dropped with the old
         // text. Re-reads only the already-authorized visited path, so it is
         // safe in the sandboxed tier. There is deliberately no force-save
-        // counterpart — overwriting an external writer's work stays
-        // impossible; revert, re-apply, save. The three Emacs arguments are
-        // accepted for signature compatibility and ignored: there is no
-        // auto-save file, no confirmation prompt, and no major mode here.
+        // counterpart — overwriting an external writer's work stays impossible;
+        // revert, re-apply, save. The three Emacs arguments are accepted for
+        // signature compatibility and ignored: there is no auto-save file, no
+        // confirmation prompt, and no major mode here.
         let s = session.clone();
         ctx.defun(
             "revert-buffer",
@@ -811,9 +817,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                   _preserve_modes: Option<TulispObject>|
                   -> Result<bool, Error> {
                 // Keeps the buffer's (possibly uniquified) name, drops the old
-                // content's markers/narrowing, and resets the modified
-                // baseline — see `engine::revert_in_place`, shared with
-                // auto-revert.
+                // content's markers/narrowing, and resets the modified baseline
+                // — see `engine::revert_in_place`, shared with auto-revert.
                 let mut sess = s.borrow_mut();
                 crate::engine::revert_in_place(&mut sess).map_err(|e| err(&e))?;
                 sess.disk_io = true;
@@ -905,9 +910,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     {
         let s = session.clone();
         // (mark-paragraph &optional N) — point to the start of the current
-        // paragraph (the blank line before it, or point-min), mark N
-        // paragraphs ahead, as Emacs: forward N, mark, then back N. Returns
-        // the mark. A count of zero is an error, as in Emacs.
+        // paragraph (the blank line before it, or point-min), mark N paragraphs
+        // ahead, as Emacs: forward N, mark, then back N. Returns the mark. A
+        // count of zero is an error, as in Emacs.
         ctx.defun(
             "mark-paragraph",
             move |n: Option<i64>| -> Result<i64, Error> {
@@ -927,8 +932,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         );
     }
     // (mark-defun) — point to the start of the enclosing defun (attributes,
-    // decorators and doc comments included), mark at its end. Errors when point is in no
-    // defun. Returns the mark.
+    // decorators and doc comments included), mark at its end. Errors when point
+    // is in no defun. Returns the mark.
     {
         let s = session.clone();
         ctx.defun("mark-defun", move || -> Result<i64, Error> {
@@ -954,7 +959,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         });
     }
 
-    // ---- markers (durable positions; the multi-cursor / viewport primitive) ----
+    // ---- markers (durable positions; the multi-cursor / viewport primitive)
+    // ----
     {
         let s = session.clone();
         // (make-marker) — a marker that points nowhere until `set-marker`.
@@ -1276,9 +1282,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     {
         let s = session.clone();
         // (skip-chars-forward SPEC &optional LIM) — the Emacs character-set
-        // skip: move point forward over chars in SPEC (literals, `a-z`
-        // ranges, [:class:] names, leading `^` negates), bounded by LIM and
-        // the narrowing. Returns the distance moved.
+        // skip: move point forward over chars in SPEC (literals, `a-z` ranges,
+        // [:class:] names, leading `^` negates), bounded by LIM and the
+        // narrowing. Returns the distance moved.
         ctx.defun(
             "skip-chars-forward",
             move |spec: String, lim: Option<i64>| -> Result<i64, Error> {
@@ -1289,8 +1295,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     {
         let s = session.clone();
         // (skip-chars-backward SPEC &optional LIM) — the mirror: move point
-        // back over the run of chars in SPEC, bounded by LIM and the
-        // narrowing. Returns the signed distance moved (≤ 0).
+        // back over the run of chars in SPEC, bounded by LIM and the narrowing.
+        // Returns the signed distance moved (≤ 0).
         ctx.defun(
             "skip-chars-backward",
             move |spec: String, lim: Option<i64>| -> Result<i64, Error> {
@@ -1320,8 +1326,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         ctx.defun("backward-word", move |n: Option<i64>| -> i64 {
             let mut sess = s.borrow_mut();
             let from = sess.buffer.point();
-            // `saturating_neg`, not `-n`: `i64::MIN` has no positive twin
-            // and negating it panics in a debug build.
+            // `saturating_neg`, not `-n`: `i64::MIN` has no positive twin and
+            // negating it panics in a debug build.
             let n = n.unwrap_or(1).saturating_neg();
             let to = move_units(&*sess.buffer, from, n, &is_word_char);
             sess.buffer.goto_char(to);
@@ -1359,8 +1365,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         // (forward-sexp &optional N) — over N balanced expressions: a bracket
         // group, a string, a symbol or a punctuation character. A negative N
-        // moves back. Errors on unbalanced text, point unmoved. Returns the
-        // new point.
+        // moves back. Errors on unbalanced text, point unmoved. Returns the new
+        // point.
         ctx.defun(
             "forward-sexp",
             move |n: Option<i64>| -> Result<i64, Error> {
@@ -1374,8 +1380,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     {
         let s = session.clone();
         // (backward-sexp &optional N) — the mirror of forward-sexp: N sexps
-        // back, a negative N forward. Errors on unbalanced text, point
-        // unmoved. Returns the new point.
+        // back, a negative N forward. Errors on unbalanced text, point unmoved.
+        // Returns the new point.
         ctx.defun(
             "backward-sexp",
             move |n: Option<i64>| -> Result<i64, Error> {
@@ -1388,9 +1394,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         let s = session.clone();
-        // (forward-list &optional N) — over N bracket groups, skipping atoms
-        // in between. A negative N moves back. Errors on unbalanced text,
-        // point unmoved. Returns the new point.
+        // (forward-list &optional N) — over N bracket groups, skipping atoms in
+        // between. A negative N moves back. Errors on unbalanced text, point
+        // unmoved. Returns the new point.
         ctx.defun(
             "forward-list",
             move |n: Option<i64>| -> Result<i64, Error> {
@@ -1404,8 +1410,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     {
         let s = session.clone();
         // (backward-list &optional N) — the mirror of forward-list: N groups
-        // back, a negative N forward. Errors on unbalanced text, point
-        // unmoved. Returns the new point.
+        // back, a negative N forward. Errors on unbalanced text, point unmoved.
+        // Returns the new point.
         ctx.defun(
             "backward-list",
             move |n: Option<i64>| -> Result<i64, Error> {
@@ -1418,10 +1424,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         let s = session.clone();
-        // (up-list &optional N) — out of N enclosing groups, forward past
-        // the closer. A negative N moves out backward, before the opener.
-        // No enclosing group is an error, point unmoved. Returns the new
-        // point.
+        // (up-list &optional N) — out of N enclosing groups, forward past the
+        // closer. A negative N moves out backward, before the opener.  No
+        // enclosing group is an error, point unmoved. Returns the new point.
         ctx.defun("up-list", move |n: Option<i64>| -> Result<i64, Error> {
             let mut sess = s.borrow_mut();
             let to = move_up(&sess, n.unwrap_or(1)).map_err(scan_err)?;
@@ -1432,9 +1437,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     {
         let s = session.clone();
         // (backward-up-list &optional N) — the mirror of up-list: out of N
-        // enclosing groups backward, before the opener. A negative N moves
-        // out forward, past the closer. No enclosing group is an error,
-        // point unmoved. Returns the new point.
+        // enclosing groups backward, before the opener. A negative N moves out
+        // forward, past the closer. No enclosing group is an error, point
+        // unmoved. Returns the new point.
         ctx.defun(
             "backward-up-list",
             move |n: Option<i64>| -> Result<i64, Error> {
@@ -1538,15 +1543,14 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         );
     }
 
-    // ---- buffer-level replace commands (map-shaped bulk edits) ----
-    // Both are single-pass streaming rewrites: the window [point, point-max)
-    // is materialized ONCE, every match located in it, and the edits applied
-    // in document order with a running offset (`apply_window_edits`) —
-    // O(window + matches) instead of the search loop's O(window²)
-    // re-materialization per match on a large Quire. Replacement text is
-    // never re-matched, point lands after the last replacement (unchanged
-    // when nothing matches), and markers adjust per edit exactly as the
-    // search-and-replace loop did.
+    // ---- buffer-level replace commands (map-shaped bulk edits) ---- Both are
+    // single-pass streaming rewrites: the window [point, point-max) is
+    // materialized ONCE, every match located in it, and the edits applied in
+    // document order with a running offset (`apply_window_edits`) — O(window +
+    // matches) instead of the search loop's O(window²) re-materialization per
+    // match on a large Quire. Replacement text is never re-matched, point lands
+    // after the last replacement (unchanged when nothing matches), and markers
+    // adjust per edit exactly as the search-and-replace loop did.
     {
         let s = session.clone();
         ctx.defun(
@@ -1556,9 +1560,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                 let mut sess = s.borrow_mut();
                 let from = sess.buffer.point();
                 let to = sess.buffer.point_max();
-                // One char of context before point keeps `^`/`\b` honest at
-                // the window edge, as in the store searches — but never from
-                // before point-min, which counts as a real line beginning.
+                // One char of context before point keeps `^`/`\b` honest at the
+                // window edge, as in the store searches — but never from before
+                // point-min, which counts as a real line beginning.
                 let ctx_from = from
                     .saturating_sub(1)
                     .max(sess.buffer.point_min().min(from));
@@ -1697,10 +1701,11 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
 
     // ---- buffer-file-coding-system: read/change the visited file's BOM+EOL
-    // round-trip. `(set-buffer-file-coding-system "utf-8-unix")` strips a BOM and
-    // forces LF on the next save (the "re-save as UTF-8" idiom); "utf-8-dos" /
-    // "utf-8-with-signature" force those. Bare "unix"/"dos" change only the line
-    // ending. The reader returns the current name, or nil for a fileless buffer. ----
+    // round-trip. `(set-buffer-file-coding-system "utf-8-unix")` strips a BOM
+    // and forces LF on the next save (the "re-save as UTF-8" idiom);
+    // "utf-8-dos" / "utf-8-with-signature" force those. Bare "unix"/"dos"
+    // change only the line ending. The reader returns the current name, or nil
+    // for a fileless buffer. ----
     {
         let s = session.clone();
         ctx.defun(
@@ -1708,9 +1713,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             move |name: TulispObject| -> Result<String, Error> {
                 let name = name_arg("coding system", &name)?;
                 let mut sess = s.borrow_mut();
-                // A coding only round-trips through a visited file; an in-memory
-                // buffer (open_text) has none, so reject rather than report a
-                // success the next save wouldn't honor.
+                // A coding only round-trips through a visited file; an
+                // in-memory buffer (open_text) has none, so reject rather than
+                // report a success the next save wouldn't honor.
                 if sess.buffer.file_stamp().is_none() {
                     return Err(err(
                         "buffer has no file coding system (only file-backed buffers round-trip BOM/EOL)",
@@ -1801,13 +1806,13 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                     let start = sess.buffer.last_match().map_or(end, |m| m.start);
                     // A zero-width match (the line anchors) leaves point in
                     // place — step over it so each empty match counts exactly
-                    // once and the scan continues: the same stepping occur
-                    // and the streaming replace use.
+                    // once and the scan continues: the same stepping occur and
+                    // the streaming replace use.
                     if end == start {
                         // Clamp the step limit into the accessible region: an
                         // END beyond point-max would otherwise never satisfy
-                        // `end >= limit` while goto_char clamps the step back
-                        // — an infinite loop on `(count-matches "$" 1 BIG)`.
+                        // `end >= limit` while goto_char clamps the step back —
+                        // an infinite loop on `(count-matches "$" 1 BIG)`.
                         let pmax = sess.buffer.point_max();
                         let limit = bound.map_or(pmax, |b| b.min(pmax));
                         if end >= limit {
@@ -1831,7 +1836,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             sess.buffer.end_of_line();
             let eol = sess.buffer.point();
             sess.buffer.goto_char(p);
-            // Kill to end of line; if already there, kill the newline (like Emacs).
+            // Kill to end of line; if already there, kill the newline (like
+            // Emacs).
             let end = if p == eol && p < sess.buffer.point_max() {
                 p + 1
             } else {
@@ -1843,8 +1849,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         // (kill-whole-line) — kill the entire line point is on, newline
-        // included, onto the kill-ring; point lands at the line's former
-        // start.
+        // included, onto the kill-ring; point lands at the line's former start.
         let s = session.clone();
         ctx.defun("kill-whole-line", move || -> Result<TulispObject, Error> {
             let mut sess = s.borrow_mut();
@@ -1863,8 +1868,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         let s = session.clone();
-        // (kill-sexp &optional N) — kill N sexps after point onto the kill
-        // ring (before point for a negative N). Returns nil.
+        // (kill-sexp &optional N) — kill N sexps after point onto the kill ring
+        // (before point for a negative N). Returns nil.
         ctx.defun(
             "kill-sexp",
             move |n: Option<i64>| -> Result<TulispObject, Error> {
@@ -1905,8 +1910,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     {
         // (sort-lines &optional REVERSE BEG END) — sort the lines covering
         // [BEG, END) (defaults: the whole accessible region) lexicographically;
-        // REVERSE non-nil sorts descending. Whole lines are reordered; a
-        // region cut mid-line is widened to line boundaries first.
+        // REVERSE non-nil sorts descending. Whole lines are reordered; a region
+        // cut mid-line is widened to line boundaries first.
         let s = session.clone();
         ctx.defun(
             "sort-lines",
@@ -1953,8 +1958,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         );
     }
     {
-        // (back-to-indentation) — point to the first non-whitespace char of
-        // the current line (or its end if blank); returns the new point.
+        // (back-to-indentation) — point to the first non-whitespace char of the
+        // current line (or its end if blank); returns the new point.
         let s = session.clone();
         ctx.defun("back-to-indentation", move || -> i64 {
             let mut sess = s.borrow_mut();
@@ -2005,8 +2010,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         let s = session.clone();
-        // (backward-paragraph &optional N) — the mirror: lands on the start
-        // of the blank line before the paragraph (or point-min). A negative N
+        // (backward-paragraph &optional N) — the mirror: lands on the start of
+        // the blank line before the paragraph (or point-min). A negative N
         // reverses. Returns the new point.
         ctx.defun("backward-paragraph", move |n: Option<i64>| -> i64 {
             let mut sess = s.borrow_mut();
@@ -2117,11 +2122,11 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
 
     // ---- merge conflicts (smerge-flavored; see src/conflict.rs) ----
-    // Stateless: every command re-scans the accessible region, so hunk
-    // numbers refresh after each edit (resolve top-down, or re-list). All
-    // mutating commands return the REMAINING conflict count — the loop
-    // condition and the "am I done" signal in one. Addressing: a 1-based
-    // hunk index, or nil for the hunk containing point (smerge-keep-current).
+    // Stateless: every command re-scans the accessible region, so hunk numbers
+    // refresh after each edit (resolve top-down, or re-list). All mutating
+    // commands return the REMAINING conflict count — the loop condition and the
+    // "am I done" signal in one. Addressing: a 1-based hunk index, or nil for
+    // the hunk containing point (smerge-keep-current).
     {
         // (conflict-count) — the number of well-formed conflict hunks.
         let s = session.clone();
@@ -2134,14 +2139,14 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // in document order; nil when the buffer is clean. The structured
         // companion to conflict-count: count says how MANY, this says WHERE.
         // Each position lands INSIDE its hunk, so the at-point commands address
-        // it directly (goto-char → conflict-context to inspect, conflict-keep to
-        // resolve) without parsing the conflict-hunks overview text. The list is
-        // a SNAPSHOT: resolving a hunk shifts every later position, so a resolve
-        // loop must re-scan each pass — `(while (> (conflict-count) 0) (goto-char
-        // (car (conflicts))) (conflict-keep …))` — or walk one snapshot bottom-up
-        // (last hunk first), where the earlier positions stay valid. (The MCP
-        // `conflicts` tool instead renders the human overview; for that text from
-        // lisp use `(conflict-hunks)`.)
+        // it directly (goto-char → conflict-context to inspect, conflict-keep
+        // to resolve) without parsing the conflict-hunks overview text. The
+        // list is a SNAPSHOT: resolving a hunk shifts every later position, so
+        // a resolve loop must re-scan each pass — `(while (> (conflict-count)
+        // 0) (goto-char (car (conflicts))) (conflict-keep …))` — or walk one
+        // snapshot bottom-up (last hunk first), where the earlier positions
+        // stay valid. (The MCP `conflicts` tool instead renders the human
+        // overview; for that text from lisp use `(conflict-hunks)`.)
         let s = session.clone();
         ctx.defun("conflicts", move || -> Vec<i64> {
             crate::conflict::scan(s.borrow_mut().buffer.as_mut())
@@ -2166,13 +2171,13 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     {
         // (conflict-goto &optional N) — move point to hunk N's start; with nil,
         // to the next conflict at or after point (smerge-next). NOTE the two
-        // forms land at different spots: explicit N at the opener line's
-        // start, nil just past the opener — *inside* the hunk, so the at-point
-        // commands address it and the next call advances to the following
-        // hunk (a hunk starting exactly at point, e.g. at point-min, is found
-        // rather than skipped). Both positions are inside the hunk for
-        // at-point addressing. Returns the new position, or nil when there is
-        // no next conflict.
+        // forms land at different spots: explicit N at the opener line's start,
+        // nil just past the opener — *inside* the hunk, so the at-point
+        // commands address it and the next call advances to the following hunk
+        // (a hunk starting exactly at point, e.g. at point-min, is found rather
+        // than skipped). Both positions are inside the hunk for at-point
+        // addressing. Returns the new position, or nil when there is no next
+        // conflict.
         let s = session.clone();
         ctx.defun(
             "conflict-goto",
@@ -2199,9 +2204,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         );
     }
     {
-        // (conflict-text SIDE &optional N) — the text of one side of hunk N
-        // (or the hunk at point): "ours" | "theirs" | "base" (diff3 only), plus
-        // the combinations "both" / "all" (what conflict-keep would insert).
+        // (conflict-text SIDE &optional N) — the text of one side of hunk N (or
+        // the hunk at point): "ours" | "theirs" | "base" (diff3 only), plus the
+        // combinations "both" / "all" (what conflict-keep would insert).
         let s = session.clone();
         ctx.defun(
             "conflict-text",
@@ -2234,12 +2239,12 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         );
     }
     {
-        // (conflict-context &optional N LINES) — the decision view in one
-        // call: hunk N (or the hunk at point) rendered in place with LINES
-        // (default 3) lines of surrounding code, view-style gutter marking
-        // the hunk's own lines. Deciding a resolution usually needs the code
-        // AROUND the hunk; this replaces the conflict-hunks → parse @pos →
-        // view round-trip. Read-only: point is preserved.
+        // (conflict-context &optional N LINES) — the decision view in one call:
+        // hunk N (or the hunk at point) rendered in place with LINES (default
+        // 3) lines of surrounding code, view-style gutter marking the hunk's
+        // own lines. Deciding a resolution usually needs the code AROUND the
+        // hunk; this replaces the conflict-hunks → parse @pos → view
+        // round-trip. Read-only: point is preserved.
         let s = session.clone();
         ctx.defun(
             "conflict-context",
@@ -2388,18 +2393,18 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         });
     }
 
-    // ---- structural / AST-aware editing (M7, tree-sitter) ----
-    // Markdown, Rust, and Python; the language comes from the buffer name's
-    // extension (`Lang::from_buffer_name`), overridable per buffer with
-    // `treesit-set-language`, falling back to Markdown (`syntax_of`). The
-    // parse persists on the Session keyed by content version — a run of
-    // treesit calls parses once, an edit re-parses on the next call (full
-    // re-parse; incremental InputEdits are a TODO in syntax.rs). Node spans
-    // are reported in 1-based char positions, like the rest of the builtins,
-    // and are WHOLE-DOCUMENT positions by design: the structural layer reads
-    // the full document regardless of narrowing (the one deliberate exception
-    // to narrowing composition — a restriction that cuts a function in half
-    // must not change what the tree says the function is). Motion still can't
+    // ---- structural / AST-aware editing (M7, tree-sitter) ---- Markdown,
+    // Rust, and Python; the language comes from the buffer name's extension
+    // (`Lang::from_buffer_name`), overridable per buffer with
+    // `treesit-set-language`, falling back to Markdown (`syntax_of`). The parse
+    // persists on the Session keyed by content version — a run of treesit calls
+    // parses once, an edit re-parses on the next call (full re-parse;
+    // incremental InputEdits are a TODO in syntax.rs). Node spans are reported
+    // in 1-based char positions, like the rest of the builtins, and are
+    // WHOLE-DOCUMENT positions by design: the structural layer reads the full
+    // document regardless of narrowing (the one deliberate exception to
+    // narrowing composition — a restriction that cuts a function in half must
+    // not change what the tree says the function is). Motion still can't
     // escape: goto_char clamps into the accessible region. A "defun" is the
     // language's enclosing construct: a Markdown `section`, a Rust
     // `function_item`/`impl_item`/type item, a Python
@@ -2466,8 +2471,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         let s = session.clone();
-        // (treesit-node-at &optional POS) — the smallest NAMED node covering POS
-        // (default point), as a first-class node value (nil for an empty
+        // (treesit-node-at &optional POS) — the smallest NAMED node covering
+        // POS (default point), as a first-class node value (nil for an empty
         // tree). Reports its type and 1-based char start/end too. Feed the
         // value to the treesit-node-* family: parent / child / siblings /
         // child-by-field-name / type / start / end / text.
@@ -2497,9 +2502,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         let s = session.clone();
-        // (treesit-defun-at &optional POS) — the nearest enclosing defun at
-        // POS (default point) as a node value; nil if POS is inside no defun.
-        // The node-valued sibling of treesit-beginning-of-defun.
+        // (treesit-defun-at &optional POS) — the nearest enclosing defun at POS
+        // (default point) as a node value; nil if POS is inside no defun.  The
+        // node-valued sibling of treesit-beginning-of-defun.
         ctx.defun(
             "treesit-defun-at",
             move |pos: Option<i64>| -> Result<TulispObject, Error> {
@@ -2661,13 +2666,14 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     // ---- node-EDIT ops: splice at a node's span, return the re-parsed result.
     // Thin wrappers over the store's delete/insert that take a NODE from the
-    // CURRENT buffer (live_current_node), edit at its span, then re-parse so the
-    // replacement node comes back for chaining. A node from another buffer or an
-    // outdated parse is refused — its span would address the wrong text.
+    // CURRENT buffer (live_current_node), edit at its span, then re-parse so
+    // the replacement node comes back for chaining. A node from another buffer
+    // or an outdated parse is refused — its span would address the wrong text.
     {
         let s = session.clone();
         // (treesit-replace-node NODE TEXT) — replace NODE's whole span with the
-        // literal TEXT. Returns the re-parsed node now at the replacement start.
+        // literal TEXT. Returns the re-parsed node now at the replacement
+        // start.
         ctx.defun(
             "treesit-replace-node",
             move |n: TsNode, text: String| -> Result<TulispObject, Error> {
@@ -2704,7 +2710,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         // (treesit-raise-node NODE) — replace NODE's PARENT with NODE (paredit
         // raise-sexp): the node's text takes the parent's place, DELETING the
-        // node's siblings. Errors at the root (no parent). Returns the raised node.
+        // node's siblings. Errors at the root (no parent). Returns the raised
+        // node.
         ctx.defun(
             "treesit-raise-node",
             move |n: TsNode| -> Result<TulispObject, Error> {
@@ -2728,8 +2735,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         let s = session.clone();
-        // (treesit-kill-node NODE) — delete NODE's span, pushing its text to the
-        // kill-ring (yank-able). Point lands at the deletion start; returns nil.
+        // (treesit-kill-node NODE) — delete NODE's span, pushing its text to
+        // the kill-ring (yank-able). Point lands at the deletion start; returns
+        // nil.
         ctx.defun(
             "treesit-kill-node",
             move |n: TsNode| -> Result<TulispObject, Error> {
@@ -2749,8 +2757,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         let s = session.clone();
-        // (treesit-insert-sibling NODE TEXT &optional BEFORE) — insert TEXT just
-        // after NODE (or before it when BEFORE is non-nil), as an adjacent
+        // (treesit-insert-sibling NODE TEXT &optional BEFORE) — insert TEXT
+        // just after NODE (or before it when BEFORE is non-nil), as an adjacent
         // sibling. Returns the re-parsed node at the insertion point.
         ctx.defun(
             "treesit-insert-sibling",
@@ -2793,9 +2801,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     {
         let s = session.clone();
-        // (treesit-end-of-defun) — move point to the end of the enclosing
-        // defun and return the new point. If point is in no defun, leave it
-        // put and return it unchanged.
+        // (treesit-end-of-defun) — move point to the end of the enclosing defun
+        // and return the new point. If point is in no defun, leave it put and
+        // return it unchanged.
         ctx.defun("treesit-end-of-defun", move || -> i64 {
             goto_defun_edge(&mut s.borrow_mut(), |d| d.end)
         });
@@ -2833,11 +2841,11 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // (treesit-narrow-to-defun &optional POS) — narrow the buffer to the
         // enclosing defun at POS (default point), scoping every subsequent
         // edit/search to that one function/class/section (compose with
-        // save-restriction / widen). Returns t, or nil (no narrowing) if POS
-        // is inside no defun. REPLACES any existing restriction, like Emacs's
+        // save-restriction / widen). Returns t, or nil (no narrowing) if POS is
+        // inside no defun. REPLACES any existing restriction, like Emacs's
         // narrowing commands — the defun is found in the whole document (see
-        // the section comment), so this can deliberately re-narrow outside
-        // the current restriction.
+        // the section comment), so this can deliberately re-narrow outside the
+        // current restriction.
         ctx.defun("treesit-narrow-to-defun", move |pos: Option<i64>| -> bool {
             narrow_to_defun(&mut s.borrow_mut(), pos)
         });
@@ -2853,8 +2861,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     {
         let s = session.clone();
         // (bounds-of-thing-at-point THING) — `(START . END)` of the THING at
-        // point, or nil. THING is a symbol: sexp list string word symbol
-        // line paragraph defun.
+        // point, or nil. THING is a symbol: sexp list string word symbol line
+        // paragraph defun.
         ctx.defun(
             "bounds-of-thing-at-point",
             move |thing: TulispObject| -> Result<TulispObject, Error> {
@@ -2891,8 +2899,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         // (treesit-list-defuns) — the buffer outline: report every defun in
         // document order (nested ones included) as "KIND START END NAME" and
-        // return the list of names. How an agent surveys a source file
-        // without reading it whole.
+        // return the list of names. How an agent surveys a source file without
+        // reading it whole.
         ctx.defun("treesit-list-defuns", move || -> Vec<String> {
             let mut sess = s.borrow_mut();
             let defuns = syntax_of(&mut sess).defuns();
@@ -2911,8 +2919,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         // (treesit-goto-defun NAME) — move point to the start of the first
         // defun (document order) named NAME — "go to fn parse_args" without
-        // knowing where it is. Reports its span and returns the new point;
-        // nil (point unmoved) if no defun has that name.
+        // knowing where it is. Reports its span and returns the new point; nil
+        // (point unmoved) if no defun has that name.
         ctx.defun("treesit-goto-defun", move |name: String| -> TulispObject {
             let mut sess = s.borrow_mut();
             match syntax_of(&mut sess).find_defun(&name) {
@@ -2931,12 +2939,12 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     {
         let s = session.clone();
         // (treesit-query PATTERN) — run a tree-sitter query (.scm pattern
-        // syntax) over the buffer: structural search ("every call to foo",
-        // "all pub fns") instead of regex. Reports each capture as
-        // "@CAPTURE KIND START END" and returns the captures as a list of
-        // first-class NODE values (feed treesit-node-text / -start / the
-        // navigation family; the report rows carry the capture names).
-        // Errors if the pattern does not compile for the buffer's language.
+        // syntax) over the buffer: structural search ("every call to foo", "all
+        // pub fns") instead of regex. Reports each capture as "@CAPTURE KIND
+        // START END" and returns the captures as a list of first-class NODE
+        // values (feed treesit-node-text / -start / the navigation family; the
+        // report rows carry the capture names).  Errors if the pattern does not
+        // compile for the buffer's language.
         ctx.defun(
             "treesit-query",
             move |pattern: String| -> Result<Vec<TsNode>, Error> {
@@ -2960,9 +2968,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             },
         );
     }
-    // ---- filling ----
-    // The Emacs variables the filler reads. `defvar` marks them special, so
-    // a `let` rebinding is seen from Rust as `setq` is.
+    // ---- filling ---- The Emacs variables the filler reads. `defvar` marks
+    // them special, so a `let` rebinding is seen from Rust as `setq` is.
     ctx.eval_string(
         "(progn (defvar fill-column 80) (defvar fill-prefix nil) \
                 (defvar sentence-end-double-space t))",
@@ -2979,14 +2986,13 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             double_space.clone(),
         );
         // (fill-paragraph) — refill the prose unit at point (a run of line
-        // comments, a block comment, a Python docstring, a Markdown
-        // paragraph; the tree-sitter parse says which) to `fill-column`,
-        // keeping the comment marker, list hanging indents, fences and
-        // tables; with `fill-prefix` set, the paragraph is instead the run
-        // of lines around point carrying that prefix. Point keeps its
-        // position, clamped to the end of the refilled unit.
-        // Returns (KIND START END) for the unit after the fill; errors
-        // naming what point is in when it is not prose.
+        // comments, a block comment, a Python docstring, a Markdown paragraph;
+        // the tree-sitter parse says which) to `fill-column`, keeping the
+        // comment marker, list hanging indents, fences and tables; with
+        // `fill-prefix` set, the paragraph is instead the run of lines around
+        // point carrying that prefix. Point keeps its position, clamped to the
+        // end of the refilled unit.  Returns (KIND START END) for the unit
+        // after the fill; errors naming what point is in when it is not prose.
         ctx.defun("fill-paragraph", move || -> Result<TulispObject, Error> {
             let opts = fill_opts(&col, &dbl)?;
             let prefix = fill_prefix_of(&pfx)?;
@@ -3029,10 +3035,10 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         );
         // (fill-region START END) — refill every prose unit whose lines the
         // region touches, each paragraph of each unit, and leave the code
-        // between them alone: over the whole buffer it reflows every
-        // comment, or every paragraph of a README. With `fill-prefix` set,
-        // the units are the runs of prefixed lines in the region. Returns
-        // (SEEN . CHANGED): units found, and how many the fill changed.
+        // between them alone: over the whole buffer it reflows every comment,
+        // or every paragraph of a README. With `fill-prefix` set, the units are
+        // the runs of prefixed lines in the region. Returns (SEEN . CHANGED):
+        // units found, and how many the fill changed.
         ctx.defun(
             "fill-region",
             move |a: i64, b: i64| -> Result<TulispObject, Error> {
@@ -3043,8 +3049,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                 let (a, b) = (a.max(1) as usize, b.max(1) as usize);
                 let (a, b) = (a.min(b).clamp(min, max), a.max(b).clamp(min, max));
                 let p = sess.buffer.point();
-                // The units, and the filler for them: by the prefix, or by
-                // the parse.
+                // The units, and the filler for them: by the prefix, or by the
+                // parse.
                 type Filler<'a> = Box<dyn Fn(&str, ProseKind) -> Result<String, String> + 'a>;
                 let (units, fill): (Vec<ProseUnit>, Filler<'_>) = match &prefix {
                     Some(pre) => {
@@ -3099,11 +3105,11 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
 }
 
-/// Shared body of `find-file` / `find-file-noselect`: a buffer already
-/// visiting `path` (canonical compare — dedup by FILE, not basename) is
-/// reused; otherwise the file is opened and installed under its basename,
-/// uniquified Emacs-style (`doc.txt<2>`) when a different file already owns
-/// that name. `select` makes the buffer current.
+/// Shared body of `find-file` / `find-file-noselect`: a buffer already visiting
+/// `path` (canonical compare — dedup by FILE, not basename) is reused;
+/// otherwise the file is opened and installed under its basename, uniquified
+/// Emacs-style (`doc.txt<2>`) when a different file already owns that name.
+/// `select` makes the buffer current.
 fn find_file_buffer(s: &SharedSession, path: &str, select: bool) -> Result<String, Error> {
     let p = std::path::Path::new(path);
     let mut sess = s.borrow_mut();
@@ -3123,9 +3129,9 @@ fn find_file_buffer(s: &SharedSession, path: &str, select: bool) -> Result<Strin
     Ok(sess.install_buffer(store, select))
 }
 
-/// Apply a batch of non-overlapping window edits in document order — the
-/// shared tail of the streaming `replace-regexp` / `replace-string`. `edits`
-/// are ascending `(byte_start, byte_end, replacement)` spans in `window`;
+/// Apply a batch of non-overlapping window edits in document order — the shared
+/// tail of the streaming `replace-regexp` / `replace-string`. `edits` are
+/// ascending `(byte_start, byte_end, replacement)` spans in `window`;
 /// `window_start` is the absolute char position of the window's first byte.
 /// One forward pass maps the byte offsets to char offsets, then each span is
 /// spliced as delete+insert — markers and the narrowing bound adjust per edit,
@@ -3185,8 +3191,8 @@ fn lang_of(sess: &crate::engine::Session) -> Lang {
     detected_lang(sess).unwrap_or(Lang::Markdown)
 }
 
-/// The language the buffer is known to be: a `treesit-set-language`
-/// override, else what its name's extension says.
+/// The language the buffer is known to be: a `treesit-set-language` override,
+/// else what its name's extension says.
 fn detected_lang(sess: &crate::engine::Session) -> Option<Lang> {
     let name = sess.buffer.name();
     sess.lang_overrides
@@ -3196,8 +3202,8 @@ fn detected_lang(sess: &crate::engine::Session) -> Option<Lang> {
         .or_else(|| Lang::from_buffer_name(file_name(name)))
 }
 
-/// The buffer name without the `<N>` a colliding basename gets, so
-/// `lib.rs<2>` is still a Rust file.
+/// The buffer name without the `<N>` a colliding basename gets, so `lib.rs<2>`
+/// is still a Rust file.
 fn file_name(name: &str) -> &str {
     if let Some((base, rest)) = name.rsplit_once('<')
         && let Some(n) = rest.strip_suffix('>')
@@ -3209,10 +3215,10 @@ fn file_name(name: &str) -> &str {
     }
 }
 
-/// `skip-chars-forward` (`forward`) and `skip-chars-backward`: move point
-/// over the run of characters matching SPEC, bounded by LIM — clamped to the
-/// side of point the walk runs on — and by the narrowing. Returns the signed
-/// distance moved (backward ≤ 0).
+/// `skip-chars-forward` (`forward`) and `skip-chars-backward`: move point over
+/// the run of characters matching SPEC, bounded by LIM — clamped to the side of
+/// point the walk runs on — and by the narrowing. Returns the signed distance
+/// moved (backward ≤ 0).
 fn skip_chars(
     sess: &mut crate::engine::Session,
     spec: &str,
@@ -3259,8 +3265,8 @@ pub const THING_KINDS: [&str; 8] = [
 ];
 
 /// The span of the `kind` thing at `pos` — see `sexp::Scanner::bounds_of` —
-/// with `defun` resolved through the tree-sitter parse as the decorated span
-/// of the enclosing defun. `up` widens a sexp or list by enclosing groups.
+/// with `defun` resolved through the tree-sitter parse as the decorated span of
+/// the enclosing defun. `up` widens a sexp or list by enclosing groups.
 pub fn thing_bounds(
     sess: &mut crate::engine::Session,
     kind: &str,
@@ -3274,8 +3280,8 @@ pub fn thing_bounds(
     }
     let k = Kind::parse(kind).ok_or_else(|| unknown_thing(kind))?;
     // The scanner clamps a position into the accessible region, which would
-    // quietly name the LAST thing for a typo'd position; point-max stays
-    // valid as the probe for the thing at the region's end.
+    // quietly name the LAST thing for a typo'd position; point-max stays valid
+    // as the probe for the thing at the region's end.
     let (min, max) = (sess.buffer.point_min(), sess.buffer.point_max());
     if pos < min || pos > max {
         return Err(err(&format!(
@@ -3295,13 +3301,13 @@ fn unknown_thing(kind: &str) -> Error {
 }
 
 /// The `kind` thing an `after:` anchor names, widened by `up`. `pos` is the
-/// anchor line's start. `list` takes the LAST one beginning on the anchor
-/// line, or — when none begins on it — the first one beginning after the
-/// line: an anchor like `fn main() {` names the block it opens, not the `()`
-/// earlier on the same line. EVERY other kind, `sexp` included, takes the
-/// first thing at or after `pos`, so `old(1, 2);` names `old` rather than the
-/// trailing `;`. Depth-zero closers on the way are stepped over: the anchor
-/// line may sit at any depth.
+/// anchor line's start. `list` takes the LAST one beginning on the anchor line,
+/// or — when none begins on it — the first one beginning after the line: an
+/// anchor like `fn main() {` names the block it opens, not the `()` earlier on
+/// the same line. EVERY other kind, `sexp` included, takes the first thing at
+/// or after `pos`, so `old(1, 2);` names `old` rather than the trailing `;`.
+/// Depth-zero closers on the way are stepped over: the anchor line may sit at
+/// any depth.
 pub fn thing_after(
     sess: &mut crate::engine::Session,
     kind: &str,
@@ -3321,17 +3327,17 @@ pub fn thing_after(
     let store = &*sess.buffer;
     let max = store.point_max();
     let sc = Scanner::new(store, lang);
-    // A line inside a block comment or a multi-line string has no structure
-    // of its own: the sexp, list and string walks start after it.
+    // A line inside a block comment or a multi-line string has no structure of
+    // its own: the sexp, list and string walks start after it.
     let pos = match k {
         Kind::Sexp | Kind::List | Kind::Str => sc.out_of_string_or_comment(pos),
         _ => pos,
     };
     // Walk `step` forward from the anchor line's start, keeping the latest
-    // candidate that still begins on the line; the first one beginning past
-    // the line ends the walk, and is the answer only when the line held none.
-    // Only `list` wants this: an anchor line names the block it OPENS, which
-    // is the last list to begin on it. Every other kind takes the first.
+    // candidate that still begins on the line; the first one beginning past the
+    // line ends the walk, and is the answer only when the line held none.  Only
+    // `list` wants this: an anchor line names the block it OPENS, which is the
+    // last list to begin on it. Every other kind takes the first.
     let last_on_line = |step: &dyn Fn(usize) -> Result<Option<Sexp>, Error>| {
         let eol = crate::motion::skip_forward(store, pos, max, &|c| c != '\n');
         let mut p = pos;
@@ -3368,10 +3374,10 @@ pub fn thing_after(
                 }
             }
         }
-        // No constituent left after the line means no thing, not the empty
-        // span at point-max: `bounds_of` probes the char BEFORE a point-max
-        // `pos`, which would look backwards past the anchor. Mirrors the
-        // `end > min` guard in `thing_before`.
+        // No constituent left after the line means no thing, not the empty span
+        // at point-max: `bounds_of` probes the char BEFORE a point-max `pos`,
+        // which would look backwards past the anchor. Mirrors the `end > min`
+        // guard in `thing_before`.
         Kind::Word | Kind::Symbol => {
             let inside = constituent(k, lang);
             let start = crate::motion::skip_forward(store, pos, max, &|c| !inside(c));
@@ -3394,8 +3400,8 @@ fn constituent(k: Kind, lang: Lang) -> Box<dyn Fn(char) -> bool> {
     }
 }
 
-/// The last `kind` thing ending at or before `pos` (an anchor line's
-/// start), widened by `up`. An opener met on the way back is stepped over.
+/// The last `kind` thing ending at or before `pos` (an anchor line's start),
+/// widened by `up`. An opener met on the way back is stepped over.
 pub fn thing_before(
     sess: &mut crate::engine::Session,
     kind: &str,
@@ -3457,9 +3463,9 @@ pub fn thing_before(
     span.map(|s| sc.widen(s, up)).transpose().map_err(scan_err)
 }
 
-/// Where N sexp hops from point land: forward for a positive N, backward
-/// for a negative one. A hop that finds nothing before the region edge
-/// stops the run at that edge, as Emacs's `forward-sexp` does.
+/// Where N sexp hops from point land: forward for a positive N, backward for a
+/// negative one. A hop that finds nothing before the region edge stops the run
+/// at that edge, as Emacs's `forward-sexp` does.
 fn move_sexps(sess: &crate::engine::Session, n: i64) -> Result<usize, ScanError> {
     let store = &*sess.buffer;
     let sc = Scanner::new(store, lang_of(sess));
@@ -3492,9 +3498,9 @@ fn hop_n(
     Ok(p)
 }
 
-/// Kill from point over N sexps (back for a negative N) onto the kill
-/// ring; point lands at the start of the killed text. A zero count kills
-/// nothing and pushes nothing.
+/// Kill from point over N sexps (back for a negative N) onto the kill ring;
+/// point lands at the start of the killed text. A zero count kills nothing and
+/// pushes nothing.
 fn kill_sexps(sess: &mut crate::engine::Session, n: i64) -> Result<(), Error> {
     let here = sess.buffer.point();
     let to = move_sexps(sess, n).map_err(scan_err)?;
@@ -3528,9 +3534,9 @@ fn move_lists(sess: &crate::engine::Session, n: i64) -> Result<usize, ScanError>
     )
 }
 
-/// `up-list`: out of N enclosing groups, forward past the closer for a
-/// positive N, back before the opener for a negative one. No enclosing
-/// group is `Unbalanced` at point.
+/// `up-list`: out of N enclosing groups, forward past the closer for a positive
+/// N, back before the opener for a negative one. No enclosing group is
+/// `Unbalanced` at point.
 fn move_up(sess: &crate::engine::Session, n: i64) -> Result<usize, ScanError> {
     let store = &*sess.buffer;
     let sc = Scanner::new(store, lang_of(sess));
@@ -3560,8 +3566,8 @@ fn move_down(sess: &crate::engine::Session, n: i64) -> Result<usize, Error> {
     Ok(p)
 }
 
-/// `beginning-of-defun` / `end-of-defun`: point to the `edge` of the
-/// enclosing defun (left put when point is in none); returns point.
+/// `beginning-of-defun` / `end-of-defun`: point to the `edge` of the enclosing
+/// defun (left put when point is in none); returns point.
 fn goto_defun_edge(
     sess: &mut crate::engine::Session,
     edge: fn(&crate::syntax::NodeSpan) -> usize,
@@ -3573,8 +3579,8 @@ fn goto_defun_edge(
     sess.buffer.point() as i64
 }
 
-/// `narrow-to-defun`: narrow to the defun at `pos` (default point); `true`
-/// when one was found. Replaces any existing restriction, like Emacs.
+/// `narrow-to-defun`: narrow to the defun at `pos` (default point); `true` when
+/// one was found. Replaces any existing restriction, like Emacs.
 fn narrow_to_defun(sess: &mut crate::engine::Session, pos: Option<i64>) -> bool {
     let p = pos.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
     match syntax_of(sess).enclosing_defun(p) {
@@ -3610,8 +3616,8 @@ fn fill_prefix_of(prefix: &TulispObject) -> Result<Option<String>, Error> {
     }
 }
 
-/// The prose unit at `p`, or the error `fill-paragraph` reports: what
-/// point is in instead, and the two ways round it.
+/// The prose unit at `p`, or the error `fill-paragraph` reports: what point is
+/// in instead, and the two ways round it.
 fn prose_unit_at(sess: &mut crate::engine::Session, p: usize) -> Result<ProseUnit, Error> {
     let u = syntax_of(sess).prose_unit_at(p).map_err(|e| {
         err(&format!(
@@ -3629,9 +3635,8 @@ fn prose_unit_at(sess: &mut crate::engine::Session, p: usize) -> Result<ProseUni
     clip_to_narrowing(u, min, max).ok_or_else(|| err(&crosses))
 }
 
-/// `u` clipped to the narrowing `[min, max)`, or `None` when it crosses
-/// it. A unit may end with the newline at `max`; beyond that it is
-/// outside.
+/// `u` clipped to the narrowing `[min, max)`, or `None` when it crosses it. A
+/// unit may end with the newline at `max`; beyond that it is outside.
 fn clip_to_narrowing(u: ProseUnit, min: usize, max: usize) -> Option<ProseUnit> {
     (u.start >= min && u.end <= max + 1).then(|| ProseUnit {
         end: u.end.min(max),
@@ -3639,10 +3644,9 @@ fn clip_to_narrowing(u: ProseUnit, min: usize, max: usize) -> Option<ProseUnit> 
     })
 }
 
-/// The language the filler parses the buffer as: the buffer's, or
-/// Markdown for a name with no extension or a `.txt` one. A file type
-/// mime has no grammar for is refused, since its comments cannot be told
-/// from its code.
+/// The language the filler parses the buffer as: the buffer's, or Markdown for
+/// a name with no extension or a `.txt` one. A file type mime has no grammar
+/// for is refused, since its comments cannot be told from its code.
 fn fill_lang(sess: &crate::engine::Session) -> Result<Lang, Error> {
     if let Some(lang) = detected_lang(sess) {
         return Ok(lang);
@@ -3678,16 +3682,16 @@ fn line_at(store: &mut dyn TextStore, p: usize) -> (usize, usize, String) {
     (start, end, store.substring(start, eol))
 }
 
-/// Whether a line belongs to a `fill-prefix` paragraph: it carries the
-/// prefix and has text after it (Emacs: a prefixed blank line still
-/// separates paragraphs).
+/// Whether a line belongs to a `fill-prefix` paragraph: it carries the prefix
+/// and has text after it (Emacs: a prefixed blank line still separates
+/// paragraphs).
 fn carries(line: &str, prefix: &str) -> bool {
     line.strip_prefix(prefix)
         .is_some_and(|rest| !rest.trim().is_empty())
 }
 
-/// With a `fill-prefix`, the paragraph holding `p`: the run of lines
-/// around it that carry the prefix, or `None` when `p`'s own line does not.
+/// With a `fill-prefix`, the paragraph holding `p`: the run of lines around it
+/// that carry the prefix, or `None` when `p`'s own line does not.
 fn prefixed_run(store: &mut dyn TextStore, p: usize, prefix: &str) -> Option<(usize, usize)> {
     let (mut start, mut end, line) = line_at(store, p);
     if !carries(&line, prefix) {
@@ -3724,8 +3728,8 @@ fn prefixed_paragraph(
     })
 }
 
-/// With a `fill-prefix`, the paragraphs in `[a, b)`: each run of lines
-/// carrying the prefix that the range touches, as whole lines.
+/// With a `fill-prefix`, the paragraphs in `[a, b)`: each run of lines carrying
+/// the prefix that the range touches, as whole lines.
 fn prefixed_paragraphs(
     store: &mut dyn TextStore,
     a: usize,
@@ -3747,8 +3751,8 @@ fn prefixed_paragraphs(
     out
 }
 
-/// The 0-based line of the char `offset` chars into `text`; the end of
-/// the text counts as on its last line.
+/// The 0-based line of the char `offset` chars into `text`; the end of the text
+/// counts as on its last line.
 fn line_within(text: &str, offset: usize) -> usize {
     let n = text.chars().count();
     let offset = if offset >= n && text.ends_with('\n') {
@@ -3759,8 +3763,8 @@ fn line_within(text: &str, offset: usize) -> usize {
     text.chars().take(offset).filter(|c| *c == '\n').count()
 }
 
-/// Replace `[start, end)`, whose text is `old`, with `new` and return the
-/// new end. Leaves the buffer untouched when nothing changes.
+/// Replace `[start, end)`, whose text is `old`, with `new` and return the new
+/// end. Leaves the buffer untouched when nothing changes.
 fn replace_span(b: &mut dyn TextStore, start: usize, end: usize, old: &str, new: &str) -> usize {
     if new != old {
         b.delete_region(start, end);
@@ -3771,10 +3775,10 @@ fn replace_span(b: &mut dyn TextStore, start: usize, end: usize, old: &str, new:
 }
 
 /// The current buffer's parse for the `treesit-*` builtins — cached on the
-/// Session and reused while (buffer, language, content version) are
-/// unchanged, so a run of treesit calls parses once. An edit re-stamps the
-/// store version and the next call re-parses in full (incremental re-parse
-/// via InputEdits remains the syntax.rs TODO).
+/// Session and reused while (buffer, language, content version) are unchanged,
+/// so a run of treesit calls parses once. An edit re-stamps the store version
+/// and the next call re-parses in full (incremental re-parse via InputEdits
+/// remains the syntax.rs TODO).
 fn syntax_of(sess: &mut crate::engine::Session) -> std::rc::Rc<Syntax> {
     let lang = lang_of(sess);
     let version = sess.buffer.version();
@@ -3825,8 +3829,8 @@ fn within_region(
     }
 }
 
-/// Resolve a node for an edit op: it must be current and its span must lie within
-/// the accessible region. Returns the span to splice.
+/// Resolve a node for an edit op: it must be current and its span must lie
+/// within the accessible region. Returns the span to splice.
 fn edit_span(sess: &crate::engine::Session, n: &TsNode) -> Result<crate::syntax::NodeSpan, Error> {
     live_current_node(sess, n)?;
     let span = n.described()?;
@@ -3834,10 +3838,11 @@ fn edit_span(sess: &crate::engine::Session, n: &TsNode) -> Result<crate::syntax:
     Ok(span)
 }
 
-/// The parse-tree node now covering 1-based char `pos`, as a fresh node value in
-/// a re-parse of the (just-mutated) current buffer — `nil` if none. The tail of
-/// every node-edit op: the splice re-stamped the version, so this re-parses and
-/// hands back the replacement, letting edits chain (replace → navigate result).
+/// The parse-tree node now covering 1-based char `pos`, as a fresh node value
+/// in a re-parse of the (just-mutated) current buffer — `nil` if none. The tail
+/// of every node-edit op: the splice re-stamped the version, so this re-parses
+/// and hands back the replacement, letting edits chain (replace → navigate
+/// result).
 fn reparse_at(sess: &mut crate::engine::Session, pos: usize) -> TulispObject {
     let version = sess.buffer.version();
     let syn = syntax_of(sess);
@@ -3846,9 +3851,10 @@ fn reparse_at(sess: &mut crate::engine::Session, pos: usize) -> TulispObject {
         .into_tulisp_opt()
 }
 
-/// Splice `text` over the current buffer's char span `[start, end)` — delete then
-/// insert at `start`, via the store mutators (which re-stamp the version, adjust
-/// markers, and clear match-data) — and return the re-parsed node at `start`.
+/// Splice `text` over the current buffer's char span `[start, end)` — delete
+/// then insert at `start`, via the store mutators (which re-stamp the version,
+/// adjust markers, and clear match-data) — and return the re-parsed node at
+/// `start`.
 fn splice_and_reparse(
     sess: &mut crate::engine::Session,
     start: usize,
@@ -3871,13 +3877,13 @@ fn splice_and_reparse(
 /// Register the *orchestration* builtin group — multiple buffers, file I/O,
 /// directory listing, and program arguments — on top of the core vocabulary.
 /// Only the TRUSTED tier calls this (see [`crate::engine::Capabilities`]); the
-/// sandboxed, agent-facing tier never does. This is the seam M10 fills in; today
-/// it is empty (the core group is the whole vocabulary).
+/// sandboxed, agent-facing tier never does. This is the seam M10 fills in;
+/// today it is empty (the core group is the whole vocabulary).
 pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) {
-    // ---- multiple buffers ----
-    // These close over the SharedSession exactly like the core editing builtins.
-    // The ~90 core primitives all act on `sess.buffer` (the current buffer);
-    // `set-buffer` swaps which store that is, so per-buffer editing just works.
+    // ---- multiple buffers ---- These close over the SharedSession exactly
+    // like the core editing builtins.  The ~90 core primitives all act on
+    // `sess.buffer` (the current buffer); `set-buffer` swaps which store that
+    // is, so per-buffer editing just works.
     {
         let s = session.clone();
         // (generate-new-buffer NAME) — create an empty in-memory buffer, name
@@ -3889,8 +3895,8 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
     }
     {
         let s = session.clone();
-        // (set-buffer NAME) — make NAME the current buffer; returns NAME. Errors
-        // if no such buffer exists.
+        // (set-buffer NAME) — make NAME the current buffer; returns NAME.
+        // Errors if no such buffer exists.
         ctx.defun(
             "set-buffer",
             move |name: String| -> Result<TulispObject, Error> {
@@ -3924,8 +3930,8 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
     }
     {
         let s = session.clone();
-        // (get-buffer NAME) — NAME if such a buffer exists (current or inactive),
-        // else nil.
+        // (get-buffer NAME) — NAME if such a buffer exists (current or
+        // inactive), else nil.
         ctx.defun(
             "get-buffer",
             move |name: String| -> Result<TulispObject, Error> {
@@ -3952,8 +3958,9 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
     {
         let s = session.clone();
         // (with-current-buffer NAME BODY...) — evaluate BODY with NAME current,
-        // then restore the previously-current buffer *even if BODY errors*. NAME
-        // (the first arg) is evaluated; BODY is the rest. Returns BODY's value.
+        // then restore the previously-current buffer *even if BODY errors*.
+        // NAME (the first arg) is evaluated; BODY is the rest. Returns BODY's
+        // value.
         ctx.defspecial("with-current-buffer", move |ctx, args| {
             let name_form = args.car_and_then(|f| Ok(f.clone()))?;
             let name = ctx.eval(&name_form)?.as_string()?;
@@ -3961,28 +3968,28 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
 
             let previous = s.borrow().current_buffer_name();
             s.borrow_mut().set_buffer(&name).map_err(|e| err(&e))?;
-            // Capture BODY's result, restore the previous buffer regardless, then
-            // surface the result (value or error).
+            // Capture BODY's result, restore the previous buffer regardless,
+            // then surface the result (value or error).
             let res = ctx.eval_progn(&body);
             s.borrow_mut().set_buffer(&previous).map_err(|e| err(&e))?;
             res
         });
     }
 
-    // ---- file I/O (trusted tier only → UNRESTRICTED filesystem) ----
-    // These run only on the trusted, local CLI tier, so they get the user's full
+    // ---- file I/O (trusted tier only → UNRESTRICTED filesystem) ---- These
+    // run only on the trusted, local CLI tier, so they get the user's full
     // filesystem reach — NO `safety::check_path` root/allowlist check. (The
     // sandboxed agent-facing tier never registers this group.) Writes still go
-    // through `safety::write_atomic` so a save is atomic (temp file + rename) and
-    // never mutates a file in place under a live mmap.
+    // through `safety::write_atomic` so a save is atomic (temp file + rename)
+    // and never mutates a file in place under a live mmap.
     {
         let s = session.clone();
-        // (find-file PATH) — open PATH (mmap-backed Quire) into a new buffer and
-        // make it current; returns the buffer name. A buffer already VISITING
-        // that file (canonical-path compare) is switched to instead of opening
-        // a duplicate, like Emacs `find-file`; a different file that merely
-        // shares the basename gets a uniquified name (`doc.txt<2>`). IO errors
-        // propagate as a tulisp Error.
+        // (find-file PATH) — open PATH (mmap-backed Quire) into a new buffer
+        // and make it current; returns the buffer name. A buffer already
+        // VISITING that file (canonical-path compare) is switched to instead of
+        // opening a duplicate, like Emacs `find-file`; a different file that
+        // merely shares the basename gets a uniquified name (`doc.txt<2>`). IO
+        // errors propagate as a tulisp Error.
         ctx.defun("find-file", move |path: String| -> Result<String, Error> {
             find_file_buffer(&s, &path, true)
         });
@@ -3999,8 +4006,9 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
     }
     {
         let s = session.clone();
-        // (insert-file-contents PATH) — read PATH and insert its text at point in
-        // the CURRENT buffer (no new buffer); returns the char count inserted.
+        // (insert-file-contents PATH) — read PATH and insert its text at point
+        // in the CURRENT buffer (no new buffer); returns the char count
+        // inserted.
         ctx.defun(
             "insert-file-contents",
             move |path: String| -> Result<i64, Error> {
@@ -4016,9 +4024,10 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
     }
     {
         let s = session.clone();
-        // (write-file PATH) — write the CURRENT buffer's text to PATH atomically;
-        // returns the byte count written. Streams the buffer via `write_to`, so a
-        // multi-GB Quire is never materialized into one allocation just to save.
+        // (write-file PATH) — write the CURRENT buffer's text to PATH
+        // atomically; returns the byte count written. Streams the buffer via
+        // `write_to`, so a multi-GB Quire is never materialized into one
+        // allocation just to save.
         ctx.defun("write-file", move |path: String| -> Result<i64, Error> {
             let p = std::path::Path::new(&path);
             // Is this our OWN visited file? If so, apply the same stale-read
@@ -4054,9 +4063,10 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
             };
             // Overwrote our own visited file → re-stamp the session onto the
             // fresh bytes (mirrors save_to's rebase) so the guard doesn't later
-            // trip against this very write and force a needless re-open. Writing
-            // elsewhere left visiting — and the stamp — untouched. Best-effort:
-            // a failed re-stamp just leaves the guard conservatively armed.
+            // trip against this very write and force a needless re-open.
+            // Writing elsewhere left visiting — and the stamp — untouched.
+            // Best-effort: a failed re-stamp just leaves the guard
+            // conservatively armed.
             let mut sess = s.borrow_mut();
             sess.disk_io = true;
             if own_file {
@@ -4067,8 +4077,8 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
     }
     {
         let s = session.clone();
-        // (write-region START END PATH) — write the buffer substring [START, END)
-        // to PATH atomically; returns the byte count written.
+        // (write-region START END PATH) — write the buffer substring [START,
+        // END) to PATH atomically; returns the byte count written.
         ctx.defun(
             "write-region",
             move |start: i64, end: i64, path: String| -> Result<i64, Error> {
@@ -4124,8 +4134,8 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
     }
     {
         let s = session.clone();
-        // (args) — the whole argument list as an alist `((KEY . VALUE) …)`, in the
-        // order the CLI gave them. Each element is a cons of two strings.
+        // (args) — the whole argument list as an alist `((KEY . VALUE) …)`, in
+        // the order the CLI gave them. Each element is a cons of two strings.
         ctx.defun("args", move || -> TulispObject {
             let pairs: Vec<TulispObject> = s
                 .borrow()
@@ -4172,8 +4182,8 @@ mod tests {
         Workspace::new_trusted(Box::new(Buffer::from_string("main", text)))
     }
 
-    /// The fixture the `thing_after` / `thing_before` tests count against —
-    /// a `.rs` buffer, so the language rules and the tree-sitter defuns apply.
+    /// The fixture the `thing_after` / `thing_before` tests count against — a
+    /// `.rs` buffer, so the language rules and the tree-sitter defuns apply.
     /// Char positions are 1-based; the counts are in the tests' comments.
     const THINGS: &str = "fn one() {\n    let s = \"hi\";\n    call(s, 2);\n}\n\nfn two() {}\n";
 
@@ -4251,7 +4261,8 @@ mod tests {
         let mut ws = trusted("MAIN");
         ws.run(r#"(generate-new-buffer "side") (set-buffer "side") (insert "SIDE") (set-buffer "main")"#)
             .unwrap();
-        // BODY runs in "side" (sees "SIDE"); afterwards "main" is current again.
+        // BODY runs in "side" (sees "SIDE"); afterwards "main" is current
+        // again.
         let r = ws
             .run(
                 r#"(report "in" (with-current-buffer "side" (buffer-string)))
@@ -4269,7 +4280,8 @@ mod tests {
         let mut ws = trusted("MAIN");
         ws.run(r#"(generate-new-buffer "scratch")"#).unwrap();
         // BODY switches into "scratch", mutates it, then signals an error; the
-        // error is caught, but the current buffer must already be back to "main".
+        // error is caught, but the current buffer must already be back to
+        // "main".
         let r = ws
             .run(
                 r#"(condition-case e
@@ -4281,8 +4293,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(report(&r, "cur"), "\"main\"");
-        // The pre-error edit inside BODY still happened (it is not rolled back —
-        // only the *current buffer* is restored), proving BODY did run in scratch.
+        // The pre-error edit inside BODY still happened (it is not rolled back
+        // — only the *current buffer* is restored), proving BODY did run in
+        // scratch.
         assert_eq!(report(&r, "scratch"), "\"X\"");
     }
 
@@ -4307,7 +4320,8 @@ mod tests {
         assert_eq!(report(&r, "got"), "\"a\""); // existing buffer → its name
         assert_eq!(report(&r, "miss"), "nil"); // absent → nil
 
-        // kill-buffer removes an inactive buffer; it then drops out of buffer-list.
+        // kill-buffer removes an inactive buffer; it then drops out of
+        // buffer-list.
         let r = ws
             .run(r#"(report "k" (kill-buffer "a")) (report "list" (buffer-list))"#)
             .unwrap();
@@ -4474,8 +4488,8 @@ mod tests {
         let e = ws.save_to(&file).unwrap_err().to_string();
         assert!(e.contains("revert-buffer"), "recovery hint missing: {e}");
 
-        // Revert: the buffer now matches the disk, point clamped, stamp
-        // fresh — and a re-applied edit saves cleanly.
+        // Revert: the buffer now matches the disk, point clamped, stamp fresh —
+        // and a re-applied edit saves cleanly.
         let r = ws
             .run(
                 r#"(report "reverted" (if (revert-buffer) 1 0))
@@ -4495,8 +4509,8 @@ mod tests {
         );
 
         // A revert keeps the buffer's (possibly uniquified) name, and live
-        // marker handles DETACH rather than aliasing newly created markers
-        // (the fresh registry is padded to the old id space).
+        // marker handles DETACH rather than aliasing newly created markers (the
+        // fresh registry is padded to the old id space).
         let r = ws
             .run(
                 r#"(setq m (copy-marker 3))
@@ -4583,8 +4597,9 @@ mod tests {
             .unwrap();
 
         // An external writer lands after open (atomic rename → new inode, so
-        // the Quire's mmap of the old inode stays intact); writing back over the
-        // visited file must refuse (like save_buffer) rather than clobber it.
+        // the Quire's mmap of the old inode stays intact); writing back over
+        // the visited file must refuse (like save_buffer) rather than clobber
+        // it.
         crate::safety::write_atomic(&file, b"theirs v2 external\n").unwrap();
         let err = match ws.run(&format!(r#"(write-file "{path}")"#)) {
             Err(e) => e,
@@ -4668,8 +4683,8 @@ mod tests {
         // The original "main" buffer was stashed inactive — both are present.
         assert_eq!(report(&r, "list"), "(\"doc.txt\" \"main\")");
 
-        // Revisiting the same file reuses the existing buffer (no duplicate): the
-        // buffer-list is unchanged and still has exactly the two buffers.
+        // Revisiting the same file reuses the existing buffer (no duplicate):
+        // the buffer-list is unchanged and still has exactly the two buffers.
         let r = ws
             .run(&format!(
                 r#"(set-buffer "main")
@@ -4693,8 +4708,8 @@ mod tests {
         let path = file.to_string_lossy().into_owned();
 
         let mut ws = trusted("main-body");
-        // A file-less buffer has no visited file and is never stale; right after
-        // find-file the visited file is recorded and clean.
+        // A file-less buffer has no visited file and is never stale; right
+        // after find-file the visited file is recorded and clean.
         let r = ws
             .run(&format!(
                 r#"(report "no-file" (buffer-file-name))
@@ -4818,8 +4833,8 @@ mod tests {
 
     #[test]
     fn zero_width_nodes_negative_indexes_and_cross_buffer_access() {
-        // Zero-width nodes (incomplete code) answer through every accessor —
-        // a query capturing one used to PANIC the process.
+        // Zero-width nodes (incomplete code) answer through every accessor — a
+        // query capturing one used to PANIC the process.
         let mut ws = trusted("def f():");
         let r = ws
             .run(
@@ -4848,8 +4863,8 @@ mod tests {
         assert_eq!(report(&r, "last"), "\"{ 1; }\"");
         assert_eq!(report(&r, "too-neg"), "0");
 
-        // A node from a non-current buffer still answers (its parse reflects
-        // a LIVE buffer); it only outdates when its own buffer changes.
+        // A node from a non-current buffer still answers (its parse reflects a
+        // LIVE buffer); it only outdates when its own buffer changes.
         let mut ws = trusted("fn alpha() {}");
         let r = ws
             .run(
@@ -5013,8 +5028,8 @@ mod tests {
     fn node_edit_ops_refuse_a_node_outside_the_narrowing() {
         // The treesit layer reads the whole document, so a node can be fetched
         // OUTSIDE an active narrowing — but its span would corrupt the buffer
-        // (delete honors absolute coords, goto clamps to the restriction), so the
-        // edit is refused and the buffer is left untouched.
+        // (delete honors absolute coords, goto clamps to the restriction), so
+        // the edit is refused and the buffer is left untouched.
         let original = "fn a() {\n    foo(bar)\n}\nfn b() {\n    qux\n}\n";
         let mut ws = trusted(original);
         let e = match ws.run(
@@ -5145,8 +5160,8 @@ mod tests {
     #[test]
     fn conflict_goto_finds_a_hunk_at_point_min_and_iterates() {
         // A file that BEGINS with a conflict: the nil form must find it (not
-        // skip past), land inside it for at-point addressing, and a second
-        // call must advance — the iteration idiom visits every hunk once.
+        // skip past), land inside it for at-point addressing, and a second call
+        // must advance — the iteration idiom visits every hunk once.
         let mut ws = trusted(
             "<<<<<<< A\nfirst\n=======\nf2\n>>>>>>> B\nmid\n<<<<<<< A\nsecond\n=======\ns2\n>>>>>>> B\n",
         );
@@ -5175,9 +5190,9 @@ mod tests {
 
     #[test]
     fn conflict_goto_explicit_n_lands_on_the_opener() {
-        // Explicit N addresses by index and lands at the hunk START (the
-        // opener line) — unlike nil, which lands just past it; both are
-        // inside the hunk for the at-point commands.
+        // Explicit N addresses by index and lands at the hunk START (the opener
+        // line) — unlike nil, which lands just past it; both are inside the
+        // hunk for the at-point commands.
         let mut ws = trusted("pre\n<<<<<<< A\no\n=======\nt\n>>>>>>> B\n");
         let r = ws
             .run(
@@ -5264,8 +5279,8 @@ mod tests {
         assert!(e.contains("keyword :start"), "{e}");
         assert!(e.contains("'start"), "{e}");
 
-        // Only the SYMBOL spelling is a keyword; a string ":wip" is an
-        // ordinary label (the MCP checkpoint tool sends exactly this shape).
+        // Only the SYMBOL spelling is a keyword; a string ":wip" is an ordinary
+        // label (the MCP checkpoint tool sends exactly this shape).
         let r = ws
             .run(r#"(checkpoint ":wip") (report "back" (restore-checkpoint ":wip"))"#)
             .unwrap();
@@ -5277,8 +5292,8 @@ mod tests {
         let text =
             "<<<<<<< A\no1\n=======\nt1\n>>>>>>> B\nmid\n<<<<<<< A\no2\n=======\nt2\n>>>>>>> B\n";
         let mut ws = trusted(text);
-        // Narrowed to the second hunk: it is the only one visible, addressed
-        // as N=1, and resolving it leaves the first hunk untouched outside.
+        // Narrowed to the second hunk: it is the only one visible, addressed as
+        // N=1, and resolving it leaves the first hunk untouched outside.
         let r = ws
             .run(
                 r#"(narrow-to-region 39 73)
@@ -5298,8 +5313,8 @@ mod tests {
         assert_eq!(report(&r, "all"), "1", "the first hunk is still there");
         assert!(r.log[0].contains("mid\nt2\n"), "got: {}", r.log[0]);
 
-        // Narrowing into the MIDDLE of a hunk hides it entirely: the opener
-        // is outside, so neither a hunk nor a stray is reported (documented).
+        // Narrowing into the MIDDLE of a hunk hides it entirely: the opener is
+        // outside, so neither a hunk nor a stray is reported (documented).
         let mut ws = trusted("<<<<<<< A\no1\n=======\nt1\n>>>>>>> B\n");
         let r = ws
             .run(
@@ -5415,7 +5430,8 @@ mod tests {
             .unwrap();
         assert_eq!(r.log[0], "pre\nmerged\npost\n");
 
-        // A hunk that is the buffer's final, newline-less line keeps no newline.
+        // A hunk that is the buffer's final, newline-less line keeps no
+        // newline.
         let mut ws = trusted("pre\n<<<<<<< A\no\n=======\nt\n>>>>>>> B");
         let r = ws
             .run(r#"(conflict-replace "merged" 1) (message (buffer-string))"#)
@@ -5436,8 +5452,8 @@ mod tests {
                    (report "txt" (buffer-string))"#,
             )
             .unwrap();
-        // Each resolution returns the remaining count; hunk numbers refresh,
-        // so the second hunk is addressed as 1 after the first resolves.
+        // Each resolution returns the remaining count; hunk numbers refresh, so
+        // the second hunk is addressed as 1 after the first resolves.
         assert_eq!(report(&r, "left"), "1");
         assert_eq!(report(&r, "done"), "0");
         assert_eq!(
@@ -5458,8 +5474,8 @@ mod tests {
     fn conflict_keep_both_warns_when_a_shared_suffix_fuses_the_sides() {
         // Each side is the BODY of a brace block that the post-marker `}` was
         // meant to close; keeping both concatenates them, so the single `}`
-        // closes only theirs and ours' block is left open — broken but
-        // reported resolved. The keep still happens; a warning rides the log.
+        // closes only theirs and ours' block is left open — broken but reported
+        // resolved. The keep still happens; a warning rides the log.
         let mut ws = trusted(
             "fn pick() {\n<<<<<<< HEAD\n  if a {\n    one()\n=======\n  if b {\n    two()\n\
              >>>>>>> branch\n  }\n}\n",
@@ -5529,8 +5545,8 @@ mod tests {
         assert_eq!(report(&r, "n"), "2");
         assert_eq!(report(&r, "first"), "3");
 
-        // A whole resolve loop driven from lisp alone — no MCP front door:
-        // jump to each hunk's position and resolve it at point until none remain.
+        // A whole resolve loop driven from lisp alone — no MCP front door: jump
+        // to each hunk's position and resolve it at point until none remain.
         let r = ws
             .run(
                 r#"(while (> (conflict-count) 0)
@@ -5583,12 +5599,13 @@ mod tests {
 
     #[test]
     fn conflict_keep_all_is_all_or_nothing_on_an_unavailable_side() {
-        // "base" needs a diff3 hunk; the FIRST hunk here has none. All side-texts
-        // are resolved before any splice, so the call errors before touching the
-        // buffer. The diff3 hunk is placed SECOND on purpose: an impl that
-        // spliced as it scanned bottom-up (no planning phase) would resolve it
-        // before hitting the error and leave the buffer half-resolved — this
-        // ordering, plus the byte-for-byte check, catches that.
+        // "base" needs a diff3 hunk; the FIRST hunk here has none. All
+        // side-texts are resolved before any splice, so the call errors before
+        // touching the buffer. The diff3 hunk is placed SECOND on purpose: an
+        // impl that spliced as it scanned bottom-up (no planning phase) would
+        // resolve it before hitting the error and leave the buffer
+        // half-resolved — this ordering, plus the byte-for-byte check, catches
+        // that.
         let mut ws = trusted(
             "<<<<<<< A\no1\n=======\nt1\n>>>>>>> B\n\
              <<<<<<< A\no2\n||||||| base\nb2\n=======\nt2\n>>>>>>> B\n",
@@ -5605,10 +5622,11 @@ mod tests {
 
     #[test]
     fn conflict_keep_all_collects_fused_keep_warnings() {
-        // Two hunks whose "both" join each leaves a brace open. conflict-keep-all
-        // resolves every hunk AND drains a fused-keep warning per hunk to the log
-        // — exercising its own warning-collection path (collect during planning,
-        // push after the buffer borrow ends), which conflict-keep does not share.
+        // Two hunks whose "both" join each leaves a brace open.
+        // conflict-keep-all resolves every hunk AND drains a fused-keep warning
+        // per hunk to the log — exercising its own warning-collection path
+        // (collect during planning, push after the buffer borrow ends), which
+        // conflict-keep does not share.
         let mut ws = trusted(
             "fn a() {\n<<<<<<< HEAD\n  if x {\n    p()\n=======\n  if y {\n    q()\n\
              >>>>>>> branch\n  }\n}\n\
@@ -5638,8 +5656,8 @@ mod tests {
         let path = file.to_string_lossy().into_owned();
 
         let mut ws = trusted("ab");
-        // Insert at point (between 'a' and 'b' after goto-char 2) — no new buffer,
-        // current stays "main"; returns the char count inserted.
+        // Insert at point (between 'a' and 'b' after goto-char 2) — no new
+        // buffer, current stays "main"; returns the char count inserted.
         let r = ws
             .run(&format!(
                 r#"(goto-char 2)
@@ -5899,10 +5917,10 @@ mod tests {
     fn vocabulary_doc_lists_every_registered_builtin() {
         // docs/vocabulary.md is hand-written (make docs regenerates only
         // mcp-tools.md), so it drifts silently — this is the drift guard, in
-        // the same spirit as meta_covers_every_tool: every `defun`/`defspecial`/
-        // `defmacro` registered in the builtin sources must appear in the doc as a
-        // `name` code token (compound tokens like `string-trim`(`-left`) count
-        // via substring).
+        // the same spirit as meta_covers_every_tool: every
+        // `defun`/`defspecial`/ `defmacro` registered in the builtin sources
+        // must appear in the doc as a `name` code token (compound tokens like
+        // `string-trim`(`-left`) count via substring).
         let doc = include_str!("../docs/vocabulary.md");
         let sources = [
             include_str!("builtins.rs"),
@@ -5987,8 +6005,8 @@ mod tests {
         assert_eq!(report(&r, "w"), "11");
         assert_eq!(report(&r, "s"), "11");
         assert_eq!(report(&r, "p"), "11");
-        // mark-paragraph negates the count twice over, so it saturates too:
-        // the mark is the saturated backward hop, point the forward one.
+        // mark-paragraph negates the count twice over, so it saturates too: the
+        // mark is the saturated backward hop, point the forward one.
         assert_eq!(report(&r, "mp"), "1");
     }
 
@@ -6056,8 +6074,8 @@ mod tests {
 
     #[test]
     fn paragraph_motion_takes_a_signed_count() {
-        // "one\n" = 1-4, "two\n" = 5-8, "\n" = 9, "three\n" = 10-15,
-        // "\n" = 16, "four" = 17-20, point_max = 21.
+        // "one\n" = 1-4, "two\n" = 5-8, "\n" = 9, "three\n" = 10-15, "\n" = 16,
+        // "four" = 17-20, point_max = 21.
         let mut ws = trusted("one\ntwo\n\nthree\n\nfour");
         let r = ws
             .run(
@@ -6131,8 +6149,8 @@ mod tests {
 
     #[test]
     fn mark_paragraph_brackets_the_paragraph() {
-        // "one\n" = 1-4, "two\n" = 5-8, "\n" = 9, "three\n" = 10-15,
-        // "\n" = 16, "four" = 17-20, point_max = 21.
+        // "one\n" = 1-4, "two\n" = 5-8, "\n" = 9, "three\n" = 10-15, "\n" = 16,
+        // "four" = 17-20, point_max = 21.
         let mut ws = trusted("one\ntwo\n\nthree\n\nfour");
         let r = ws
             .run(
@@ -6227,9 +6245,8 @@ mod tests {
 
     /// Run `prog` over `text` on both stores — the in-memory oracle and a
     /// file-backed Quire — and return both reports. Both buffers are named
-    /// `name`, so a caller can pick an extension that puts the right
-    /// language table (or tree-sitter grammar) behind the motions under
-    /// test.
+    /// `name`, so a caller can pick an extension that puts the right language
+    /// table (or tree-sitter grammar) behind the motions under test.
     fn on_both_stores_as(tag: &str, name: &str, text: &str, prog: &str) -> (RunReport, RunReport) {
         let mut oracle = Workspace::new_trusted(Box::new(Buffer::from_string(name, text)));
         let dir = temp_dir(tag);
@@ -6242,8 +6259,8 @@ mod tests {
         (a, b)
     }
 
-    /// [`on_both_stores_as`] with an `.el` buffer name, so symbol motion
-    /// sees the Elisp table.
+    /// [`on_both_stores_as`] with an `.el` buffer name, so symbol motion sees
+    /// the Elisp table.
     fn on_both_stores(tag: &str, text: &str, prog: &str) -> (RunReport, RunReport) {
         on_both_stores_as(tag, "doc.el", text, prog)
     }
@@ -6383,8 +6400,8 @@ mod tests {
 
     #[test]
     fn sexp_and_list_motions_walk_groups_strings_and_atoms() {
-        // 1 `(`, 2 a, 4 `(`, 5 b, 7-10 "c)", 11 `)`, 13 d, 14 `)`, 16 `[`, 17 e,
-        // 18 `]`, 20 f, point-max 21.
+        // 1 `(`, 2 a, 4 `(`, 5 b, 7-10 "c)", 11 `)`, 13 d, 14 `)`, 16 `[`, 17
+        // e, 18 `]`, 20 f, point-max 21.
         let mut ws = Workspace::new_trusted(Box::new(Buffer::from_string(
             "t.rs",
             "(a (b \"c)\") d) [e] f",
@@ -6437,8 +6454,8 @@ mod tests {
     #[test]
     fn sexp_motions_stop_at_the_narrowing_boundary() {
         // `(a (b) c) d` narrowed to 4..9, the `(b) c` inside the outer group:
-        // the region edge stops a hop, the cut outer group is out of reach,
-        // and the thing at the edge is nil.
+        // the region edge stops a hop, the cut outer group is out of reach, and
+        // the thing at the edge is nil.
         let mut ws = trusted("(a (b) c) d");
         let r = ws
             .run(
@@ -6571,8 +6588,8 @@ mod tests {
                    (report "no-defun" (if (progn (goto-char 11) (thing-at-point 'defun)) 1 0))"#,
             )
             .unwrap();
-        // Line 2 is the blank line at 11; line 3 `fn b() {` starts at 12; line 4
-        // at 21: 4 spaces, `foo` 25-27, `(` 28, `x` 29, `,` 30, space 31,
+        // Line 2 is the blank line at 11; line 3 `fn b() {` starts at 12; line
+        // 4 at 21: 4 spaces, `foo` 25-27, `(` 28, `x` 29, `,` 30, space 31,
         // `"s"` 32-34, `)` 35, `;` 36, newline 37; `}` 38; point-max 40.
         assert_eq!(report(&r, "sym"), "\"x\"");
         assert_eq!(report(&r, "b-car"), "29");
@@ -6607,10 +6624,9 @@ mod tests {
     fn thing_after_takes_the_first_thing_on_the_line_but_the_last_list() {
         // Line 1 `fn one() {` 1-10 + newline 11; line 2 starts at 12: indent
         // 12-15, `let` 16-18, `s` 20, `=` 22, `"hi"` 24-27, `;` 28, newline 29;
-        // line 3 starts at 30: indent 30-33, `call` 34-37, `(` 38, `s` 39,
-        // `,` 40, `2` 42, `)` 43, `;` 44, newline 45; `}` 46, newline 47;
-        // the blank line 48; line 6 `fn two() {}` 49-59, newline 60;
-        // point-max 61.
+        // line 3 starts at 30: indent 30-33, `call` 34-37, `(` 38, `s` 39, `,`
+        // 40, `2` 42, `)` 43, `;` 44, newline 45; `}` 46, newline 47; the blank
+        // line 48; line 6 `fn two() {}` 49-59, newline 60; point-max 61.
         let ws = Workspace::new_trusted(Box::new(Buffer::from_string("t.rs", THINGS)));
 
         // The divergence the rule is about: on line 3 the first sexp is the
@@ -6645,8 +6661,8 @@ mod tests {
     /// the anchor's own depth or shallower.
     #[test]
     fn thing_after_skips_the_comment_or_string_the_anchor_line_is_inside() {
-        // `/*` 1-2, newline 3; line 2 `  if (x) { y }` 4-17, newline 18;
-        // `*/` 19-20, newline 21; line 4 `fn real() { body }` from 22.
+        // `/*` 1-2, newline 3; line 2 ` if (x) { y }` 4-17, newline 18; `*/`
+        // 19-20, newline 21; line 4 `fn real() { body }` from 22.
         let text = "/*\n  if (x) { y }\n*/\nfn real() { body }\n";
         let ws = Workspace::new_trusted(Box::new(Buffer::from_string("t.rs", text)));
         assert_eq!(
@@ -6665,8 +6681,9 @@ mod tests {
             "the anchor line itself"
         );
 
-        // The closing quote of a multi-line string opens the anchor line:
-        // `let s = "aaa` 1-12, newline 13, `"` 14, `;` 15, newline 16, `foo();` from 17.
+        // The closing quote of a multi-line string opens the anchor line: `let
+        // s = "aaa` 1-12, newline 13, `"` 14, `;` 15, newline 16, `foo();` from
+        // 17.
         let text = "let s = \"aaa\n\";\nfoo();\n";
         let ws = Workspace::new_trusted(Box::new(Buffer::from_string("t.rs", text)));
         assert_eq!(
@@ -6685,8 +6702,8 @@ mod tests {
             "no string after it"
         );
 
-        // A blank line after a line comment is not inside it: the walk must
-        // not move back to the comment.
+        // A blank line after a line comment is not inside it: the walk must not
+        // move back to the comment.
         let ws = Workspace::new_trusted(Box::new(Buffer::from_string(
             "t.rs",
             "// c\n\nfn f() { x }\n",
@@ -6741,8 +6758,8 @@ mod tests {
         let ws = Workspace::new_trusted(Box::new(Buffer::from_string("t.rs", THINGS)));
         // From inside the same group the string IS found…
         assert_eq!(thing_before(&ws, "string", 30, 0), Some((24, 28)));
-        // …but from `fn two`'s line the walk crosses the whole body as one
-        // sexp and never sees it.
+        // …but from `fn two`'s line the walk crosses the whole body as one sexp
+        // and never sees it.
         assert_eq!(thing_before(&ws, "string", 49, 0), None);
     }
 
@@ -6778,9 +6795,9 @@ mod tests {
             assert_eq!(report(&r, "p"), "12", "({name} 0) moved point");
         }
         // A negative count is Emacs's mark-paragraph over again with the
-        // directions swapped: hop back one paragraph and mark there (the
-        // blank line at 9), then hop forward one from the mark (point-max,
-        // there being no blank line after "three four").
+        // directions swapped: hop back one paragraph and mark there (the blank
+        // line at 9), then hop forward one from the mark (point-max, there
+        // being no blank line after "three four").
         let r = ws
             .run(
                 r#"(goto-char 12)
@@ -6830,8 +6847,8 @@ mod tests {
 
     #[test]
     fn sexp_motions_stay_linear_on_a_large_group() {
-        // One 200 KB group holding 7000 small groups: every motion here
-        // walks a long way, and the backward ones lex the region once.
+        // One 200 KB group holding 7000 small groups: every motion here walks a
+        // long way, and the backward ones lex the region once.
         let text = "(\n".to_string() + &"lorem ipsum (dolor) sit amet\n".repeat(7000) + ")\n";
         let max = text.chars().count() + 1;
         let prog = r#"

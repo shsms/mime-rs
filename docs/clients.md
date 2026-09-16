@@ -106,14 +106,14 @@ Then point an HTTP-capable client at the endpoint `http://127.0.0.1:7711/mcp`:
 ```
 
 It speaks JSON over `POST /mcp` (no SSE — mime never server-initiates). The
-server binds localhost and rejects a non-local browser `Origin`. A legacy
-client (one that sends `initialize`) is isolated by the
-`Mcp-Session-Id` it is issued. A `2026-07-28` client sends no handshake and
-no session header; it must send `MCP-Protocol-Version`, `Mcp-Method` and, on
-`tools/call`, `Mcp-Name`, and it scopes warm state with the `workspace`
-handle reported by its first stateful call (see README, "Protocol"). Verify
-it the same way: `npx @modelcontextprotocol/inspector --cli
-http://127.0.0.1:7711/mcp --method tools/list`.
+server binds localhost and rejects a non-local browser `Origin`. A legacy client
+(one that sends `initialize`) is isolated by the `Mcp-Session-Id` it is issued.
+A `2026-07-28` client sends no handshake and no session header; it must send
+`MCP-Protocol-Version`, `Mcp-Method` and, on `tools/call`, `Mcp-Name`, and it
+scopes warm state with the `workspace` handle reported by its first stateful
+call (see README, "Protocol"). Verify it the same way: `npx
+@modelcontextprotocol/inspector --cli http://127.0.0.1:7711/mcp --method
+tools/list`.
 
 ## Verifying a connection
 

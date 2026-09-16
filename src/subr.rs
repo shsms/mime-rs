@@ -5,9 +5,9 @@
 use tulisp::{Error, TulispContext, TulispObject, destruct_bind, list};
 
 pub fn register(ctx: &mut TulispContext) {
-    // (push NEWELT PLACE) — macro expanding to (setq PLACE (cons NEWELT PLACE)).
-    // PLACE must be a symbol; Emacs's generalized places (setf-able forms)
-    // are not supported.
+    // (push NEWELT PLACE) — macro expanding to (setq PLACE (cons NEWELT
+    // PLACE)).  PLACE must be a symbol; Emacs's generalized places (setf-able
+    // forms) are not supported.
     ctx.defmacro("push", |ctx, args| {
         destruct_bind!((newelt place) = args);
         list!(

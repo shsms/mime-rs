@@ -1,6 +1,6 @@
-//! Git sequencer — drives rebase / cherry-pick / revert as a sequence of
-//! pick → 3-way-merge → commit steps, entirely in-process via `git2`
-//! (libgit2). See todo.org "Rebase / cherry-pick driver".
+//! Git sequencer — drives rebase / cherry-pick / revert as a sequence of pick →
+//! 3-way-merge → commit steps, entirely in-process via `git2` (libgit2). See
+//! todo.org "Rebase / cherry-pick driver".
 //!
 //! The discriminating capability the whole feature rests on is a 3-way merge
 //! that writes conflict markers into the worktree, so a conflicted step routes
@@ -23,9 +23,9 @@
 //! single-writer.
 //!
 //! Network and arbitrary-code channels are unused by default: no
-//! remotes/transports, hooks or filters. `MIME_EXEC=1` allows the explicit
-//! exec tool and the configured commit signer; repos are confined to
-//! `MIME_ROOTS` at the tool boundary (see todo.org for the security checklist).
+//! remotes/transports, hooks or filters. `MIME_EXEC=1` allows the explicit exec
+//! tool and the configured commit signer; repos are confined to `MIME_ROOTS` at
+//! the tool boundary (see todo.org for the security checklist).
 
 use crate::buffer::Buffer;
 use git2::{
@@ -79,8 +79,8 @@ fn require_signing_ready(repo: &Repository) -> Result<(), Error> {
             "commit.gpgsign=true with gpg.format={format}, but mime currently supports openpgp signing only"
         )));
     }
-    // An unresolvable identity must refuse here — at the start of an
-    // operation, before any ref is stamped — not at commit N of a replay.
+    // An unresolvable identity must refuse here — at the start of an operation,
+    // before any ref is stamped — not at commit N of a replay.
     signing_key(repo)?;
     Ok(())
 }
@@ -88,8 +88,8 @@ fn require_signing_ready(repo: &Repository) -> Result<(), Error> {
 /// The signer's `--local-user` value: `user.signingkey`, else the configured
 /// user identity ("Name <email>"), like git's `get_signing_key()`. mime signs
 /// as the CURRENT user even where a replay preserves a foreign committer (git
-/// instead resets the committer to the current user) — that committer's key
-/// may not be in the keyring at all.
+/// instead resets the committer to the current user) — that committer's key may
+/// not be in the keyring at all.
 fn signing_key(repo: &Repository) -> Result<String, Error> {
     if let Some(key) =
         optional_config_string(repo, "user.signingkey")?.filter(|k| !k.trim().is_empty())
@@ -198,10 +198,10 @@ fn create_commit(
         } else {
             reference.to_string()
         };
-        // The reflog line repo.commit would have written for this update:
-        // infix from the parent count, summary via git_commit_summary (which
-        // folds a wrapped subject into one line — not the same as the first
-        // physical line of `message`).
+        // The reflog line repo.commit would have written for this update: infix
+        // from the parent count, summary via git_commit_summary (which folds a
+        // wrapped subject into one line — not the same as the first physical
+        // line of `message`).
         let commit = repo.find_commit(oid)?;
         let infix = match commit.parent_count() {
             0 => " (initial)",
@@ -229,9 +229,9 @@ fn hard_reset_keeping_paths(repo: &Repository, oid: Oid, paths: &[String]) -> Re
         return hard_reset(repo, oid);
     }
     let workdir = repo.workdir().ok_or_else(|| estr("bare repository"))?;
-    // Only a clean read or a clean not-found participates — an unreadable
-    // path (permissions, transient I/O) is left to the plain reset rather
-    // than mistaken for a deletion.
+    // Only a clean read or a clean not-found participates — an unreadable path
+    // (permissions, transient I/O) is left to the plain reset rather than
+    // mistaken for a deletion.
     let read_opt = |p: &str| -> Option<Option<Vec<u8>>> {
         match std::fs::read(workdir.join(p)) {
             Ok(b) => Some(Some(b)),
@@ -269,8 +269,8 @@ fn hard_reset_keeping_autostash(repo: &Repository, oid: Oid, st: &State) -> Resu
 }
 
 /// The recovery ref a `begin` stamps with the pre-op tip of `branch` (a full
-/// refname). Lives under `refs/mime-backup/` so it stays out of `git branch` yet
-/// is trivially recoverable (`git reset --hard <ref>`).
+/// refname). Lives under `refs/mime-backup/` so it stays out of `git branch`
+/// yet is trivially recoverable (`git reset --hard <ref>`).
 fn backup_ref(branch: &str) -> String {
     backup_slot(branch, 0)
 }
@@ -289,8 +289,8 @@ fn backup_slot(branch: &str, n: usize) -> String {
 const BACKUP_RING: usize = 3;
 
 /// Rotate the ring and stamp `orig` as the newest slot. A pre-ring FLAT ref
-/// (refs/mime-backup/<branch>) occupies the path the ring's directory needs,
-/// so it is folded in as the previous newest and deleted.
+/// (refs/mime-backup/<branch>) occupies the path the ring's directory needs, so
+/// it is folded in as the previous newest and deleted.
 fn rotate_backup_ring(repo: &Repository, branch: &str, orig: Oid) -> Result<(), Error> {
     let flat = format!(
         "refs/mime-backup/{}",
@@ -372,9 +372,10 @@ impl Action {
     }
 }
 
-/// One planned step: a commit to replay, how, an optional message change (a full
-/// `message` and/or ordered `message_edits`, for reword/squash/fixup/edit), and
-/// for a `split` the output parts (`split_into`).
+/// One planned step: a commit to replay, how, an optional message change (a
+/// full `message` and/or ordered `message_edits`, for
+/// reword/squash/fixup/edit), and for a `split` the output parts
+/// (`split_into`).
 #[derive(Clone, Debug)]
 pub struct Step {
     pub commit: Oid,
@@ -409,9 +410,9 @@ pub struct MsgEditSpec {
     pub append: Option<String>,
 }
 
-/// One output commit of a `split`: a message and the paths whose changes go into
-/// it. At most one part per split may set `rest` (omit `paths` in the MCP form) to
-/// collect every changed path not claimed by another part.
+/// One output commit of a `split`: a message and the paths whose changes go
+/// into it. At most one part per split may set `rest` (omit `paths` in the MCP
+/// form) to collect every changed path not claimed by another part.
 #[derive(Clone, Debug)]
 pub struct SplitPart {
     pub message: String,
@@ -420,10 +421,10 @@ pub struct SplitPart {
     pub rest: bool,
 }
 
-/// Selects whole diff-hunks of `path` — by the new-side line span they
-/// overlap (the line numbers grep/blame hand back) or by a literal text one
-/// of their changed lines contains. Lets one part claim some of a file's
-/// changes and another the rest.
+/// Selects whole diff-hunks of `path` — by the new-side line span they overlap
+/// (the line numbers grep/blame hand back) or by a literal text one of their
+/// changed lines contains. Lets one part claim some of a file's changes and
+/// another the rest.
 #[derive(Clone, Debug)]
 pub struct HunkSel {
     pub path: String,
@@ -486,8 +487,8 @@ impl HunkSel {
 struct Hunk {
     ns: u32,
     nl: u32,
-    /// One entry per line, so a text can never match across a seam (a last
-    /// line without its newline would otherwise fuse with the next).
+    /// One entry per line, so a text can never match across a seam (a last line
+    /// without its newline would otherwise fuse with the next).
     changed: Vec<String>,
 }
 
@@ -596,9 +597,8 @@ fn apply_msg_edits(msg: String, edits: &[MsgEdit]) -> Result<String, Error> {
 }
 
 /// The counting core of [`apply_msg_edits`]: per-edit replacement counts
-/// instead of the absent-find error — the range rewrite tolerates zero
-/// matches in ONE commit (the count says so) and checks range-wide totals
-/// itself.
+/// instead of the absent-find error — the range rewrite tolerates zero matches
+/// in ONE commit (the count says so) and checks range-wide totals itself.
 fn apply_msg_edits_counted(msg: &str, edits: &[MsgEdit]) -> (String, Vec<usize>) {
     let mut msg = msg.to_string();
     let mut counts = Vec::with_capacity(edits.len());
@@ -659,13 +659,13 @@ impl Mode {
 pub enum Outcome {
     Done {
         head: Oid,
-        /// Autostashed paths whose restore was skipped because the user
-        /// edited them during the operation — the parked bytes stay on the
+        /// Autostashed paths whose restore was skipped because the user edited
+        /// them during the operation — the parked bytes stay on the
         /// `-autostash` ref. Empty on a clean restore (or no autostash).
         kept: Vec<String>,
         /// Paths explicitly selected by `include_untracked` while editing.
-        /// Kept separate so the result cannot explain their addition away as
-        /// an ordinary tree difference.
+        /// Kept separate so the result cannot explain their addition away as an
+        /// ordinary tree difference.
         committed_untracked: Vec<String>,
     },
     Conflict {
@@ -692,11 +692,12 @@ pub struct Status {
 }
 
 /// A dry-run of a plan: the commits it WOULD produce (oldest→newest, with
-/// summaries) and the resulting tree, computed entirely in the object DB without
-/// moving HEAD/refs or touching the worktree. Unlike a real run, the rehearsal
-/// does NOT stop at the first conflicting step: the step's change is skipped and
-/// the preview continues, so ONE pass lists every step that needs attention
-/// (later conflicts can be knock-on effects of an earlier skipped change).
+/// summaries) and the resulting tree, computed entirely in the object DB
+/// without moving HEAD/refs or touching the worktree. Unlike a real run, the
+/// rehearsal does NOT stop at the first conflicting step: the step's change is
+/// skipped and the preview continues, so ONE pass lists every step that needs
+/// attention (later conflicts can be knock-on effects of an earlier skipped
+/// change).
 #[derive(Debug)]
 pub struct Preview {
     pub commits: Vec<(Oid, String)>,
@@ -704,9 +705,9 @@ pub struct Preview {
     pub conflicts: Vec<PreviewConflict>,
 }
 
-/// One step a real run would stop on, with the WHY an agent needs to repair
-/// the plan: per conflicted file, the commit that last set those lines at
-/// this point of the replayed history — usually the right fold target.
+/// One step a real run would stop on, with the WHY an agent needs to repair the
+/// plan: per conflicted file, the commit that last set those lines at this
+/// point of the replayed history — usually the right fold target.
 #[derive(Debug)]
 pub struct PreviewConflict {
     pub step: usize,
@@ -726,7 +727,8 @@ struct State {
     next: usize,
     steps: Vec<Step>,
     mode: Mode,
-    /// True while paused at a landed `edit` step, awaiting the amend on continue.
+    /// True while paused at a landed `edit` step, awaiting the amend on
+    /// continue.
     editing: bool,
     /// Paths of uncommitted changes autostashed at begin (their bytes live on
     /// the `-autostash` backup ref); restored by finish/abort. Empty = none.
@@ -826,9 +828,9 @@ fn load_state(repo: &Repository) -> Result<State, Error> {
                                 } else {
                                     MsgEdit::Replace {
                                         find: e["find"].as_str().unwrap_or("").to_string(),
-                                        // `with` is the pre-unification key: fall
-                                        // back so a mid-op upgrade doesn't turn a
-                                        // replacement into a deletion.
+                                        // `with` is the pre-unification key:
+                                        // fall back so a mid-op upgrade doesn't
+                                        // turn a replacement into a deletion.
                                         with: e["replace"]
                                             .as_str()
                                             .or_else(|| e["with"].as_str())
@@ -988,12 +990,13 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
     {
         return Err(estr("the first applied step cannot be squash/fixup"));
     }
-    // Pre-validate message_edits before mutating. They only make sense for actions
-    // that build a message from a base; reject them on any other action so a
-    // silently-dropped edit can't masquerade as applied. For reword/edit the base
-    // is known up front (the provided message, else the commit's own), so a typo'd
-    // `find` fails BEFORE we mutate rather than stranding a half-applied op.
-    // (squash/fixup meld a dynamic base, so their finds are only checked at land.)
+    // Pre-validate message_edits before mutating. They only make sense for
+    // actions that build a message from a base; reject them on any other action
+    // so a silently-dropped edit can't masquerade as applied. For reword/edit
+    // the base is known up front (the provided message, else the commit's own),
+    // so a typo'd `find` fails BEFORE we mutate rather than stranding a
+    // half-applied op.  (squash/fixup meld a dynamic base, so their finds are
+    // only checked at land.)
     for s in &plan.steps {
         if !s.message_edits.is_empty()
             && !matches!(
@@ -1008,11 +1011,12 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
         }
         if matches!(s.action, Action::Reword | Action::Edit) {
             // Dry-run the edits against the same base make_commit will use (the
-            // provided message if any, else the commit's own), reusing the exact
-            // land-time logic so a bad edit fails BEFORE we mutate. Checking each
-            // `find` independently against the static base would disagree with the
-            // sequential apply: it would miss a later edit whose anchor an earlier
-            // edit deletes, and falsely reject one whose anchor an earlier creates.
+            // provided message if any, else the commit's own), reusing the
+            // exact land-time logic so a bad edit fails BEFORE we mutate.
+            // Checking each `find` independently against the static base would
+            // disagree with the sequential apply: it would miss a later edit
+            // whose anchor an earlier edit deletes, and falsely reject one
+            // whose anchor an earlier creates.
             let base = match &s.message {
                 Some(m) => m.clone(),
                 None => repo
@@ -1024,11 +1028,12 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
             apply_msg_edits(base, &s.message_edits)?;
         }
         // Best-effort early check: validate the split against the commit's OWN
-        // parent→commit diff — the authoritative path set for the common case, so a
-        // bad partition usually fails before any mutation. NOT a guarantee: if
-        // `onto` or an earlier step already contains some of the change, the
-        // replayed net-diff differs and split_commits re-validates against it,
-        // surfacing any mismatch mid-op (recoverable via git_abort).
+        // parent→commit diff — the authoritative path set for the common case,
+        // so a bad partition usually fails before any mutation. NOT a
+        // guarantee: if `onto` or an earlier step already contains some of the
+        // change, the replayed net-diff differs and split_commits re-validates
+        // against it, surfacing any mismatch mid-op (recoverable via
+        // git_abort).
         if s.action == Action::Split {
             let c = repo.find_commit(s.commit)?;
             if c.parent_count() == 0 {
@@ -1087,10 +1092,10 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
                     .join(", ")
             )));
         }
-        // The autostash restores WORKTREE bytes only. Staged changes would
-        // come back with the staged/unstaged split flattened — and content
-        // that is staged but reverted in the worktree would not be captured
-        // at all. Refuse those instead of quietly losing index state.
+        // The autostash restores WORKTREE bytes only. Staged changes would come
+        // back with the staged/unstaged split flattened — and content that is
+        // staged but reverted in the worktree would not be captured at all.
+        // Refuse those instead of quietly losing index state.
         let idx_tree_id = repo.index()?.write_tree()?;
         if idx_tree_id != head_tree.id() {
             let idx_tree = repo.find_tree(idx_tree_id)?;
@@ -1105,17 +1110,17 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
         }
         autostash_diff = Some(dirty_diff);
     }
-    // is_dirty ignores untracked files, but the hard reset to `onto` would still
-    // clobber an untracked file colliding with a path in onto's tree — git rebase
-    // refuses that, so we do too.
+    // is_dirty ignores untracked files, but the hard reset to `onto` would
+    // still clobber an untracked file colliding with a path in onto's tree —
+    // git rebase refuses that, so we do too.
     let onto_tree = repo.find_commit(plan.onto)?.tree()?;
     let mut uopts = git2::StatusOptions::new();
     uopts
         .include_untracked(true)
-        // Recurse so a fully-untracked directory yields per-file entries —
-        // a bare `dir/` entry cannot be resolved against the tree (bypath
-        // needs a full path), so only recursion lets the checks below see
-        // and NAME each colliding file.
+        // Recurse so a fully-untracked directory yields per-file entries — a
+        // bare `dir/` entry cannot be resolved against the tree (bypath needs a
+        // full path), so only recursion lets the checks below see and NAME each
+        // colliding file.
         .recurse_untracked_dirs(true)
         .include_ignored(false);
     for e in repo.statuses(Some(&mut uopts))?.iter() {
@@ -1127,10 +1132,10 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
                     "untracked file {p} would be overwritten by the checkout — move or remove it first"
                 )));
             }
-            // A FILE in onto where the untracked path needs a directory:
-            // the checkout would delete the whole untracked directory to
-            // write the file. get_path cannot descend through a blob, so
-            // check each proper ancestor explicitly.
+            // A FILE in onto where the untracked path needs a directory: the
+            // checkout would delete the whole untracked directory to write the
+            // file. get_path cannot descend through a blob, so check each
+            // proper ancestor explicitly.
             let mut anc = Path::new(p).parent();
             while let Some(a) = anc {
                 if !a.as_os_str().is_empty()
@@ -1161,9 +1166,9 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
     // multi-rebase session keeps its earlier ropes too.
     rotate_backup_ring(repo, &branch, orig)?;
 
-    // Park the autostash: a full-worktree dangling commit on the -autostash
-    // ref carries the dirty files' bytes across processes (a conflict pause
-    // may be finished by a later invocation).
+    // Park the autostash: a full-worktree dangling commit on the -autostash ref
+    // carries the dirty files' bytes across processes (a conflict pause may be
+    // finished by a later invocation).
     let mut autostash: Vec<String> = Vec::new();
     if let Some(diff) = &autostash_diff {
         let head_commit = repo.find_commit(orig)?;
@@ -1260,12 +1265,12 @@ fn autostash_ref(branch: &str) -> String {
     )
 }
 
-/// Put the autostashed files back, byte-exact, from the `-autostash` ref
-/// (paths absent from the stash tree were deleted in the worktree). Deletes
-/// the ref afterwards. A path the user edited DURING the operation keeps the
-/// later edit — the parked bytes then stay on the ref, and the caller's
-/// result says so. Failures name the paths and leave the ref in place — the
-/// bytes stay recoverable. Returns the kept (skipped) paths.
+/// Put the autostashed files back, byte-exact, from the `-autostash` ref (paths
+/// absent from the stash tree were deleted in the worktree). Deletes the ref
+/// afterwards. A path the user edited DURING the operation keeps the later edit
+/// — the parked bytes then stay on the ref, and the caller's result says so.
+/// Failures name the paths and leave the ref in place — the bytes stay
+/// recoverable. Returns the kept (skipped) paths.
 fn restore_autostash(repo: &Repository, st: &State) -> Result<Vec<String>, Error> {
     if st.autostash.is_empty() {
         return Ok(Vec::new());
@@ -1343,8 +1348,8 @@ fn restore_autostash(repo: &Repository, st: &State) -> Result<Vec<String>, Error
     Ok(kept)
 }
 
-/// Set a restored file's exec bits to match the stash entry's mode exactly —
-/// on for 100755, off otherwise. No-op off unix or when there is no entry.
+/// Set a restored file's exec bits to match the stash entry's mode exactly — on
+/// for 100755, off otherwise. No-op off unix or when there is no entry.
 fn apply_stash_mode(abs: &std::path::Path, entry: Option<&git2::TreeEntry>) {
     #[cfg(unix)]
     if let Some(entry) = entry
@@ -1365,8 +1370,8 @@ fn apply_stash_mode(abs: &std::path::Path, entry: Option<&git2::TreeEntry>) {
 
 /// Dry-run a plan: compute the commits it would produce, entirely in the object
 /// DB (loose objects, no ref/worktree change), stopping at the first step that
-/// would conflict. Lets a caller preview a reorder/fold — and confirm the result
-/// tree is unchanged — before committing to it.
+/// would conflict. Lets a caller preview a reorder/fold — and confirm the
+/// result tree is unchanged — before committing to it.
 fn rehearse(repo: &Repository, plan: &Plan, mode: Mode) -> Result<Preview, Error> {
     // Mirror begin's leading-squash guard so the preview matches a real run.
     if let Some(first) = plan.steps.iter().find(|s| s.action != Action::Drop)
@@ -1392,8 +1397,8 @@ fn rehearse(repo: &Repository, plan: &Plan, mode: Mode) -> Result<Preview, Error
             // Skip the step's change and keep previewing: one rehearsal lists
             // EVERY step that needs attention, not just the first (a real run
             // still stops there). The why names the commit that last set the
-            // conflicted lines at this point of the replay — usually the
-            // fold target the step should have named.
+            // conflicted lines at this point of the replay — usually the fold
+            // target the step should have named.
             let files = conflict_paths(&index);
             // The context the step patches lives in its ORIGINAL history (a
             // fixup is built against the tip, where later commits already
@@ -1437,10 +1442,10 @@ fn rehearse(repo: &Repository, plan: &Plan, mode: Mode) -> Result<Preview, Error
         } else {
             let new = make_commit(repo, mode, plan.onto, current, step, &tree, false)?;
             let summary = repo.find_commit(new)?.summary().unwrap_or("").to_string();
-            // A squash/fixup re-parents onto the PREVIOUS commit's parent, so the
-            // new commit supersedes it rather than adding one — mirror that in the
-            // preview by replacing the last entry, so the list and "-> N commits"
-            // count match a real apply (which folds).
+            // A squash/fixup re-parents onto the PREVIOUS commit's parent, so
+            // the new commit supersedes it rather than adding one — mirror that
+            // in the preview by replacing the last entry, so the list and "-> N
+            // commits" count match a real apply (which folds).
             if matches!(step.action, Action::Squash | Action::Fixup) {
                 commits.pop();
             }
@@ -1513,9 +1518,9 @@ fn last_touchers(
 /// Resume after the agent resolved a conflict in the worktree: stage the
 /// resolved paths, commit the stopped step, then continue the plan. `force`
 /// skips the conflict-marker guard (for a resolution that legitimately contains
-/// marker-like lines, e.g. a diff fixture).
-/// Resume from an `edit` pause: fold the agent's worktree changes into the
-/// paused commit (an amend), then drive the remaining steps.
+/// marker-like lines, e.g. a diff fixture).  Resume from an `edit` pause: fold
+/// the agent's worktree changes into the paused commit (an amend), then drive
+/// the remaining steps.
 fn amend_step(
     repo: &Repository,
     mut st: State,
@@ -1568,7 +1573,8 @@ fn amend_step(
     }
     // Native git users may have staged a new file themselves at the pause.
     // Record every index entry absent from the paused commit's tree, not only
-    // include_untracked selections, so abort and the result classify both paths.
+    // include_untracked selections, so abort and the result classify both
+    // paths.
     let current_tree = current.tree()?;
     for entry in index.iter() {
         let Ok(path) = std::str::from_utf8(&entry.path) else {
@@ -1584,14 +1590,14 @@ fn amend_step(
     // Persist the opt-in before committing. If commit creation fails, abort
     // still knows which newly staged paths a hard reset must carry across.
     save_state(repo, &st)?;
-    // Autostashed paths never belong to the plan — a pause-time edit there
-    // is the user's live change and must not be folded into this commit
-    // (the restore logic keeps it in the worktree instead).
+    // Autostashed paths never belong to the plan — a pause-time edit there is
+    // the user's live change and must not be folded into this commit (the
+    // restore logic keeps it in the worktree instead).
     if !st.autostash.is_empty() {
         let target = repo.find_object(st.current, None)?;
         // reset_default matches pathspecs with fnmatch globbing — escape the
-        // metacharacters so a literal path like `notes[1]` matches itself
-        // and nothing else.
+        // metacharacters so a literal path like `notes[1]` matches itself and
+        // nothing else.
         let literal: Vec<String> = st
             .autostash
             .iter()
@@ -1609,7 +1615,8 @@ fn amend_step(
     }
     let tree = repo.find_tree(index.write_tree()?)?;
     // Amend in place: same author/committer/message, the worktree's tree, the
-    // same parent. An unedited worktree reproduces the identical commit (no-op).
+    // same parent. An unedited worktree reproduces the identical commit
+    // (no-op).
     let amended = create_commit(
         repo,
         None,
@@ -1654,16 +1661,17 @@ pub fn continue_op(
         .ok_or_else(|| estr("a bare repo has no worktree to resolve in"))?
         .to_path_buf();
     // Stage exactly the conflicted paths from the worktree (like `git add` on
-    // the resolved files) — NOT the whole worktree, so unrelated edits or
-    // stray markers elsewhere never get folded into this commit.
+    // the resolved files) — NOT the whole worktree, so unrelated edits or stray
+    // markers elsewhere never get folded into this commit.
     let mut index = repo.index()?;
     for path in conflict_paths(&index) {
         let full = workdir.join(&path);
         if full.exists() {
             // Refuse to commit a file that still reads as conflicted —
-            // has_conflict_markers parses it (a full hunk OR a stray opener), so
-            // a partial cleanup doesn't slip through. Reading must succeed (fail
-            // closed); `force` overrides for the rare legitimate-marker resolution.
+            // has_conflict_markers parses it (a full hunk OR a stray opener),
+            // so a partial cleanup doesn't slip through. Reading must succeed
+            // (fail closed); `force` overrides for the rare legitimate-marker
+            // resolution.
             if !force {
                 let bytes = std::fs::read(&full)
                     .map_err(|e| estr(&format!("cannot read {path} to verify resolution: {e}")))?;
@@ -1693,8 +1701,8 @@ pub fn continue_op(
     st.current = new;
     st.next += 1;
     if step.action == Action::Edit {
-        // A conflicted `edit` step: now that it's resolved and landed, pause for
-        // the agent to amend it (same as a clean edit step in drive).
+        // A conflicted `edit` step: now that it's resolved and landed, pause
+        // for the agent to amend it (same as a clean edit step in drive).
         st.editing = true;
         save_state(repo, &st)?;
         return Ok(Outcome::Paused {
@@ -1711,8 +1719,8 @@ pub fn continue_op(
 pub fn skip(repo: &Repository) -> Result<Outcome, Error> {
     let mut st = load_state(repo)?;
     if st.editing {
-        // Skipping an edit pause = abandon the pending worktree edits and resume,
-        // leaving the landed commit unchanged.
+        // Skipping an edit pause = abandon the pending worktree edits and
+        // resume, leaving the landed commit unchanged.
         hard_reset_keeping_autostash(repo, st.current, &st)?;
         let _ = repo.cleanup_state();
         st.editing = false;
@@ -1732,8 +1740,9 @@ pub fn skip(repo: &Repository) -> Result<Outcome, Error> {
 
 /// Abort: drop the replay and put HEAD back on the branch at its CURRENT tip.
 /// We never move the branch ref during an op (only `finish` does), so resetting
-/// to the branch's present tip — not the recorded `orig` — preserves any commits
-/// another process added while we were paused, instead of clobbering them.
+/// to the branch's present tip — not the recorded `orig` — preserves any
+/// commits another process added while we were paused, instead of clobbering
+/// them.
 pub fn abort(repo: &Repository) -> Result<Vec<String>, Error> {
     let st = load_state(repo)?;
     // Where to land: the branch's current tip if it still exists (preserve a
@@ -1785,11 +1794,12 @@ pub fn status(repo: &Repository) -> Result<Option<Status>, Error> {
 /// Build the commit for `step` on top of `current_oid` and return its oid,
 /// WITHOUT moving any ref or the worktree. Pick/reword add a new commit on
 /// `current` (reword swaps the message); squash/fixup REPLACE `current` with a
-/// commit on `current`'s parent, melding the message (squash concatenates, fixup
-/// keeps `current`'s) — so the step folds into the preceding one; revert appends
-/// a generated message. Authorship follows git: the picked commit's for
+/// commit on `current`'s parent, melding the message (squash concatenates,
+/// fixup keeps `current`'s) — so the step folds into the preceding one; revert
+/// appends a generated message. Authorship follows git: the picked commit's for
 /// pick/reword/revert, the kept (earlier) commit's for squash/fixup. Shared by
-/// `land_step` (which then moves HEAD) and `rehearse` (which discards the result).
+/// `land_step` (which then moves HEAD) and `rehearse` (which discards the
+/// result).
 fn make_commit(
     repo: &Repository,
     mode: Mode,
@@ -1901,7 +1911,8 @@ fn land(repo: &Repository, st: &State, step: &Step, tree: &git2::Tree) -> Result
     }
 }
 
-/// Paths that differ between the `base` and `target` trees (a commit's net change).
+/// Paths that differ between the `base` and `target` trees (a commit's net
+/// change).
 fn changed_paths(
     repo: &Repository,
     base: &git2::Tree,
@@ -1918,10 +1929,10 @@ fn changed_paths(
     Ok(paths)
 }
 
-/// Validate a split's parts against the `touched` paths and return the catch-all
-/// part's paths (every touched path no explicit part claimed). Errors on an empty
-/// plan, an unchanged or doubly-claimed path, an empty part, more than one
-/// catch-all, or (with no catch-all) any unassigned changed path.
+/// Validate a split's parts against the `touched` paths and return the
+/// catch-all part's paths (every touched path no explicit part claimed). Errors
+/// on an empty plan, an unchanged or doubly-claimed path, an empty part, more
+/// than one catch-all, or (with no catch-all) any unassigned changed path.
 fn split_assignment(touched: &[String], parts: &[SplitPart]) -> Result<Vec<String>, Error> {
     if parts.is_empty() {
         return Err(estr("split: `into` must list at least one part"));
@@ -1976,9 +1987,10 @@ fn split_assignment(touched: &[String], parts: &[SplitPart]) -> Result<Vec<Strin
     Ok(leftover)
 }
 
-/// Build a split's output commits: replay each part's paths (taken from `target`)
-/// onto a chain rooted at `base`, in order. Returns the new oids; the last one's
-/// tree equals `target`. Pure tree construction — touches no worktree.
+/// Build a split's output commits: replay each part's paths (taken from
+/// `target`) onto a chain rooted at `base`, in order. Returns the new oids; the
+/// last one's tree equals `target`. Pure tree construction — touches no
+/// worktree.
 fn split_commits(
     repo: &Repository,
     pick: &git2::Commit,
@@ -2044,7 +2056,8 @@ fn split_commits(
 }
 
 /// Build a split's output commits, choosing the path- or hunk-level builder by
-/// whether any part selects hunks. Both are pure tree construction — no worktree.
+/// whether any part selects hunks. Both are pure tree construction — no
+/// worktree.
 fn build_split(
     repo: &Repository,
     pick: &git2::Commit,
@@ -2071,11 +2084,11 @@ struct HunkPlan {
     per_hunk: std::collections::HashMap<(String, u32, u32), usize>,
 }
 
-/// Resolve and validate a hunk-aware split against the commit's own
-/// `base_tree → target` diff. Errors on an empty plan, an empty message, a path
-/// the commit doesn't change, a path claimed twice (or by both path and hunk), a
-/// hunk claimed twice, a selector that overlaps no hunk, more than one catch-all,
-/// an unassigned file/hunk with no catch-all, or a part that ends up empty.
+/// Resolve and validate a hunk-aware split against the commit's own `base_tree
+/// → target` diff. Errors on an empty plan, an empty message, a path the commit
+/// doesn't change, a path claimed twice (or by both path and hunk), a hunk
+/// claimed twice, a selector that overlaps no hunk, more than one catch-all, an
+/// unassigned file/hunk with no catch-all, or a part that ends up empty.
 fn hunk_assignment(
     repo: &Repository,
     base_tree: &git2::Tree,
@@ -2091,8 +2104,8 @@ fn hunk_assignment(
             return Err(estr("split: every part needs a non-empty message"));
         }
         // Honour the caller-computed `rest` flag (set only when BOTH keys are
-        // absent), so a present-but-empty `paths`/`hunks` is rejected rather than
-        // silently promoted to the catch-all — matching split_assignment.
+        // absent), so a present-but-empty `paths`/`hunks` is rejected rather
+        // than silently promoted to the catch-all — matching split_assignment.
         if p.rest {
             if rest_idx.is_some() {
                 return Err(estr(
@@ -2133,7 +2146,7 @@ fn hunk_assignment(
     }
 
     // 2) explicit hunk claims: a selector takes every hunk whose new-side span
-    // overlaps it.
+    //    overlaps it.
     for (i, part) in parts.iter().enumerate() {
         for sel in &part.hunks {
             if whole.contains_key(&sel.path) {
@@ -2252,17 +2265,18 @@ fn split_commits_hunked(
     let mut current = base;
     let mut made = Vec::new();
     for (k, part) in parts.iter().enumerate() {
-        // Apply, cumulatively, every file/hunk owned by parts 0..=k onto the base
-        // tree. apply_subset gates whole-file add/delete at the delta level, so an
-        // added file whose hunks aren't owned yet doesn't linger as an empty file.
+        // Apply, cumulatively, every file/hunk owned by parts 0..=k onto the
+        // base tree. apply_subset gates whole-file add/delete at the delta
+        // level, so an added file whose hunks aren't owned yet doesn't linger
+        // as an empty file.
         let tree_oid = apply_subset(
             repo,
             &base_tree,
             &diff,
             |path| whole.get(path).map(|&o| o <= k).unwrap_or(false),
             |path, ns, nl| {
-                // A whole-file-owned file's hunks aren't in per_hunk; fall back to
-                // its whole owner so they land with the file.
+                // A whole-file-owned file's hunks aren't in per_hunk; fall back
+                // to its whole owner so they land with the file.
                 per_hunk
                     .get(&(path.to_string(), ns, nl))
                     .or_else(|| whole.get(path))
@@ -2295,12 +2309,13 @@ fn delta_path(d: Option<git2::DiffDelta>) -> String {
         .unwrap_or_default()
 }
 
-/// Apply the subset of `diff` that the callbacks keep onto `base_tree`, returning
-/// the resulting tree oid. `keep_hunk` decides each hunk of a text file;
-/// `keep_whole` decides a no-hunk delta (rename/mode/binary). A file with NO kept
-/// content is dropped at the DELTA level — so an add/delete that is entirely
-/// excluded doesn't leave an empty file behind (which per-hunk rejection alone
-/// would, since git creates the added file before its hunks run).
+/// Apply the subset of `diff` that the callbacks keep onto `base_tree`,
+/// returning the resulting tree oid. `keep_hunk` decides each hunk of a text
+/// file; `keep_whole` decides a no-hunk delta (rename/mode/binary). A file with
+/// NO kept content is dropped at the DELTA level — so an add/delete that is
+/// entirely excluded doesn't leave an empty file behind (which per-hunk
+/// rejection alone would, since git creates the added file before its hunks
+/// run).
 fn apply_subset(
     repo: &Repository,
     base_tree: &git2::Tree,
@@ -2365,9 +2380,10 @@ impl MoveSel {
     }
 }
 
-/// Validate the requested paths/hunks against `from`'s diff and resolve them to a
-/// [`MoveSel`]. Errors on a path/selector the commit doesn't change, a path named
-/// both ways, a selector overlapping no hunk, or a rename/mode/binary hunk-select.
+/// Validate the requested paths/hunks against `from`'s diff and resolve them to
+/// a [`MoveSel`]. Errors on a path/selector the commit doesn't change, a path
+/// named both ways, a selector overlapping no hunk, or a rename/mode/binary
+/// hunk-select.
 fn resolve_move_selection(
     from_diff: &git2::Diff,
     paths: &[String],
@@ -2429,8 +2445,8 @@ fn resolve_move_selection(
     })
 }
 
-/// Relocate `from`'s changes to the adjacent commit `to`, then replay the rest of
-/// the branch. The FINAL tree never changes — only which of the two commits
+/// Relocate `from`'s changes to the adjacent commit `to`, then replay the rest
+/// of the branch. The FINAL tree never changes — only which of the two commits
 /// introduces the moved change — so a move can't alter the branch's end state.
 /// Returns the sequencer outcome (a conflict during tail replay stops for the
 /// conflict tools + git_continue, like any rebase).
@@ -2464,7 +2480,8 @@ fn move_changes(
     let older_tree = older.tree()?;
     let newer_tree = newer.tree()?;
 
-    // The move set lives in `from`'s own diff; reject anything `to` also changes.
+    // The move set lives in `from`'s own diff; reject anything `to` also
+    // changes.
     let from_parent_tree = fc.parent(0)?.tree()?;
     let from_diff = repo.diff_tree_to_tree(Some(&from_parent_tree), Some(&fc.tree()?), None)?;
     let sel = resolve_move_selection(&from_diff, paths, hunks, "move")?;
@@ -2477,11 +2494,13 @@ fn move_changes(
         }
     }
 
-    // Rebuild `older`: forward move (from=older) drops the move set from its diff;
-    // backward move (from=newer) adds it to older's tree. `newer` keeps the final
-    // tree unchanged, so the branch end state is identical either way.
+    // Rebuild `older`: forward move (from=older) drops the move set from its
+    // diff; backward move (from=newer) adds it to older's tree. `newer` keeps
+    // the final tree unchanged, so the branch end state is identical either
+    // way.
     let older_new_tree = if from_is_child {
-        // Backward: older' = older + the moved subset of newer's (=from's) diff.
+        // Backward: older' = older + the moved subset of newer's (=from's)
+        // diff.
         apply_subset(
             repo,
             &older_tree,
@@ -2490,7 +2509,8 @@ fn move_changes(
             |p, ns, nl| sel.takes(p, ns, nl),
         )?
     } else {
-        // Forward: older' = base + older's (=from's) diff minus the moved subset.
+        // Forward: older' = base + older's (=from's) diff minus the moved
+        // subset.
         apply_subset(
             repo,
             &base_tree,
@@ -2523,7 +2543,8 @@ fn move_changes(
     )?;
 
     // Replay the commits after `newer` onto the rebuilt pair via the sequencer,
-    // reusing its conflict handling + backup ref. Empty tail = just move the branch.
+    // reusing its conflict handling + backup ref. Empty tail = just move the
+    // branch.
     let tail = commits_since(repo, newer.id())?;
     let note = backup_note(repo);
     let plan = Plan {
@@ -2591,11 +2612,13 @@ fn drive(repo: &Repository, mut st: State) -> Result<Outcome, Error> {
             st.editing = true;
         }
         // Persist after each landed step: a crash mid-run otherwise leaves HEAD
-        // ahead of a stale next=0/current=onto state that would re-apply commits.
+        // ahead of a stale next=0/current=onto state that would re-apply
+        // commits.
         save_state(repo, &st)?;
         if st.editing {
-            // Pause with the just-landed commit checked out; the agent edits the
-            // worktree, then git_continue amends it (git_skip leaves it as-is).
+            // Pause with the just-landed commit checked out; the agent edits
+            // the worktree, then git_continue amends it (git_skip leaves it
+            // as-is).
             return Ok(Outcome::Paused {
                 step: st.next - 1,
                 head: st.current,
@@ -2610,9 +2633,9 @@ fn drive(repo: &Repository, mut st: State) -> Result<Outcome, Error> {
     })
 }
 
-/// Land the rebased history: move the branch ref to the new tip, reattach
-/// HEAD, clean the worktree, drop the state. Returns the autostash paths
-/// whose restore was skipped in favor of a pause-time edit.
+/// Land the rebased history: move the branch ref to the new tip, reattach HEAD,
+/// clean the worktree, drop the state. Returns the autostash paths whose
+/// restore was skipped in favor of a pause-time edit.
 fn finish(repo: &Repository, st: &State) -> Result<Vec<String>, Error> {
     // Only land if the branch still points where `begin` left it. If another
     // process moved it (would drop their commits) or deleted it (recreating it
@@ -2639,11 +2662,10 @@ fn finish(repo: &Repository, st: &State) -> Result<Vec<String>, Error> {
     let _ = repo.cleanup_state();
     let _ = std::fs::remove_file(state_path(repo));
     // Hand back any autostashed uncommitted changes. The paths were checked
-    // disjoint from everything the plan rewrites, so this can't mix old and
-    // new content; a path the user edited during the operation keeps the
-    // later edit (the parked bytes stay on the ref). The rewrite itself has
-    // already landed — a restore failure must say so, not read as a failed
-    // operation.
+    // disjoint from everything the plan rewrites, so this can't mix old and new
+    // content; a path the user edited during the operation keeps the later edit
+    // (the parked bytes stay on the ref). The rewrite itself has already landed
+    // — a restore failure must say so, not read as a failed operation.
     restore_autostash(repo, st).map_err(|e| {
         estr(&format!(
             "the rewrite LANDED (new tip {}) — but {}",
@@ -2672,15 +2694,16 @@ pub fn commits_since(repo: &Repository, onto: Oid) -> Result<Vec<Oid>, Error> {
 
 /// The patch-id that identifies `commit` as a cherry-pick candidate, or `None`
 /// when the commit has no single well-defined patch to match on:
-/// - a MERGE (more than one parent) — never an "already-applied" cherry-pick, and
-///   its first-parent diff wouldn't capture what it integrated anyway;
-/// - an EMPTY-diff commit — libgit2 hashes the empty diff to a constant, so every
-///   empty commit would collide on one id and be mistaken for a copy of any other.
+/// - a MERGE (more than one parent) — never an "already-applied" cherry-pick,
+///   and its first-parent diff wouldn't capture what it integrated anyway;
+/// - an EMPTY-diff commit — libgit2 hashes the empty diff to a constant, so
+///   every empty commit would collide on one id and be mistaken for a copy of
+///   any other.
 ///
 /// A non-merge commit diffs against its first parent (the empty tree for a root
-/// commit); the id is a content hash stable across cherry-pick/reorder — the same
-/// change yields the same id at a different oid, which is how we recognise a
-/// commit as already-applied regardless of where it sits.
+/// commit); the id is a content hash stable across cherry-pick/reorder — the
+/// same change yields the same id at a different oid, which is how we recognise
+/// a commit as already-applied regardless of where it sits.
 fn commit_patch_id(repo: &Repository, commit: Oid) -> Result<Option<Oid>, Error> {
     let c = repo.find_commit(commit)?;
     if c.parent_count() > 1 {
@@ -2699,15 +2722,15 @@ fn commit_patch_id(repo: &Repository, commit: Oid) -> Result<Option<Oid>, Error>
 }
 
 /// Split `from..HEAD` (`from` = `onto` in the two-arg case) into (kept,
-/// dropped): commits whose patch-id already
-/// appears among the upstream-only commits (`HEAD..onto`) are dropped. This
-/// matches `git rebase`'s default cherry-pick detection
-/// (`--no-reapply-cherry-picks`): when a base rewrite (reorder/amend) leaves the
-/// merge-base *below* the rewrite, `onto..HEAD` still contains the pre-rewrite
-/// copies of commits now present — by patch-id — in the new base, and a naive
-/// pick-all would replay them a second time (duplicates). Comparing against only
-/// the onto-only side (not all of `onto`) mirrors git's `onto...HEAD` symmetric
-/// difference, so distinct commits that merely share a base are never dropped.
+/// dropped): commits whose patch-id already appears among the upstream-only
+/// commits (`HEAD..onto`) are dropped. This matches `git rebase`'s default
+/// cherry-pick detection (`--no-reapply-cherry-picks`): when a base rewrite
+/// (reorder/amend) leaves the merge-base *below* the rewrite, `onto..HEAD`
+/// still contains the pre-rewrite copies of commits now present — by patch-id —
+/// in the new base, and a naive pick-all would replay them a second time
+/// (duplicates). Comparing against only the onto-only side (not all of `onto`)
+/// mirrors git's `onto...HEAD` symmetric difference, so distinct commits that
+/// merely share a base are never dropped.
 fn partition_cherry_picks(
     repo: &Repository,
     onto: Oid,
@@ -2728,8 +2751,8 @@ fn partition_cherry_picks(
     let mut dropped = Vec::new();
     for oid in commits_since(repo, from)? {
         // Conservative on both None (merge/empty, no patch to match) and Err (a
-        // diff/patchid failure): keep the commit rather than risk dropping one we
-        // can't positively identify as already-applied.
+        // diff/patchid failure): keep the commit rather than risk dropping one
+        // we can't positively identify as already-applied.
         match commit_patch_id(repo, oid) {
             Ok(Some(pid)) if upstream.contains(&pid) => dropped.push(oid),
             _ => kept.push(oid),
@@ -2743,10 +2766,10 @@ fn short(oid: Oid) -> String {
     s[..s.len().min(10)].to_string()
 }
 
-/// Feed `range` to a revwalk: `A..B` goes to libgit2's push_range; a bare
-/// rev (`HEAD`, a branch) means everything reachable from it, which is how
-/// a walk reaches the root commit (`A..B` hides A and its ancestors).
-/// `A...B` is refused with a message naming both accepted forms.
+/// Feed `range` to a revwalk: `A..B` goes to libgit2's push_range; a bare rev
+/// (`HEAD`, a branch) means everything reachable from it, which is how a walk
+/// reaches the root commit (`A..B` hides A and its ancestors).  `A...B` is
+/// refused with a message naming both accepted forms.
 fn push_range_or_rev(
     repo: &Repository,
     walk: &mut git2::Revwalk,
@@ -2895,9 +2918,10 @@ pub fn show(repo: &Repository, oid: Oid) -> Result<String, Error> {
         let p = if p.is_empty() { "?" } else { &p };
         out.push_str(&format!("  {mark} {p}\n"));
     }
-    // Full unified diff after the file summary: reconstruct the patch, prefixing
-    // each content line with its +/-/space origin (hunk/file headers carry their
-    // own text). Binary content that isn't UTF-8 renders as its header only.
+    // Full unified diff after the file summary: reconstruct the patch,
+    // prefixing each content line with its +/-/space origin (hunk/file headers
+    // carry their own text). Binary content that isn't UTF-8 renders as its
+    // header only.
     out.push_str("\nDiff:\n");
     diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
         if matches!(line.origin(), '+' | '-' | ' ') {
@@ -2910,9 +2934,9 @@ pub fn show(repo: &Repository, oid: Oid) -> Result<String, Error> {
 }
 
 /// "Which commit last touched each line" for `rel` (relative to the repo
-/// workdir), collapsed into contiguous same-commit hunks: one `L<a>-<b>  <oid>
-/// <summary>` line per hunk. `range` (1-based, inclusive) restricts the blame to
-/// those lines; `None` blames the whole file. The discovery half of the
+/// workdir), collapsed into contiguous same-commit hunks: one `L<a>-<b> <oid>
+/// <summary>` line per hunk. `range` (1-based, inclusive) restricts the blame
+/// to those lines; `None` blames the whole file. The discovery half of the
 /// find-the-commit → fold-in workflow (feeds a git_rebase fixup/edit plan).
 pub fn blame(
     repo: &Repository,
@@ -2926,8 +2950,9 @@ pub fn blame(
         opts.max_line(hi.max(lo.max(1)));
     }
     // Scope history to `since..`: lines last touched at or after `since` keep
-    // their commit; older lines collapse to the `since` boundary — so the answer
-    // is "which of MY commits owns this", not any commit in the whole history.
+    // their commit; older lines collapse to the `since` boundary — so the
+    // answer is "which of MY commits owns this", not any commit in the whole
+    // history.
     if let Some(s) = since {
         opts.oldest_commit(s);
     }
@@ -2940,8 +2965,8 @@ pub fn blame(
         }
         let start = h.final_start_line();
         let end = start + n - 1;
-        // libgit2 still returns whole-file hunks with min/max set; drop the ones
-        // that fall outside the requested window ourselves.
+        // libgit2 still returns whole-file hunks with min/max set; drop the
+        // ones that fall outside the requested window ourselves.
         if let Some((lo, hi)) = range
             && (end < lo || start > hi)
         {
@@ -2982,8 +3007,8 @@ struct WorktreeHunk {
 
 /// Map every hunk of `diff` (HEAD→worktree, context 0) to the commit(s) that
 /// last set the lines it changes — the shared discovery behind the worktree
-/// blame and absorb. Blames the OLD-side lines (as they stand in HEAD); a
-/// pure insertion borrows the owner of the line it sits after.
+/// blame and absorb. Blames the OLD-side lines (as they stand in HEAD); a pure
+/// insertion borrows the owner of the line it sits after.
 fn worktree_hunk_owners(
     repo: &Repository,
     diff: &git2::Diff,
@@ -3061,10 +3086,10 @@ fn worktree_diff<'r>(repo: &'r Repository, rel: Option<&Path>) -> Result<git2::D
 }
 
 /// "Which commit owns each uncommitted change": per hunk (`rel` or the whole
-/// worktree), the commit that last set the lines it touches. The
-/// absorb-target discovery — each reported oid feeds a git_fixup/git_move for
-/// that hunk (or git_absorb folds them all). With `group_by_commit`, hunks are
-/// grouped under their owning commit — the natural absorb preview.
+/// worktree), the commit that last set the lines it touches. The absorb-target
+/// discovery — each reported oid feeds a git_fixup/git_move for that hunk (or
+/// git_absorb folds them all). With `group_by_commit`, hunks are grouped under
+/// their owning commit — the natural absorb preview.
 fn blame_worktree(
     repo: &Repository,
     rel: Option<&Path>,
@@ -3152,14 +3177,14 @@ fn blame_worktree(
 // ---- text rendering for the tool layer ------------------------------------
 
 /// `outcome_text`, plus — on a COMPLETED rewrite — whether HEAD's tree is
-/// byte-identical to the pre-op tip on the backup ring: the one-line answer
-/// to "did this rewrite change WHAT the branch builds, or only how history
-/// slices it?" that otherwise costs a hand-rolled rev-parse comparison.
-/// Used by the pure-reslice operations (rebase, committed fixup, move) and
-/// by continue/skip, which finish ANY paused op — so a cherry-pick/revert
-/// resumed after a conflict reports too (its tree differing is expected).
-/// Direct cherry-pick/revert results and worktree folds skip the note; they
-/// change the tree by design, so it would be noise there.
+/// byte-identical to the pre-op tip on the backup ring: the one-line answer to
+/// "did this rewrite change WHAT the branch builds, or only how history slices
+/// it?" that otherwise costs a hand-rolled rev-parse comparison.  Used by the
+/// pure-reslice operations (rebase, committed fixup, move) and by
+/// continue/skip, which finish ANY paused op — so a cherry-pick/revert resumed
+/// after a conflict reports too (its tree differing is expected).  Direct
+/// cherry-pick/revert results and worktree folds skip the note; they change the
+/// tree by design, so it would be noise there.
 fn outcome_with_tree_note(repo: &Repository, out: &Outcome) -> String {
     let text = outcome_text(out);
     match out {
@@ -3189,9 +3214,9 @@ fn outcome_with_tree_note(repo: &Repository, out: &Outcome) -> String {
     }
 }
 
-/// One line naming the autostashed paths whose restore was skipped because
-/// they were edited during the operation — the later edits were kept and
-/// the parked bytes stayed on the `-autostash` ref. Empty on a clean restore.
+/// One line naming the autostashed paths whose restore was skipped because they
+/// were edited during the operation — the later edits were kept and the parked
+/// bytes stayed on the `-autostash` ref. Empty on a clean restore.
 fn kept_note(kept: &[String]) -> String {
     if kept.is_empty() {
         return String::new();
@@ -3434,14 +3459,14 @@ fn backup_note(repo: &Repository) -> String {
     }
 }
 
-/// `git_rebase`: replay `onto..HEAD` (or an explicit `plan` of
-/// `(commit, action, message)`) onto `onto`. With `rehearse`, only preview the
-/// result (commit list + whether the tree is unchanged) — no changes applied.
-/// Expand sparse autosquash directives into a full `onto..HEAD` plan: pick every
-/// commit in order, but relocate each named commit to sit right after its target
-/// with the fixup/squash action — git's `--autosquash` as data. Removes the
-/// transcribe-every-untouched-commit chore. A directive whose relocation lands a
-/// fixup/squash first is rejected downstream by the sequencer.
+/// `git_rebase`: replay `onto..HEAD` (or an explicit `plan` of `(commit,
+/// action, message)`) onto `onto`. With `rehearse`, only preview the result
+/// (commit list + whether the tree is unchanged) — no changes applied.  Expand
+/// sparse autosquash directives into a full `onto..HEAD` plan: pick every
+/// commit in order, but relocate each named commit to sit right after its
+/// target with the fixup/squash action — git's `--autosquash` as data. Removes
+/// the transcribe-every-untouched-commit chore. A directive whose relocation
+/// lands a fixup/squash first is rejected downstream by the sequencer.
 fn autosquash_steps(
     repo: &Repository,
     onto: Oid,
@@ -3493,13 +3518,13 @@ fn autosquash_steps(
     Ok(steps)
 }
 
-/// Split a subject into its marker action and remainder: `fixup! X` →
-/// (Fixup, "X"). ONE prefix only: a chained marker's remainder
-/// (`fixup! fixup! X` → "fixup! X") names the intermediate marker's full
-/// subject, and target resolution follows it. (git instead strips ALL
-/// prefixes and rematches — same root target when the intermediate marker
-/// exists; when it was already folded away, git guesses the base subject
-/// while this errors the marker as an orphan.) `None` for a plain subject.
+/// Split a subject into its marker action and remainder: `fixup! X` → (Fixup,
+/// "X"). ONE prefix only: a chained marker's remainder (`fixup! fixup! X` →
+/// "fixup! X") names the intermediate marker's full subject, and target
+/// resolution follows it. (git instead strips ALL prefixes and rematches — same
+/// root target when the intermediate marker exists; when it was already folded
+/// away, git guesses the base subject while this errors the marker as an
+/// orphan.) `None` for a plain subject.
 fn marker_split(subject: &str) -> Option<(Action, &str)> {
     if let Some(rest) = subject.strip_prefix("fixup! ") {
         Some((Action::Fixup, rest))
@@ -3513,17 +3538,17 @@ fn marker_split(subject: &str) -> Option<(Action, &str)> {
 /// Derive sparse autosquash directives from `fixup!`/`squash!` subject markers
 /// in onto..HEAD — git's `--autosquash` as a plan derivation. Scans oldest-
 /// first; each marker resolves its target among the PRECEDING non-marker
-/// commits: nearest exact subject match, then nearest subject-prefix match
-/// (a hand-written marker may truncate the subject), then the remainder as a
+/// commits: nearest exact subject match, then nearest subject-prefix match (a
+/// hand-written marker may truncate the subject), then the remainder as a
 /// revspec (`fixup! 1a2b3c`). The exact tier matches EVERY preceding commit,
 /// markers included — a chained `fixup! fixup! X` resolves to the earlier
-/// `fixup! X` marker by full subject, never to an unrelated commit that
-/// happens to share X's subject — and a marker hit flattens to that marker's
-/// own target, so `autosquash_steps`' no-chain invariant holds. The prefix
-/// tier matches plain subjects only.
-/// Unmatched markers are an ERROR naming each orphan — git leaves them in
-/// place silently, but a silent no-fold here would read as folded. `amend!`
-/// (message-replacing fixup) is rejected rather than half-supported.
+/// `fixup! X` marker by full subject, never to an unrelated commit that happens
+/// to share X's subject — and a marker hit flattens to that marker's own
+/// target, so `autosquash_steps`' no-chain invariant holds. The prefix tier
+/// matches plain subjects only.  Unmatched markers are an ERROR naming each
+/// orphan — git leaves them in place silently, but a silent no-fold here would
+/// read as folded. `amend!` (message-replacing fixup) is rejected rather than
+/// half-supported.
 ///
 /// Directives come back newest-first: `autosquash_steps` inserts each directly
 /// after its target, so processing newest-first lands the oldest marker first
@@ -3598,9 +3623,9 @@ fn marker_directives(repo: &Repository, onto: Oid) -> Result<Vec<(Oid, Oid, Acti
     Ok(directives)
 }
 
-/// The rebase base for folding `source` into `target`: the parent of whichever is
-/// the ancestor. Errors if they aren't on one line of history, or the ancestor is
-/// a root commit.
+/// The rebase base for folding `source` into `target`: the parent of whichever
+/// is the ancestor. Errors if they aren't on one line of history, or the
+/// ancestor is a root commit.
 fn fixup_onto(repo: &Repository, target: Oid, source: Oid) -> Result<Oid, Error> {
     if source == target {
         return Err(estr("fixup: source and target are the same commit"));
@@ -3650,11 +3675,10 @@ pub fn cmd_fixup(
 }
 
 /// A byte-exact snapshot of the worktree files a diff touches. The worktree
-/// fixup runs the replay on a CLEAN tree (the sequencer hard-resets and
-/// replays through the worktree), so the uncommitted state is captured first
-/// and written back verbatim afterwards — after a successful fold the
-/// restored files differ from the new tip by exactly the changes that were
-/// NOT folded.
+/// fixup runs the replay on a CLEAN tree (the sequencer hard-resets and replays
+/// through the worktree), so the uncommitted state is captured first and
+/// written back verbatim afterwards — after a successful fold the restored
+/// files differ from the new tip by exactly the changes that were NOT folded.
 struct WorktreeSnapshot(Vec<(std::path::PathBuf, SnapshotFile)>);
 
 /// One snapshotted file: its bytes + executable bit; `None` = the path is
@@ -3696,9 +3720,9 @@ fn snapshot_worktree(repo: &Repository, diff: &git2::Diff) -> Result<WorktreeSna
     Ok(WorktreeSnapshot(files))
 }
 
-/// Write a snapshot back over the worktree. Failures are collected and
-/// reported per path, never swallowed — a lost uncommitted change must be
-/// loud (and is still recoverable from the `-worktree` backup ref).
+/// Write a snapshot back over the worktree. Failures are collected and reported
+/// per path, never swallowed — a lost uncommitted change must be loud (and is
+/// still recoverable from the `-worktree` backup ref).
 fn restore_worktree(repo: &Repository, snap: &WorktreeSnapshot) -> Result<(), Error> {
     let workdir = repo.workdir().ok_or_else(|| estr("bare repository"))?;
     let mut failed: Vec<String> = Vec::new();
@@ -3742,12 +3766,12 @@ fn restore_worktree(repo: &Repository, snap: &WorktreeSnapshot) -> Result<(), Er
 }
 
 /// Fold selected UNCOMMITTED changes into `target` — `git add -p` for agents:
-/// build a fixup commit from just those worktree hunks (a dangling commit;
-/// the branch never points at it), relocate it under `target` exactly like
+/// build a fixup commit from just those worktree hunks (a dangling commit; the
+/// branch never points at it), relocate it under `target` exactly like
 /// `cmd_fixup`, and hand the unfolded rest of the uncommitted work back
-/// afterwards. An empty selection folds every uncommitted change. A fold
-/// whose tail replay conflicts is aborted whole: branch and worktree come
-/// back exactly as they were (no half-done rebase is ever left over parked
+/// afterwards. An empty selection folds every uncommitted change. A fold whose
+/// tail replay conflicts is aborted whole: branch and worktree come back
+/// exactly as they were (no half-done rebase is ever left over parked
 /// uncommitted work).
 pub fn cmd_fixup_worktree(
     repo_path: &std::path::Path,
@@ -3761,13 +3785,13 @@ pub fn cmd_fixup_worktree(
     fixup_worktree(&repo, target, paths, hunks, rehearse_only).map_err(gerr)
 }
 
-/// Compare a branch before and after a rewrite, commit by commit — the
-/// "did the rewrite change anything it should not have" answer, natural
-/// after any rebase/fixup: `git_range_diff {old: refs/mime-backup/<branch>/0,
-/// new: HEAD}`. Commits of `base..old` and `base..new` (base = merge base)
-/// pair by patch-id, then by summary; each pair reports whether its PATCH
-/// and its MESSAGE drifted (an approximation of git range-diff — patch-id
-/// equality instead of a full diff-of-diffs).
+/// Compare a branch before and after a rewrite, commit by commit — the "did the
+/// rewrite change anything it should not have" answer, natural after any
+/// rebase/fixup: `git_range_diff {old: refs/mime-backup/<branch>/0, new:
+/// HEAD}`. Commits of `base..old` and `base..new` (base = merge base) pair by
+/// patch-id, then by summary; each pair reports whether its PATCH and its
+/// MESSAGE drifted (an approximation of git range-diff — patch-id equality
+/// instead of a full diff-of-diffs).
 pub fn cmd_range_diff(repo_path: &std::path::Path, old: &str, new: &str) -> Result<String, String> {
     let repo = open(repo_path)?;
     let old = resolve_s(&repo, old)?;
@@ -3919,12 +3943,12 @@ fn range_diff(repo: &Repository, old: Oid, new: Oid) -> Result<String, Error> {
     Ok(out)
 }
 
-/// Discard selected UNCOMMITTED hunks — the destructive sibling of the
-/// worktree git_fixup: the same {paths, hunks} selectors, but the chosen
-/// changes reset to HEAD content instead of folding into a commit. Always
-/// recoverable: the FULL pre-discard worktree is stamped on the
-/// `-worktree` backup ref before anything is touched. Selection is
-/// mandatory (discarding "everything" must be said path by path).
+/// Discard selected UNCOMMITTED hunks — the destructive sibling of the worktree
+/// git_fixup: the same {paths, hunks} selectors, but the chosen changes reset
+/// to HEAD content instead of folding into a commit. Always recoverable: the
+/// FULL pre-discard worktree is stamped on the `-worktree` backup ref before
+/// anything is touched. Selection is mandatory (discarding "everything" must be
+/// said path by path).
 pub fn cmd_discard(
     repo_path: &std::path::Path,
     paths: &[String],
@@ -4083,11 +4107,11 @@ fn discard(
 
 /// Absorb: fold EVERY uncommitted hunk into the commit that owns its lines —
 /// `git_blame {worktree}` composed with `git_fixup {hunks}` in one call
-/// (magit-commit-absorb / git-absorb). Hunks without a single clear owner
-/// (new lines, split ownership, owners at the `since` boundary or off the
-/// branch line, root commits) stay in the worktree and are reported; the
-/// clear ones fold in ONE replay. `rehearse_only` previews the grouping and
-/// the resulting history without touching anything.
+/// (magit-commit-absorb / git-absorb). Hunks without a single clear owner (new
+/// lines, split ownership, owners at the `since` boundary or off the branch
+/// line, root commits) stay in the worktree and are reported; the clear ones
+/// fold in ONE replay. `rehearse_only` previews the grouping and the resulting
+/// history without touching anything.
 pub fn cmd_absorb(
     repo_path: &std::path::Path,
     since: Option<&str>,
@@ -4099,15 +4123,15 @@ pub fn cmd_absorb(
 }
 
 /// Visit every commit of `range` (oldest-first) in the worktree and run
-/// `command` at each — the pr-prep gate loop ("does every commit build?")
-/// that otherwise gets hand-rolled as `for c in rev-list; checkout c; cargo
-/// check` in a shell. Stops on the first failure, naming the commit and the
-/// command's output tail; the original HEAD (branch or detached) is restored
-/// afterwards either way. Refuses on a dirty worktree.
+/// `command` at each — the pr-prep gate loop ("does every commit build?")  that
+/// otherwise gets hand-rolled as `for c in rev-list; checkout c; cargo check`
+/// in a shell. Stops on the first failure, naming the commit and the command's
+/// output tail; the original HEAD (branch or detached) is restored afterwards
+/// either way. Refuses on a dirty worktree.
 ///
-/// GATED: running an arbitrary command breaks the git tools' default
-/// "no hooks, no exec" posture, so it must be enabled explicitly by whoever
-/// LAUNCHES the server (not the agent): set MIME_EXEC=1 in the environment.
+/// GATED: running an arbitrary command breaks the git tools' default "no hooks,
+/// no exec" posture, so it must be enabled explicitly by whoever LAUNCHES the
+/// server (not the agent): set MIME_EXEC=1 in the environment.
 pub fn cmd_exec_over(
     repo_path: &std::path::Path,
     range: &str,
@@ -4143,10 +4167,10 @@ fn exec_over(repo: &Repository, range: &str, command: &str) -> Result<String, Er
     if commits.is_empty() {
         return Err(estr(&format!("exec_over: no commits in {range}")));
     }
-    // A bare rev means "the whole history up to that commit" — for a tool
-    // that checks out and runs a command at every commit, accept it only
-    // for HEAD itself, so `HEAD~5` cannot mean "everything except the
-    // last 5" by surprise.
+    // A bare rev means "the whole history up to that commit" — for a tool that
+    // checks out and runs a command at every commit, accept it only for HEAD
+    // itself, so `HEAD~5` cannot mean "everything except the last 5" by
+    // surprise.
     if !range.contains("..")
         && *commits.last().expect("non-empty") != repo.head()?.peel_to_commit()?.id()
     {
@@ -4157,8 +4181,8 @@ fn exec_over(repo: &Repository, range: &str, command: &str) -> Result<String, Er
         )));
     }
     // is_dirty ignores untracked files, but the force checkouts would still
-    // clobber an untracked file colliding with a path in any visited tree —
-    // and restoring HEAD (where the path is untracked) would then delete it.
+    // clobber an untracked file colliding with a path in any visited tree — and
+    // restoring HEAD (where the path is untracked) would then delete it.
     // begin() refuses this for its one target tree; here every commit of the
     // range is a target.
     let mut uopts = git2::StatusOptions::new();
@@ -4220,8 +4244,8 @@ fn exec_over(repo: &Repository, range: &str, command: &str) -> Result<String, Er
                 report.push_str(&format!("  ok  {} {}\n", short(*oid), summary_of(*oid)));
             }
             Ok(out) => {
-                // The command's output tail rides in the error — enough to
-                // see WHAT broke without re-running by hand.
+                // The command's output tail rides in the error — enough to see
+                // WHAT broke without re-running by hand.
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let lines: Vec<&str> = stdout.lines().chain(stderr.lines()).collect();
@@ -4270,10 +4294,10 @@ fn exec_over(repo: &Repository, range: &str, command: &str) -> Result<String, Er
 
 /// Apply one `message_edits` vocabulary to EVERY commit of `range` — the bulk
 /// trailer strip/add or identifier rename after a symbol rename. A sparse
-/// rewrite touching only messages: each commit is re-created with its own
-/// tree (byte-identical by construction) and re-parented, so nothing can
-/// conflict. Per-commit replacement counts ride in the report; a `find` that
-/// matches NOWHERE in the range is an error and nothing changes.
+/// rewrite touching only messages: each commit is re-created with its own tree
+/// (byte-identical by construction) and re-parented, so nothing can conflict.
+/// Per-commit replacement counts ride in the report; a `find` that matches
+/// NOWHERE in the range is an error and nothing changes.
 pub fn cmd_msg_rewrite(
     repo_path: &std::path::Path,
     range: &str,
@@ -4293,9 +4317,9 @@ pub fn cmd_msg_rewrite(
 
 /// Reword ONE commit's message — `message` replaces it wholesale, or
 /// `message_edits` tweak it in place — as a sparse rewrite: the commit and its
-/// descendants are re-created with their own trees (byte-identical, nothing
-/// can conflict), no plan transcription needed. The everyday follow-up to a
-/// review comment.
+/// descendants are re-created with their own trees (byte-identical, nothing can
+/// conflict), no plan transcription needed. The everyday follow-up to a review
+/// comment.
 pub fn cmd_reword(
     repo_path: &std::path::Path,
     commit: &str,
@@ -4367,8 +4391,8 @@ fn reword(
     }
     require_signing_ready(repo)?;
 
-    // Re-create the target with its own tree + the new message, then chain
-    // its descendants (same trees and messages, re-parented).
+    // Re-create the target with its own tree + the new message, then chain its
+    // descendants (same trees and messages, re-parented).
     rotate_backup_ring(repo, &branch, head)?;
     let parents: Vec<git2::Commit> = tc.parents().collect();
     let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
@@ -4407,8 +4431,8 @@ fn reword(
 }
 
 /// The oid `c` gets when re-created unsigned with `msg` and its own tree,
-/// parents, author and committer — what msg_rewrite writes for a commit
-/// whose parents did not move.
+/// parents, author and committer — what msg_rewrite writes for a commit whose
+/// parents did not move.
 fn recreated_oid(repo: &Repository, c: &git2::Commit, msg: &str) -> Result<Oid, Error> {
     let parents: Vec<git2::Commit> = c.parents().collect();
     let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
@@ -4418,8 +4442,8 @@ fn recreated_oid(repo: &Repository, c: &git2::Commit, msg: &str) -> Result<Oid, 
 }
 
 /// Branches and tags other than `branch` that msg_rewrite leaves on the old
-/// history: those at `first_changed` (the oldest commit whose oid changes)
-/// or at a descendant of it. Empty when nothing is left behind.
+/// history: those at `first_changed` (the oldest commit whose oid changes) or
+/// at a descendant of it. Empty when nothing is left behind.
 fn stranded_refs(
     repo: &Repository,
     branch: &str,
@@ -4490,10 +4514,10 @@ fn msg_rewrite(
     // range-wide miss aborts before anything is created.
     let mut new_msgs: Vec<(Oid, String, Vec<usize>)> = Vec::new();
     let mut totals = vec![0usize; edits.len()];
-    // The oldest commit whose oid will change: the first that re-creates to
-    // a different object (a rewritten message, or a header libgit2 does not
-    // reproduce) — or the first of the range when commits are signed, since
-    // a fresh signature changes the oid by itself. Everything after it is
+    // The oldest commit whose oid will change: the first that re-creates to a
+    // different object (a rewritten message, or a header libgit2 does not
+    // reproduce) — or the first of the range when commits are signed, since a
+    // fresh signature changes the oid by itself. Everything after it is
     // re-parented, so it changes too.
     let mut first_changed: Option<Oid> = None;
     let resigned = signing_required(repo)?;
@@ -4946,10 +4970,10 @@ fn run_plan_over_parked_worktree(
     let outcome = match begin(repo, plan, Mode::Pick) {
         Ok(o) => o,
         Err(e) => {
-            // begin can die AFTER detaching HEAD and writing the state file
-            // (an I/O error mid-replay, not a conflict): abort any
-            // half-started operation first, so the "nothing changed"
-            // contract holds for hard errors too.
+            // begin can die AFTER detaching HEAD and writing the state file (an
+            // I/O error mid-replay, not a conflict): abort any half-started
+            // operation first, so the "nothing changed" contract holds for hard
+            // errors too.
             let mut e = e;
             if status(repo).ok().flatten().is_some()
                 && let Err(a) = abort(repo)
@@ -5026,8 +5050,8 @@ pub fn cmd_rebase(
         Some(f) => resolve_s(&repo, f)?,
         None => onto_oid,
     };
-    // Commits omitted from a plan-less pick-all because they are already present
-    // in `onto` by patch-id (git's default cherry-pick detection).
+    // Commits omitted from a plan-less pick-all because they are already
+    // present in `onto` by patch-id (git's default cherry-pick detection).
     let mut dropped: Vec<Oid> = Vec::new();
     // A bare replay leaves fixup!/squash! commits as they are — the note below
     // points at autosquash:true, which is usually what such a branch wants.
@@ -5121,11 +5145,11 @@ pub fn cmd_rebase(
     ))
 }
 
-/// A report of the commits a plan-less rebase skipped as already-applied, so the
-/// drop is never silent. Empty when nothing was dropped.
-/// A note appended to a plan-less replay whose range carries fixup!/squash!
-/// marker commits: they are picked unchanged, so name the one argument that
-/// would fold them instead — the point where an agent learns it exists.
+/// A report of the commits a plan-less rebase skipped as already-applied, so
+/// the drop is never silent. Empty when nothing was dropped.  A note appended
+/// to a plan-less replay whose range carries fixup!/squash!  marker commits:
+/// they are picked unchanged, so name the one argument that would fold them
+/// instead — the point where an agent learns it exists.
 fn marker_note(repo: &Repository, steps: &[Step]) -> String {
     let n = steps
         .iter()
@@ -5214,8 +5238,8 @@ pub fn cmd_abort(repo_path: &std::path::Path) -> Result<String, String> {
     ))
 }
 
-/// Two-char porcelain marks for one dirty entry (`git status --short`):
-/// index column then worktree column; conflicts are UU, untracked ??.
+/// Two-char porcelain marks for one dirty entry (`git status --short`): index
+/// column then worktree column; conflicts are UU, untracked ??.
 fn status_marks(s: git2::Status) -> (char, char) {
     if s.is_conflicted() {
         return ('U', 'U');
@@ -5246,9 +5270,9 @@ fn status_marks(s: git2::Status) -> (char, char) {
     } else {
         ' '
     };
-    // Untracked proper: nothing staged AND new in the worktree. A staged
-    // entry whose file is also new in the worktree (e.g. git rm --cached)
-    // keeps its index column: `D?`, not `??`.
+    // Untracked proper: nothing staged AND new in the worktree. A staged entry
+    // whose file is also new in the worktree (e.g. git rm --cached) keeps its
+    // index column: `D?`, not `??`.
     if x == ' ' && y == '?' {
         return ('?', '?');
     }
@@ -5283,8 +5307,8 @@ fn branch_line(repo: &Repository) -> String {
             "## HEAD detached at {}",
             head.target().map(short).unwrap_or_else(|| "?".into())
         ),
-        // head() errors on an unborn branch — a repo with no commits yet
-        // still names its target branch on the HEAD symref.
+        // head() errors on an unborn branch — a repo with no commits yet still
+        // names its target branch on the HEAD symref.
         Err(_) => match repo
             .find_reference("HEAD")
             .ok()
@@ -5299,8 +5323,8 @@ fn branch_line(repo: &Repository) -> String {
     }
 }
 
-/// Every dirty path with its two-char mark, capped so a huge tree cannot
-/// flood the reply; "worktree clean" when there is nothing to report.
+/// Every dirty path with its two-char mark, capped so a huge tree cannot flood
+/// the reply; "worktree clean" when there is nothing to report.
 fn worktree_summary(repo: &Repository) -> Result<String, Error> {
     const CAP: usize = 30;
     let mut opts = git2::StatusOptions::new();
@@ -5348,16 +5372,16 @@ pub fn cmd_status(repo_path: &std::path::Path) -> Result<String, String> {
 }
 
 /// `git_commit`: commit exactly `paths` — each file staged from its worktree
-/// content, a listed-but-missing file becoming a deletion — with `message`,
-/// on the current branch. There is deliberately no pathspec-less mode: the
-/// sweep (`git add -A`/`.`) that bakes stray files into history cannot be
-/// expressed. Pre-staged index changes OUTSIDE `paths` refuse, naming them;
-/// unlisted worktree changes simply stay dirty. With `after`, the new commit
-/// is then relocated to sit directly after that ancestor via the rebase
-/// machinery (backup ring; a conflict pauses for the conflict tools +
-/// git_continue). `hunks` selects part of a tracked file's worktree change
-/// (the tree is HEAD plus the selection and the index follows it); that mode
-/// refuses ANY staged change, untracked paths, and `after`.
+/// content, a listed-but-missing file becoming a deletion — with `message`, on
+/// the current branch. There is deliberately no pathspec-less mode: the sweep
+/// (`git add -A`/`.`) that bakes stray files into history cannot be expressed.
+/// Pre-staged index changes OUTSIDE `paths` refuse, naming them; unlisted
+/// worktree changes simply stay dirty. With `after`, the new commit is then
+/// relocated to sit directly after that ancestor via the rebase machinery
+/// (backup ring; a conflict pauses for the conflict tools + git_continue).
+/// `hunks` selects part of a tracked file's worktree change (the tree is HEAD
+/// plus the selection and the index follows it); that mode refuses ANY staged
+/// change, untracked paths, and `after`.
 pub fn cmd_commit(
     repo_path: &std::path::Path,
     paths: &[String],
@@ -5386,8 +5410,8 @@ pub fn cmd_commit(
         .workdir()
         .ok_or("git_commit: bare repository")?
         .to_path_buf();
-    // Absolute (the form grep/occur return) or workdir-relative; a directory
-    // is refused — a directory pathspec is a sweep, not an explicit list.
+    // Absolute (the form grep/occur return) or workdir-relative; a directory is
+    // refused — a directory pathspec is a sweep, not an explicit list.
     let rel_of = |p: &str| -> Result<String, String> {
         let path = Path::new(p);
         let rel = if path.is_absolute() {
@@ -5412,8 +5436,8 @@ pub fn cmd_commit(
                 }
             }
         }
-        // symlink_metadata: a tracked symlink whose target is a directory is
-        // a committable blob, not a directory sweep.
+        // symlink_metadata: a tracked symlink whose target is a directory is a
+        // committable blob, not a directory sweep.
         if workdir
             .join(&norm)
             .symlink_metadata()
@@ -5478,10 +5502,10 @@ pub fn cmd_commit(
     let staged = repo
         .diff_tree_to_index(head_tree.as_ref(), Some(&index), None)
         .map_err(gerr)?;
-    // Whole-path mode re-stages each listed file from the worktree, so a
-    // staged change inside `paths` is superseded and one outside would ride
-    // along uninvited. Hunk mode commits worktree content and then sets the
-    // index to the new HEAD, so ANY staged change would be lost: refuse them.
+    // Whole-path mode re-stages each listed file from the worktree, so a staged
+    // change inside `paths` is superseded and one outside would ride along
+    // uninvited. Hunk mode commits worktree content and then sets the index to
+    // the new HEAD, so ANY staged change would be lost: refuse them.
     let hunk_mode = !hunks.is_empty();
     let blocking: Vec<String> = staged
         .deltas()
@@ -5511,7 +5535,8 @@ pub fn cmd_commit(
             } else if index.get_path(rp, 0).is_some()
                 || head_tree.as_ref().is_some_and(|t| t.get_path(rp).is_ok())
             {
-                // Listed but absent on disk: stage the deletion of a tracked file.
+                // Listed but absent on disk: stage the deletion of a tracked
+                // file.
                 index.remove_path(rp).map_err(gerr)?;
             } else {
                 return Err(format!("git_commit: no such file: {rel}"));
@@ -5519,9 +5544,9 @@ pub fn cmd_commit(
         }
         index.write_tree().map_err(gerr)?
     } else {
-        // Hunk mode: the tree is HEAD plus the selected worktree hunks (and
-        // the whole `paths`), built the way git_fixup's worktree mode builds
-        // its fold; the unselected changes simply stay in the worktree.
+        // Hunk mode: the tree is HEAD plus the selected worktree hunks (and the
+        // whole `paths`), built the way git_fixup's worktree mode builds its
+        // fold; the unselected changes simply stay in the worktree.
         let Some(head_tree) = head_tree.as_ref() else {
             return Err(
                 "git_commit: `hunks` selects from the diff against HEAD — the root \
@@ -5574,10 +5599,10 @@ pub fn cmd_commit(
     let parents: Vec<&git2::Commit> = head_commit.iter().collect();
     let new = create_commit(&repo, Some("HEAD"), &sig, &sig, &msg, &tree, &parents, true)
         .map_err(gerr)?;
-    // Persist the staged entries only once the commit exists — a failure
-    // above must not leave staged state the caller never asked to keep. In
-    // hunk mode the index becomes the new HEAD tree, so the committed part
-    // reads clean and the rest of the change shows as unstaged.
+    // Persist the staged entries only once the commit exists — a failure above
+    // must not leave staged state the caller never asked to keep. In hunk mode
+    // the index becomes the new HEAD tree, so the committed part reads clean
+    // and the rest of the change shows as unstaged.
     if hunk_mode {
         index.read_tree(&tree).map_err(gerr)?;
     }
@@ -5591,8 +5616,8 @@ pub fn cmd_commit(
     let Some(after_oid) = after_oid else {
         return Ok(out);
     };
-    // In-series placement: replay after..HEAD onto `after` with the new
-    // commit first — a pure reorder unless the moved hunks collide.
+    // In-series placement: replay after..HEAD onto `after` with the new commit
+    // first — a pure reorder unless the moved hunks collide.
     let range = commits_since(&repo, after_oid).map_err(gerr)?;
     if range.len() == 1 {
         return Ok(format!(
@@ -5603,9 +5628,9 @@ pub fn cmd_commit(
     let mut steps = vec![pick_step(new)];
     steps.extend(range.into_iter().filter(|o| *o != new).map(pick_step));
     let note = backup_note(&repo);
-    // The sequencer can still refuse here (an in-progress op, a dirty path
-    // some replayed commit rewrites) — by then the commit exists, so the
-    // error must say so instead of hiding it.
+    // The sequencer can still refuse here (an in-progress op, a dirty path some
+    // replayed commit rewrites) — by then the commit exists, so the error must
+    // say so instead of hiding it.
     let res = start(
         &repo,
         Plan {
@@ -5800,8 +5825,8 @@ mod tests {
         }
     }
 
-    /// A stand-in gpg: logs its argv to `<script>.args`, reports SIG_CREATED
-    /// on the status fd, and prints a well-formed armored signature. Callers
+    /// A stand-in gpg: logs its argv to `<script>.args`, reports SIG_CREATED on
+    /// the status fd, and prints a well-formed armored signature. Callers
     /// configure it as `gpg.openpgp.program` — the highest-precedence program
     /// key — so a developer's global signer config cannot shadow the stub.
     fn fake_signer(dir: &Path) -> std::path::PathBuf {
@@ -5833,7 +5858,8 @@ mod tests {
         dir
     }
 
-    /// Commit a tree built from `files`, with explicit parents, updating no ref.
+    /// Commit a tree built from `files`, with explicit parents, updating no
+    /// ref.
     fn commit(repo: &Repository, parents: &[Oid], files: &[(&str, &str)], msg: &str) -> Oid {
         // Test repositories must not inherit the developer's global signing
         // policy; signing-specific tests opt back in explicitly.
@@ -6174,7 +6200,8 @@ mod tests {
         let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
         on_branch(&repo, "topic", f1);
 
-        // Default plan (onto..HEAD) via the path-facing wrapper, onto by oid string.
+        // Default plan (onto..HEAD) via the path-facing wrapper, onto by oid
+        // string.
         let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, false, false).unwrap();
         assert!(out.starts_with("done"), "{out}");
         // `add b` and `change a` are distinct patches, so cherry-pick detection
@@ -6299,8 +6326,9 @@ mod tests {
     fn plan_less_rebase_drops_commits_already_in_the_rewritten_base() {
         // The dogfooding scenario: branch `topic` sits on a base whose top two
         // commits get REORDERED (rewritten to new oids, identical patch-ids).
-        // Re-rebasing topic onto the rewritten base must drop topic's stale copies
-        // of those commits (already present by patch-id) rather than replay them.
+        // Re-rebasing topic onto the rewritten base must drop topic's stale
+        // copies of those commits (already present by patch-id) rather than
+        // replay them.
         let dir = tmp("rebase-cherry-drop");
         let repo = Repository::init(&dir).unwrap();
         let base = commit(&repo, &[], &[("base", "0\n")], "base");
@@ -6319,9 +6347,10 @@ mod tests {
         );
         on_branch(&repo, "topic", t);
 
-        // Rewrite the base: add-y then add-x — new oids, same patch-ids. `a1p` is
-        // the rewritten tip we rebase onto; the merge-base with topic is `base`,
-        // BELOW the rewrite, so onto..HEAD still holds the pre-rewrite add-x/add-y.
+        // Rewrite the base: add-y then add-x — new oids, same patch-ids. `a1p`
+        // is the rewritten tip we rebase onto; the merge-base with topic is
+        // `base`, BELOW the rewrite, so onto..HEAD still holds the pre-rewrite
+        // add-x/add-y.
         let a2p = commit(&repo, &[base], &[("base", "0\n"), ("y", "1\n")], "add y");
         let a1p = commit(
             &repo,
@@ -6330,7 +6359,8 @@ mod tests {
             "add x",
         );
 
-        // rehearse, default: the two already-applied commits are reported dropped.
+        // rehearse, default: the two already-applied commits are reported
+        // dropped.
         let pre = cmd_rebase(&dir, &a1p.to_string(), None, None, None, true, false).unwrap();
         assert!(pre.contains("dropped 2 commit(s)"), "{pre}");
         assert!(pre.contains("add x") && pre.contains("add y"), "{pre}");
@@ -6355,10 +6385,10 @@ mod tests {
 
     #[test]
     fn cherry_pick_detection_never_drops_empty_or_merge_commits() {
-        // Empty commits all hash to the constant empty-diff patch-id, and a merge
-        // has no single patch — so neither may be matched as "already applied".
-        // Otherwise one intentional empty commit upstream would drop an unrelated
-        // empty commit (or an `ours` merge) on the branch.
+        // Empty commits all hash to the constant empty-diff patch-id, and a
+        // merge has no single patch — so neither may be matched as "already
+        // applied".  Otherwise one intentional empty commit upstream would drop
+        // an unrelated empty commit (or an `ours` merge) on the branch.
         let dir = tmp("cherry-empty-merge");
         let repo = Repository::init(&dir).unwrap();
         let base = commit(&repo, &[], &[("a", "1\n")], "base");
@@ -6370,8 +6400,9 @@ mod tests {
             &[("a", "1\n"), ("u", "1\n")],
             "upstream empty",
         );
-        // Branch: an intentional empty commit, a real commit, and an `ours` merge
-        // (tree equals its first parent, so its first-parent diff is empty).
+        // Branch: an intentional empty commit, a real commit, and an `ours`
+        // merge (tree equals its first parent, so its first-parent diff is
+        // empty).
         let h_empty = commit(&repo, &[base], &[("a", "1\n")], "keep me (empty)");
         let t_real = commit(&repo, &[h_empty], &[("a", "1\n"), ("t", "1\n")], "add t");
         let side = commit(&repo, &[base], &[("a", "1\n"), ("s", "1\n")], "add s");
@@ -6401,7 +6432,8 @@ mod tests {
 
         let out = cmd_blame(&dir, Some("f.txt"), None, None, false, false).unwrap();
         let lines: Vec<&str> = out.lines().collect();
-        // Line 1 is still c1's; line 2 now belongs to c2. Hunks are one line each.
+        // Line 1 is still c1's; line 2 now belongs to c2. Hunks are one line
+        // each.
         assert!(
             lines[0].starts_with("  L1\t") && lines[0].ends_with("add one and two"),
             "L1 -> c1: {out}"
@@ -6437,8 +6469,8 @@ mod tests {
         // Unscoped: line 1 ("a") is still base's.
         let full = cmd_blame(&dir, Some("f"), None, None, false, false).unwrap();
         assert!(full.contains(&short(base)), "base owns line 1: {full}");
-        // Scoped to c1..: base predates the boundary, so its line collapses to c1
-        // and base's oid no longer appears; c2 still owns its own line.
+        // Scoped to c1..: base predates the boundary, so its line collapses to
+        // c1 and base's oid no longer appears; c2 still owns its own line.
         let scoped = cmd_blame(&dir, Some("f"), None, Some(&c1.to_string()), false, false).unwrap();
         assert!(
             !scoped.contains(&short(base)),
@@ -6504,8 +6536,8 @@ mod tests {
 
     #[test]
     fn absorb_leaves_ambiguous_hunks_in_the_worktree() {
-        // Wider fixture so the split hunk and the clear hunk stay separate:
-        // c1 owns line 2, c2 owns line 6.
+        // Wider fixture so the split hunk and the clear hunk stay separate: c1
+        // owns line 2, c2 owns line 6.
         let dir = tmp("absorb-ambig");
         let repo = Repository::init(&dir).unwrap();
         let all = "l1\nl2\nl3\nl4\nl5\nl6\nl7\n";
@@ -6523,8 +6555,8 @@ mod tests {
             "edit six",
         );
         on_branch(&repo, "main", c2);
-        // One hunk spans lines owned by two commits (line 2: c1, line 3:
-        // base) — split ownership; the line-6 hunk is clearly c2's.
+        // One hunk spans lines owned by two commits (line 2: c1, line 3: base)
+        // — split ownership; the line-6 hunk is clearly c2's.
         std::fs::write(
             repo.workdir().unwrap().join("f"),
             b"l1\nx\ny\nl4\nl5\nw6\nl7\n",
@@ -6652,8 +6684,8 @@ mod tests {
             "m1",
         );
         on_branch(&repo, "topic", f1);
-        // An unrelated uncommitted edit: `notes` is touched by NO step and
-        // does not differ between onto and HEAD.
+        // An unrelated uncommitted edit: `notes` is touched by NO step and does
+        // not differ between onto and HEAD.
         std::fs::write(dir.join("notes"), "scratch\n").unwrap();
 
         // m1 adds b; rebase f1 onto m1. `notes` is untouched.
@@ -6725,8 +6757,8 @@ mod tests {
         // f1 conflicts with m1 on `a`; `notes` rides the autostash.
         let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, false, false).unwrap();
         assert!(out.contains("conflict"), "{out}");
-        // During the pause the user writes `notes` again — the later edit
-        // must win over the parked bytes.
+        // During the pause the user writes `notes` again — the later edit must
+        // win over the parked bytes.
         std::fs::write(dir.join("notes"), "newer\n").unwrap();
         std::fs::write(dir.join("a"), "3\n").unwrap();
         let out = cmd_continue(&dir, false, &[]).unwrap();
@@ -6820,8 +6852,8 @@ mod tests {
         let f1 = commit(&repo, &[base], &[("a", "2\n"), ("notes", "n\n")], "f1");
         let m1 = commit(&repo, &[base], &[("a", "3\n"), ("notes", "n\n")], "m1");
         on_branch(&repo, "topic", f1);
-        // Stage a change to a path no step touches — the autostash cannot
-        // carry index state, so this refuses instead of flattening it.
+        // Stage a change to a path no step touches — the autostash cannot carry
+        // index state, so this refuses instead of flattening it.
         std::fs::write(dir.join("notes"), "staged\n").unwrap();
         let mut index = repo.index().unwrap();
         index.add_path(Path::new("notes")).unwrap();
@@ -6850,8 +6882,8 @@ mod tests {
         on_branch(&repo, "main", c3);
         let before = c3;
 
-        // Rewrite: reword c1 (patch identical, message drifts) and drop the
-        // tip commit ("add c") by moving the branch to its parent.
+        // Rewrite: reword c1 (patch identical, message drifts) and drop the tip
+        // commit ("add c") by moving the branch to its parent.
         cmd_reword(
             &dir,
             &c1.to_string(),
@@ -6904,8 +6936,8 @@ mod tests {
         );
         assert_eq!(read(&repo, "f"), "l1\nw1\nl3\nw2\nl5\n");
 
-        // Discard just the line-2 hunk: it resets to HEAD content ("c1"),
-        // the line-4 hunk stays, and the parachute holds the full pre-state.
+        // Discard just the line-2 hunk: it resets to HEAD content ("c1"), the
+        // line-4 hunk stays, and the parachute holds the full pre-state.
         let out = cmd_discard(&dir, &[], &sel, false).unwrap();
         assert!(out.contains("discarded 1"), "{out}");
         assert_eq!(read(&repo, "f"), "l1\nc1\nl3\nw2\nl5\n");
@@ -7107,8 +7139,8 @@ mod tests {
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.message().unwrap(), "two new_name\n");
 
-        // log and exec_over take the same bare-rev form. A rev below HEAD
-        // pins that the range argument is honored, not silently ignored.
+        // log and exec_over take the same bare-rev form. A rev below HEAD pins
+        // that the range argument is honored, not silently ignored.
         let out = log(&repo, Some("HEAD"), 10, false).unwrap();
         assert_eq!(out.lines().count(), 3, "{out}");
         let out = log(&repo, Some(&root.id().to_string()), 10, false).unwrap();
@@ -7189,8 +7221,8 @@ mod tests {
         let dir = tmp("strand-header");
         let repo = Repository::init(&dir).unwrap();
         // A signed root in a repository that no longer signs: re-creating it
-        // drops the gpgsig header, so its oid changes although its message
-        // does not, and a tag on it is left behind.
+        // drops the gpgsig header, so its oid changes although its message does
+        // not, and a tag on it is left behind.
         let sig = Signature::now("test", "test@example.invalid").unwrap();
         let tree = repo
             .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
@@ -7352,8 +7384,8 @@ mod tests {
         config
             .set_str("user.email", "test@example.invalid")
             .unwrap();
-        // A configured-but-blank signingkey must fall through to the
-        // identity, not reach the signer as --local-user "".
+        // A configured-but-blank signingkey must fall through to the identity,
+        // not reach the signer as --local-user "".
         config.set_str("user.signingkey", " ").unwrap();
         drop(config);
 
@@ -7476,8 +7508,8 @@ mod tests {
             std::fs::write(repo.workdir().unwrap().join("f.txt"), "two\n").unwrap();
             cmd_commit(&dir, &["f.txt".to_string()], &[], "more", None).unwrap();
             // Subjects that diverge from the first physical line: a wrapped
-            // subject (folded into one line) and a leading blank line
-            // (skipped) — git_commit_summary handles both.
+            // subject (folded into one line) and a leading blank line (skipped)
+            // — git_commit_summary handles both.
             std::fs::write(repo.workdir().unwrap().join("f.txt"), "three\n").unwrap();
             cmd_commit(
                 &dir,
@@ -7494,7 +7526,8 @@ mod tests {
         let signed = mk("reflog-signed", true);
         let unsigned = mk("reflog-unsigned", false);
 
-        // Compare the raw log files — what `git reflog` on a real checkout reads.
+        // Compare the raw log files — what `git reflog` on a real checkout
+        // reads.
         let msgs = |repo: &Repository, rel: &str| -> Vec<String> {
             std::fs::read_to_string(repo.path().join(rel))
                 .unwrap_or_default()
@@ -7907,9 +7940,9 @@ mod tests {
     fn autosquash_markers_stack_in_commit_order() {
         let dir = tmp("asq-marker-order");
         let (repo, base, _c1, c2) = marker_fixture(&dir);
-        // Two fixups of one target: f2's diff (a: 2→3) only applies AFTER
-        // f1's (a: 1→2) — a reversed stacking would conflict, not just
-        // mis-order messages.
+        // Two fixups of one target: f2's diff (a: 2→3) only applies AFTER f1's
+        // (a: 1→2) — a reversed stacking would conflict, not just mis-order
+        // messages.
         let f1 = commit(
             &repo,
             &[c2],
@@ -8095,8 +8128,8 @@ mod tests {
         );
         on_branch(&repo, "main", f);
 
-        // A bare replay leaves the marker unfolded — the result must say so
-        // and name the argument that folds it (rehearse and real run alike).
+        // A bare replay leaves the marker unfolded — the result must say so and
+        // name the argument that folds it (rehearse and real run alike).
         let pre = cmd_rebase(&dir, &base.to_string(), None, None, None, true, false).unwrap();
         assert!(
             pre.contains("1 fixup!/squash! commit(s) replayed as-is"),
@@ -8302,8 +8335,8 @@ mod tests {
             cmd_fixup_worktree(&dir, &c3.to_string(), &["a".to_string()], &[], false).unwrap();
         assert!(out.contains("back in the worktree"), "{out}");
 
-        // History: the tip amends c3 (same message), now carrying the fold;
-        // `b` in history is untouched.
+        // History: the tip amends c3 (same message), now carrying the fold; `b`
+        // in history is untouched.
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.summary().unwrap(), "fix a");
         assert_eq!(at_commit(&repo, head.id(), "a"), "3\n");
@@ -8415,8 +8448,9 @@ mod tests {
 
     #[test]
     fn state_round_trips_message_edits_and_split_parts() {
-        // Guards the persisted-vs-input key unification: save_state/load_state and
-        // the MCP input must agree, or a resume after a conflict loses edits.
+        // Guards the persisted-vs-input key unification: save_state/load_state
+        // and the MCP input must agree, or a resume after a conflict loses
+        // edits.
         let dir = tmp("state-rt");
         let repo = Repository::init(&dir).unwrap();
         let base = commit(&repo, &[], &[("a", "1\n")], "base");
@@ -8516,7 +8550,8 @@ mod tests {
         assert!(!state_path(&repo).exists(), "rejected before any mutation");
     }
 
-    /// A conflicting plan, stopped at the conflict, for the continue/guard tests.
+    /// A conflicting plan, stopped at the conflict, for the continue/guard
+    /// tests.
     fn conflict_repo(dir: &std::path::Path) -> (Repository, Oid) {
         let repo = Repository::init(dir).unwrap();
         let base = commit(&repo, &[], &[("a", "1\n"), ("b", "1\n")], "base");
@@ -8552,8 +8587,9 @@ mod tests {
     #[test]
     fn continue_refuses_a_stray_opener_but_force_overrides() {
         // A partial resolution that deletes the lower markers but leaves the
-        // `<<<<<<<` opener must NOT slip through (a structural parser would miss
-        // it); `force` is the escape hatch when the marker line is intentional.
+        // `<<<<<<<` opener must NOT slip through (a structural parser would
+        // miss it); `force` is the escape hatch when the marker line is
+        // intentional.
         let dir = tmp("stray-opener");
         let (repo, _) = conflict_repo(&dir);
         std::fs::write(dir.join("a"), "resolved\n<<<<<<< leftover opener\n").unwrap();
@@ -8561,7 +8597,8 @@ mod tests {
             continue_op(&repo, false, &[]).is_err(),
             "stray opener must block"
         );
-        // The failed continue committed/advanced nothing, so a forced retry works.
+        // The failed continue committed/advanced nothing, so a forced retry
+        // works.
         let out = continue_op(&repo, true, &[]).unwrap();
         assert!(matches!(out, Outcome::Done { .. }));
         assert_eq!(read(&repo, "a"), "resolved\n<<<<<<< leftover opener\n");
@@ -8588,15 +8625,17 @@ mod tests {
     fn continue_commits_only_the_conflicted_paths() {
         let dir = tmp("outofset");
         let (repo, _) = conflict_repo(&dir);
-        // Resolve the conflicted file AND scribble on an unrelated tracked file.
+        // Resolve the conflicted file AND scribble on an unrelated tracked
+        // file.
         std::fs::write(dir.join("a"), "resolved\n").unwrap();
         std::fs::write(dir.join("b"), "also changed\n").unwrap();
         assert!(matches!(
             continue_op(&repo, false, &[]).unwrap(),
             Outcome::Done { .. }
         ));
-        // Only the conflicted path is committed; the unrelated edit is NOT folded
-        // into the cherry-picked commit (it stays uncommitted in the worktree).
+        // Only the conflicted path is committed; the unrelated edit is NOT
+        // folded into the cherry-picked commit (it stays uncommitted in the
+        // worktree).
         let tip = repo.head().unwrap().peel_to_commit().unwrap();
         let entry = tip.tree().unwrap().get_path(Path::new("b")).unwrap();
         let blob = repo.find_blob(entry.id()).unwrap();
@@ -8625,7 +8664,8 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(out, Outcome::Conflict { .. }));
-        // Resolve by keeping the deletion — add_path on a missing file would error.
+        // Resolve by keeping the deletion — add_path on a missing file would
+        // error.
         let _ = std::fs::remove_file(dir.join("f"));
         assert!(matches!(
             continue_op(&repo, false, &[]).unwrap(),
@@ -8729,10 +8769,10 @@ mod tests {
         let repo = Repository::init(&dir).unwrap();
         let base = commit(&repo, &[], &[("a", "1\n")], "base");
         let f1 = commit(&repo, &[base], &[("a", "2\n")], "f1");
-        // `onto` introduces `d/u`; the worktree has a fully-untracked
-        // directory `d` containing `u`. Statuses without recursion reports
-        // only `d/`, which matches no tree path — the guard must still see
-        // the file inside.
+        // `onto` introduces `d/u`; the worktree has a fully-untracked directory
+        // `d` containing `u`. Statuses without recursion reports only `d/`,
+        // which matches no tree path — the guard must still see the file
+        // inside.
         let sub = {
             let blob = repo.blob(b"from onto\n").unwrap();
             let mut tb = repo.treebuilder(None).unwrap();
@@ -8850,7 +8890,8 @@ mod tests {
             },
         )
         .unwrap();
-        // The pre-op tip is recoverable even after a clean finish moved the branch.
+        // The pre-op tip is recoverable even after a clean finish moved the
+        // branch.
         assert_eq!(repo.refname_to_id("refs/mime-backup/topic/0").unwrap(), f1);
         assert_ne!(repo.refname_to_id("refs/heads/topic").unwrap(), f1);
     }
@@ -8890,8 +8931,8 @@ mod tests {
         assert_eq!(slot(0), tips[2]);
         assert_eq!(slot(1), tips[1]);
         assert_eq!(slot(2), tips[0]);
-        // The legacy flat ref was consumed (rotated to /1 by the first op,
-        // then aged out) and no longer exists.
+        // The legacy flat ref was consumed (rotated to /1 by the first op, then
+        // aged out) and no longer exists.
         assert!(repo.refname_to_id("refs/mime-backup/topic").is_err());
     }
 
@@ -8938,8 +8979,8 @@ mod tests {
             steps: vec![step(c1, Action::Pick, None), step(c2, Action::Fixup, None)],
         };
         let preview = rehearse(&repo, &plan, Mode::Pick).unwrap();
-        // The fixup folds into the pick: ONE previewed commit, not two, carrying
-        // the target's message (matching a real apply, checked below).
+        // The fixup folds into the pick: ONE previewed commit, not two,
+        // carrying the target's message (matching a real apply, checked below).
         assert_eq!(preview.commits.len(), 1, "fixup folded in preview");
         assert_eq!(preview.commits[0].1, "add a");
 
@@ -8981,8 +9022,8 @@ mod tests {
         let dir = tmp("rehearse-multi-conflict");
         let repo = Repository::init(&dir).unwrap();
         // Two files, each rewritten by a later commit; two fixups that target
-        // the ORIGINAL commits conflict independently — one rehearsal must
-        // name both, each with the commit that last reshaped its lines.
+        // the ORIGINAL commits conflict independently — one rehearsal must name
+        // both, each with the commit that last reshaped its lines.
         let base = commit(&repo, &[], &[("a", "1\n"), ("b", "1\n")], "base");
         let add = commit(
             &repo,
@@ -9006,16 +9047,16 @@ mod tests {
         let preview = rehearse(&repo, &Plan { onto: base, steps }, Mode::Pick).unwrap();
 
         assert_eq!(preview.conflicts.len(), 2, "{:?}", preview.conflicts);
-        // autosquash inserts the LAST directive right after the target, so
-        // fb replays first (conflicting in b), then fa (in a).
+        // autosquash inserts the LAST directive right after the target, so fb
+        // replays first (conflicting in b), then fa (in a).
         let files: Vec<&str> = preview
             .conflicts
             .iter()
             .flat_map(|c| c.files.iter().map(String::as_str))
             .collect();
         assert_eq!(files, vec!["b", "a"], "both fixups reported in one pass");
-        // The why names the reshaping commits — the targets the fixups
-        // should have used.
+        // The why names the reshaping commits — the targets the fixups should
+        // have used.
         assert!(
             preview.conflicts[0].why[0].contains("reshape b"),
             "{:?}",
@@ -9183,8 +9224,8 @@ mod tests {
         assert!(matches!(out, Outcome::Paused { .. }));
 
         std::fs::write(repo.workdir().unwrap().join("scratch"), b"keep\n").unwrap();
-        // First attempt stages the opt-in, then fails at commit creation:
-        // the repo starts requiring signatures mid-pause with MIME_EXEC off.
+        // First attempt stages the opt-in, then fails at commit creation: the
+        // repo starts requiring signatures mid-pause with MIME_EXEC off.
         repo.config()
             .unwrap()
             .set_bool("commit.gpgsign", true)
@@ -9198,8 +9239,8 @@ mod tests {
             "first attempt left the opt-in staged"
         );
 
-        // The retry must accept the same selection even though the path is
-        // no longer worktree-new (already_selected && is_index_new).
+        // The retry must accept the same selection even though the path is no
+        // longer worktree-new (already_selected && is_index_new).
         repo.config()
             .unwrap()
             .set_bool("commit.gpgsign", false)
@@ -9238,7 +9279,8 @@ mod tests {
         .unwrap();
         assert!(matches!(out, Outcome::Paused { .. }));
 
-        // A stray edit, then skip — the edit must be discarded, the commit kept.
+        // A stray edit, then skip — the edit must be discarded, the commit
+        // kept.
         std::fs::write(repo.workdir().unwrap().join("b"), b"STRAY\n").unwrap();
         let out = skip(&repo).unwrap();
         assert!(matches!(out, Outcome::Done { .. }));
@@ -9268,7 +9310,8 @@ mod tests {
             "edit step conflicts on apply"
         );
 
-        // Resolve the conflict, continue → lands the commit, then PAUSES for the edit.
+        // Resolve the conflict, continue → lands the commit, then PAUSES for
+        // the edit.
         std::fs::write(repo.workdir().unwrap().join("a"), b"resolved\n").unwrap();
         let out = continue_op(&repo, false, &[]).unwrap();
         assert!(
@@ -9341,8 +9384,8 @@ mod tests {
             msg, "add new_name\n\nnew_name feeds the meter; see new_name docs.\n",
             "every occurrence replaced"
         );
-        // Replacement text containing the find must not re-match (no loop,
-        // no double replacement).
+        // Replacement text containing the find must not re-match (no loop, no
+        // double replacement).
         let msg = apply_msg_edits(
             "x x\n".to_string(),
             &[MsgEdit::Replace {
@@ -9443,8 +9486,9 @@ mod tests {
         let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
         on_branch(&repo, "topic", f1);
 
-        // message_edits apply to the PROVIDED message, not the commit's original;
-        // pre-validation must use the same base or it falsely rejects this plan.
+        // message_edits apply to the PROVIDED message, not the commit's
+        // original; pre-validation must use the same base or it falsely rejects
+        // this plan.
         let s = Step {
             commit: f1,
             action: Action::Reword,
@@ -9509,8 +9553,9 @@ mod tests {
         let base = commit(&repo, &[], &[("a", "1\n")], "base");
         let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
 
-        // Create-then-match: edit 2's anchor is produced by edit 1 — must SUCCEED
-        // (validating each find against the static base would falsely reject it).
+        // Create-then-match: edit 2's anchor is produced by edit 1 — must
+        // SUCCEED (validating each find against the static base would falsely
+        // reject it).
         let f_ok = commit(
             &repo,
             &[base],
@@ -9740,7 +9785,8 @@ mod tests {
         assert_eq!(first.message().unwrap(), "top");
         assert_eq!(tip.message().unwrap(), "bottom");
         assert_eq!(first.parent(0).unwrap().id(), base, "chain rooted on base");
-        // The first commit carries ONLY the top hunk; the bottom line is still base's.
+        // The first commit carries ONLY the top hunk; the bottom line is still
+        // base's.
         let e = first.tree().unwrap().get_path(Path::new("f")).unwrap();
         assert_eq!(
             repo.find_blob(e.id()).unwrap().content(),
@@ -9874,8 +9920,9 @@ mod tests {
         );
         on_branch(&repo, "topic", c1);
 
-        // part0 takes `other`; part1 takes the added file by hunk. `new` must NOT
-        // appear (even empty) in part0 — the delta-level gate drops the add there.
+        // part0 takes `other`; part1 takes the added file by hunk. `new` must
+        // NOT appear (even empty) in part0 — the delta-level gate drops the add
+        // there.
         let out = start(
             &repo,
             Plan {
@@ -9911,8 +9958,9 @@ mod tests {
         let c1 = commit(&repo, &[base], &[("f", "A\nb\n")], "edit");
         on_branch(&repo, "topic", c1);
 
-        // A hunk part forces the hunk-aware validator; a second part with neither
-        // paths nor hunks and rest=false must be rejected (not silently promoted).
+        // A hunk part forces the hunk-aware validator; a second part with
+        // neither paths nor hunks and rest=false must be rejected (not silently
+        // promoted).
         let err = start(
             &repo,
             Plan {
@@ -10272,17 +10320,17 @@ mod tests {
         on_branch(&repo, "main", base);
         let wd = repo.workdir().unwrap().to_path_buf();
         // Two hunks in f (top and bottom), a whole-file change to g, a last
-        // line without its newline replaced in h, and a new file the
-        // selection never names.
+        // line without its newline replaced in h, and a new file the selection
+        // never names.
         std::fs::write(wd.join("f"), "X\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nY\n").unwrap();
         std::fs::write(wd.join("g"), "G\n").unwrap();
         std::fs::write(wd.join("h"), "a\nc").unwrap();
         std::fs::write(wd.join("new"), "n\n").unwrap();
 
         // Refusals, each before anything is created: a selector matching
-        // nothing, `after` (the leftover hunks would block the relocation),
-        // and staged content (hunk mode commits worktree content and would
-        // drop it).
+        // nothing, `after` (the leftover hunks would block the relocation), and
+        // staged content (hunk mode commits worktree content and would drop
+        // it).
         let sel = [HunkSel::contains("f", "Y")];
         let err = cmd_commit(&dir, &[], &[HunkSel::contains("f", "nope")], "x", None).unwrap_err();
         assert!(err.contains("no hunk of f contains"), "{err}");
@@ -10303,8 +10351,8 @@ mod tests {
             .unwrap();
         index.write().unwrap();
 
-        // An untracked file has no hunks to select from: it goes in whole,
-        // by `paths` alone.
+        // An untracked file has no hunks to select from: it goes in whole, by
+        // `paths` alone.
         let err = cmd_commit(&dir, &["new".to_string()], &sel, "x", None).unwrap_err();
         assert!(err.contains("new is untracked"), "{err}");
         assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), base);
@@ -10329,8 +10377,8 @@ mod tests {
         assert_eq!(blob("g"), "G\n");
         assert_eq!(blob("h"), "a\nc");
         assert!(head.tree().unwrap().get_path(Path::new("new")).is_err());
-        // The worktree keeps everything; the index equals HEAD, so the top
-        // hunk shows as the one unstaged change to a tracked file.
+        // The worktree keeps everything; the index equals HEAD, so the top hunk
+        // shows as the one unstaged change to a tracked file.
         assert_eq!(read(&repo, "f"), "X\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nY\n");
         let staged = repo
             .diff_tree_to_index(Some(&head.tree().unwrap()), None, None)

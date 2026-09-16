@@ -2,31 +2,29 @@
 //!
 //! Three modes share one parser:
 //!
-//! * One-shot, embedded (no daemon) — the default for `run`/`rehearse`:
-//!   `mime run PROG.tl [--file FILE] [--write]` — or just `mime PROG.tl` — runs
-//!   a tulisp edit program against FILE (or stdin) in-process and prints the
+//! * One-shot, embedded (no daemon) — the default for `run`/`rehearse`: `mime
+//!   run PROG.tl [--file FILE] [--write]` — or just `mime PROG.tl` — runs a
+//!   tulisp edit program against FILE (or stdin) in-process and prints the
 //!   structured JSON result; `--write` saves the edited text back to FILE.
 //!   `mime rehearse PROG.tl` is the dry-run twin (never writes).
 //!
-//! * Interactive, embedded (no daemon):
-//!   `mime repl [--file FILE]` opens a warm in-process session and reads
-//!   tulisp from stdin a form at a time, printing the diff + reports + value for
-//!   each. State (buffer, kill-ring, checkpoints, `defun`s) persists across
-//!   lines; nothing is ever written back to disk.
+//! * Interactive, embedded (no daemon): `mime repl [--file FILE]` opens a warm
+//!   in-process session and reads tulisp from stdin a form at a time, printing
+//!   the diff + reports + value for each. State (buffer, kill-ring,
+//!   checkpoints, `defun`s) persists across lines; nothing is ever written back
+//!   to disk.
 //!
-//! * Daemon-backed — opt in with `--session S` (or `$MIME_SESSION`), which talks
-//!   to `mime --daemon` over its unix socket (`$MIME_SOCKET` or
-//!   `/tmp/mimed.sock`):
-//!     - `mime --session S open --file FILE` / `--text STR`
-//!     - `mime --session S run PROG.tl`
-//!     - `mime --session S save --path PATH`
-//!     - `mime --session S close`
-//!     - `mime status` — live sessions, the allowed roots, and audit state
+//! * Daemon-backed — opt in with `--session S` (or `$MIME_SESSION`), which
+//!   talks to `mime --daemon` over its unix socket (`$MIME_SOCKET` or
+//!   `/tmp/mimed.sock`): - `mime --session S open --file FILE` / `--text STR` -
+//!   `mime --session S run PROG.tl` - `mime --session S save --path PATH` -
+//!   `mime --session S close` - `mime status` — live sessions, the allowed
+//!   roots, and audit state
 //!
 //! `run`/`rehearse` use the daemon only when a session is given (and `--local`
 //! is not — `--local` forces the embedded path even if `$MIME_SESSION` is set).
-//! Each daemon verb is sent as one JSON request line; the daemon's JSON response
-//! line is printed verbatim.
+//! Each daemon verb is sent as one JSON request line; the daemon's JSON
+//! response line is printed verbatim.
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::exit;
@@ -43,10 +41,10 @@ struct Args {
     text: Option<String>,
     path: Option<String>,
     prog_path: Option<String>,
-    /// Extra CLI arguments that are not known mime flags — passed through to the
-    /// trusted program as `(arg "KEY")` values. `--KEY VALUE` becomes
-    /// `(KEY, VALUE)`; a bare `--KEY` (next is another `--…` or the end) becomes
-    /// `(KEY, "t")`. Only the local trusted run path forwards these on.
+    /// Extra CLI arguments that are not known mime flags — passed through to
+    /// the trusted program as `(arg "KEY")` values. `--KEY VALUE` becomes
+    /// `(KEY, VALUE)`; a bare `--KEY` (next is another `--…` or the end)
+    /// becomes `(KEY, "t")`. Only the local trusted run path forwards these on.
     prog_args: Vec<(String, String)>,
 }
 
@@ -54,8 +52,8 @@ pub fn run() {
     let argv: Vec<String> = std::env::args().collect();
     let args = parse(&argv);
 
-    // A bare program path with no verb is shorthand for a one-shot `run`
-    // (`mime PROG.tl` == `mime run PROG.tl`).
+    // A bare program path with no verb is shorthand for a one-shot `run` (`mime
+    // PROG.tl` == `mime run PROG.tl`).
     let verb = match args.verb.clone() {
         Some(v) => v,
         None if args.prog_path.is_some() => "run".to_string(),
@@ -79,8 +77,8 @@ pub fn run() {
 
 /// `mime tui PROG.tl --file F [--write]` — the script stepper (Phases 0–1 of
 /// the TUI cockpit): watch the program land form by form, with playback
-/// controls (auto-play, step back, restart, write-on-finish). Behind the
-/// `tui` feature so the default build stays lean.
+/// controls (auto-play, step back, restart, write-on-finish). Behind the `tui`
+/// feature so the default build stays lean.
 fn run_tui(args: &Args) {
     let (Some(prog), Some(file)) = (args.prog_path.as_deref(), args.file.as_deref()) else {
         eprintln!("usage: mime tui PROG.tl --file FILE [--write]");
@@ -149,8 +147,9 @@ fn describe_mcp_markdown() -> String {
     out
 }
 
-/// Should a `run`/`rehearse` go to the daemon? Only when the caller opts in with
-/// `--session` or `$MIME_SESSION`, and `--local` has not forced the embedded path.
+/// Should a `run`/`rehearse` go to the daemon? Only when the caller opts in
+/// with `--session` or `$MIME_SESSION`, and `--local` has not forced the
+/// embedded path.
 fn uses_daemon(args: &Args) -> bool {
     !args.local && (args.session.is_some() || std::env::var("MIME_SESSION").is_ok())
 }
@@ -187,9 +186,9 @@ fn parse(argv: &[String]) -> Args {
                 a.path = argv.get(i).cloned();
             }
             // Any other `--KEY` is a program argument forwarded to the trusted
-            // program: `--KEY VALUE` → (KEY, VALUE) when the next arg is a plain
-            // value; a bare `--KEY` (next is another `--…` or the end) → (KEY,
-            // "t"), so a flag reads back as "t".
+            // program: `--KEY VALUE` → (KEY, VALUE) when the next arg is a
+            // plain value; a bare `--KEY` (next is another `--…` or the end) →
+            // (KEY, "t"), so a flag reads back as "t".
             flag if flag.starts_with("--") => {
                 let key = flag.trim_start_matches('-').to_string();
                 match argv.get(i + 1) {
@@ -258,11 +257,12 @@ fn run_local(args: &Args, verb: &str) {
     // `rehearse` rolls back inside the workspace, so the result is identical to
     // discarding the report; we just never write it back. `run` may persist.
     // Trusted tier: the local `mime` CLI also gets the orchestration group
-    // (multiple buffers, file I/O, args) — see Workspace::new_trusted / Capabilities.
+    // (multiple buffers, file I/O, args) — see Workspace::new_trusted /
+    // Capabilities.
     let mut ws = crate::Workspace::new_trusted(store);
     // Forward the extra CLI args (everything that is not a known mime flag) to
-    // the trusted program, readable via `(arg "KEY")`. This is what parameterizes
-    // a program like add-anno (--date, --anno_path, --infile, …).
+    // the trusted program, readable via `(arg "KEY")`. This is what
+    // parameterizes a program like add-anno (--date, --anno_path, --infile, …).
     ws.set_program_args(args.prog_args.clone());
     let result = if rehearse {
         ws.rehearse(&program)
@@ -275,8 +275,8 @@ fn run_local(args: &Args, verb: &str) {
                 "{}",
                 serde_json::to_string_pretty(&report.to_json()).unwrap()
             );
-            // A rehearsal is a dry-run by definition: never touch the file, even
-            // if `--write` was passed by mistake.
+            // A rehearsal is a dry-run by definition: never touch the file,
+            // even if `--write` was passed by mistake.
             if args.write_back && rehearse {
                 eprintln!("note: --write ignored for a rehearsal (a rehearsal never writes)");
             } else if args.write_back {
@@ -317,11 +317,11 @@ fn run_local(args: &Args, verb: &str) {
     }
 }
 
-/// The interactive REPL (`mime repl [--file FILE]`): a single warm,
-/// in-process [`Workspace`] that survives across lines, so the buffer, the
-/// kill-ring, checkpoints, and any `defun`s persist between expressions. Reads
-/// tulisp from stdin a form at a time and prints, for each, the diff (if the
-/// buffer changed), any `(report ...)`/`(message ...)` output, and the value.
+/// The interactive REPL (`mime repl [--file FILE]`): a single warm, in-process
+/// [`Workspace`] that survives across lines, so the buffer, the kill-ring,
+/// checkpoints, and any `defun`s persist between expressions. Reads tulisp from
+/// stdin a form at a time and prints, for each, the diff (if the buffer
+/// changed), any `(report ...)`/`(message ...)` output, and the value.
 ///
 /// `--file FILE` loads FILE into the session first (via Quire, the production
 /// store); without it the session starts on an empty in-memory buffer. The REPL
@@ -349,7 +349,8 @@ fn run_repl(args: &Args) {
     };
 
     // Trusted tier: the local `mime` CLI also gets the orchestration group
-    // (multiple buffers, file I/O, args) — see Workspace::new_trusted / Capabilities.
+    // (multiple buffers, file I/O, args) — see Workspace::new_trusted /
+    // Capabilities.
     let mut ws = crate::Workspace::new_trusted(store);
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -394,11 +395,12 @@ fn repl_loop<R: BufRead, W: Write>(ws: &mut crate::Workspace, mut input: R, out:
         let blank = line.trim().is_empty();
         pending.push_str(&line);
 
-        // A blank line submits whatever has accumulated (and is the way to force
-        // an incomplete form to run, or to clear a stray one). Otherwise we wait
-        // until the form is balanced.
+        // A blank line submits whatever has accumulated (and is the way to
+        // force an incomplete form to run, or to clear a stray one). Otherwise
+        // we wait until the form is balanced.
         if pending.trim().is_empty() {
-            // Nothing buffered yet — a blank line at the primary prompt is a no-op.
+            // Nothing buffered yet — a blank line at the primary prompt is a
+            // no-op.
             pending.clear();
             prompt(out, true);
             continue;
@@ -415,8 +417,8 @@ fn repl_loop<R: BufRead, W: Write>(ws: &mut crate::Workspace, mut input: R, out:
 
 /// Evaluate one REPL form against `ws` and write the formatted result: the diff
 /// when the buffer changed, each `(message …)` line, each `(report K V)` pair,
-/// and the value (tulisp-printed) after `=>`. A tulisp error prints as
-/// `error: …` and does not abort the loop.
+/// and the value (tulisp-printed) after `=>`. A tulisp error prints as `error:
+/// …` and does not abort the loop.
 fn eval_and_print<W: Write>(ws: &mut crate::Workspace, form: &str, out: &mut W) {
     match ws.run_value(form) {
         Ok((report, value)) => {
@@ -470,14 +472,16 @@ fn form_complete(src: &str) -> bool {
             continue;
         }
         if escaped {
-            // The previous char was a backslash; this one is consumed literally.
+            // The previous char was a backslash; this one is consumed
+            // literally.
             escaped = false;
             continue;
         }
         if char_literal {
             // `?c` — c is a single literal char that moves no paren depth. A
             // `?\(` / `?\n` escape spends one more char: hand the backslash to
-            // the `escaped` branch so the *next* char is the literal, not a paren.
+            // the `escaped` branch so the *next* char is the literal, not a
+            // paren.
             char_literal = false;
             saw_atom = true;
             if c == '\\' {
@@ -522,8 +526,8 @@ fn form_complete(src: &str) -> bool {
     depth == 0 && !in_string && !in_comment && saw_atom
 }
 
-/// The daemon-backed path: build the JSON request for `verb`, send it to
-/// the daemon, and print the response line.
+/// The daemon-backed path: build the JSON request for `verb`, send it to the
+/// daemon, and print the response line.
 fn run_daemon(args: &Args, verb: &str) {
     let req = match verb {
         "status" => serde_json::json!({ "op": "status" }),
@@ -572,12 +576,14 @@ fn run_daemon(args: &Args, verb: &str) {
     };
 
     let response = request(&req);
-    // Pretty-print if the daemon returned JSON (it always does); fall back to raw.
+    // Pretty-print if the daemon returned JSON (it always does); fall back to
+    // raw.
     match serde_json::from_str::<serde_json::Value>(&response) {
         Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
         Err(_) => println!("{response}"),
     }
-    // Exit non-zero when the daemon reported failure, so scripts can branch on it.
+    // Exit non-zero when the daemon reported failure, so scripts can branch on
+    // it.
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&response)
         && v.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
     {
@@ -681,8 +687,8 @@ fn read_or_die(path: &str, what: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Drive `repl_loop` with canned stdin against a fresh workspace seeded with
-    /// `text`, and return everything it wrote to stdout as a String.
+    /// Drive `repl_loop` with canned stdin against a fresh workspace seeded
+    /// with `text`, and return everything it wrote to stdout as a String.
     fn repl(text: &str, stdin: &str) -> String {
         let mut ws = crate::Workspace::new(Box::new(crate::Buffer::from_string("*t*", text)));
         let mut out: Vec<u8> = Vec::new();
@@ -702,8 +708,8 @@ mod tests {
         // docs/mcp-tools.md is a generated projection of the live schemas (see
         // the `docs` Makefile target). Unlike the instructions preamble and the
         // meta() summaries, nothing else guards it — so a schema change that
-        // forgets `make docs` would silently ship a stale catalogue. Fail loudly
-        // instead.
+        // forgets `make docs` would silently ship a stale catalogue. Fail
+        // loudly instead.
         let generated = describe_mcp_markdown();
         let on_disk = include_str!("../docs/mcp-tools.md");
         assert_eq!(
@@ -724,8 +730,9 @@ mod tests {
     #[test]
     fn run_uses_the_daemon_only_when_a_session_opts_in() {
         // run/rehearse default to embedded; --session opts into the daemon;
-        // --local forces embedded even with a session. (These cases don't depend
-        // on $MIME_SESSION: the && / || short-circuit before reading the env.)
+        // --local forces embedded even with a session. (These cases don't
+        // depend on $MIME_SESSION: the && / || short-circuit before reading the
+        // env.)
         let mut a = Args {
             session: Some("s".to_string()),
             ..Args::default()
@@ -771,7 +778,8 @@ mod tests {
 
     #[test]
     fn parse_treats_a_bare_flag_before_another_flag_as_t() {
-        // `--with_badges` followed by another `--KEY` (not a value) is a bare flag.
+        // `--with_badges` followed by another `--KEY` (not a value) is a bare
+        // flag.
         let a = parse(&argv(&["run", "--with_badges", "--date", "May 1"]));
         assert_eq!(
             a.prog_args,

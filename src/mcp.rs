@@ -5,23 +5,24 @@
 //! `eprintln!` for logs so stdout stays a clean protocol channel) and exposes
 //! the editing engine as MCP tools.
 //!
-//! Like the daemon, it embeds the engine directly — it does NOT talk to a running
-//! daemon. It owns a `HashMap<String, Workspace>` of *warm* sessions: each
-//! `Workspace` holds a long-lived `TulispContext` + `Session`, so a buffer,
-//! checkpoints, kill-ring, and agent-defined `defun`s persist across
+//! Like the daemon, it embeds the engine directly — it does NOT talk to a
+//! running daemon. It owns a `HashMap<String, Workspace>` of *warm* sessions:
+//! each `Workspace` holds a long-lived `TulispContext` + `Session`, so a
+//! buffer, checkpoints, kill-ring, and agent-defined `defun`s persist across
 //! `run_program` calls. A `session` argument names one; it defaults to
 //! `"default"` when omitted, so a single-session agent never has to think about
 //! it.
 //!
-//! Threading: a `Workspace` embeds an `Rc`-based `TulispContext` and is `!Send`,
-//! so this server is single-threaded — it reads, dispatches, and replies on one
-//! thread, one request to completion before the next. MCP over stdio is a single
-//! client, so this is the natural model (mirrors the daemon's single-writer loop).
+//! Threading: a `Workspace` embeds an `Rc`-based `TulispContext` and is
+//! `!Send`, so this server is single-threaded — it reads, dispatches, and
+//! replies on one thread, one request to completion before the next. MCP over
+//! stdio is a single client, so this is the natural model (mirrors the daemon's
+//! single-writer loop).
 //!
 //! Most tools are implemented by running a tiny tulisp program through
 //! `Workspace::run` (so there is one editing code path) and reading values back
-//! out of the resulting `RunReport.reports`. The core `run_program` tool returns
-//! the full `RunReport` JSON (diff + reports + point + len).
+//! out of the resulting `RunReport.reports`. The core `run_program` tool
+//! returns the full `RunReport` JSON (diff + reports + point + len).
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -34,10 +35,10 @@ use serde_json::{Value, json};
 const DEFAULT_SESSION: &str = "default";
 
 /// Cap on warm sessions. Each file-backed session pins an open fd and a warm
-/// buffer; agents rarely work more than a handful of files, so past the cap
-/// the least-recently-used CLEAN session is evicted to make room. Sessions
-/// with un-persisted content (file-backed unsaved edits, or any modified
-/// scratch buffer) are never evicted — boundedness must not cost edits.
+/// buffer; agents rarely work more than a handful of files, so past the cap the
+/// least-recently-used CLEAN session is evicted to make room. Sessions with
+/// un-persisted content (file-backed unsaved edits, or any modified scratch
+/// buffer) are never evicted — boundedness must not cost edits.
 const SESSION_CAP: usize = 16;
 
 /// The next recency stamp for [`Workspace::touch`].
@@ -47,8 +48,8 @@ fn next_stamp() -> u64 {
 }
 
 /// Make room before installing a new warm session: evict clean LRU sessions
-/// until under [`SESSION_CAP`]. Best-effort — if everything holds unsaved
-/// work, the map grows past the cap rather than dropping edits.
+/// until under [`SESSION_CAP`]. Best-effort — if everything holds unsaved work,
+/// the map grows past the cap rather than dropping edits.
 fn evict_for_room(sessions: &mut HashMap<String, Workspace>) {
     while sessions.len() >= SESSION_CAP {
         let victim = sessions
@@ -71,8 +72,8 @@ pub fn run() {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
-    // One store; stdio is a single client, so one implicit workspace minted
-    // at startup is where every call without a `workspace` lands. Not behind a
+    // One store; stdio is a single client, so one implicit workspace minted at
+    // startup is where every call without a `workspace` lands. Not behind a
     // lock — the server is single-threaded (a `Workspace` is `!Send`).
     let mut store = crate::rpc::WorkspaceStore::new();
     let default = store.mint();
@@ -115,11 +116,12 @@ pub fn run() {
 
 /// Dispatch `tools/call` and hand back what the tool said — even on failure,
 /// because at the JSON-RPC layer the call itself succeeded; the tool-level
-/// error rides in `is_error` + the text. The caller ([`crate::rpc::tools_call`])
-/// may still amend the result (merging in the workspace handle) before wrapping
-/// it with [`tool_result`], which is why this returns the [`ToolOutput`] rather
-/// than the envelope. `workspace` is the handle this call resolved to, or
-/// `None` for a tool that touches no warm state.
+/// error rides in `is_error` + the text. The caller
+/// ([`crate::rpc::tools_call`]) may still amend the result (merging in the
+/// workspace handle) before wrapping it with [`tool_result`], which is why this
+/// returns the [`ToolOutput`] rather than the envelope. `workspace` is the
+/// handle this call resolved to, or `None` for a tool that touches no warm
+/// state.
 pub(crate) fn tools_call_result(
     params: &Value,
     sessions: &mut Sessions,
@@ -143,7 +145,8 @@ pub(crate) fn tools_call_result(
     }
 
     // The tools that also answer as JSON say so through their `Render`; the
-    // rest answer in prose and are lifted into a `ToolOutput` by `From<String>`.
+    // rest answer in prose and are lifted into a `ToolOutput` by
+    // `From<String>`.
     let outcome: Result<ToolOutput, String> = match name {
         "run_program" => tool_run_program(&args, sessions, false),
         "rehearse" => tool_run_program(&args, sessions, true),
@@ -177,9 +180,9 @@ pub(crate) fn tools_call_result(
 }
 
 /// Common alias → canonical argument spellings, accepted per tool. Only
-/// unambiguous aliases are absorbed; anything else still errors. The
-/// vocabulary stays consistent: pattern/replacement for text, pos for
-/// positions, topic for briefs.
+/// unambiguous aliases are absorbed; anything else still errors. The vocabulary
+/// stays consistent: pattern/replacement for text, pos for positions, topic for
+/// briefs.
 fn alias_table(tool: &str) -> &'static [(&'static str, &'static str)] {
     match tool {
         "occur" | "grep" => &[("regexp", "pattern"), ("regex", "pattern")],
@@ -262,11 +265,11 @@ fn normalize_aliases(tool: &str, args: &mut Value) -> Result<(), String> {
 }
 
 /// insert_text sugar: `before: "line"` / `after: "line"` — at top level or
-/// inside `anchor` — are shorthand for the canonical
-/// `anchor: {"pattern": "line", "where": "before"|"after"}`. That is the
-/// spelling first-time callers reach for, so absorb it before validation.
-/// Combining the shorthand with the keys it expands to (or both sides at
-/// once) is ambiguous — an error naming the conflict, never a silent pick.
+/// inside `anchor` — are shorthand for the canonical `anchor: {"pattern":
+/// "line", "where": "before"|"after"}`. That is the spelling first-time callers
+/// reach for, so absorb it before validation.  Combining the shorthand with the
+/// keys it expands to (or both sides at once) is ambiguous — an error naming
+/// the conflict, never a silent pick.
 fn normalize_insert_sugar(args: &mut Value) -> Result<(), String> {
     let Some(obj) = args.as_object_mut() else {
         return Ok(());
@@ -349,8 +352,8 @@ pub(crate) fn validate_args(name: &str, args: &Value) -> Result<(), String> {
             valid.join(", ")
         ));
     }
-    // Then descend: nested objects (plan steps, message_edits, edits, scope,
-    // …) are validated against the same schema, so a typo'd nested key can't
+    // Then descend: nested objects (plan steps, message_edits, edits, scope, …)
+    // are validated against the same schema, so a typo'd nested key can't
     // silently change meaning (message_edits [{find, replcae}] would DELETE —
     // an absent `replace` means delete — instead of replacing).
     for (k, v) in obj {
@@ -362,10 +365,9 @@ pub(crate) fn validate_args(name: &str, args: &Value) -> Result<(), String> {
 }
 
 /// Recursively reject unknown keys in nested objects/arrays, driven by the
-/// schema's `properties`/`items`. A schema level that declares no
-/// `properties` leaves its objects unconstrained (nothing to validate
-/// against); `path` names where the offender sits (e.g.
-/// `plan[0].message_edits[1]`).
+/// schema's `properties`/`items`. A schema level that declares no `properties`
+/// leaves its objects unconstrained (nothing to validate against); `path` names
+/// where the offender sits (e.g.  `plan[0].message_edits[1]`).
 fn validate_nested(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
     if let (Some(props), Some(obj)) = (schema["properties"].as_object(), value.as_object()) {
         for (k, v) in obj {
@@ -401,8 +403,8 @@ pub(crate) enum Render {
     Pretty,
 }
 
-/// What a tool hands back: readable text, optionally the same information
-/// as JSON for `structuredContent`, how the two relate, and whether it is a
+/// What a tool hands back: readable text, optionally the same information as
+/// JSON for `structuredContent`, how the two relate, and whether it is a
 /// tool-level failure.
 pub(crate) struct ToolOutput {
     pub text: String,
@@ -538,8 +540,8 @@ fn bool_arg(args: &Value, key: &str) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
-/// `bool_arg`, but strict: a non-boolean value is an error, for a flag
-/// that read as false would change what the call does.
+/// `bool_arg`, but strict: a non-boolean value is an error, for a flag that
+/// read as false would change what the call does.
 fn strict_bool_arg(args: &Value, key: &str) -> Result<bool, String> {
     match args.get(key) {
         None => Ok(false),
@@ -598,10 +600,10 @@ fn resolve_session(
     }
 }
 
-/// Save the session's buffer back to its VISITED file — the `save: true`
-/// half of one-call editing. `Workspace::save_to` supplies the atomic write,
-/// the stale-read guard, and the rebase. Errors for a buffer with no visited
-/// file (e.g. `open_text`): those need `save_buffer` with an explicit path.
+/// Save the session's buffer back to its VISITED file — the `save: true` half
+/// of one-call editing. `Workspace::save_to` supplies the atomic write, the
+/// stale-read guard, and the rebase. Errors for a buffer with no visited file
+/// (e.g. `open_text`): those need `save_buffer` with an explicit path.
 fn save_visited(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
@@ -615,8 +617,8 @@ fn save_visited(
             "save: the buffer has no visited file — use save_buffer with a path".to_string(),
         );
     };
-    // A refused save (e.g. the stale-read guard) must not strand the edit:
-    // the error names the warm session that still holds it.
+    // A refused save (e.g. the stale-read guard) must not strand the edit: the
+    // error names the warm session that still holds it.
     let bytes = ws.save_to(&path).map_err(|e| {
         format!(
             "save failed: {e} — the edit is preserved in warm session \
@@ -636,8 +638,8 @@ fn save_visited(
 /// non-empty warning when the buffer no longer parses. Warns, never blocks.
 fn parse_warning(sessions: &mut HashMap<String, Workspace>, session: &str) -> &'static str {
     // Markdown and HTML are forgiving grammars (almost nothing errors);
-    // everything else is strict enough that a parse error after a save
-    // very likely means the edit broke the file.
+    // everything else is strict enough that a parse error after a save very
+    // likely means the edit broke the file.
     let program = "(if (member (treesit-language)\
                                '(\"rust\" \"python\" \"javascript\" \"typescript\"\
                                  \"tsx\" \"go\" \"css\" \"toml\" \"yaml\"\
@@ -668,8 +670,8 @@ fn make_workspace(store: Box<dyn TextStore>, read_only: bool) -> Workspace {
 
 /// Run a program against an existing session and return the resulting
 /// `RunReport`; an engine error becomes `Err(message)`. The internal tools that
-/// build on this (read_region, view, …) only read, so they always
-/// `run`; see [`run_or_rehearse`] for the user-facing rehearse path.
+/// build on this (read_region, view, …) only read, so they always `run`; see
+/// [`run_or_rehearse`] for the user-facing rehearse path.
 fn run_in_session(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
@@ -679,8 +681,8 @@ fn run_in_session(
 }
 
 /// [`run_in_session`] for a program whose positions were computed against
-/// buffer version `expect_version` (a `thing` edit): after the auto-revert
-/// the run takes, a moved version means those positions describe nothing.
+/// buffer version `expect_version` (a `thing` edit): after the auto-revert the
+/// run takes, a moved version means those positions describe nothing.
 fn run_in_session_expecting(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
@@ -706,13 +708,14 @@ fn run_or_rehearse(
     }
     let ws = sessions.get_mut(session).expect("checked above");
     ws.touch(next_stamp());
-    // Emacs auto-revert-mode: before serving a read or running a program, if the
-    // visited file drifted and the warm buffer has NO unsaved edits, silently
-    // re-read it so the operation sees the current file rather than stale-or-
-    // corrupt bytes. A modified buffer is left alone (the stale-WARN conflict).
-    // This runs BEFORE a rehearse takes its rollback snapshot too: the revert
-    // discards nothing (the buffer is clean), and without it the preview would
-    // run against bytes the committing run — which does revert — won't use.
+    // Emacs auto-revert-mode: before serving a read or running a program, if
+    // the visited file drifted and the warm buffer has NO unsaved edits,
+    // silently re-read it so the operation sees the current file rather than
+    // stale-or- corrupt bytes. A modified buffer is left alone (the stale-WARN
+    // conflict).  This runs BEFORE a rehearse takes its rollback snapshot too:
+    // the revert discards nothing (the buffer is clean), and without it the
+    // preview would run against bytes the committing run — which does revert —
+    // won't use.
     ws.auto_revert_if_clean();
     if expect_version.is_some_and(|v| ws.version() != v) {
         return Err("the buffer changed since its positions were resolved; retry".to_string());
@@ -720,8 +723,8 @@ fn run_or_rehearse(
     if !rehearse {
         // Auto-capture the pre-program state (version-deduped, bounded) so
         // undo_last can rewind a misfired edit without prior checkpoint
-        // discipline. After the auto-revert, so undo never resurrects bytes
-        // an external writer already replaced.
+        // discipline. After the auto-revert, so undo never resurrects bytes an
+        // external writer already replaced.
         ws.push_undo();
     }
     if rehearse {
@@ -733,8 +736,8 @@ fn run_or_rehearse(
 
 /// Resolve a tool's target to an EXISTING warm session — the lookup half of
 /// [`resolve_session`] without its auto-open (closing a file that isn't warm
-/// must not first open it). `path` matches the canonical-path key or a
-/// session visiting the file; a bare `session` id is taken as-is.
+/// must not first open it). `path` matches the canonical-path key or a session
+/// visiting the file; a bare `session` id is taken as-is.
 fn resolve_existing_session(
     args: &Value,
     sessions: &HashMap<String, Workspace>,
@@ -778,9 +781,9 @@ fn session_of_path(p: &str, sessions: &HashMap<String, Workspace>) -> Result<Str
 /// warm sessions, releasing their buffers (and the open fd a file-backed one
 /// holds). Targets may mix the singular and plural forms; `all: true` takes
 /// every warm session instead. All-or-nothing: every target is resolved and
-/// checked before any is dropped. A target that is not warm closes nothing
-/// (the error names the first miss); unsaved targets close nothing unless
-/// `force: true` discards their edits (the error names all of them).
+/// checked before any is dropped. A target that is not warm closes nothing (the
+/// error names the first miss); unsaved targets close nothing unless `force:
+/// true` discards their edits (the error names all of them).
 fn tool_close_session(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
@@ -803,8 +806,8 @@ fn tool_close_session(
     } else {
         let mut v = Vec::new();
         // The singular form (and its "default" fallback) applies only when no
-        // plural form is given — `{paths: [...]}` must not also close
-        // "default" on the side, even when the list is empty.
+        // plural form is given — `{paths: [...]}` must not also close "default"
+        // on the side, even when the list is empty.
         if singular || !plural {
             v.push(resolve_existing_session(args, sessions)?);
         }
@@ -906,9 +909,9 @@ fn tool_open_file(
     let path = str_arg(args, "path")?;
     let read_only = bool_arg(args, "read_only");
     let checked = crate::safety::check_path(Path::new(&path))?;
-    // `create` is find-file's "visit a file that does not exist yet": an
-    // empty buffer bound to the path, written out by the first save. An
-    // existing file opens normally under it.
+    // `create` is find-file's "visit a file that does not exist yet": an empty
+    // buffer bound to the path, written out by the first save. An existing file
+    // opens normally under it.
     let created = bool_arg(args, "create") && !checked.exists();
     let quire = if created {
         Quire::new_file(&checked)
@@ -972,8 +975,8 @@ fn tool_open_text(
 /// `run_program {program, session?}` — the core tool. Evaluate a tulisp edit
 /// program against the warm session and return the full `RunReport` JSON.
 ///
-/// With `rehearse = true` (the `rehearse` tool) the program is dry-run: the same
-/// `RunReport` comes back (diff/reports/len of the hypothetical edit, with
+/// With `rehearse = true` (the `rehearse` tool) the program is dry-run: the
+/// same `RunReport` comes back (diff/reports/len of the hypothetical edit, with
 /// `rehearsed: true`), but the buffer — and the kill-ring/checkpoints — are
 /// rolled back, so nothing persists. The two share one body since they differ
 /// only in whether the effects stick.
@@ -995,9 +998,9 @@ fn tool_run_program(
         None,
     ) {
         Ok(rv) => rv,
-        // A failed program still said things before it died: the error
-        // content is the failure JSON carrying its reports/log, not just the
-        // bare error string.
+        // A failed program still said things before it died: the error content
+        // is the failure JSON carrying its reports/log, not just the bare error
+        // string.
         Err(e) => {
             let (reports, log, dirty, rolled_back) = sessions
                 .get(&session)
@@ -1005,8 +1008,8 @@ fn tool_run_program(
                 .unwrap_or_default();
             let mut json = crate::result::failure_json(&e, &reports, &log, dirty);
             // The transactional rollback lives in the ENGINE
-            // (Workspace::run_value_with), shared by every front-end; here
-            // the outcome just rides into the error text.
+            // (Workspace::run_value_with), shared by every front-end; here the
+            // outcome just rides into the error text.
             if !rehearse {
                 if rolled_back {
                     json["rolled_back"] = Value::Bool(true);
@@ -1057,8 +1060,9 @@ fn tool_run_program(
         let note = save_visited(sessions, &session)?;
         json["saved"] = Value::String(note.trim_start_matches("; ").to_string());
     }
-    // Structured, present only when true (like `stale`): the edit is in the warm
-    // buffer, not on disk — saving was not requested and the buffer is dirty.
+    // Structured, present only when true (like `stale`): the edit is in the
+    // warm buffer, not on disk — saving was not requested and the buffer is
+    // dirty.
     if is_unsaved(sessions, &session) {
         json["unsaved"] = Value::Bool(true);
     }
@@ -1072,8 +1076,8 @@ fn tool_run_program(
 /// One warning line appended to read-tool output when the visited file has
 /// drifted under the warm buffer. The stale guard protects saves; READS were
 /// silent — and a warm mmap-backed buffer can serve outright corrupted bytes
-/// after an external IN-PLACE overwrite (rename-based writers are safe), so
-/// a stale read must not pass as clean.
+/// after an external IN-PLACE overwrite (rename-based writers are safe), so a
+/// stale read must not pass as clean.
 fn stale_note(sessions: &HashMap<String, Workspace>, session: &str) -> &'static str {
     if sessions.get(session).is_some_and(|ws| ws.is_stale()) {
         "\nWARNING: the visited file changed on disk after it was opened — \
@@ -1116,8 +1120,8 @@ fn clobbers_unsaved_session<'a>(
         .map(|(id, _)| id.as_str())
 }
 
-/// A reminder appended to an edit tool's message when the edit lives only in the
-/// warm buffer, not on disk — so a forgotten `save` reads as a visible note
+/// A reminder appended to an edit tool's message when the edit lives only in
+/// the warm buffer, not on disk — so a forgotten `save` reads as a visible note
 /// instead of a silent loss. Empty when there's nothing to save.
 fn unsaved_note(sessions: &HashMap<String, Workspace>, session: &str) -> &'static str {
     if is_unsaved(sessions, session) {
@@ -1129,9 +1133,9 @@ fn unsaved_note(sessions: &HashMap<String, Workspace>, session: &str) -> &'stati
 
 /// The stale warning for the EDIT tools and their errors — the counterpart of
 /// [`stale_note`] on the read side. A stale buffer at edit time necessarily
-/// holds unsaved edits (a clean drifted buffer auto-reverts before the
-/// program runs), so the wording names the actual situation: the edit ran
-/// against the warm buffer, not the file now on disk. Empty when not stale.
+/// holds unsaved edits (a clean drifted buffer auto-reverts before the program
+/// runs), so the wording names the actual situation: the edit ran against the
+/// warm buffer, not the file now on disk. Empty when not stale.
 fn stale_edit_note(sessions: &HashMap<String, Workspace>, session: &str) -> &'static str {
     if sessions.get(session).is_some_and(|ws| ws.is_stale()) {
         "\nNOTE: the visited file changed on disk after it was opened and this \
@@ -1146,9 +1150,9 @@ fn stale_edit_note(sessions: &HashMap<String, Workspace>, session: &str) -> &'st
 /// Evaluate `(message EXPR)` in the session and hand back the logged string
 /// verbatim. `message` stores its argument *raw* in the log, so rendered text
 /// comes back without tulisp's string re-quoting (`report` would print
-/// \"hello\" rather than hello). The read-only convenience tools —
-/// read_region, view, occur, conflicts — all ride this channel, so the stale
-/// warning lands on each of them here.
+/// \"hello\" rather than hello). The read-only convenience tools — read_region,
+/// view, occur, conflicts — all ride this channel, so the stale warning lands
+/// on each of them here.
 fn run_message(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
@@ -1179,8 +1183,8 @@ fn tool_read_region(
 ) -> Result<String, String> {
     let session = resolve_session(args, sessions)?;
     // The structural form: `thing: {kind, at | after | before, up?}` — the
-    // region named by syntax rather than by counted positions. It resolves to
-    // a span here, and the echoed `KIND @START-END (lines A-B)` header makes a
+    // region named by syntax rather than by counted positions. It resolves to a
+    // span here, and the echoed `KIND @START-END (lines A-B)` header makes a
     // wrong pick visible without a second call.
     if let Some(spec) = thing_spec(args, "read_region")? {
         reject_with_thing(args, "read_region", &["start", "end", "lines"])?;
@@ -1201,8 +1205,8 @@ fn tool_read_region(
         ));
     }
     // The line-based form: `lines: [a, b]` (1-based inclusive, narrowing-
-    // relative like goto-line) — the natural shape for "read around this
-    // line"; start/end stay the char-position form conflicts output feeds.
+    // relative like goto-line) — the natural shape for "read around this line";
+    // start/end stay the char-position form conflicts output feeds.
     if args.get("lines").is_some() && (args.get("start").is_some() || args.get("end").is_some()) {
         return Err("read_region: pass start/end (char positions) OR lines, not both".into());
     }
@@ -1228,17 +1232,17 @@ fn tool_read_region(
     )
 }
 
-/// `view {session?, lines?, pos?}` — a rendered viewport: `lines` rows of context
-/// on each side of the cursor (or of `pos`), with a gutter, the current line
-/// marked, and a header (buffer name, line/col, point/size). The agent's "look at
-/// the screen". Backed by the `window` builtin; like `read_region`, it only reads.
+/// `view {session?, lines?, pos?}` — a rendered viewport: `lines` rows of
+/// context on each side of the cursor (or of `pos`), with a gutter, the current
+/// line marked, and a header (buffer name, line/col, point/size). The agent's
+/// "look at the screen". Backed by the `window` builtin; like `read_region`, it
+/// only reads.
 fn tool_view(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result<String, String> {
     let session = resolve_session(args, sessions)?;
-    // Both args are optional and map straight onto `(window LINES POS)`; we build
-    // the call positionally, dropping trailing args so `window`'s own defaults
-    // (4 lines, current point) apply when they're omitted.
-    // A wrong SHAPE must fail loudly, not silently fall back to the default
-    // viewport.
+    // Both args are optional and map straight onto `(window LINES POS)`; we
+    // build the call positionally, dropping trailing args so `window`'s own
+    // defaults (4 lines, current point) apply when they're omitted.  A wrong
+    // SHAPE must fail loudly, not silently fall back to the default viewport.
     let lines = match args.get("lines") {
         None => None,
         Some(v) => Some(v.as_i64().ok_or_else(|| {
@@ -1259,9 +1263,9 @@ fn tool_view(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result<
         (None, Some(p)) => format!("(window 4 {p})"),
         (None, None) => "(window)".to_string(),
     };
-    // A view of a buffer with unsaved edits says so — an agent alternating
-    // mime reads with shell reads (disk) must see which state it is looking
-    // at, at the moment of looking.
+    // A view of a buffer with unsaved edits says so — an agent alternating mime
+    // reads with shell reads (disk) must see which state it is looking at, at
+    // the moment of looking.
     let text = run_message(sessions, &session, &call, "view")?;
     Ok(format!("{text}{}", unsaved_view_note(sessions, &session)))
 }
@@ -1277,9 +1281,9 @@ fn unsaved_view_note(sessions: &HashMap<String, Workspace>, session: &str) -> &'
     }
 }
 
-/// `unsaved_diff {path?|session?}` — the unified diff between a warm buffer
-/// and its visited file on disk: "what exactly have I not saved". Read-only;
-/// never auto-opens (a fresh buffer trivially matches disk).
+/// `unsaved_diff {path?|session?}` — the unified diff between a warm buffer and
+/// its visited file on disk: "what exactly have I not saved". Read-only; never
+/// auto-opens (a fresh buffer trivially matches disk).
 fn tool_unsaved_diff(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
@@ -1318,11 +1322,11 @@ fn tool_unsaved_diff(
 }
 
 /// `insert_text {session?, text, pos?}` — insert literal `text` at point (or at
-/// `pos`). The text arrives as a raw JSON string and is escaped for tulisp *on the
-/// server*, so the agent never hand-escapes a program — the fix for the "big
-/// literal blocks" friction (no JSON-over-Lisp double escaping). Newlines and tabs
-/// become `\n`/`\t` so the generated `(insert "…")` stays a single, unambiguous
-/// line. Edits the warm buffer; call `save_buffer` to persist.
+/// `pos`). The text arrives as a raw JSON string and is escaped for tulisp *on
+/// the server*, so the agent never hand-escapes a program — the fix for the
+/// "big literal blocks" friction (no JSON-over-Lisp double escaping). Newlines
+/// and tabs become `\n`/`\t` so the generated `(insert "…")` stays a single,
+/// unambiguous line. Edits the warm buffer; call `save_buffer` to persist.
 fn tool_insert_text(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
@@ -1335,8 +1339,8 @@ fn tool_insert_text(
         return Err("pass either \"pos\" or \"anchor\", not both".to_string());
     }
     // The structural form: `thing` names a span, and top-level `where` picks
-    // which end of it to insert at. The result echoes the span so a wrong
-    // pick is visible without a follow-up read.
+    // which end of it to insert at. The result echoes the span so a wrong pick
+    // is visible without a follow-up read.
     let thing = thing_spec(args, "insert_text")?;
     // Typed explicitly: `validate_args` checks key names, not value types, so a
     // non-string `where` (a number, a bool) would fall through a `as_str()` to
@@ -1372,8 +1376,8 @@ fn tool_insert_text(
         }
         None => None,
     };
-    // `pos` is a char position, or the "eob"/"bob" sentinels — appending at
-    // the end of the file needs no anchor and no position arithmetic.
+    // `pos` is a char position, or the "eob"/"bob" sentinels — appending at the
+    // end of the file needs no anchor and no position arithmetic.
     let pos_form = match thing_pos {
         Some(p) => Some(p.to_string()),
         None => match args.get("pos") {
@@ -1440,12 +1444,11 @@ fn tool_insert_text(
 
 /// `fill_text {path|session, pos? | anchor? | lines? | all?, column?, prefix?,
 /// save?, diff?, view?}` — the one-call form of `fill-paragraph` /
-/// `fill-region`: reflow the comment run, docstring or Markdown paragraph
-/// at a position (point, `pos`, or the unique line an `anchor` pattern
-/// names) or every one a line range or the whole buffer touches, to
-/// `column` (default `fill-column`, 80). Code is never reflowed: a
-/// position in code is an error naming the node. `prefix` sets
-/// `fill-prefix` for the call.
+/// `fill-region`: reflow the comment run, docstring or Markdown paragraph at a
+/// position (point, `pos`, or the unique line an `anchor` pattern names) or
+/// every one a line range or the whole buffer touches, to `column` (default
+/// `fill-column`, 80). Code is never reflowed: a position in code is an error
+/// naming the node. `prefix` sets `fill-prefix` for the call.
 fn tool_fill_text(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
@@ -1554,8 +1557,8 @@ enum FillTarget {
     Point,
     /// The unit at a char position.
     Pos(i64),
-    /// The unit holding the unique line a pattern names: the pattern, and
-    /// the program that finds the line.
+    /// The unit holding the unique line a pattern names: the pattern, and the
+    /// program that finds the line.
     Anchor(String, String),
     /// Every unit a 1-based inclusive line range touches.
     Lines(i64, i64),
@@ -1575,8 +1578,8 @@ impl FillTarget {
     }
 }
 
-/// The one target `fill_text`'s arguments name; two at once is an error,
-/// not a guess.
+/// The one target `fill_text`'s arguments name; two at once is an error, not a
+/// guess.
 fn fill_target(args: &Value) -> Result<FillTarget, String> {
     let mut given = Vec::new();
     let mut target = FillTarget::Point;
@@ -1613,8 +1616,8 @@ fn fill_target(args: &Value) -> Result<FillTarget, String> {
     Ok(target)
 }
 
-/// `(fill-paragraph)` with its `(KIND START END)` result and the unit's
-/// line numbers reported, for the tool's summary line.
+/// `(fill-paragraph)` with its `(KIND START END)` result and the unit's line
+/// numbers reported, for the tool's summary line.
 const FILL_PARAGRAPH_FORM: &str = "(let* ((u (fill-paragraph)) (a (car (cdr u))) (b (car (cdr (cdr u))))) \
        (report \"kind\" (car u)) (report \"start\" a) (report \"end\" b) \
        (report \"la\" (line-number-at-pos a)) \
@@ -1647,11 +1650,10 @@ fn line_range_arg(args: &Value, tool: &str) -> Result<Option<(i64, i64)>, String
     Ok(Some((a, b)))
 }
 
-/// The error for an anchor abort from [`unique_line_program`] — `e`
-/// naming `__no_anchor__` or `__ambiguous_anchor__` — on the pattern
-/// `pat`, with `not_done` saying what the tool therefore left undone.
-/// Any other error, and every error of a call without an anchor, comes
-/// back as it is.
+/// The error for an anchor abort from [`unique_line_program`] — `e` naming
+/// `__no_anchor__` or `__ambiguous_anchor__` — on the pattern `pat`, with
+/// `not_done` saying what the tool therefore left undone.  Any other error, and
+/// every error of a call without an anchor, comes back as it is.
 fn anchor_abort(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
@@ -1683,12 +1685,11 @@ fn anchor_abort(
 /// `replace_text {session?, pattern, replacement, all?}` — replace the first
 /// occurrence of literal `pattern` (searching from the top of the accessible
 /// region) with literal `replacement`; `all: true` replaces every occurrence.
-/// `insert_text`'s counterpart: both strings arrive as raw JSON and are
-/// escaped on the server, and the replacement is spliced via
-/// delete-region + insert — never `replace-match` — so backslashes and `\1`
-/// in the replacement stay literal. Errors when nothing matches (the agent's
-/// signal that its anchor text is wrong). Edits the warm buffer; `save_buffer`
-/// persists.
+/// `insert_text`'s counterpart: both strings arrive as raw JSON and are escaped
+/// on the server, and the replacement is spliced via delete-region + insert —
+/// never `replace-match` — so backslashes and `\1` in the replacement stay
+/// literal. Errors when nothing matches (the agent's signal that its anchor
+/// text is wrong). Edits the warm buffer; `save_buffer` persists.
 fn tool_replace_text(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
@@ -1726,19 +1727,19 @@ fn tool_replace_text(
     let all_flag = if all { "t" } else { "nil" };
     // search → delete → insert per hit, tracking the line of the last
     // replacement so the result can say WHERE it landed; `more` counts the
-    // matches left after the last replacement so a single replace can say
-    // "N more remain". The continue-guard runs BEFORE the search so a
-    // finished single replace does not move point past (and so under-count)
-    // the next match. A miss restores point — a failed replace is a no-op,
-    // not a stealth (goto-char (point-min)).
+    // matches left after the last replacement so a single replace can say "N
+    // more remain". The continue-guard runs BEFORE the search so a finished
+    // single replace does not move point past (and so under-count) the next
+    // match. A miss restores point — a failed replace is a no-op, not a stealth
+    // (goto-char (point-min)).
     //
     // expect_unique wraps the same loop in a transaction and errors (rolling
     // the replacement back) if the pattern still matches afterwards — a
     // repeated anchor means the FIRST hit may not be the intended one, so
     // ambiguity is an error, not a silent edit.
     let program = if unique && regex {
-        // Same transaction + ambiguity post-check as the literal form, with
-        // the regex search/replace pair (replace-match expands \\1 backrefs).
+        // Same transaction + ambiguity post-check as the literal form, with the
+        // regex search/replace pair (replace-match expands \\1 backrefs).
         format!(
             "(with-transaction (let ((n 0) (line 0))\
                (goto-char (point-min))\
@@ -1882,8 +1883,8 @@ fn tool_replace_text(
     })
 }
 
-/// The `thing` selector: `{kind, at | after | before, up?}` names a region
-/// by structure. Parsed once here, resolved by [`resolve_thing`].
+/// The `thing` selector: `{kind, at | after | before, up?}` names a region by
+/// structure. Parsed once here, resolved by [`resolve_thing`].
 struct ThingSpec {
     kind: String,
     at: ThingAt,
@@ -1895,8 +1896,8 @@ enum ThingAt {
     Pos(usize),
     /// The thing the unique line containing the text names: for `list`, the
     /// last one beginning on that line (the block the line opens), else the
-    /// first one beginning after it; for every other kind, the first one at
-    /// or after the line.
+    /// first one beginning after it; for every other kind, the first one at or
+    /// after the line.
     After(String),
     /// The last thing ending before the unique line containing the text.
     Before(String),
@@ -1981,8 +1982,8 @@ fn line_text(
 }
 
 /// The `thing` selector property shared by read_region, insert_text and
-/// replace_text. `lead` says what the tool does with the span; `tail`
-/// continues the last sentence and names the keys the selector excludes.
+/// replace_text. `lead` says what the tool does with the span; `tail` continues
+/// the last sentence and names the keys the selector excludes.
 fn thing_schema(lead: &str, tail: &str) -> Value {
     let kinds = crate::builtins::THING_KINDS;
     let description = format!(
@@ -2012,8 +2013,8 @@ fn reject_with_thing(args: &Value, tool: &str, keys: &[&str]) -> Result<(), Stri
     Ok(())
 }
 
-/// The start and end positions of the unique line containing `pat`, with
-/// the same errors as insert_text's anchor.
+/// The start and end positions of the unique line containing `pat`, with the
+/// same errors as insert_text's anchor.
 fn anchor_line(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
@@ -2062,10 +2063,10 @@ fn with_session_of<R>(
 }
 
 /// The span a `thing` selector names, or why it names none, plus the buffer
-/// version it was resolved against. Each step of the resolve, and the
-/// program run after it, auto-reverts a clean buffer whose file drifted, so
-/// the version is taken first and the program runs through
-/// [`run_in_session_expecting`] with it: any drift in between refuses.
+/// version it was resolved against. Each step of the resolve, and the program
+/// run after it, auto-reverts a clean buffer whose file drifted, so the version
+/// is taken first and the program runs through [`run_in_session_expecting`]
+/// with it: any drift in between refuses.
 fn resolve_thing(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
@@ -2107,9 +2108,9 @@ fn resolve_thing(
     Ok((a, b, version))
 }
 
-/// `replace_text {thing, replacement}` — splice `replacement` over the span
-/// the selector names. One transaction, so a failed insert leaves the
-/// buffer as it was.
+/// `replace_text {thing, replacement}` — splice `replacement` over the span the
+/// selector names. One transaction, so a failed insert leaves the buffer as it
+/// was.
 fn replace_thing(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
@@ -2143,13 +2144,13 @@ fn replace_thing(
     ))
 }
 
-/// Parse `anchor: {defun: NAME | pattern: TEXT, where?: "after"|"before"}`
-/// into the motion prelude for insert_text. The defun form is "add this block
-/// right after function X"; the pattern form anchors on the unique LINE
-/// containing a literal text ("insert after the line matching X"). `after`
-/// (the default) lands at the end of the defun or the matched line; `before`
-/// above the whole decorated item, or at the matched line's start. An
-/// ambiguous pattern is an error, never a silent first match.
+/// Parse `anchor: {defun: NAME | pattern: TEXT, where?: "after"|"before"}` into
+/// the motion prelude for insert_text. The defun form is "add this block right
+/// after function X"; the pattern form anchors on the unique LINE containing a
+/// literal text ("insert after the line matching X"). `after` (the default)
+/// lands at the end of the defun or the matched line; `before` above the whole
+/// decorated item, or at the matched line's start. An ambiguous pattern is an
+/// error, never a silent first match.
 fn anchor_prelude(args: &Value) -> Result<Option<(String, String)>, String> {
     let Some(anchor) = args.get("anchor") else {
         return Ok(None);
@@ -2193,8 +2194,8 @@ fn anchor_prelude(args: &Value) -> Result<Option<(String, String)>, String> {
     }
 }
 
-/// The `{pattern}` anchor: the literal line text, checked non-empty, and
-/// the program that finds its unique line and runs `motion` there.
+/// The `{pattern}` anchor: the literal line text, checked non-empty, and the
+/// program that finds its unique line and runs `motion` there.
 fn pattern_anchor(pattern: &str, motion: &str) -> Result<(String, String), String> {
     if pattern.is_empty() {
         return Err("anchor: pattern must not be empty".to_string());
@@ -2219,10 +2220,9 @@ fn unique_line_program(lp: &str, then: &str) -> String {
     )
 }
 
-/// Parse `scope: {defun: NAME}` into a prelude that narrows to that defun
-/// (the caller wraps it in `save-restriction` so the narrowing is scoped to
-/// the one call). `None` when no scope was given; only the defun form exists
-/// today.
+/// Parse `scope: {defun: NAME}` into a prelude that narrows to that defun (the
+/// caller wraps it in `save-restriction` so the narrowing is scoped to the one
+/// call). `None` when no scope was given; only the defun form exists today.
 fn scope_prelude(args: &Value) -> Result<Option<(String, String)>, String> {
     let Some(scope) = args.get("scope") else {
         return Ok(None);
@@ -2240,9 +2240,9 @@ fn scope_prelude(args: &Value) -> Result<Option<(String, String)>, String> {
     )))
 }
 
-/// The error an `__no_defun__` abort becomes: names the missing defun and
-/// lists what the outline actually has, so the next call needs no detour
-/// through a separate orientation step.
+/// The error an `__no_defun__` abort becomes: names the missing defun and lists
+/// what the outline actually has, so the next call needs no detour through a
+/// separate orientation step.
 fn no_defun_error(sessions: &mut HashMap<String, Workspace>, session: &str, name: &str) -> String {
     let names: Vec<String> = run_in_session(sessions, session, "(treesit-list-defuns)")
         .map(|r| {
@@ -2273,9 +2273,9 @@ fn no_defun_error(sessions: &mut HashMap<String, Workspace>, session: &str, name
 }
 
 /// `mode: "exact" | "regex"` — the search dialect switch replace_text shares
-/// with occur/grep. Exact (the default) is a literal search; regex is the
-/// Emacs dialect, with `\\1`..`\\9`/`\\&` backrefs expanding in the
-/// replacement. `what` names the tool (or batch edit) in the error.
+/// with occur/grep. Exact (the default) is a literal search; regex is the Emacs
+/// dialect, with `\\1`..`\\9`/`\\&` backrefs expanding in the replacement.
+/// `what` names the tool (or batch edit) in the error.
 fn regex_mode(args: &Value, what: &str) -> Result<bool, String> {
     match args.get("mode").and_then(Value::as_str) {
         None | Some("exact") => Ok(false),
@@ -2360,8 +2360,8 @@ fn replace_text_batch(
     ))
 }
 
-/// Copy `items`, filling in a top-level `mode` (exact|regex) as the default
-/// for entries that don't set their own.
+/// Copy `items`, filling in a top-level `mode` (exact|regex) as the default for
+/// entries that don't set their own.
 fn with_default_mode(args: &Value, items: &[Value]) -> Vec<Value> {
     let default = args.get("mode").cloned();
     items
@@ -2379,10 +2379,10 @@ fn with_default_mode(args: &Value, items: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Build + run the transactional edit batch against ONE session and return
-/// the total replacement count — the core shared by the single-session
-/// `edits` form and the multi-file form. All-or-nothing per session: a miss
-/// or failed uniqueness check rolls the whole transaction back.
+/// Build + run the transactional edit batch against ONE session and return the
+/// total replacement count — the core shared by the single-session `edits` form
+/// and the multi-file form. All-or-nothing per session: a miss or failed
+/// uniqueness check rolls the whole transaction back.
 fn run_batch_edits(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
@@ -2423,8 +2423,8 @@ fn run_batch_edits(
         let all_flag = if all { "t" } else { "nil" };
         // The uniqueness post-check searches on from point (just past the
         // replacement), so a later genuine occurrence aborts the whole
-        // transaction — evaluated against the buffer as the previous edits
-        // left it, like everything else in the batch.
+        // transaction — evaluated against the buffer as the previous edits left
+        // it, like everything else in the batch.
         let search = if regex {
             "re-search-forward"
         } else {
@@ -2436,8 +2436,8 @@ fn run_batch_edits(
             String::new()
         };
         if regex {
-            // replace-match expands \\N backrefs; a zero-width match steps
-            // one char forward so the sweep terminates.
+            // replace-match expands \\N backrefs; a zero-width match steps one
+            // char forward so the sweep terminates.
             body.push_str(&format!(
                 "(goto-char (point-min))\
                  (let ((n 0) (stop nil))\
@@ -2499,15 +2499,15 @@ fn run_batch_edits(
 }
 
 /// `replace_in_files {files, pattern/replacement | edits, …}`: the same edit
-/// spec applied to EVERY listed file, atomically ACROSS the set — a failure
-/// in any file rolls the already-edited ones back via their undo rings, so a
-/// cross-file rename is one call that either lands everywhere or nowhere.
-/// With `save: true` the files are saved only after every edit succeeded.
-/// Rewind the already-edited sessions of a failed cross-file call (newest
-/// first) and describe the outcome: the all-rolled-back reassurance, or — if
-/// any session could not be rewound — a LOUD list of the files whose warm
-/// buffers may still hold the aborted edit, so a broken all-or-nothing
-/// promise never reads as kept.
+/// spec applied to EVERY listed file, atomically ACROSS the set — a failure in
+/// any file rolls the already-edited ones back via their undo rings, so a
+/// cross-file rename is one call that either lands everywhere or nowhere.  With
+/// `save: true` the files are saved only after every edit succeeded.  Rewind
+/// the already-edited sessions of a failed cross-file call (newest first) and
+/// describe the outcome: the all-rolled-back reassurance, or — if any session
+/// could not be rewound — a LOUD list of the files whose warm buffers may still
+/// hold the aborted edit, so a broken all-or-nothing promise never reads as
+/// kept.
 fn rollback_files(
     sessions: &mut HashMap<String, Workspace>,
     done: &[(String, String, usize)],
@@ -2578,8 +2578,8 @@ fn tool_replace_files(
     };
     let scope = scope_prelude(args)?;
 
-    // Apply per file; on any failure undo the files already edited so the
-    // whole call is all-or-nothing in the warm buffers.
+    // Apply per file; on any failure undo the files already edited so the whole
+    // call is all-or-nothing in the warm buffers.
     let mut done: Vec<(String, String, usize)> = Vec::new(); // (path, session, n)
     for f in &files {
         let session = match resolve_session(&json!({ "path": f }), sessions) {
@@ -2599,9 +2599,9 @@ fn tool_replace_files(
         }
     }
 
-    // Saves happen only after every file succeeded. A failed save (the
-    // stale guard) reports precisely which files reached disk and which
-    // stay warm — nothing is silently lost.
+    // Saves happen only after every file succeeded. A failed save (the stale
+    // guard) reports precisely which files reached disk and which stay warm —
+    // nothing is silently lost.
     let mut save_note = String::new();
     if bool_arg(args, "save") {
         let mut saved = 0usize;
@@ -2748,8 +2748,8 @@ fn grep_matches(lines: &[&str], re: &regex::Regex) -> Vec<(usize, usize)> {
 }
 
 /// Render a line for display: if longer than `max` chars, a `max`-char window
-/// centred on `focus` (a char column), `…` marking each elision — so a match far
-/// from column 0 stays visible (unlike a head-only clamp).
+/// centred on `focus` (a char column), `…` marking each elision — so a match
+/// far from column 0 stays visible (unlike a head-only clamp).
 fn clamp_line(line: &str, focus: usize, max: usize) -> String {
     let chars: Vec<char> = line.chars().collect();
     if chars.len() <= max {
@@ -2768,15 +2768,16 @@ fn clamp_line(line: &str, focus: usize, max: usize) -> String {
     s
 }
 
-/// Walk state for [`tool_grep`]'s file collection — config plus the accumulators
-/// threaded through the recursion, in one struct so the recursive helper stays a
-/// clean method instead of an 8-argument function.
+/// Walk state for [`tool_grep`]'s file collection — config plus the
+/// accumulators threaded through the recursion, in one struct so the recursive
+/// helper stays a clean method instead of an 8-argument function.
 struct Walk<'a> {
     glob_re: Option<&'a regex::Regex>,
     /// The repo containing the search dir, if any, used to skip git-ignored
     /// paths (`target/`, build output …) so a large ignored subtree can't
     /// starve the visit cap. `None` when the dir isn't in a repo, or when the
-    /// dir is ITSELF ignored (the caller asked for it explicitly — honour that).
+    /// dir is ITSELF ignored (the caller asked for it explicitly — honour
+    /// that).
     repo: Option<&'a git2::Repository>,
     /// The repo's tracked paths, so ignored-BUT-tracked content (a committed
     /// `vendor/`, a force-added `*.log`) is still searched — only ignored AND
@@ -2836,9 +2837,9 @@ impl Tracked {
 impl Walk<'_> {
     /// Collect regular files under `dir` whose path relative to `base` matches
     /// `glob_re` (if any), skipping dot-entries, symlinks, and git-ignored
-    /// paths (see `repo`/`tracked`). Bounded by `max` files VISITED (a wide tree
-    /// can't run away) and a depth cap (a deep chain can't overflow the stack);
-    /// sets `capped` when a bound trips.
+    /// paths (see `repo`/`tracked`). Bounded by `max` files VISITED (a wide
+    /// tree can't run away) and a depth cap (a deep chain can't overflow the
+    /// stack); sets `capped` when a bound trips.
     fn collect(&mut self, dir: &Path, base: &Path, depth: usize) {
         const MAX_DEPTH: usize = 64;
         if depth > MAX_DEPTH {
@@ -2889,15 +2890,15 @@ impl Walk<'_> {
 }
 
 /// `grep {pattern, glob?, dir?, mode?, case_insensitive?, nlines?, limit?}` —
-/// read-only cross-file search: which files (and lines) mention a pattern. Walks
-/// `dir` (default: every MIME_ROOTS root) recursively, skipping dot-entries
-/// (`.git` …), symlinks, and git-ignored-and-untracked paths (`target/` …;
-/// tracked files are always searched), keeping only paths that match `glob`
-/// (relative to the search dir; `**` crosses directories). Line-oriented like
-/// occur. Prints
-/// CANONICAL absolute paths that feed `replace_in_files {files: …}` directly. No
-/// session needed — reads files within the sandbox (each routed through the
-/// path chokepoint). Caps files visited and matches rendered.
+/// read-only cross-file search: which files (and lines) mention a pattern.
+/// Walks `dir` (default: every MIME_ROOTS root) recursively, skipping
+/// dot-entries (`.git` …), symlinks, and git-ignored-and-untracked paths
+/// (`target/` …; tracked files are always searched), keeping only paths that
+/// match `glob` (relative to the search dir; `**` crosses directories).
+/// Line-oriented like occur. Prints CANONICAL absolute paths that feed
+/// `replace_in_files {files: …}` directly. No session needed — reads files
+/// within the sandbox (each routed through the path chokepoint). Caps files
+/// visited and matches rendered.
 fn tool_grep(args: &Value, sessions: &HashMap<String, Workspace>) -> Result<ToolOutput, String> {
     const MAX_FILES: usize = 5000;
     const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -2951,9 +2952,9 @@ fn tool_grep(args: &Value, sessions: &HashMap<String, Workspace>) -> Result<Tool
     let mut files_with_hits = 0usize;
     let mut truncated = false;
     let mut out = String::new();
-    // The same hits, as data: one entry per RENDERED match line (context
-    // lines stay prose-only), plus the files whose warm buffer has edits the
-    // disk scan could not see.
+    // The same hits, as data: one entry per RENDERED match line (context lines
+    // stay prose-only), plus the files whose warm buffer has edits the disk
+    // scan could not see.
     let mut matches: Vec<Value> = Vec::new();
     let mut unsaved: Vec<String> = Vec::new();
 
@@ -3131,10 +3132,10 @@ fn tool_grep(args: &Value, sessions: &HashMap<String, Workspace>) -> Result<Tool
     ))
 }
 
-/// `outline {session?|path?}` — the buffer's structural outline: one
-/// `KIND START END NAME` line per defun (Rust/Python functions, types,
-/// impls; Markdown sections), via `treesit-list-defuns`. The natural first
-/// move on a code file — survey without reading it whole.
+/// `outline {session?|path?}` — the buffer's structural outline: one `KIND
+/// START END NAME` line per defun (Rust/Python functions, types, impls;
+/// Markdown sections), via `treesit-list-defuns`. The natural first move on a
+/// code file — survey without reading it whole.
 fn tool_outline(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
@@ -3154,15 +3155,15 @@ fn tool_outline(
         .filter(|(k, _)| k == "defun")
         .map(|(_, v)| v.clone())
         .collect();
-    // Each report line is `KIND START END NAME`; NAME may contain spaces
-    // (a Markdown section title), so split at most four ways.
+    // Each report line is `KIND START END NAME`; NAME may contain spaces (a
+    // Markdown section title), so split at most four ways.
     let defuns: Vec<Value> = lines
         .iter()
         .map(|l| {
             let mut it = l.splitn(4, ' ');
             let kind = it.next().unwrap_or("");
-            // Always integers: the outputSchema says so, and a malformed
-            // report line must not turn them into nulls.
+            // Always integers: the outputSchema says so, and a malformed report
+            // line must not turn them into nulls.
             let start = it.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
             let end = it.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
             let name = it.next().unwrap_or("");
@@ -3193,10 +3194,10 @@ fn tool_outline(
     ))
 }
 
-/// `conflicts {session?}` — the rendered merge-conflict overview (hunk
-/// numbers, positions, labels, side sizes) via the `conflict-hunks` builtin.
-/// Read-only; resolution runs through `run_program` (`conflict-keep` /
-/// `conflict-replace` / `conflict-resolve-trivial`).
+/// `conflicts {session?}` — the rendered merge-conflict overview (hunk numbers,
+/// positions, labels, side sizes) via the `conflict-hunks` builtin.  Read-only;
+/// resolution runs through `run_program` (`conflict-keep` / `conflict-replace`
+/// / `conflict-resolve-trivial`).
 fn tool_conflicts(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
@@ -3262,11 +3263,11 @@ fn tool_undo_last(
 
 /// `save_buffer {session?|path?, to?}` — write the session buffer's text to
 /// disk. `path` addresses WHICH session, like on every other tool; the
-/// destination is `to` (save-as), defaulting to the session's visited file —
-/// so a plain `save_buffer {path}` is "save this file" with the stale guard
-/// and parse warning applied. A `to` pointing at a DIFFERENT file writes a copy
-/// and leaves the session bound to its original file (so a later plain save
-/// still targets the original) — it does not adopt the new path.
+/// destination is `to` (save-as), defaulting to the session's visited file — so
+/// a plain `save_buffer {path}` is "save this file" with the stale guard and
+/// parse warning applied. A `to` pointing at a DIFFERENT file writes a copy and
+/// leaves the session bound to its original file (so a later plain save still
+/// targets the original) — it does not adopt the new path.
 fn tool_save_buffer(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
@@ -3284,22 +3285,23 @@ fn tool_save_buffer(
                 .expect("checked above")
                 .visited_path();
             // Adopt-or-in-place via save_to (which binds + applies the stale
-            // guard) when the session is UNBOUND (an in-memory buffer naming its
-            // first file) or `to` is the file it already visits — compared
-            // canonically, so a non-canonical-but-same path can't skip the guard.
-            // Only a session bound to a DIFFERENT file takes the copy-out branch,
-            // which writes a copy and does NOT rebind (so a later plain save still
-            // targets the original — the footgun this avoids).
+            // guard) when the session is UNBOUND (an in-memory buffer naming
+            // its first file) or `to` is the file it already visits — compared
+            // canonically, so a non-canonical-but-same path can't skip the
+            // guard.  Only a session bound to a DIFFERENT file takes the
+            // copy-out branch, which writes a copy and does NOT rebind (so a
+            // later plain save still targets the original — the footgun this
+            // avoids).
             let in_place = match &visited {
                 None => true,
                 Some(v) => crate::engine::same_file(v, &checked),
             };
             if !in_place && let Some(other) = clobbers_unsaved_session(sessions, &session, &checked)
             {
-                // The copy-out must not clobber the visited file of ANOTHER live
-                // session that has unsaved edits: it overwrites the file under
-                // that session, which learns of it only as a stale conflict on
-                // its own next save. Refuse up front instead.
+                // The copy-out must not clobber the visited file of ANOTHER
+                // live session that has unsaved edits: it overwrites the file
+                // under that session, which learns of it only as a stale
+                // conflict on its own next save. Refuse up front instead.
                 return Err(format!(
                     "cannot copy to {to}: it is the unsaved visited file of live session \"{other}\" — save or close that session first, or copy elsewhere"
                 ));
@@ -3352,7 +3354,8 @@ fn tool_session_status(sessions: &Sessions, workspace: Option<&str>) -> Result<T
                 "checkpoints": if ws.has_checkpoints() { json!(ws.checkpoint_labels()) } else { json!([]) },
             });
             // Only when it's not the plain utf-8-unix default, to keep the
-            // common case quiet — like Emacs only flagging non-LF in the modeline.
+            // common case quiet — like Emacs only flagging non-LF in the
+            // modeline.
             if !coding.is_plain() {
                 entry["coding"] = Value::String(coding.name().to_string());
             }
@@ -3373,9 +3376,9 @@ fn tool_session_status(sessions: &Sessions, workspace: Option<&str>) -> Result<T
 }
 
 /// `help {topic?}` — the canonical reference briefs (regex dialect, treesit
-/// vocabulary, conflict workflow, session/saving semantics, recipes), served
-/// on demand so the always-loaded schemas can stay terse. No topic (or an
-/// unknown one) lists what exists.
+/// vocabulary, conflict workflow, session/saving semantics, recipes), served on
+/// demand so the always-loaded schemas can stay terse. No topic (or an unknown
+/// one) lists what exists.
 fn tool_help(args: &Value) -> Result<String, String> {
     let index = || {
         crate::help::TOPICS
@@ -3450,8 +3453,8 @@ fn audit_tool(session: &str, program: &str, report: &crate::RunReport) {
 }
 
 /// Render the viewport around point when the caller asked for it (`view: N`
-/// lines of context, or `true` for the default 4) — visual confirmation that
-/// an edit landed where intended, without a follow-up call. Empty when not
+/// lines of context, or `true` for the default 4) — visual confirmation that an
+/// edit landed where intended, without a follow-up call. Empty when not
 /// requested.
 fn view_echo(args: &Value, sessions: &mut HashMap<String, Workspace>, session: &str) -> String {
     let lines = match args.get("view") {
@@ -3481,8 +3484,8 @@ fn diff_echo(args: &Value, diff: &str) -> String {
     format!("\n— diff —\n{}", clamped_diff(args, diff))
 }
 
-/// A diff for transport: clamped to 200 lines (about a large hand-made edit —
-/// a bulk edit's can run to megabytes) unless the call passed `full_diff`.
+/// A diff for transport: clamped to 200 lines (about a large hand-made edit — a
+/// bulk edit's can run to megabytes) unless the call passed `full_diff`.
 fn clamped_diff(args: &Value, diff: &str) -> String {
     if bool_arg(args, "full_diff") {
         diff.to_string()
@@ -3505,10 +3508,10 @@ fn truncate_for_error(s: &str) -> String {
 
 /// Undo tulisp's string-printing for a final `value` that IS one printed
 /// string: strip the quotes and the printer's escapes, so multi-line text (a
-/// conflict-diff, a rendered window) reads as plain text in the report
-/// instead of a quoted-and-escaped one-liner. `None` for anything else — a
-/// non-string value, an interior unescaped quote (two printed values), or an
-/// escape we don't know — and the caller keeps the printed form.
+/// conflict-diff, a rendered window) reads as plain text in the report instead
+/// of a quoted-and-escaped one-liner. `None` for anything else — a non-string
+/// value, an interior unescaped quote (two printed values), or an escape we
+/// don't know — and the caller keeps the printed form.
 fn unprint_string_value(value: &str) -> Option<String> {
     let inner = value.strip_prefix('"')?.strip_suffix('"')?;
     let mut out = String::with_capacity(inner.len());
@@ -3550,9 +3553,8 @@ pub(crate) fn tools_list_result() -> Value {
 // the plain editing tools: same `MIME_ROOTS` confinement (the repo path runs
 // through `safety::check_path`), and the library does everything in-process —
 // no network, no hooks/filters/exec. Each destructive op first stamps a
-// `refs/mime-backup/<branch>/0` recovery ref — a ring: /1, /2 hold the two
-// ops before (see `sequencer`). All git2 use lives
-// in `crate::sequencer`.
+// `refs/mime-backup/<branch>/0` recovery ref — a ring: /1, /2 hold the two ops
+// before (see `sequencer`). All git2 use lives in `crate::sequencer`.
 
 /// Resolve + confine the `repo` argument to the allowed roots.
 fn repo_path(args: &Value) -> Result<std::path::PathBuf, String> {
@@ -3625,9 +3627,9 @@ fn split_parts(arr: &[Value]) -> Result<Vec<crate::sequencer::SplitPart>, String
 }
 
 /// Parse `message_edits` items. `delete: true` is the explicit spelling of
-/// "omit replace" — both mean "delete the found text" — so the intent is in
-/// the call, not in an absence. It contradicts a present `replace` and needs
-/// a `find`, and either mismatch is an error instead of a silent deletion.
+/// "omit replace" — both mean "delete the found text" — so the intent is in the
+/// call, not in an absence. It contradicts a present `replace` and needs a
+/// `find`, and either mismatch is an error instead of a silent deletion.
 fn msg_edit_specs(a: &[Value]) -> Result<Vec<crate::sequencer::MsgEditSpec>, String> {
     a.iter()
         .enumerate()
@@ -3665,10 +3667,10 @@ fn lines_arg(args: &Value) -> Option<(usize, usize)> {
 
 /// Parse the `autosquash` argument. `true` derives the plan from
 /// `fixup!`/`squash!` commit subjects (git's `--autosquash`); an array is the
-/// explicit sparse plan `[{commit, into, action?}]` (action defaults to
-/// fixup). `None` when absent or `false`, so `git_rebase` falls back to
-/// `plan`/full replay. Any other value is an ERROR — dropping it would
-/// silently replay the branch with every fixup! commit left unfolded.
+/// explicit sparse plan `[{commit, into, action?}]` (action defaults to fixup).
+/// `None` when absent or `false`, so `git_rebase` falls back to `plan`/full
+/// replay. Any other value is an ERROR — dropping it would silently replay the
+/// branch with every fixup! commit left unfolded.
 fn autosquash_arg(args: &Value) -> Result<Option<crate::sequencer::Autosquash>, String> {
     use crate::sequencer::Autosquash;
     let Some(v) = args.get("autosquash") else {
@@ -3776,9 +3778,9 @@ fn hunk_sel_of(h: &Value) -> Result<crate::sequencer::HunkSel, String> {
     }
 }
 
-/// A string-list argument that is optional but, when present, must be a list
-/// of strings — unlike `opt_str_list`, a malformed list is an error rather
-/// than silently empty.
+/// A string-list argument that is optional but, when present, must be a list of
+/// strings — unlike `opt_str_list`, a malformed list is an error rather than
+/// silently empty.
 fn present_str_list(args: &Value, key: &str) -> Result<Vec<String>, String> {
     if args.get(key).is_some() {
         str_list_arg(args, key)
@@ -3975,7 +3977,8 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
     }
 }
 
-/// Raw schemas for the `git_*` tools; `catalogue` pairs each with its annotations.
+/// Raw schemas for the `git_*` tools; `catalogue` pairs each with its
+/// annotations.
 fn git_tool_schemas() -> Vec<Value> {
     let repo = json!({
         "type": "string",
@@ -4379,8 +4382,8 @@ fn git_tool_schemas() -> Vec<Value> {
 // schema plus cross-cutting metadata; today that's the MCP annotations, with
 // summary/category/examples joining it as `instructions`/`help` consume them.
 
-/// MCP tool annotations — hints a client uses for allow/confirm UX. mime reaches
-/// no external entities, so `openWorldHint` is always false.
+/// MCP tool annotations — hints a client uses for allow/confirm UX. mime
+/// reaches no external entities, so `openWorldHint` is always false.
 #[derive(Clone, Copy)]
 struct ToolAnnotations {
     read_only: bool,
@@ -4474,11 +4477,11 @@ impl ToolDoc {
             .get("workspace")
             .is_some()
     }
-    /// The `tools/list` entry: the schema with `annotations` merged in, and
-    /// the `workspace` handle declared in the `outputSchema` of every stateful
-    /// tool that returns a structured value of its own. On modern HTTP
-    /// `rpc::tools_call` merges the handle into the `structuredContent` of
-    /// such a result, and MCP requires a structured result to conform to the
+    /// The `tools/list` entry: the schema with `annotations` merged in, and the
+    /// `workspace` handle declared in the `outputSchema` of every stateful tool
+    /// that returns a structured value of its own. On modern HTTP
+    /// `rpc::tools_call` merges the handle into the `structuredContent` of such
+    /// a result, and MCP requires a structured result to conform to the
     /// declared schema — so the handle is declared here once instead of in
     /// every such schema literal. No `required`: the key is present only on
     /// modern HTTP. A tool that declares the key itself keeps its own spelling
@@ -4505,8 +4508,9 @@ impl ToolDoc {
 
 /// The cross-cutting metadata for a tool, by name — the ONE place category,
 /// annotations, and summary live (the schema literals hold name/description/
-/// inputSchema). A `_` fallthrough has an empty summary; `meta_covers_every_tool`
-/// asserts no tool reaches it, so this can't silently drift from the schemas.
+/// inputSchema). A `_` fallthrough has an empty summary;
+/// `meta_covers_every_tool` asserts no tool reaches it, so this can't silently
+/// drift from the schemas.
 fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
     use Category::*;
     use ToolAnnotations as A;
@@ -4749,8 +4753,9 @@ fn catalogue() -> Vec<ToolDoc> {
 
 /// The MCP server `instructions` (returned from `initialize`): how to drive
 /// mime, plus a category-grouped tool index — all client-agnostic, so any
-/// harness onboards its model from the protocol rather than an out-of-band file.
-/// The index is generated from the catalogue, so it can't drift from the tools.
+/// harness onboards its model from the protocol rather than an out-of-band
+/// file.  The index is generated from the catalogue, so it can't drift from the
+/// tools.
 pub(crate) fn instructions() -> String {
     let mut s = String::from(
         "mime-rs is a transactional text-editing engine — make it your DEFAULT for ALL file \
@@ -4801,8 +4806,8 @@ pub(crate) fn instructions() -> String {
 }
 
 /// The MCP tool catalogue as `tools/list` values, built once and shared.
-/// `validate_args`, `tools/list`, and `describe-mcp` all read this projection of
-/// [`catalogue`], so they can't drift from the registry or each other.
+/// `validate_args`, `tools/list`, and `describe-mcp` all read this projection
+/// of [`catalogue`], so they can't drift from the registry or each other.
 pub(crate) fn tool_schemas() -> &'static [Value] {
     static SCHEMAS: LazyLock<Vec<Value>> =
         LazyLock::new(|| catalogue().iter().map(ToolDoc::to_list_value).collect());
@@ -4827,8 +4832,8 @@ fn build_tool_schemas() -> Vec<Value> {
         "type": "boolean",
         "description": "After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false."
     });
-    // `full_diff` lifts the 200-line clamp every tool that answers with a
-    // diff applies; `edit_diff` is the edit tools' opt-in diff echo.
+    // `full_diff` lifts the 200-line clamp every tool that answers with a diff
+    // applies; `edit_diff` is the edit tools' opt-in diff echo.
     let full_diff = json!({
         "type": "boolean",
         "description": "Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count."
@@ -4842,11 +4847,11 @@ fn build_tool_schemas() -> Vec<Value> {
         "description": "Restrict this call to one part of the buffer without writing a program. {\"defun\": \"name\"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.",
         "properties": { "defun": { "type": "string" } },
     });
-    // The RunReport shape run_program and rehearse both answer with. Every
-    // key either tool can emit is declared: the conditional ones (`stale`,
-    // `saved`, `unsaved`, `view`) ride only when they apply. The `workspace`
-    // handle the stateless-HTTP path merges in is declared by `to_list_value`,
-    // like every other stateful tool's.
+    // The RunReport shape run_program and rehearse both answer with. Every key
+    // either tool can emit is declared: the conditional ones (`stale`, `saved`,
+    // `unsaved`, `view`) ride only when they apply. The `workspace` handle the
+    // stateless-HTTP path merges in is declared by `to_list_value`, like every
+    // other stateful tool's.
     let run_report_output = json!({
         "type": "object",
         "properties": {
@@ -5295,8 +5300,8 @@ mod git_tool_tests {
     /// recursing through properties/items. Enough to keep an outputSchema
     /// honest without a validator crate.
     fn conforms(schema: &Value, value: &Value, at: &str) -> Result<(), String> {
-        /// One named JSON type against a value; `Err` for a type this
-        /// validator does not know (a typo in a schema, not a bad value).
+        /// One named JSON type against a value; `Err` for a type this validator
+        /// does not know (a typo in a schema, not a bad value).
         fn is_type(ty: &str, value: &Value, at: &str) -> Result<bool, String> {
             Ok(match ty {
                 "object" => value.is_object(),
@@ -5353,9 +5358,9 @@ mod git_tool_tests {
 
     #[test]
     fn structured_outputs_conform_to_their_output_schemas() {
-        // Under the crate's own `target/` so it sits inside the default
-        // allowed root (cwd) for grep; a git-ignored base dir is walked
-        // unfiltered, so the ignore rule does not hide it.
+        // Under the crate's own `target/` so it sits inside the default allowed
+        // root (cwd) for grep; a git-ignored base dir is walked unfiltered, so
+        // the ignore rule does not hide it.
         let pid = std::process::id();
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
@@ -5386,8 +5391,8 @@ mod git_tool_tests {
         // `tool_session_status` is handed `None` whenever the call has no
         // workspace to name — off the stateless HTTP protocol, or on a
         // handle-free call that holds none — and reports the handle as null.
-        // The schema has to allow it, or that case breaks session_status's
-        // own contract.
+        // The schema has to allow it, or that case breaks session_status's own
+        // contract.
         let no_workspace = tool_session_status(&sessions, None).unwrap();
         let s = no_workspace.structured.unwrap();
         assert_eq!(s["workspace"], Value::Null);
@@ -5417,8 +5422,8 @@ mod git_tool_tests {
         assert_eq!(s["ok"], false);
         assert!(s["error"].as_str().unwrap().contains("boom"));
 
-        // grep walks the allowed roots (cwd when MIME_ROOTS is unset, which
-        // the unit tests rely on); `dir` narrows it to our scratch directory.
+        // grep walks the allowed roots (cwd when MIME_ROOTS is unset, which the
+        // unit tests rely on); `dir` narrows it to our scratch directory.
         let grep = tool_grep(
             &json!({"pattern": "return", "dir": dir.display().to_string()}),
             &sessions,
@@ -5462,8 +5467,8 @@ mod git_tool_tests {
         assert_eq!(s["rehearsed"], true);
 
         // On the stateless protocol `rpc::tools_call` merges the workspace
-        // handle into whatever structuredContent the tool produced — the
-        // schema has to allow it, or the merged result stops conforming.
+        // handle into whatever structuredContent the tool produced — the schema
+        // has to allow it, or the merged result stops conforming.
         let mut shaped = tool_outline(&json!({"path": file.display().to_string()}), &mut sessions)
             .unwrap()
             .structured
@@ -5524,10 +5529,10 @@ mod git_tool_tests {
 
     /// A `thing` edit resolves its span, then runs a program that auto-reverts
     /// a clean drifted buffer — so a file rewritten in that window would be
-    /// spliced at positions computed against the old contents. The program
-    /// run carries the version the span was resolved against and refuses
-    /// when its own revert moved it. Driven here at the helpers, because the
-    /// disk write has to land INSIDE a single tool call.
+    /// spliced at positions computed against the old contents. The program run
+    /// carries the version the span was resolved against and refuses when its
+    /// own revert moved it. Driven here at the helpers, because the disk write
+    /// has to land INSIDE a single tool call.
     #[test]
     fn a_thing_edit_refuses_a_buffer_that_changed_under_the_resolve() {
         struct Tmp(std::path::PathBuf);
@@ -5629,8 +5634,8 @@ mod git_tool_tests {
     #[test]
     fn aliases_rewrite_borrowed_argument_names() {
         // The spellings that kept dying in the field are absorbed. "regexp"
-        // also carries regex INTENT, so mode defaults to "regex" with it —
-        // an exact-mode search for the same string would silently miss.
+        // also carries regex INTENT, so mode defaults to "regex" with it — an
+        // exact-mode search for the same string would silently miss.
         let mut args = json!({ "regexp": "foo" });
         normalize_aliases("occur", &mut args).unwrap();
         assert_eq!(args, json!({ "pattern": "foo", "mode": "regex" }));
@@ -5665,8 +5670,8 @@ mod git_tool_tests {
         let err = normalize_aliases("replace_text", &mut args).unwrap_err();
         assert!(err.contains("alias"), "{err}");
 
-        // The rewritten shape passes validation (aliases can't drift from
-        // the schema: they map onto declared properties).
+        // The rewritten shape passes validation (aliases can't drift from the
+        // schema: they map onto declared properties).
         let mut args = json!({ "regex": "x", "path": "f" });
         normalize_aliases("grep", &mut args).unwrap();
         validate_args("grep", &args).unwrap_err(); // grep has no `path`
@@ -5677,9 +5682,9 @@ mod git_tool_tests {
 
     #[test]
     fn insert_text_before_after_sugar_normalizes() {
-        // `before`/`after` name both the anchor line and the side to insert
-        // on — the spelling first calls reach for. Top level lifts into an
-        // anchor; anchor level rewrites to the canonical {pattern, where}.
+        // `before`/`after` name both the anchor line and the side to insert on
+        // — the spelling first calls reach for. Top level lifts into an anchor;
+        // anchor level rewrites to the canonical {pattern, where}.
         let mut args = json!({ "text": "x", "before": "fn main() {" });
         normalize_aliases("insert_text", &mut args).unwrap();
         assert_eq!(
@@ -5827,7 +5832,7 @@ mod git_tool_tests {
         // "αβ" is 2 chars (4 bytes) — offsets must be in CHARS, not bytes.
         let lines: Vec<&str> = "αβ\nneedle here\nno\nneedle again\n".split('\n').collect();
         assert_eq!(grep_matches(&lines, &re), vec![(1, 4), (3, 19)]);
-        // @pos is the MATCH offset, not the line start: "  X y" — X at col 2.
+        // @pos is the MATCH offset, not the line start: " X y" — X at col 2.
         let lines2: Vec<&str> = "ab\n  X y\n".split('\n').collect();
         assert_eq!(
             grep_matches(&lines2, &regex::Regex::new("X").unwrap()),
@@ -5862,8 +5867,8 @@ mod git_tool_tests {
         std::fs::write(root.join("kept.txt"), "needle\n").unwrap();
         std::fs::write(root.join("ignored").join("hit.txt"), "needle\n").unwrap();
         std::fs::write(root.join("ignored").join("tracked.txt"), "needle\n").unwrap();
-        // Force-add the tracked file under the ignored dir (plumbing add bypasses
-        // the ignore check, like `git add -f`).
+        // Force-add the tracked file under the ignored dir (plumbing add
+        // bypasses the ignore check, like `git add -f`).
         let mut index = repo.index().unwrap();
         index.add_path(Path::new("ignored/tracked.txt")).unwrap();
         index.write().unwrap();
@@ -5930,12 +5935,12 @@ mod git_tool_tests {
 
     #[test]
     fn conflicts_description_names_every_conflict_builtin() {
-        // The conflicts tool description ENUMERATES the resolve vocabulary,
-        // and an enumerated list reads as exhaustive — a verb it omits is
-        // effectively hidden (agents don't consult help for what already
-        // looks complete; conflict-context was invisible exactly this way).
-        // Harvest the registered conflict-* builtins from the source and
-        // require each one in the description.
+        // The conflicts tool description ENUMERATES the resolve vocabulary, and
+        // an enumerated list reads as exhaustive — a verb it omits is
+        // effectively hidden (agents don't consult help for what already looks
+        // complete; conflict-context was invisible exactly this way).  Harvest
+        // the registered conflict-* builtins from the source and require each
+        // one in the description.
         let src = include_str!("builtins.rs");
         let re = regex::Regex::new(r#""(conflict-[a-z-]+)""#).unwrap();
         let desc = tool_schemas()
@@ -5966,8 +5971,8 @@ mod git_tool_tests {
             unprint_string_value("\"@@ -1 +1\\n+x\\ttab\\\\s\\\"q\\\"\"").as_deref(),
             Some("@@ -1 +1\n+x\ttab\\s\"q\"")
         );
-        // Everything else keeps the printed form: non-strings, several
-        // printed values (interior unescaped quote), unknown escapes.
+        // Everything else keeps the printed form: non-strings, several printed
+        // values (interior unescaped quote), unknown escapes.
         assert_eq!(unprint_string_value("42"), None);
         assert_eq!(unprint_string_value("(\"a\" \"b\")"), None);
         assert_eq!(unprint_string_value("\"a\" \"b\""), None);
@@ -6073,12 +6078,12 @@ mod git_tool_tests {
 
     /// MCP: "If an output schema is provided, servers MUST provide structured
     /// results that conform to this schema." Only the tools that return a
-    /// structured value of their own declare one, and since
-    /// `rpc::tools_call` merges the handle into their structuredContent on
-    /// modern HTTP, each has to declare `workspace` — added by
-    /// `to_list_value`, not written per tool. A text-only tool declares none:
-    /// Claude Code renders a structured value in preference to the text, so a
-    /// schema-mandated `{}` would hide the prose.
+    /// structured value of their own declare one, and since `rpc::tools_call`
+    /// merges the handle into their structuredContent on modern HTTP, each has
+    /// to declare `workspace` — added by `to_list_value`, not written per tool.
+    /// A text-only tool declares none: Claude Code renders a structured value
+    /// in preference to the text, so a schema-mandated `{}` would hide the
+    /// prose.
     #[test]
     fn only_json_tools_declare_an_output_schema() {
         let mut declared: Vec<&str> = Vec::new();

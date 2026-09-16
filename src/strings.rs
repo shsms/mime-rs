@@ -37,11 +37,11 @@ pub fn register(ctx: &mut TulispContext) {
     );
 
     // (split-string STRING &optional SEPARATORS OMIT-NULLS TRIM) — the Emacs
-    // signature and semantics. SEPARATORS is a regex; nil means whitespace
-    // runs AND forces OMIT-NULLS, as in Emacs. With an explicit SEPARATORS,
-    // empty pieces are kept unless OMIT-NULLS is non-nil. TRIM is a regex
-    // whose match is removed from the start and end of every piece; a piece
-    // that trims to empty counts as a null. An invalid regexp is an error.
+    // signature and semantics. SEPARATORS is a regex; nil means whitespace runs
+    // AND forces OMIT-NULLS, as in Emacs. With an explicit SEPARATORS, empty
+    // pieces are kept unless OMIT-NULLS is non-nil. TRIM is a regex whose match
+    // is removed from the start and end of every piece; a piece that trims to
+    // empty counts as a null. An invalid regexp is an error.
     ctx.defun(
         "split-string",
         |s: String,
@@ -96,8 +96,8 @@ pub fn register(ctx: &mut TulispContext) {
         s.ends_with(&suffix)
     });
 
-    // (string-search NEEDLE HAYSTACK &optional START) — 0-based *char* index
-    // of the first match at or after START, or nil. START out of range errors,
+    // (string-search NEEDLE HAYSTACK &optional START) — 0-based *char* index of
+    // the first match at or after START, or nil. START out of range errors,
     // matching Emacs (`args-out-of-range`).
     ctx.defun(
         "string-search",
@@ -181,14 +181,13 @@ pub fn register(ctx: &mut TulispContext) {
 }
 
 /// The characters Emacs's `string-trim` default and
-/// `split-string-default-separators` treat as whitespace: space, tab,
-/// newline, carriage return, form feed, vertical tab. Literal control
-/// characters: inside `[...]` the Emacs regex dialect takes a backslash as a
-/// class member.
+/// `split-string-default-separators` treat as whitespace: space, tab, newline,
+/// carriage return, form feed, vertical tab. Literal control characters: inside
+/// `[...]` the Emacs regex dialect takes a backslash as a class member.
 const EMACS_WHITESPACE: &str = " \t\n\r\u{c}\u{b}";
 
-/// An `&optional` string argument: `None` when missing or nil, else the
-/// string (a non-string is a type error).
+/// An `&optional` string argument: `None` when missing or nil, else the string
+/// (a non-string is a type error).
 fn optional_string(v: Option<TulispObject>) -> Result<Option<String>, Error> {
     match v {
         Some(v) if !v.null() => Ok(Some(String::try_from(v)?)),
@@ -196,12 +195,12 @@ fn optional_string(v: Option<TulispObject>) -> Result<Option<String>, Error> {
     }
 }
 
-/// The body of `split-string`, a direct port of the Emacs `subr.el` loop so
-/// the edge cases (empty matches, leading/trailing separators, a TRIM that
-/// empties a piece) come out identical. `trim` is the (leading, trailing)
-/// regex pair: the leading one is matched unanchored from the piece's start
-/// and only counts when it begins exactly there; the trailing one already
-/// carries the end anchor and is run against the piece alone.
+/// The body of `split-string`, a direct port of the Emacs `subr.el` loop so the
+/// edge cases (empty matches, leading/trailing separators, a TRIM that empties
+/// a piece) come out identical. `trim` is the (leading, trailing) regex pair:
+/// the leading one is matched unanchored from the piece's start and only counts
+/// when it begins exactly there; the trailing one already carries the end
+/// anchor and is run against the piece alone.
 fn split_string(
     s: &str,
     rx: &regex::Regex,
@@ -292,9 +291,9 @@ fn number_to_string(n: &TulispObject) -> Result<String, Error> {
 /// round-tripping decimal, always carrying a decimal point or exponent (so 3.0
 /// prints "3.0", not "3"). Emacs follows C `%g`'s decimal-vs-exponential rule
 /// keyed on the shortest digit string: with D significant digits and the
-/// leading digit at decimal exponent X, it prints in exponent form when
-/// X < -4 or X >= max(15, D) — e.g. 1e15 -> "1e+15" but 1234567890123456.0
-/// stays decimal — and pads the exponent to at least two digits ("1e-05").
+/// leading digit at decimal exponent X, it prints in exponent form when X < -4
+/// or X >= max(15, D) — e.g. 1e15 -> "1e+15" but 1234567890123456.0 stays
+/// decimal — and pads the exponent to at least two digits ("1e-05").
 fn format_float(f: f64) -> String {
     if f.is_nan() {
         // Emacs prints these as 0.0e+NaN / N.Ne+INF; we won't hit them from
@@ -437,8 +436,8 @@ fn parse_decimal(s: &str) -> Option<Number> {
         if !has_int && i == frac_start {
             return None;
         }
-        // Only count the dot as making it a float if a fraction follows;
-        // "1." parses as the integer 1 in Emacs.
+        // Only count the dot as making it a float if a fraction follows; "1."
+        // parses as the integer 1 in Emacs.
         if i > frac_start {
             is_float = true;
         } else {
@@ -655,8 +654,8 @@ mod tests {
         // Unicode-aware.
         assert_eq!(s(r#"(upcase "café")"#), "CAFÉ");
         assert_eq!(s(r#"(downcase "CAFÉ")"#), "café");
-        // capitalize: first letter of each word up, rest down; digits are
-        // word constituents so "foo2bar" stays one word.
+        // capitalize: first letter of each word up, rest down; digits are word
+        // constituents so "foo2bar" stays one word.
         assert_eq!(s(r#"(capitalize "hello WORLD")"#), "Hello World");
         assert_eq!(s(r#"(capitalize "foo-bar baz")"#), "Foo-Bar Baz");
         assert_eq!(s(r#"(capitalize "foo2bar")"#), "Foo2bar");

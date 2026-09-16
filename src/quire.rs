@@ -1,10 +1,10 @@
 //! Quire — the `TextStore` over an immutable, read-on-demand original plus an
 //! append-only add buffer (M1), with a **persistent measured B-tree** spine.
 //! This is VS Code's piece tree in its copy-on-write form: the document is an
-//! ordered sequence of *pieces* `(source, start, len)` that reference one of two
-//! immutable backing stores; the original file is read on demand a page at a
-//! time into a bounded LRU cache (never fully resident — and never `mmap`ed, so
-//! external truncation can't SIGBUS and an in-place rewrite can't alias an
+//! ordered sequence of *pieces* `(source, start, len)` that reference one of
+//! two immutable backing stores; the original file is read on demand a page at
+//! a time into a bounded LRU cache (never fully resident — and never `mmap`ed,
+//! so external truncation can't SIGBUS and an in-place rewrite can't alias an
 //! in-flight read), and the add buffer holds only inserted text. An edit splits
 //! pieces and points a new one at the add buffer — original bytes never move.
 //!
@@ -14,35 +14,34 @@
 //!
 //! ## Data structure: a persistent measured B-tree
 //! The spine is an [`Arc`]-wrapped B-tree ([`Node`]). Internal nodes hold child
-//! pointers plus a monoid [`Summary`] (total bytes / chars / lines) for the whole
-//! subtree; leaves hold a small `Vec<Piece>` and that run's summary. Seeks
-//! (char → leaf/piece/offset, char → line, accumulated newlines before a
+//! pointers plus a monoid [`Summary`] (total bytes / chars / lines) for the
+//! whole subtree; leaves hold a small `Vec<Piece>` and that run's summary.
+//! Seeks (char → leaf/piece/offset, char → line, accumulated newlines before a
 //! position) descend the tree guided by the summaries, so they are **O(log n)**
 //! in the number of pieces instead of a linear scan of a piece vector. Edits
 //! (`insert`, `delete_region`, `replace_match`) rebuild only the root→leaf path
-//! they touch ([path-copying]); every prior version stays intact, so the tree is
-//! **persistent** and a snapshot is just a clone of the root `Arc`.
+//! they touch ([path-copying]); every prior version stays intact, so the tree
+//! is **persistent** and a snapshot is just a clone of the root `Arc`.
 //!
 //! ## Shared, immutable backings → O(1) snapshots
 //! The original (a paged file or owned string) is immutable for the program's
 //! life and shared via `Rc`. The add buffer is `Arc`-shared and append-only; a
-//! `Quire` appends to it in place while it is uniquely owned, and **copies it on
-//! write** the first time it must grow while a snapshot still shares it (so
+//! `Quire` appends to it in place while it is uniquely owned, and **copies it
+//! on write** the first time it must grow while a snapshot still shares it (so
 //! divergent timelines never clobber each other's bytes). A snapshot therefore
 //! clones those two backing pointers and copies only the cursor state — no
-//! document bytes move. See
-//! [`Quire::snapshot`].
+//! document bytes move. See [`Quire::snapshot`].
 //!
 //! ## What is (and isn't) materialized
 //! Editing, search, line/char navigation and snapshotting touch O(log n) nodes
 //! and the OS page cache, never a full copy of the text. The *one* exception is
-//! [`TextStore::text`], whose signature returns `&str`: a borrow has to point at
-//! contiguous bytes that live somewhere, so the first `text()` after a mutation
-//! lazily fills a cached `String` (see [`Quire::full_text`]). That cache is a
-//! clearly-marked fallback for the trait's shape, invalidated on every edit, and
-//! is the single place a GB file would be brought fully resident — flagged so it
-//! can be removed once the surface is fully ranged/streamed. No internal method
-//! calls it.
+//! [`TextStore::text`], whose signature returns `&str`: a borrow has to point
+//! at contiguous bytes that live somewhere, so the first `text()` after a
+//! mutation lazily fills a cached `String` (see [`Quire::full_text`]). That
+//! cache is a clearly-marked fallback for the trait's shape, invalidated on
+//! every edit, and is the single place a GB file would be brought fully
+//! resident — flagged so it can be removed once the surface is fully
+//! ranged/streamed. No internal method calls it.
 //!
 //! [path-copying]: https://en.wikipedia.org/wiki/Persistent_data_structure
 
@@ -87,20 +86,20 @@ impl Piece {
     }
 }
 
-/// One remembered char→byte seek inside one piece: char `n` of that piece starts
-/// at byte `bp` (an offset within the piece) and has `nl` `\n` bytes before it.
-/// What makes a sequential walk linear instead of quadratic — see
+/// One remembered char→byte seek inside one piece: char `n` of that piece
+/// starts at byte `bp` (an offset within the piece) and has `nl` `\n` bytes
+/// before it.  What makes a sequential walk linear instead of quadratic — see
 /// [`Quire::scan_prefix`].
 ///
 /// The piece is named by `(source, start, len)`, which pins an immutable byte
 /// range of an immutable backing (`Original` is immutable, the add buffer
-/// append-only). The map depends on the view as well as the bytes — a normalized
-/// DOS view ([`Quire::strips_crlf`]) folds each `\r\n` into one char — but the
-/// view is not part of the key: it is fixed at construction and changed only by
-/// [`Quire::rebase_to`], which resets the memo anyway. So the invariant is: same
-/// key, same bytes ⇒ same char→byte map, no matter what the tree did in between.
-/// (A future setter for the VIEW would have to reset the memo too — along with
-/// far more, see [`Quire::view_coding`].)
+/// append-only). The map depends on the view as well as the bytes — a
+/// normalized DOS view ([`Quire::strips_crlf`]) folds each `\r\n` into one char
+/// — but the view is not part of the key: it is fixed at construction and
+/// changed only by [`Quire::rebase_to`], which resets the memo anyway. So the
+/// invariant is: same key, same bytes ⇒ same char→byte map, no matter what the
+/// tree did in between.  (A future setter for the VIEW would have to reset the
+/// memo too — along with far more, see [`Quire::view_coding`].)
 ///
 /// That makes the memo survive ordinary edits rather than being thrown away by
 /// them: a splice re-keys only the pieces it cuts (their `len`, and a suffix's
@@ -130,20 +129,22 @@ impl SeekMemo {
 #[cfg(test)]
 thread_local! {
     /// Test-only: seeks that resumed from [`Quire::seek_memo`] rather than from
-    /// the piece head or end. Per thread, so tests running in parallel don't see
-    /// each other's; sampled around an operation, it says the memo was really
-    /// used — an answer alone can't, since the cold walk gives the same one.
+    /// the piece head or end. Per thread, so tests running in parallel don't
+    /// see each other's; sampled around an operation, it says the memo was
+    /// really used — an answer alone can't, since the cold walk gives the same
+    /// one.
     static MEMO_RESUMES: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Bytes the backward seek reads at a time (see [`Quire::scan_prefix_back`]), so
-/// a long hop back costs bounded memory rather than the piece prefix.
+/// Bytes the backward seek reads at a time (see [`Quire::scan_prefix_back`]),
+/// so a long hop back costs bounded memory rather than the piece prefix.
 const BACK_WINDOW: usize = 8 * 1024;
 
 /// The immutable original: either owned text (`from_string`) or a file read on
-/// demand a page at a time (`open`). Read uniformly through [`Original::for_bytes`]
-/// — never one contiguous `&[u8]` over the whole thing — so the file backing
-/// need not be fully resident. Shared via [`Rc`] so every snapshot shares it.
+/// demand a page at a time (`open`). Read uniformly through
+/// [`Original::for_bytes`] — never one contiguous `&[u8]` over the whole thing
+/// — so the file backing need not be fully resident. Shared via [`Rc`] so every
+/// snapshot shares it.
 enum Original {
     /// `from_string` — owns its "original" text (no file). Needed for tests and
     /// scratch buffers without a path.
@@ -163,8 +164,8 @@ impl Original {
     /// Invoke `f` with successive byte slices covering `[start, start+len)`, in
     /// order; `f` returns `false` to stop. An owned original yields the whole
     /// range as one slice; a paged original yields page-bounded slices. A slice
-    /// may end mid-char — treat it as raw bytes, never `from_utf8` a single chunk
-    /// on its own.
+    /// may end mid-char — treat it as raw bytes, never `from_utf8` a single
+    /// chunk on its own.
     fn for_bytes(&self, start: usize, len: usize, f: &mut dyn FnMut(&[u8]) -> bool) {
         match self {
             Original::Owned(s) => {
@@ -175,8 +176,9 @@ impl Original {
     }
 
     /// Char and `\n` counts of the whole original — the one O(filesize) scan at
-    /// open time. Owned text fans out over cores above [`PARALLEL_INDEX_THRESHOLD`];
-    /// a paged file is scanned sequentially page by page (nothing kept resident).
+    /// open time. Owned text fans out over cores above
+    /// [`PARALLEL_INDEX_THRESHOLD`]; a paged file is scanned sequentially page
+    /// by page (nothing kept resident).
     fn count_chars_lines(&self) -> (usize, usize) {
         match self {
             Original::Owned(s) => {
@@ -191,8 +193,8 @@ impl Original {
         }
     }
 
-    /// Whether a paged file has been observed drifted on a fresh read since open
-    /// (always `false` for owned text — it has no file to drift).
+    /// Whether a paged file has been observed drifted on a fresh read since
+    /// open (always `false` for owned text — it has no file to drift).
     fn drifted(&self) -> bool {
         match self {
             Original::Owned(_) => false,
@@ -204,13 +206,14 @@ impl Original {
 /// Bytes per page the on-demand reader fetches and caches.
 const PAGE: usize = 64 * 1024;
 /// Resident page budget: at most this many pages are cached at once (LRU
-/// eviction past it), bounding a paged Quire's read footprint regardless of file
-/// size. 256 × 64 KiB = 16 MiB.
+/// eviction past it), bounding a paged Quire's read footprint regardless of
+/// file size. 256 × 64 KiB = 16 MiB.
 const CACHE_PAGES: usize = 256;
 
-/// Initial chars materialized by an adaptively-windowed regex search/`looking_at`
-/// before it grows toward the bound. A hit within this window of point never
-/// copies the document tail; only a far hit (or a genuine miss) grows past it.
+/// Initial chars materialized by an adaptively-windowed regex
+/// search/`looking_at` before it grows toward the bound. A hit within this
+/// window of point never copies the document tail; only a far hit (or a genuine
+/// miss) grows past it.
 const SEARCH_WINDOW_START: usize = 8 * 1024;
 
 /// A bounded LRU of file pages. Single-threaded (the engine is `!Send`); pages
@@ -272,26 +275,26 @@ struct PagedFile {
     len: usize,
     cache: RefCell<PageCache>,
     /// Identity of the file at open time. A read that touches the file — and
-    /// only such a read — re-checks it (a stat-by-path) and latches `drifted` on
-    /// a mismatch: once an external writer has landed, a not-yet-cached page can
-    /// no longer be trusted to be consistent with the open-time char/line
-    /// summaries. A cached page was read before the writer landed, so re-statting
-    /// to serve it would say nothing about the bytes handed back.
+    /// only such a read — re-checks it (a stat-by-path) and latches `drifted`
+    /// on a mismatch: once an external writer has landed, a not-yet-cached page
+    /// can no longer be trusted to be consistent with the open-time char/line
+    /// summaries. A cached page was read before the writer landed, so
+    /// re-statting to serve it would say nothing about the bytes handed back.
     stamp: crate::safety::FileStamp,
     /// Sticky: set the first time a read that touches the file sees it drifted,
-    /// so the buffer keeps reporting stale even if the writer later restores the
-    /// mtime (which a bare stat would then read as clean again). It latches what
-    /// a read SAW: an external in-place rewrite that restores size and mtime
-    /// between two reads served entirely from the page cache is never statted,
-    /// so it is not latched here — `Engine::is_stale` runs a live
-    /// [`crate::safety::FileStamp::check`] alongside this flag, and that catches
-    /// every change that alters size, mtime, or inode.
+    /// so the buffer keeps reporting stale even if the writer later restores
+    /// the mtime (which a bare stat would then read as clean again). It latches
+    /// what a read SAW: an external in-place rewrite that restores size and
+    /// mtime between two reads served entirely from the page cache is never
+    /// statted, so it is not latched here — `Engine::is_stale` runs a live
+    /// [`crate::safety::FileStamp::check`] alongside this flag, and that
+    /// catches every change that alters size, mtime, or inode.
     drifted: std::cell::Cell<bool>,
     /// Whether the read call in flight has already statted for drift.
     /// [`PagedFile::for_bytes`] clears it on entry (restoring the outer call's
-    /// value on the way out) and the first page the call actually READS sets it.
-    /// So one read call costs one stat however many pages it misses on, where a
-    /// stat per miss made a cold pass pay ~16k syscalls per GB.
+    /// value on the way out) and the first page the call actually READS sets
+    /// it.  So one read call costs one stat however many pages it misses on,
+    /// where a stat per miss made a cold pass pay ~16k syscalls per GB.
     statted: std::cell::Cell<bool>,
     /// Test-only: how many times `check_drift` has actually statted, so the
     /// tests can pin the contract above rather than infer it.
@@ -326,7 +329,8 @@ impl PagedFile {
         }
     }
 
-    /// Whether a read that touched the file has ever observed it drifted since open.
+    /// Whether a read that touched the file has ever observed it drifted since
+    /// open.
     fn drifted(&self) -> bool {
         self.drifted.get()
     }
@@ -411,15 +415,15 @@ impl PagedFile {
             return p;
         }
         // Fresh read: the file may have drifted since open, and THIS is the
-        // only moment it can be observed — a page already in the cache was
-        // read before any later drift and cannot tell us about it. So the stat
-        // lives here, on the first page a read call actually reads (`statted`
-        // covers the rest of the call), and nowhere else. We still serve the
-        // page (no fault, no hard stop) — but note already-cached pages keep
-        // their pre-drift bytes while this fresh page reads the changed file,
-        // so a post-drift read can interleave old and new content. That's why
-        // the sticky flag is the only correctness signal here: callers must
-        // treat a drifted buffer as untrustworthy and revert, not parse it.
+        // only moment it can be observed — a page already in the cache was read
+        // before any later drift and cannot tell us about it. So the stat lives
+        // here, on the first page a read call actually reads (`statted` covers
+        // the rest of the call), and nowhere else. We still serve the page (no
+        // fault, no hard stop) — but note already-cached pages keep their
+        // pre-drift bytes while this fresh page reads the changed file, so a
+        // post-drift read can interleave old and new content. That's why the
+        // sticky flag is the only correctness signal here: callers must treat a
+        // drifted buffer as untrustworthy and revert, not parse it.
         if !self.statted.replace(true) {
             self.check_drift();
         }
@@ -434,14 +438,14 @@ impl PagedFile {
 
     /// Page-chunked [`Original::for_bytes`]. One read call stats at most once:
     /// this marks the call and the first page it actually reads does the drift
-    /// check, so a cold pass over a file costs one stat rather than one per
-    /// 64 KiB page, and a range served entirely from the cache costs no syscall
-    /// at all.
+    /// check, so a cold pass over a file costs one stat rather than one per 64
+    /// KiB page, and a range served entirely from the cache costs no syscall at
+    /// all.
     fn for_bytes(&self, start: usize, len: usize, f: &mut dyn FnMut(&[u8]) -> bool) {
         // Mark the start of a read call. Restoring the outer value rather than
-        // clearing it keeps a nested read (one started from `f`) from making the
-        // enclosing call stat a second time. Nothing else resets the flag, so
-        // `page` must only be called from here.
+        // clearing it keeps a nested read (one started from `f`) from making
+        // the enclosing call stat a second time. Nothing else resets the flag,
+        // so `page` must only be called from here.
         let outer = self.statted.replace(false);
         let end = start + len;
         let mut pos = start;
@@ -480,12 +484,11 @@ impl PagedFile {
     }
 
     /// ONE pass over the whole file: validate UTF-8 AND count chars/lines —
-    /// fusing the two open-time scans that used to read a multi-GB file
-    /// twice. `None` = not valid UTF-8. Keeps nothing resident. Above
-    /// [`PARALLEL_INDEX_THRESHOLD`] the pass fans out over the available
-    /// cores (threads `read_at` disjoint byte ranges; chars split by the
-    /// partition are stitched at the seams), mirroring the owned-text
-    /// parallel count.
+    /// fusing the two open-time scans that used to read a multi-GB file twice.
+    /// `None` = not valid UTF-8. Keeps nothing resident. Above
+    /// [`PARALLEL_INDEX_THRESHOLD`] the pass fans out over the available cores
+    /// (threads `read_at` disjoint byte ranges; chars split by the partition
+    /// are stitched at the seams), mirroring the owned-text parallel count.
     fn validate_and_count(&self) -> Option<(usize, usize)> {
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -502,8 +505,8 @@ impl PagedFile {
             ranges.push((start, end));
             start = end;
         }
-        // Only the File crosses threads (`read_at` is positional + &self);
-        // the PagedFile itself is !Sync (page cache, drift cells).
+        // Only the File crosses threads (`read_at` is positional + &self); the
+        // PagedFile itself is !Sync (page cache, drift cells).
         let file = &self.file;
         let parts: Vec<ScanPart> = std::thread::scope(|scope| {
             let handles: Vec<_> = ranges
@@ -513,11 +516,11 @@ impl PagedFile {
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
 
-        // Stitch: each seam's (previous tail carry + next head skip) must
-        // form EXACTLY one valid char — which can never be '\n' (single
-        // byte, never split), so only the char count grows. A leading
-        // continuation byte in the first chunk, a dangling tail at EOF, or
-        // any malformed seam is invalid.
+        // Stitch: each seam's (previous tail carry + next head skip) must form
+        // EXACTLY one valid char — which can never be '\n' (single byte, never
+        // split), so only the char count grows. A leading continuation byte in
+        // the first chunk, a dangling tail at EOF, or any malformed seam is
+        // invalid.
         let (mut chars, mut lines) = (0usize, 0usize);
         let mut prev_tail: Vec<u8> = Vec::new();
         for part in parts {
@@ -583,25 +586,25 @@ impl PagedFile {
 // ----------------------------------------------------------------------------
 
 /// Below this many bytes the initial char/line scan stays single-threaded:
-/// spawning scoped threads (stack setup, joins) has a roughly fixed cost
-/// (~0.2 ms on commodity hardware) that swamps the work on small inputs — at
-/// 256 KiB the parallel path is actually ~2x *slower*, and it only pulls clearly
-/// ahead past ~1 MiB. We set the cutoff at 1 MiB, where the sequential scan is
-/// still only ~0.5 ms (so nothing user-visible is lost below it) and the
-/// parallel driver already wins ~1.8x and climbs toward the core count as the
-/// file grows. Above this, `count_chars_lines_parallel` fans the scan out over
-/// the available cores.
+/// spawning scoped threads (stack setup, joins) has a roughly fixed cost (~0.2
+/// ms on commodity hardware) that swamps the work on small inputs — at 256 KiB
+/// the parallel path is actually ~2x *slower*, and it only pulls clearly ahead
+/// past ~1 MiB. We set the cutoff at 1 MiB, where the sequential scan is still
+/// only ~0.5 ms (so nothing user-visible is lost below it) and the parallel
+/// driver already wins ~1.8x and climbs toward the core count as the file
+/// grows. Above this, `count_chars_lines_parallel` fans the scan out over the
+/// available cores.
 const PARALLEL_INDEX_THRESHOLD: usize = 1024 * 1024;
 
 /// Count Unicode scalar values (chars) and `\n` bytes in a UTF-8 slice.
 ///
 /// Chars are counted as the number of non-continuation bytes — in valid UTF-8
-/// every scalar value has exactly one leading byte `b` with `(b & 0xC0) != 0x80`
-/// — which equals `bytes.chars().count()` but works directly on `&[u8]`. The
-/// view-blind, chunk-at-a-time form of [`starts_char`]: it is only used where no
-/// `\r\n` folding applies, so it needs no previous byte and no per-byte branch.
-/// This is a *pure* helper so the parallel driver and the unit tests can compare
-/// it against the sequential count. O(bytes).
+/// every scalar value has exactly one leading byte `b` with `(b & 0xC0) !=
+/// 0x80` — which equals `bytes.chars().count()` but works directly on `&[u8]`.
+/// The view-blind, chunk-at-a-time form of [`starts_char`]: it is only used
+/// where no `\r\n` folding applies, so it needs no previous byte and no
+/// per-byte branch.  This is a *pure* helper so the parallel driver and the
+/// unit tests can compare it against the sequential count. O(bytes).
 fn count_chars_lines(bytes: &[u8]) -> (usize, usize) {
     let mut chars = 0;
     let mut lines = 0;
@@ -634,8 +637,9 @@ fn starts_char(b: u8, prev: Option<u8>, strips_crlf: bool) -> bool {
 /// Scan one reverse window right to left, counting `\n` bytes into `newlines`
 /// and char starts into `seen`; returns the index in `win` of the `want`th char
 /// start, or `None` when the window ran out with fewer than that. `win[..ctx]`
-/// is left context for [`starts_char`] alone and is never counted. Both counters
-/// are carried in and out, so successive windows of one hop simply chain.
+/// is left context for [`starts_char`] alone and is never counted. Both
+/// counters are carried in and out, so successive windows of one hop simply
+/// chain.
 fn scan_char_starts_back(
     win: &[u8],
     ctx: usize,
@@ -663,8 +667,8 @@ fn scan_char_starts_back(
 
 /// A root that is one whole-file Original piece `[start, start+len)` with the
 /// given logical char/line counts — or the empty node when `len == 0`. Used at
-/// open and rebase; `start` is 3 for a BOM file (the BOM bytes precede the piece)
-/// and 0 otherwise.
+/// open and rebase; `start` is 3 for a BOM file (the BOM bytes precede the
+/// piece) and 0 otherwise.
 fn single_original_root(start: usize, len: usize, chars: usize, lines: usize) -> Arc<Node> {
     if len == 0 {
         Node::empty()
@@ -698,11 +702,11 @@ fn next_char_boundary(bytes: &[u8], mut i: usize) -> usize {
 /// chunk.
 type ScanPart = Option<(Vec<u8>, usize, usize, Vec<u8>)>;
 
-/// Validate + count one byte range of `file` for the parallel fused open
-/// scan — `read_at` is positional and thread-safe, so workers share the fd.
-/// Ragged edges are the caller's problem: head continuation bytes (max 3)
-/// are skipped and returned verbatim, an incomplete trailing char is carried
-/// out, and the seam stitching in `validate_and_count` re-joins them.
+/// Validate + count one byte range of `file` for the parallel fused open scan —
+/// `read_at` is positional and thread-safe, so workers share the fd.  Ragged
+/// edges are the caller's problem: head continuation bytes (max 3) are skipped
+/// and returned verbatim, an incomplete trailing char is carried out, and the
+/// seam stitching in `validate_and_count` re-joins them.
 fn scan_range(file: &std::fs::File, mut off: usize, end: usize) -> ScanPart {
     use std::os::unix::fs::FileExt;
     let mut head: Vec<u8> = Vec::new();
@@ -779,8 +783,8 @@ fn count_chars_lines_parallel(bytes: &[u8]) -> (usize, usize) {
     }
 
     // Partition into char-boundary-aligned chunks: target an even byte split,
-    // then nudge each boundary forward off any continuation byte. Empty trailing
-    // chunks (if a nudge consumed the rest) are simply skipped.
+    // then nudge each boundary forward off any continuation byte. Empty
+    // trailing chunks (if a nudge consumed the rest) are simply skipped.
     let target = bytes.len().div_ceil(threads);
     let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(threads);
     let mut start = 0;
@@ -839,8 +843,8 @@ impl Summary {
 /// that only affects depth, never results — a TODO for a later compaction pass.
 const MAX: usize = 16;
 
-/// A node of the persistent measured B-tree. Shared via [`Arc`]; edits copy only
-/// the root→leaf path (path-copying), so older roots stay valid snapshots.
+/// A node of the persistent measured B-tree. Shared via [`Arc`]; edits copy
+/// only the root→leaf path (path-copying), so older roots stay valid snapshots.
 enum Node {
     /// A run of pieces plus their combined summary.
     Leaf {
@@ -871,8 +875,8 @@ impl Node {
     }
 
     /// A leaf holding no pieces — the canonical empty subtree. `delete_rec`
-    /// drops exactly these from a rebuilt parent (an internal node that lost all
-    /// its children is collapsed to one of these, never kept as a child).
+    /// drops exactly these from a rebuilt parent (an internal node that lost
+    /// all its children is collapsed to one of these, never kept as a child).
     fn is_empty_leaf(&self) -> bool {
         matches!(self, Node::Leaf { pieces, .. } if pieces.is_empty())
     }
@@ -908,8 +912,8 @@ pub struct Quire {
     /// Immutable original backing, shared by every snapshot.
     original: Rc<Original>,
     /// Append-only add buffer, shared by every snapshot; copied-on-write before
-    /// a shared `Quire` grows it (see [`Quire::add_mut`]). Pieces with
-    /// `source == Add` reference byte ranges in here.
+    /// a shared `Quire` grows it (see [`Quire::add_mut`]). Pieces with `source
+    /// == Add` reference byte ranges in here.
     add: Arc<Vec<u8>>,
     /// The document spine: a persistent measured B-tree of pieces.
     root: Arc<Node>,
@@ -920,8 +924,9 @@ pub struct Quire {
     mark: Option<usize>,
     /// Narrowing `(lo, hi)`; accessible region is `[lo, hi)`. `None` = whole.
     narrowing: Option<(usize, usize)>,
-    /// Live markers, indexed by id; `None` = detached. Absolute 1-based positions
-    /// that auto-adjust across edits (Emacs markers). Cloned on `snapshot`.
+    /// Live markers, indexed by id; `None` = detached. Absolute 1-based
+    /// positions that auto-adjust across edits (Emacs markers). Cloned on
+    /// `snapshot`.
     markers: Vec<Option<usize>>,
     /// Most recent successful search, in 1-based char positions.
     last_match: Option<MatchData>,
@@ -935,24 +940,26 @@ pub struct Quire {
     text_cache: RefCell<Option<String>>,
     /// The last char→byte seek, so the next one resumes there instead of
     /// rescanning its piece from the start (see [`Quire::scan_prefix`]). A pure
-    /// cache: `None` in a fresh store and after [`Quire::rebase_to`], self-checking
-    /// against every splice in between (see [`SeekMemo`]), and every answer it
-    /// produces is the one the from-start walk would have produced.
+    /// cache: `None` in a fresh store and after [`Quire::rebase_to`],
+    /// self-checking against every splice in between (see [`SeekMemo`]), and
+    /// every answer it produces is the one the from-start walk would have
+    /// produced.
     seek_memo: Cell<Option<SeekMemo>>,
     /// Content version (see `TextStore::version`): re-stamped on every text
     /// mutation; a snapshot keeps it — same version, same text.
     version: u64,
     /// The TARGET coding for the next save (Emacs `buffer-file-coding-system`):
-    /// what `write_to` encodes to, what `set_coding` changes, what session_status
-    /// shows. Defaults to `view_coding` at open.
+    /// what `write_to` encodes to, what `set_coding` changes, what
+    /// session_status shows. Defaults to `view_coding` at open.
     coding: crate::coding::FileCoding,
     /// The format the paged Original's RAW bytes are actually in (the coding
-    /// detected at open) — the basis for the normalized view (`strips_crlf`) and
-    /// for a byte-exact save when it still equals `coding`. Immutable after open;
-    /// `set_coding` never touches it. `default()` for in-memory/plain. A setter
-    /// for the VIEW (not just the save target) would have to rebuild every piece's
-    /// char/line summary, which was computed under the open-time view, and reset
-    /// the seek memo — today only `rebase_to` changes it, and it does both.
+    /// detected at open) — the basis for the normalized view (`strips_crlf`)
+    /// and for a byte-exact save when it still equals `coding`. Immutable after
+    /// open; `set_coding` never touches it. `default()` for in-memory/plain. A
+    /// setter for the VIEW (not just the save target) would have to rebuild
+    /// every piece's char/line summary, which was computed under the open-time
+    /// view, and reset the seek memo — today only `rebase_to` changes it, and
+    /// it does both.
     view_coding: crate::coding::FileCoding,
 }
 
@@ -964,10 +971,10 @@ impl Quire {
     pub fn open(path: &Path) -> std::io::Result<Quire> {
         let file = std::fs::File::open(path)?;
         let len = file.metadata()?.len() as usize;
-        // Stamp the visited file so save paths (and the pager's fresh-read drift
-        // check) can detect an external writer. Captured right after the open;
-        // the open→stat window is tiny and a writer landing inside it still
-        // differs from the *saved* stamp later.
+        // Stamp the visited file so save paths (and the pager's fresh-read
+        // drift check) can detect an external writer. Captured right after the
+        // open; the open→stat window is tiny and a writer landing inside it
+        // still differs from the *saved* stamp later.
         let stamp = crate::safety::FileStamp::capture(path)?;
         let paged = PagedFile::open(file, len, stamp.clone());
         // One fused pass: UTF-8 validation AND the char/line index (the two
@@ -979,20 +986,21 @@ impl Quire {
             ));
         };
         let name = Quire::buffer_name_of(path);
-        // A non-plain file keeps its raw BOM/CRLF bytes on the paged backing (no
-        // materialization, so large-file support is preserved); the char/byte
-        // scan primitives present a normalized LF view (`strips_crlf`) and the BOM
-        // is excluded from the piece below, so the tree's piece summaries must be
-        // the LOGICAL counts, not the raw ones.
+        // A non-plain file keeps its raw BOM/CRLF bytes on the paged backing
+        // (no materialization, so large-file support is preserved); the
+        // char/byte scan primitives present a normalized LF view
+        // (`strips_crlf`) and the BOM is excluded from the piece below, so the
+        // tree's piece summaries must be the LOGICAL counts, not the raw ones.
         let coding = paged.detect_coding();
         let counts = if coding.is_plain() {
             raw_counts
         } else {
             paged.count_view(coding.had_bom, coding.eol == crate::coding::Eol::Dos)
         };
-        // The BOM bytes are NOT part of any piece: the Original starts 3 bytes in,
-        // and `write_to` re-emits the BOM. This keeps the signature robust against
-        // inserts/deletes at the buffer start (it can't be relocated or pruned).
+        // The BOM bytes are NOT part of any piece: the Original starts 3 bytes
+        // in, and `write_to` re-emits the BOM. This keeps the signature robust
+        // against inserts/deletes at the buffer start (it can't be relocated or
+        // pruned).
         let start = if coding.had_bom { 3 } else { 0 };
         let mut quire =
             Quire::with_original_counted(name, Original::Paged(paged), Some(counts), start);
@@ -1008,8 +1016,8 @@ impl Quire {
         Quire::with_original(name.into(), Original::Owned(text.into()))
     }
 
-    /// The buffer name a visited `path` gets: its file name, or the whole
-    /// path when it has none.
+    /// The buffer name a visited `path` gets: its file name, or the whole path
+    /// when it has none.
     fn buffer_name_of(path: &Path) -> String {
         path.file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -1038,12 +1046,13 @@ impl Quire {
         counts: Option<(usize, usize)>,
         start: usize,
     ) -> Quire {
-        // One piece spanning the original from `start` (3 past a BOM, else 0) to
-        // the end. Counting its chars/lines is the one up-front scan and the real
-        // cost of opening a multi-GB file. It is parallelized over the available
-        // cores above `PARALLEL_INDEX_THRESHOLD` (see `count_chars_lines_parallel`);
-        // the tree itself is still the single whole-file piece — only the counting
-        // is fanned out. (Making it incremental/background remains a later option.)
+        // One piece spanning the original from `start` (3 past a BOM, else 0)
+        // to the end. Counting its chars/lines is the one up-front scan and the
+        // real cost of opening a multi-GB file. It is parallelized over the
+        // available cores above `PARALLEL_INDEX_THRESHOLD` (see
+        // `count_chars_lines_parallel`); the tree itself is still the single
+        // whole-file piece — only the counting is fanned out. (Making it
+        // incremental/background remains a later option.)
         let (chars, lines) = counts.unwrap_or_else(|| original.count_chars_lines());
         let root = single_original_root(start, original.len() - start, chars, lines);
         Quire {
@@ -1066,10 +1075,11 @@ impl Quire {
     }
 
     /// An O(1)/O(log n) snapshot: clone the tree root and both backing pointers
-    /// (no document bytes copied) and copy only the cursor/narrowing/match state.
-    /// The result is an independent `Quire` whose future edits path-copy from the
-    /// shared root and copy-on-write the add buffer, so neither version disturbs
-    /// the other. This is the basis for ~KB workspace checkpoints over GB files.
+    /// (no document bytes copied) and copy only the cursor/narrowing/match
+    /// state.  The result is an independent `Quire` whose future edits
+    /// path-copy from the shared root and copy-on-write the add buffer, so
+    /// neither version disturbs the other. This is the basis for ~KB workspace
+    /// checkpoints over GB files.
     pub fn snapshot(&self) -> Quire {
         Quire {
             name: self.name.clone(),
@@ -1090,22 +1100,24 @@ impl Quire {
         }
     }
 
-    /// Re-base onto `path` after the buffer was just saved there: re-open the new
-    /// file as a single paged `Original` piece and drop the pre-save backing (the
-    /// old, now-unlinked inode + its page cache) plus the add buffer.
-    /// Point/mark/narrowing/markers are kept. The saved file is byte-identical to
-    /// the current content, so the char/line totals are reused from the live
-    /// summary — no re-scan, no UTF-8 re-validation. O(1) + open.
+    /// Re-base onto `path` after the buffer was just saved there: re-open the
+    /// new file as a single paged `Original` piece and drop the pre-save
+    /// backing (the old, now-unlinked inode + its page cache) plus the add
+    /// buffer.  Point/mark/narrowing/markers are kept. The saved file is
+    /// byte-identical to the current content, so the char/line totals are
+    /// reused from the live summary — no re-scan, no UTF-8 re-validation. O(1)
+    /// + open.
     pub fn rebase_to(&mut self, path: &Path) -> std::io::Result<()> {
         let stamp = crate::safety::FileStamp::capture(path)?;
         let file = std::fs::File::open(path)?;
         let bytes_len = file.metadata()?.len() as usize;
         // Only a fully-plain save (target AND original coding plain) writes the
-        // pieces' raw bytes verbatim, so its size equals the content. Any BOM/EOL
-        // encoding — restoring the view OR converting to a new coding — makes the
-        // saved file a different size; the new Original is then in the TARGET
-        // coding, and the view strips it back to the same logical text, so the
-        // char/line summary is reused with the saved file's byte length.
+        // pieces' raw bytes verbatim, so its size equals the content. Any
+        // BOM/EOL encoding — restoring the view OR converting to a new coding —
+        // makes the saved file a different size; the new Original is then in
+        // the TARGET coding, and the view strips it back to the same logical
+        // text, so the char/line summary is reused with the saved file's byte
+        // length.
         debug_assert!(
             !(self.coding.is_plain() && self.view_coding.is_plain())
                 || bytes_len == self.total_bytes(),
@@ -1125,8 +1137,8 @@ impl Quire {
         self.root = root;
         self.stamp = Some(stamp);
         self.view_coding = self.coding; // the saved file is in the target coding now
-        // The only reset the seek memo needs: everything its key names —
-        // the Original's bytes, the add buffer, the view — was just replaced.
+        // The only reset the seek memo needs: everything its key names — the
+        // Original's bytes, the add buffer, the view — was just replaced.
         self.seek_memo.set(None);
         self.invalidate();
         Ok(())
@@ -1135,8 +1147,8 @@ impl Quire {
     /// Invoke `f` with successive byte slices covering `[start, start+len)` of
     /// `source`, in order; `f` returns `false` to stop. The unit of access that
     /// works the same over a contiguous (Add / owned) backing and a paged
-    /// original: callers scan or copy bytes rather than borrowing one `&str` over
-    /// the whole range. A chunk may end mid-char, so it's raw bytes only.
+    /// original: callers scan or copy bytes rather than borrowing one `&str`
+    /// over the whole range. A chunk may end mid-char, so it's raw bytes only.
     fn for_bytes(
         &self,
         source: Source,
@@ -1155,11 +1167,12 @@ impl Quire {
         }
     }
 
-    /// Like [`for_bytes`](Self::for_bytes), but yields the NORMALIZED VIEW bytes:
-    /// for a non-plain Original it elides a leading BOM and the `\r` of each
-    /// `\r\n` (keeping the `\n`). The read paths (`full_text`, `collect_range`)
-    /// use this; `write_to` uses raw `for_bytes` so untouched regions save
-    /// byte-exact. `start`/`len` are RAW byte offsets into the source.
+    /// Like [`for_bytes`](Self::for_bytes), but yields the NORMALIZED VIEW
+    /// bytes: for a non-plain Original it elides a leading BOM and the `\r` of
+    /// each `\r\n` (keeping the `\n`). The read paths (`full_text`,
+    /// `collect_range`) use this; `write_to` uses raw `for_bytes` so untouched
+    /// regions save byte-exact. `start`/`len` are RAW byte offsets into the
+    /// source.
     fn for_view_bytes(
         &self,
         source: Source,
@@ -1206,26 +1219,28 @@ impl Quire {
         }
     }
 
-    /// `true` when reads of `source` strip CRLF → LF for the normalized view. The
-    /// BOM is NOT handled here: its bytes are excluded from every piece's range at
-    /// open (the Original starts after them) and re-emitted on save, so it survives
-    /// edits at the buffer start. Only the paged Original of a DOS file is stripped;
-    /// the add buffer (inserted text) is always plain LF. `write_to` bypasses this
-    /// and emits raw Original bytes, so untouched regions save byte-exact.
+    /// `true` when reads of `source` strip CRLF → LF for the normalized view.
+    /// The BOM is NOT handled here: its bytes are excluded from every piece's
+    /// range at open (the Original starts after them) and re-emitted on save,
+    /// so it survives edits at the buffer start. Only the paged Original of a
+    /// DOS file is stripped; the add buffer (inserted text) is always plain LF.
+    /// `write_to` bypasses this and emits raw Original bytes, so untouched
+    /// regions save byte-exact.
     fn strips_crlf(&self, source: Source) -> bool {
         source == Source::Original && self.view_coding.eol == crate::coding::Eol::Dos
     }
 
-    /// Walk the chars of `piece` from char `ci0` (which starts at byte `bp0` and
-    /// has `nl0` `\n` bytes before it) in order, one chunked byte pass, calling
-    /// `f(byte_offset_of_char_start, char_index, newlines_before_char)`; `f`
-    /// returns `false` to stop. `(0, 0, 0)` walks the whole piece; any other
-    /// triple must name a char START and its two counts — exactly what a
-    /// [`SeekMemo`] holds. Char starts are the non-continuation bytes, so no
-    /// UTF-8 decode is needed — chunk splits inside a multi-byte char are
-    /// invisible to the counts. This is the byte pass that
-    /// [`scan_prefix`](Self::scan_prefix) resumes from an anchor; `scan_prefix` is
-    /// the primitive every within-piece char→byte seek goes through.
+    /// Walk the chars of `piece` from char `ci0` (which starts at byte `bp0`
+    /// and has `nl0` `\n` bytes before it) in order, one chunked byte pass,
+    /// calling `f(byte_offset_of_char_start, char_index,
+    /// newlines_before_char)`; `f` returns `false` to stop. `(0, 0, 0)` walks
+    /// the whole piece; any other triple must name a char START and its two
+    /// counts — exactly what a [`SeekMemo`] holds. Char starts are the
+    /// non-continuation bytes, so no UTF-8 decode is needed — chunk splits
+    /// inside a multi-byte char are invisible to the counts. This is the byte
+    /// pass that [`scan_prefix`](Self::scan_prefix) resumes from an anchor;
+    /// `scan_prefix` is the primitive every within-piece char→byte seek goes
+    /// through.
     ///
     /// Under a normalized DOS view (see [`strips_crlf`](Self::strips_crlf)) the
     /// byte offsets stay RAW (file offsets) while char indices are LOGICAL: a
@@ -1271,11 +1286,12 @@ impl Quire {
     /// count before it. `n >= piece.chars` yields `(piece.len, piece.lines)` —
     /// the end.
     ///
-    /// This is the primitive every within-piece char→byte seek goes through, and
-    /// walking the piece from its start each time is what made a multi-step
+    /// This is the primitive every within-piece char→byte seek goes through,
+    /// and walking the piece from its start each time is what made a multi-step
     /// motion quadratic: a freshly opened file is ONE whole-file piece, and the
-    /// motion walkers ask for one window per line or per word. So the seek starts
-    /// from the NEAREST exact anchor it holds for this piece, by char distance:
+    /// motion walkers ask for one window per line or per word. So the seek
+    /// starts from the NEAREST exact anchor it holds for this piece, by char
+    /// distance:
     ///
     /// * the head, `(0, 0, 0)`;
     /// * the end, `(chars, len, lines)` — free from the tree summary and in the
@@ -1287,8 +1303,8 @@ impl Quire {
     /// ([`scan_prefix_from`](Self::scan_prefix_from)); from one past it the
     /// bounded reverse windows step back
     /// ([`scan_prefix_back`](Self::scan_prefix_back)). Sequential use in either
-    /// direction is therefore amortized O(chars traversed), and a cold seek costs
-    /// the distance to the nearer END of the piece, not to its head.
+    /// direction is therefore amortized O(chars traversed), and a cold seek
+    /// costs the distance to the nearer END of the piece, not to its head.
     fn scan_prefix(&self, piece: &Piece, n: usize) -> (usize, usize) {
         let anchor = |at: usize, bp: usize, nl: usize| SeekMemo {
             source: piece.source,
@@ -1302,9 +1318,9 @@ impl Quire {
         // The end anchor satisfies a memo's invariant by construction: `[0,
         // piece.len)` holds exactly `piece.chars` char starts and `piece.lines`
         // `\n` bytes, which is all `scan_prefix_back` asks of it. It stays a
-        // LOCAL anchor — storing it in the memo slot would leave the next lookup
-        // near the head measuring back across the whole piece, and it costs
-        // nothing to rebuild.
+        // LOCAL anchor — storing it in the memo slot would leave the next
+        // lookup near the head measuring back across the whole piece, and it
+        // costs nothing to rebuild.
         let (head, end) = (anchor(0, 0, 0), anchor(piece.chars, piece.len, piece.lines));
         let mut from = if dist(&end) < dist(&head) { end } else { head };
         if let Some(m) = self
@@ -1357,20 +1373,20 @@ impl Quire {
     /// `memo.n - n` of them have been passed. Returns `(byte offset of char `n`
     /// within the piece, `\n` bytes before it)`.
     ///
-    /// The loop normally finds its `want`th char start: the anchor's invariant is
-    /// that `[0, memo.bp)` holds exactly `memo.n` of them, and `want = memo.n - n
-    /// <= memo.n - 1`. It can still run out of piece when the paged backing has
-    /// DRIFTED — an external rewrite that raises the bytes per char leaves
-    /// `[0, piece.len)` holding fewer char starts than `piece.chars`, so even the
-    /// end anchor overshoots. That is reachable from any Lisp-chosen position
-    /// rather than a broken invariant, so the exhausted loop falls through to the
-    /// from-start walk, which is bounded by the piece and answers over whatever
-    /// bytes are there now.
+    /// The loop normally finds its `want`th char start: the anchor's invariant
+    /// is that `[0, memo.bp)` holds exactly `memo.n` of them, and `want =
+    /// memo.n - n <= memo.n - 1`. It can still run out of piece when the paged
+    /// backing has DRIFTED — an external rewrite that raises the bytes per char
+    /// leaves `[0, piece.len)` holding fewer char starts than `piece.chars`, so
+    /// even the end anchor overshoots. That is reachable from any Lisp-chosen
+    /// position rather than a broken invariant, so the exhausted loop falls
+    /// through to the from-start walk, which is bounded by the piece and
+    /// answers over whatever bytes are there now.
     ///
-    /// Char starts are judged by [`starts_char`], which needs the byte before the
-    /// one under test — so each window is read with one byte of left context. At
-    /// piece byte 0 there is none and none is needed: pieces are cut on char
-    /// boundaries, which never fall between a `\r` and its `\n`.
+    /// Char starts are judged by [`starts_char`], which needs the byte before
+    /// the one under test — so each window is read with one byte of left
+    /// context. At piece byte 0 there is none and none is needed: pieces are
+    /// cut on char boundaries, which never fall between a `\r` and its `\n`.
     ///
     /// `nl` counts `\n` BYTES before the char, so the answer is `memo.nl` less
     /// the `\n`s in `[bp, memo.bp)` — additive, hence carried across windows.
@@ -1380,12 +1396,13 @@ impl Quire {
         let (mut seen, mut newlines) = (0usize, 0usize);
         let mut hi = memo.bp; // exclusive end of the window being read
         // A char is at most 4 bytes, so 4 per char plus 4 for the one the front
-        // edge may cut in half spans the whole hop. The loop bounds the window's
-        // SIZE for a long hop; it is not a retry of a guess that fell short.
+        // edge may cut in half spans the whole hop. The loop bounds the
+        // window's SIZE for a long hop; it is not a retry of a guess that fell
+        // short.
         let mut width = (4 * want + 4).min(BACK_WINDOW);
-        // One buffer for the whole hop: `for_bytes` reads front to back while the
-        // scan runs back to front, so a window is gathered whole before it can be
-        // scanned. Sized for the first window and reused (cleared, never
+        // One buffer for the whole hop: `for_bytes` reads front to back while
+        // the scan runs back to front, so a window is gathered whole before it
+        // can be scanned. Sized for the first window and reused (cleared, never
         // reallocated past `BACK_WINDOW + 1`) by every later one.
         let mut win: Vec<u8> = Vec::with_capacity(width + 1);
         while hi > 0 {
@@ -1412,9 +1429,9 @@ impl Quire {
     }
 
     /// Char and newline counts of `[start, start+len)` in `source`, summed over
-    /// chunks (chars = non-continuation bytes, lines = `\n` bytes — both additive
-    /// across chunk splits). Under a normalized DOS view, counts are LOGICAL: a
-    /// `\r\n` is one char + one line.
+    /// chunks (chars = non-continuation bytes, lines = `\n` bytes — both
+    /// additive across chunk splits). Under a normalized DOS view, counts are
+    /// LOGICAL: a `\r\n` is one char + one line.
     fn count_range(&self, source: Source, start: usize, len: usize) -> (usize, usize) {
         let (mut chars, mut lines) = (0usize, 0usize);
         if self.strips_crlf(source) {
@@ -1455,10 +1472,10 @@ impl Quire {
             }
             true
         });
-        // Under a DOS view this byte starts a newline char iff it is the `\r` of
-        // a `\r\n` (then the logical char is `\n`); a `\r` not followed by `\n`
-        // is a real lone-CR char. (Splits never separate `\r\n`, so a `\r` at the
-        // piece's end is a lone CR.)
+        // Under a DOS view this byte starts a newline char iff it is the `\r`
+        // of a `\r\n` (then the logical char is `\n`); a `\r` not followed by
+        // `\n` is a real lone-CR char. (Splits never separate `\r\n`, so a `\r`
+        // at the piece's end is a lone CR.)
         if self.strips_crlf(piece.source) && buf[0] == b'\r' {
             return Some(if i >= 2 && buf[1] == b'\n' {
                 '\n'
@@ -1481,7 +1498,8 @@ impl Quire {
     /// A mutable handle to the add buffer, performing copy-on-write if it is
     /// still shared by a snapshot. Appends thereafter are in place and O(1)
     /// amortized; the COW clone happens at most once per "first edit after a
-    /// snapshot" and copies only inserted text (typically tiny vs the document).
+    /// snapshot" and copies only inserted text (typically tiny vs the
+    /// document).
     fn add_mut(&mut self) -> &mut Vec<u8> {
         Arc::make_mut(&mut self.add)
     }
@@ -1517,8 +1535,8 @@ impl Quire {
     // ---- O(log n) seeks via the tree summaries ----------------------------
 
     /// Locate 1-based char position `p` (clamped to `1..=char_len+1`): descend
-    /// the tree by the `chars` summary to the leaf and piece containing it, then
-    /// resolve the *byte* offset of that char within the piece. Returns
+    /// the tree by the `chars` summary to the leaf and piece containing it,
+    /// then resolve the *byte* offset of that char within the piece. Returns
     /// `(leaf piece slice as &str, byte offset, char offset within piece)` for
     /// the boundary piece, or `None` at end-of-document. **O(log n)** node hops
     /// plus one within-piece char scan (was O(pieces) over a Vec prefix sum).
@@ -1556,8 +1574,8 @@ impl Quire {
         }
     }
 
-    /// The char at 1-based position `p` (absolute; ignores narrowing), or `None`
-    /// at/after end-of-document. O(log n) + a small within-piece scan.
+    /// The char at 1-based position `p` (absolute; ignores narrowing), or
+    /// `None` at/after end-of-document. O(log n) + a small within-piece scan.
     fn char_at(&self, p: usize) -> Option<char> {
         if p < 1 || p > self.total_chars() {
             return None;
@@ -1615,8 +1633,8 @@ impl Quire {
         }
     }
 
-    /// Count newlines in the absolute char range `[1, p)` — how many line breaks
-    /// precede position `p`. **O(log n)** via [`Self::summary_before`].
+    /// Count newlines in the absolute char range `[1, p)` — how many line
+    /// breaks precede position `p`. **O(log n)** via [`Self::summary_before`].
     fn newlines_before(&self, p: usize) -> usize {
         self.summary_before(p).lines
     }
@@ -1651,10 +1669,11 @@ impl Quire {
         walk(self.root.as_ref(), &mut f);
     }
 
-    /// Materialize the whole document into the lazy cache and hand back a `&str`
-    /// borrow of it. **This is the one place text is brought fully resident** —
-    /// a fallback for [`TextStore::text`]'s `&str` signature, nothing else calls
-    /// it. The borrow is valid until the next mutation (which clears the cache).
+    /// Materialize the whole document into the lazy cache and hand back a
+    /// `&str` borrow of it. **This is the one place text is brought fully
+    /// resident** — a fallback for [`TextStore::text`]'s `&str` signature,
+    /// nothing else calls it. The borrow is valid until the next mutation
+    /// (which clears the cache).
     fn full_text(&self) -> &str {
         if self.text_cache.borrow().is_none() {
             let mut bytes = Vec::with_capacity(self.total_bytes());
@@ -1681,8 +1700,8 @@ impl Quire {
 
     /// Stream the bytes of the absolute char range `[lo, hi)` (1-based) to `f`,
     /// in document order, page-bounded chunks — never materializing the range.
-    /// `f` returns `false` to stop early (e.g. a search that found its match). A
-    /// chunk may end mid-char, so it's raw bytes. O(streamed prefix + log n).
+    /// `f` returns `false` to stop early (e.g. a search that found its match).
+    /// A chunk may end mid-char, so it's raw bytes. O(streamed prefix + log n).
     fn for_range_bytes(&self, lo: usize, hi: usize, mut f: impl FnMut(&[u8]) -> bool) {
         let lo = lo.clamp(1, self.total_chars() + 1);
         let hi = hi.clamp(lo, self.total_chars() + 1);
@@ -1720,8 +1739,8 @@ impl Quire {
             out.extend_from_slice(chunk);
             true
         });
-        // SAFETY: a char range is char-boundary-aligned, so the concatenation of
-        // its byte chunks is valid UTF-8.
+        // SAFETY: a char range is char-boundary-aligned, so the concatenation
+        // of its byte chunks is valid UTF-8.
         unsafe { String::from_utf8_unchecked(out) }
     }
 
@@ -1764,9 +1783,9 @@ impl Quire {
 
     /// LAST occurrence of the literal `needle` in char range `[from, to)`,
     /// streamed BACKWARD chunk by chunk (with a needle-sized overlap reaching
-    /// down across each boundary), stopping at the first — i.e. latest —
-    /// hit. Locating an anchor just above point no longer materializes the
-    /// whole `[bound, point)` window the way `collect_range` + `rfind` did.
+    /// down across each boundary), stopping at the first — i.e. latest — hit.
+    /// Locating an anchor just above point no longer materializes the whole
+    /// `[bound, point)` window the way `collect_range` + `rfind` did.
     fn find_backward(&self, needle: &str, from: usize, to: usize) -> Option<(usize, usize)> {
         let nb = needle.as_bytes();
         if nb.is_empty() {
@@ -1779,8 +1798,8 @@ impl Quire {
         while hi > from {
             let lo = hi.saturating_sub(CHUNK_CHARS).max(from);
             // A match may straddle the lower edge: extend the window down by
-            // needle-1 chars so it is seen here (the chunk below would only
-            // see its prefix).
+            // needle-1 chars so it is seen here (the chunk below would only see
+            // its prefix).
             let scan_lo = lo.saturating_sub(nchars - 1).max(from);
             let window = self.collect_range(scan_lo, hi);
             if let Some(b) = finder.rfind(window.as_bytes()) {
@@ -1810,10 +1829,10 @@ impl Quire {
         }
     }
 
-    /// Split `piece` at `byte` (a char boundary within it) into `(left, right)`.
-    /// Counts the smaller side and derives the other from the piece's cached
-    /// totals — splitting a multi-megabyte piece near one end must not rescan
-    /// the rest of it (per-edit rescans made an edit sweep over a fresh
+    /// Split `piece` at `byte` (a char boundary within it) into `(left,
+    /// right)`.  Counts the smaller side and derives the other from the piece's
+    /// cached totals — splitting a multi-megabyte piece near one end must not
+    /// rescan the rest of it (per-edit rescans made an edit sweep over a fresh
     /// document O(n²)).
     fn split_piece(&self, piece: &Piece, byte: usize) -> (Piece, Piece) {
         let (left_chars, left_lines) = if byte <= piece.len / 2 {
@@ -1867,7 +1886,8 @@ impl Quire {
     }
 
     /// Persistently insert `piece` so that `target` chars precede it. Returns a
-    /// new root; the input root is untouched (path-copying). Splits propagate up.
+    /// new root; the input root is untouched (path-copying). Splits propagate
+    /// up.
     fn insert_piece(&self, root: &Arc<Node>, target: usize, piece: Piece) -> Arc<Node> {
         match self.insert_rec(root, target, piece) {
             (node, None) => node,
@@ -1877,8 +1897,8 @@ impl Quire {
     }
 
     /// Recursive insert. Returns the rebuilt node and, if it overflowed, the
-    /// right half of a split to be linked in by the caller. A piece straddled by
-    /// the insertion point is split on its char boundary first (recounting
+    /// right half of a split to be linked in by the caller. A piece straddled
+    /// by the insertion point is split on its char boundary first (recounting
     /// chars/lines from the real backing via [`Self::split_piece`]), so the new
     /// piece always lands at an exact boundary.
     fn insert_rec(
@@ -1890,7 +1910,8 @@ impl Quire {
         match node.as_ref() {
             Node::Leaf { pieces, .. } => {
                 let mut out = pieces.clone();
-                // Find the piece index and within-piece char offset for `target`.
+                // Find the piece index and within-piece char offset for
+                // `target`.
                 let mut acc = 0usize;
                 let mut idx = out.len();
                 let mut split_at: Option<(usize, usize)> = None; // (piece idx, char off)
@@ -1909,7 +1930,8 @@ impl Quire {
                     idx = i + 1;
                 }
                 if let Some((i, within)) = split_at {
-                    // Split the straddled piece on a char boundary, then insert.
+                    // Split the straddled piece on a char boundary, then
+                    // insert.
                     let byte = self.scan_prefix(&out[i], within).0;
                     let (l, r) = self.split_piece(&out[i], byte);
                     out[i] = l;
@@ -1942,9 +1964,9 @@ impl Quire {
         }
     }
 
-    /// Persistently delete `len` chars starting after `from` chars. Returns a new
-    /// root; the input root is untouched. The root is collapsed while it has a
-    /// single child so height stays minimal.
+    /// Persistently delete `len` chars starting after `from` chars. Returns a
+    /// new root; the input root is untouched. The root is collapsed while it
+    /// has a single child so height stays minimal.
     fn delete_chars(&self, root: &Arc<Node>, from: usize, len: usize) -> Arc<Node> {
         let node = self.delete_rec(root, from, len);
         Self::collapse_root(node)
@@ -1974,9 +1996,9 @@ impl Quire {
                     // so the second resumes from whichever of the first seek's
                     // memo, the piece head or the piece end is nearest, never a
                     // full rescan from the head. The suffix summary is derived
-                    // from the piece's cached totals,
-                    // never by rescanning the (possibly huge) tail — a per-edit
-                    // tail rescan made a replace sweep O(n²).
+                    // from the piece's cached totals, never by rescanning the
+                    // (possibly huge) tail — a per-edit tail rescan made a
+                    // replace sweep O(n²).
                     let keep_left = lo.saturating_sub(p_lo); // chars kept at front
                     let drop_to = hi.min(p_hi) - p_lo; // chars dropped up to (excl)
                     let (bend, nl_end) = self.scan_prefix(p, keep_left);
@@ -2032,8 +2054,8 @@ impl Quire {
         }
     }
 
-    /// Collapse single-child internal roots so the root's height is minimal, and
-    /// turn an all-empty tree into the canonical empty leaf.
+    /// Collapse single-child internal roots so the root's height is minimal,
+    /// and turn an all-empty tree into the canonical empty leaf.
     fn collapse_root(node: Arc<Node>) -> Arc<Node> {
         let mut node = node;
         loop {
@@ -2060,8 +2082,8 @@ impl Quire {
         )
     }
 
-    /// Build an internal node from `children`, splitting into two siblings at the
-    /// same `height` if it exceeds [`MAX`].
+    /// Build an internal node from `children`, splitting into two siblings at
+    /// the same `height` if it exceeds [`MAX`].
     fn internal_from(
         mut children: Vec<Arc<Node>>,
         height: usize,
@@ -2140,19 +2162,20 @@ impl Quire {
     /// Regex search forward from point (bounded by `bound` or point-max). On a
     /// hit: record match-data, move point past the match, return the new point.
     ///
-    /// Adaptively windowed: materialize a window growing from `ctx_from` (one char
-    /// of context before point, so `^`/`\b` judge the real boundary at a mid-line
-    /// point — never crossing point-min, a real line beginning) and run the regex,
-    /// stopping the moment the match ends strictly inside the window — so a hit
-    /// near point never copies the document tail. A match ending exactly at a
-    /// non-final boundary is re-judged against a larger window (it may extend, or
-    /// be a `$`/`\b` artifact of the cut). The final window carries one char of
-    /// context PAST an explicit bound and confines the match to a span ending at
-    /// the bound, so `$`/`\b` there consult the real buffer — Emacs semantics,
-    /// same as the in-memory oracle. A genuine *miss* still grows to the bound —
-    /// the regex must see every byte to say "no", the residual a true streaming
-    /// DFA over the piece tree would close. Capturing `replace_match`'s groups
-    /// needs the matched substrings regardless.
+    /// Adaptively windowed: materialize a window growing from `ctx_from` (one
+    /// char of context before point, so `^`/`\b` judge the real boundary at a
+    /// mid-line point — never crossing point-min, a real line beginning) and
+    /// run the regex, stopping the moment the match ends strictly inside the
+    /// window — so a hit near point never copies the document tail. A match
+    /// ending exactly at a non-final boundary is re-judged against a larger
+    /// window (it may extend, or be a `$`/`\b` artifact of the cut). The final
+    /// window carries one char of context PAST an explicit bound and confines
+    /// the match to a span ending at the bound, so `$`/`\b` there consult the
+    /// real buffer — Emacs semantics, same as the in-memory oracle. A genuine
+    /// *miss* still grows to the bound — the regex must see every byte to say
+    /// "no", the residual a true streaming DFA over the piece tree would close.
+    /// Capturing `replace_match`'s groups needs the matched substrings
+    /// regardless.
     fn re_search_forward(&mut self, re: &regex::Regex, bound: Option<usize>) -> Option<usize> {
         let from = self.point;
         let to = bound.unwrap_or_else(|| self.point_max());
@@ -2218,8 +2241,8 @@ impl Quire {
         self.splice_insert(start, &expanded);
         self.point = start + new_len;
         // Track the net length change on the narrowing bound, like
-        // insert/delete_region do (the replaced span is inside the region) —
-        // a length-changing replace under a restriction must not leave it stale.
+        // insert/delete_region do (the replaced span is inside the region) — a
+        // length-changing replace under a restriction must not leave it stale.
         if let Some((nlo, nhi)) = self.narrowing.as_mut() {
             if new_len >= old_len {
                 *nhi += new_len - old_len;
@@ -2257,9 +2280,9 @@ impl Quire {
         // real line beginning (see re_search_forward). Adaptively windowed: a
         // match anchored at point and ending inside the window settles `true`
         // without copying the tail; growth only happens when no in-window match
-        // starts at point yet (it may appear with more text) or the match ends at
-        // a non-EOF boundary (a possible `$`/`\b` cut artifact). A genuine miss
-        // still grows to EOF — the residual a streaming DFA would close.
+        // starts at point yet (it may appear with more text) or the match ends
+        // at a non-EOF boundary (a possible `$`/`\b` cut artifact). A genuine
+        // miss still grows to EOF — the residual a streaming DFA would close.
         let ctx_from = self
             .point
             .saturating_sub(1)
@@ -2385,14 +2408,14 @@ impl Quire {
                 // this line's start) for the *last* newline. `b-1` drops the
                 // single char at `start_line - 1` — the previous line's
                 // terminator — so we look for the last '\n' at a char position
-                // strictly below `start_line - 1`; the previous line then begins
-                // just after it. (When the previous line is empty its start *is*
-                // `start_line - 1`.) If there is no such newline, point goes to
-                // point_min and the move is not counted — Emacs's partial-move
-                // quirk — so we return `left`.
-                // Like the forward arm, the scan starts at the unclamped point
-                // (a stale narrowing can leave point outside [min, max]); only
-                // the target is clamped.
+                // strictly below `start_line - 1`; the previous line then
+                // begins just after it. (When the previous line is empty its
+                // start *is* `start_line - 1`.) If there is no such newline,
+                // point goes to point_min and the move is not counted — Emacs's
+                // partial-move quirk — so we return `left`.  Like the forward
+                // arm, the scan starts at the unclamped point (a stale
+                // narrowing can leave point outside [min, max]); only the
+                // target is clamped.
                 let start_line = self.point;
                 let mut j = start_line.saturating_sub(2); // last excluded pos - 1
                 let mut found = None;
@@ -2411,9 +2434,9 @@ impl Quire {
                         self.point = clamped;
                         // Same genuine-line-beginning rule as the oracle (see
                         // Buffer::forward_line): the buffer start, or a
-                        // restriction starting just after a newline, is a
-                        // real line beginning — reaching it completes the
-                        // move; a mid-line restriction start stays short.
+                        // restriction starting just after a newline, is a real
+                        // line beginning — reaching it completes the move; a
+                        // mid-line restriction start stays short.
                         let genuine =
                             clamped == min && (min == 1 || self.char_at(min - 1) == Some('\n'));
                         if genuine && moved {
@@ -2429,8 +2452,8 @@ impl Quire {
         0
     }
     /// 1-based line number containing 1-based char position `p`, counted from
-    /// the start of the accessible region (Emacs `line-number-at-pos`
-    /// semantics — see the oracle). Two O(log n) tree queries.
+    /// the start of the accessible region (Emacs `line-number-at-pos` semantics
+    /// — see the oracle). Two O(log n) tree queries.
     fn line_number_at_pos(&self, p: usize) -> usize {
         let before_p = self.newlines_before(p);
         let min = self.point_min().min(p);
@@ -2654,8 +2677,8 @@ impl TextStore for Quire {
         // The target coding still matches the file the Original came from: save
         // byte-exact. The BOM (excluded from the pieces) is re-emitted first;
         // Original pieces then emit RAW (their on-disk CRLF preserved, so
-        // untouched regions — even mixed line endings — round-trip exactly), and
-        // inserted text (the LF add buffer) is encoded to the target EOL.
+        // untouched regions — even mixed line endings — round-trip exactly),
+        // and inserted text (the LF add buffer) is encoded to the target EOL.
         if self.coding == self.view_coding {
             let dos = self.coding.eol == crate::coding::Eol::Dos;
             let mut written = 0usize;
@@ -2717,8 +2740,8 @@ impl TextStore for Quire {
         if self.coding != coding {
             self.coding = coding;
             // A coding change alters the on-disk bytes the next save writes, so
-            // it must count as a modification — otherwise the conversion reads as
-            // unsaved:false and an auto-revert could silently discard it.
+            // it must count as a modification — otherwise the conversion reads
+            // as unsaved:false and an auto-revert could silently discard it.
             self.version = crate::store::next_version();
         }
     }
@@ -2860,8 +2883,8 @@ mod tests {
 
     #[test]
     fn bounded_search_assertions_consult_past_the_bound() {
-        // Mirror of the Buffer test, plus a window-growth case: `$`/`\b` at
-        // an explicit bound judge the real buffer past it, not the cut.
+        // Mirror of the Buffer test, plus a window-growth case: `$`/`\b` at an
+        // explicit bound judge the real buffer past it, not the cut.
         let foo_eol = regex::RegexBuilder::new("foo$")
             .multi_line(true)
             .build()
@@ -2880,9 +2903,9 @@ mod tests {
             Some(4),
             "a real line end at the bound"
         );
-        // The bound lies past the initial adaptive window, so the final
-        // window (with its one-char context past the bound) is reached by
-        // growth — and must agree with the in-memory oracle.
+        // The bound lies past the initial adaptive window, so the final window
+        // (with its one-char context past the bound) is reached by growth — and
+        // must agree with the in-memory oracle.
         let mut content = "a".repeat(SEARCH_WINDOW_START + 100);
         content.push_str("foobar\n");
         let bound = SEARCH_WINDOW_START + 100 + 4; // right after "foo"
@@ -2977,7 +3000,8 @@ mod tests {
     }
 
     /// `next_char_boundary` snaps forward off continuation bytes and is a no-op
-    /// on bytes that already start a scalar value (matching `is_char_boundary`).
+    /// on bytes that already start a scalar value (matching
+    /// `is_char_boundary`).
     #[test]
     fn next_char_boundary_aligns_forward() {
         let s = "a世b"; // bytes: [a][世.0][世.1][世.2][b]; 世 spans 1..=3
@@ -3127,9 +3151,9 @@ mod tests {
     fn backward_search_chunking_matches_the_oracle() {
         // Multibyte text spanning several backward 16K-char chunks, with one
         // needle deep in the bottom chunk and one straddling the first chunk
-        // edge below point — the streamed backward search must agree with
-        // the oracle on both hits (latest first), the match data, and the
-        // final miss.
+        // edge below point — the streamed backward search must agree with the
+        // oracle on both hits (latest first), the match data, and the final
+        // miss.
         let mut chars: Vec<char> = std::iter::repeat_n('é', 40_000).collect();
         let plant = |chars: &mut Vec<char>, at: usize| {
             for (i, c) in "NEEDLE".chars().enumerate() {
@@ -3159,8 +3183,8 @@ mod tests {
     #[test]
     fn fused_open_counts_a_char_straddling_the_page_boundary() {
         // 'é' (2 bytes) sits across the first page edge: the fused
-        // validate-and-count pass must carry the split char and still
-        // count it exactly once.
+        // validate-and-count pass must carry the split char and still count it
+        // exactly once.
         let path = tmp_path("straddle");
         let mut text = "a".repeat(PAGE - 1);
         text.push('é');
@@ -3196,8 +3220,9 @@ mod tests {
 
     #[test]
     fn open_rejects_a_file_truncated_mid_char() {
-        // A 3-byte char with its last byte missing: the streaming validator must
-        // reject it (a leftover carry at EOF), like the whole-buffer check did.
+        // A 3-byte char with its last byte missing: the streaming validator
+        // must reject it (a leftover carry at EOF), like the whole-buffer check
+        // did.
         let path = tmp_path("trunc-char");
         let mut bytes = "ok\n".as_bytes().to_vec();
         bytes.extend_from_slice(&"€".as_bytes()[..2]); // drop the final byte
@@ -3211,9 +3236,10 @@ mod tests {
 
     #[test]
     fn open_reads_an_empty_file_via_the_paged_path() {
-        // A 0-byte file through Quire::open: the streaming validator accepts it,
-        // with_original short-circuits to an empty tree, and reads are empty —
-        // no page() is ever called (len 0), so no offset math runs on it.
+        // A 0-byte file through Quire::open: the streaming validator accepts
+        // it, with_original short-circuits to an empty tree, and reads are
+        // empty — no page() is ever called (len 0), so no offset math runs on
+        // it.
         let path = tmp_path("empty");
         std::fs::write(&path, b"").unwrap();
         let q = Quire::open(&path).unwrap();
@@ -3381,7 +3407,8 @@ mod tests {
         }
     }
 
-    /// Read `[0, len)` of the original in ONE read call, returning the bytes seen.
+    /// Read `[0, len)` of the original in ONE read call, returning the bytes
+    /// seen.
     fn read_all(q: &Quire, len: usize) -> usize {
         let mut seen = 0usize;
         q.for_bytes(Source::Original, 0, len, |chunk| {
@@ -3393,9 +3420,9 @@ mod tests {
 
     #[test]
     fn paged_read_stats_once_per_call_and_never_when_cached() {
-        // The contract: one read call stats once however many pages it reads
-        // (a stat per miss made a cold pass cost ~16k syscalls per GB), and a
-        // call served entirely from the page cache stats not at all.
+        // The contract: one read call stats once however many pages it reads (a
+        // stat per miss made a cold pass cost ~16k syscalls per GB), and a call
+        // served entirely from the page cache stats not at all.
         let path = tmp_path("drift-stats");
         let len = 3 * PAGE + 7;
         std::fs::write(&path, "a".repeat(len)).unwrap();
@@ -3430,8 +3457,8 @@ mod tests {
         // drift is seen by the stat on a read that TOUCHES the file, so a
         // rewrite landing between two reads of an already-resident file is not
         // latched. The live `FileStamp::check` in `Engine::is_stale` does not
-        // see it either, since size, mtime and inode are all unchanged; this
-        // is the documented blind spot, not a bug the product covers elsewhere.
+        // see it either, since size, mtime and inode are all unchanged; this is
+        // the documented blind spot, not a bug the product covers elsewhere.
         let path = tmp_path("drift-cached");
         std::fs::write(&path, "a".repeat(100)).unwrap();
         let orig_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
@@ -3511,9 +3538,10 @@ mod tests {
     #[test]
     fn paged_search_carries_a_multibyte_char_across_the_chunk_boundary() {
         // The needle is PAST a 3-byte char that straddles the PAGE edge, so
-        // find_forward's keep/drop carry runs across a multibyte split BEFORE the
-        // match — exercising the char-position accounting through a dropped
-        // multibyte prefix (the all-ASCII straddle test doesn't reach this path).
+        // find_forward's keep/drop carry runs across a multibyte split BEFORE
+        // the match — exercising the char-position accounting through a dropped
+        // multibyte prefix (the all-ASCII straddle test doesn't reach this
+        // path).
         let path = tmp_path("search-mb");
         let mut content = String::new();
         content.push_str(&"a".repeat(PAGE - 1));
@@ -3539,9 +3567,10 @@ mod tests {
 
     #[test]
     fn adaptive_regex_search_grows_the_window_and_matches_the_oracle() {
-        // A buffer larger than the initial search window so the window must grow;
-        // the match and a looking_at land PAST it. Every result is checked against
-        // the in-memory oracle, so the adaptive growth must be exact.
+        // A buffer larger than the initial search window so the window must
+        // grow; the match and a looking_at land PAST it. Every result is
+        // checked against the in-memory oracle, so the adaptive growth must be
+        // exact.
         let mut content = "a".repeat(SEARCH_WINDOW_START + 2000);
         content.push_str("NEEDLE then end\nmore\n");
         content.push_str(&"b".repeat(500));
@@ -3550,8 +3579,9 @@ mod tests {
 
         // `a$` matches at the INITIAL all-`a` window's cut (end-of-window looks
         // like end-of-text) but NOT in the full text (the a's are followed by
-        // `NEEDLE`, not a line end) — the adaptive search must grow past the cut
-        // artifact and settle to the oracle's `None`, not report the artifact.
+        // `NEEDLE`, not a line end) — the adaptive search must grow past the
+        // cut artifact and settle to the oracle's `None`, not report the
+        // artifact.
         for pat in ["NEEDLE", "end$", "x?NEEDLE", "no-such-token", "a$"] {
             let re = regex::Regex::new(pat).unwrap();
             TextStore::goto_char(&mut q, 1);
@@ -3657,8 +3687,9 @@ mod tests {
         // Force a genuinely multi-level tree so the internal-node insert/split/
         // root-growth paths (not just the single-leaf fast path) are exercised,
         // then check the summaries answer seeks correctly and a deep-tree
-        // snapshot is independent. Each insert at the front splits the straddled
-        // piece, so the piece count climbs well past one leaf's worth.
+        // snapshot is independent. Each insert at the front splits the
+        // straddled piece, so the piece count climbs well past one leaf's
+        // worth.
         let mut q = Quire::from_string("t", "");
         for i in 0..400 {
             TextStore::goto_char(&mut q, 1 + (i % 7)); // scatter the insertions
@@ -3703,9 +3734,11 @@ mod tests {
         assert_eq!(TextStore::text(&snap), full); // snapshot untouched
     }
 
-    // ---- the key deliverable: a seeded differential test vs the Buffer oracle ----
+    // ---- the key deliverable: a seeded differential test vs the Buffer oracle
+    // ----
 
-    /// Minimal seeded LCG (Numerical Recipes constants) — deterministic, no deps.
+    /// Minimal seeded LCG (Numerical Recipes constants) — deterministic, no
+    /// deps.
     struct Lcg(u64);
     impl Lcg {
         fn next_u32(&mut self) -> u32 {
@@ -3718,7 +3751,8 @@ mod tests {
         fn below(&mut self, n: usize) -> usize {
             (self.next_u32() as usize) % n.max(1)
         }
-        /// A char position in `1..=char_len+1` (the full inclusive position range).
+        /// A char position in `1..=char_len+1` (the full inclusive position
+        /// range).
         fn pos(&mut self, char_len: usize) -> usize {
             1 + self.below(char_len + 1)
         }
@@ -3763,15 +3797,16 @@ mod tests {
     }
 
     /// Drive a long, seeded-random op sequence against BOTH a `Buffer` and a
-    /// `Quire` built from the same initial string; assert they stay byte-identical
-    /// after every step. This is what proves Quire matches the oracle.
+    /// `Quire` built from the same initial string; assert they stay
+    /// byte-identical after every step. This is what proves Quire matches the
+    /// oracle.
     fn run_diff(seed: u64, steps: usize, initial: &str) {
         let mut b = Buffer::from_string("t", initial);
         let mut q = Quire::from_string("t", initial);
         let mut rng = Lcg(seed);
 
-        // A small inserts palette incl. multi-byte + newlines, and needles/regexes
-        // that actually occur so searches frequently hit.
+        // A small inserts palette incl. multi-byte + newlines, and
+        // needles/regexes that actually occur so searches frequently hit.
         let inserts = ["x", "ab", "\n", "héllo", "世界", " foo ", "Z\nZ", "12"];
         let needles = ["a", "x", "foo", "\n", "Z", "é", "界", "ab"];
         let regexes = [
@@ -3849,7 +3884,8 @@ mod tests {
                     assert_in_sync(&b, &q, step, "search_backward");
                 }
                 7 => {
-                    // search then replace, so replace_match exercises real match data
+                    // search then replace, so replace_match exercises real
+                    // match data
                     let re = &regexes[rng.below(regexes.len())];
                     let rep = replacements[rng.below(replacements.len())];
                     let hit_b = TextStore::re_search_forward(&mut b, re, None).is_some();
@@ -3892,8 +3928,8 @@ mod tests {
                     assert_in_sync(&b, &q, step, "end_of_line");
                 }
                 _ => {
-                    // read-only probes: substring, char_after/before, looking_at,
-                    // line_number_at_pos — must agree pointwise.
+                    // read-only probes: substring, char_after/before,
+                    // looking_at, line_number_at_pos — must agree pointwise.
                     let a = rng.pos(len);
                     let c = rng.pos(len);
                     assert_eq!(
@@ -3954,14 +3990,14 @@ mod tests {
 
     #[test]
     fn save_to_open_path_keeps_paged_reads_correct() {
-        // Regression for the original-aliasing bug. `save_buffer` once overwrote
-        // the very file `Quire` read as its immutable original, mutating those
-        // bytes under the live pieces — so file-backed reads (collect_range, behind
-        // substring/read_region/search) returned shifted garbage while full_text
-        // (served from the text cache) still looked fine. `safety::write_atomic`
-        // (temp + rename) leaves the original inode intact. Open a file, edit so the
-        // content shifts, save IN PLACE to the same path, and confirm windowed reads
-        // stay byte-correct.
+        // Regression for the original-aliasing bug. `save_buffer` once
+        // overwrote the very file `Quire` read as its immutable original,
+        // mutating those bytes under the live pieces — so file-backed reads
+        // (collect_range, behind substring/read_region/search) returned shifted
+        // garbage while full_text (served from the text cache) still looked
+        // fine. `safety::write_atomic` (temp + rename) leaves the original
+        // inode intact. Open a file, edit so the content shifts, save IN PLACE
+        // to the same path, and confirm windowed reads stay byte-correct.
         let initial = format!(
             "αβγ HEAD line — start\n{}UNIQUE-TAIL café naïve\n",
             "filler — line ~tilde~ ‸ here\n".repeat(300)
@@ -3969,7 +4005,8 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("mime-atomic-{}.txt", std::process::id()));
         std::fs::write(&tmp, &initial).unwrap();
         let mut q = Quire::open(&tmp).unwrap();
-        // Insert near the front so every Original byte after it shifts position.
+        // Insert near the front so every Original byte after it shifts
+        // position.
         q.goto_char(1);
         q.re_search_forward(&regex::Regex::new("HEAD line").unwrap(), None);
         q.insert(" <INSERTED so everything after shifts> ");
@@ -4072,8 +4109,9 @@ mod tests {
         assert_eq!(buf, full.as_bytes(), "streamed bytes equal full_text");
     }
 
-    /// Windowed reads (the `collect_range` path behind `substring`/`read_region`)
-    /// must match the oracle for many ranges, not just the whole text.
+    /// Windowed reads (the `collect_range` path behind
+    /// `substring`/`read_region`) must match the oracle for many ranges, not
+    /// just the whole text.
     fn assert_reads_in_sync(b: &Buffer, q: &Quire, step: usize) {
         let len = TextStore::char_len(b);
         let probes = [
@@ -4092,10 +4130,11 @@ mod tests {
         }
     }
 
-    /// Like `run_diff`, but holds a rolling set of `snapshot()`s so the add/root
-    /// `Arc`s stay shared — every edit then copies-on-write off a live snapshot,
-    /// the warm-session regime `run_diff` never exercises. Checks windowed reads
-    /// each step, since `full_text` can be right while a windowed seek is wrong.
+    /// Like `run_diff`, but holds a rolling set of `snapshot()`s so the
+    /// add/root `Arc`s stay shared — every edit then copies-on-write off a live
+    /// snapshot, the warm-session regime `run_diff` never exercises. Checks
+    /// windowed reads each step, since `full_text` can be right while a
+    /// windowed seek is wrong.
     fn run_diff_snap(seed: u64, steps: usize, initial: &str, mut q: Quire) {
         let mut b = Buffer::from_string("t", initial);
         let mut rng = Lcg(seed);
@@ -4177,9 +4216,9 @@ mod tests {
 
     #[test]
     fn differential_with_held_snapshots_paged() {
-        // Same stress, but the Quire is opened from a real file → paged file-backed
-        // original (the open_file path the warm MCP server uses), combined with
-        // held snapshots and windowed reads.
+        // Same stress, but the Quire is opened from a real file → paged
+        // file-backed original (the open_file path the warm MCP server uses),
+        // combined with held snapshots and windowed reads.
         let path = std::env::temp_dir().join(format!("mime-quire-snap-{}.txt", std::process::id()));
         std::fs::write(&path, SNAP_INITIAL).unwrap();
         for seed in SNAP_SEEDS {
@@ -4191,9 +4230,10 @@ mod tests {
     #[test]
     fn differential_crlf_view_paged() {
         // The proof the stripped-paged view is behaviourally identical to an LF
-        // buffer: open CRLF (and BOM+CRLF) files and run the full random-op stress
-        // against a Buffer holding the decoded LF text. Every text/position/read/
-        // search/insert/delete/snapshot step must stay in lockstep.
+        // buffer: open CRLF (and BOM+CRLF) files and run the full random-op
+        // stress against a Buffer holding the decoded LF text. Every
+        // text/position/read/ search/insert/delete/snapshot step must stay in
+        // lockstep.
         let crlf = SNAP_INITIAL.replace('\n', "\r\n");
         let bom_crlf = {
             let mut v = crate::coding::BOM.to_vec();
@@ -4217,8 +4257,9 @@ mod tests {
     #[test]
     fn crlf_straddling_a_page_boundary() {
         // The pending-`\r` carry in the view primitives must work when a `\r\n`
-        // splits across a 64 KiB page read (the `\r` ends page 0, the `\n` starts
-        // page 1) — text, char_at across the seam, and a save round-trip.
+        // splits across a 64 KiB page read (the `\r` ends page 0, the `\n`
+        // starts page 1) — text, char_at across the seam, and a save
+        // round-trip.
         let mut bytes = vec![b'x'; PAGE - 1]; // `\r` lands at offset PAGE-1
         bytes.extend_from_slice(b"\r\ntail\r\n");
         let path = std::env::temp_dir().join(format!("mime-pageb-{}.txt", std::process::id()));
@@ -4246,8 +4287,9 @@ mod tests {
 
     /// The read surfaces a within-piece char→byte seek feeds, all at `p`:
     /// `locate` (the chars either side), `summary_before` (the line number) and
-    /// `collect_range` (both edges of a short span). Takes any [`TextStore`], so
-    /// the same four answers are what an oracle `Buffer` is compared against.
+    /// `collect_range` (both edges of a short span). Takes any [`TextStore`],
+    /// so the same four answers are what an oracle `Buffer` is compared
+    /// against.
     fn seek_answers(q: &dyn TextStore, p: usize) -> (Option<char>, Option<char>, usize, String) {
         let hi = (p + 3).min(TextStore::point_max(q));
         (
@@ -4258,17 +4300,18 @@ mod tests {
         )
     }
 
-    /// Seeks that have resumed from the memo on this thread (see [`MEMO_RESUMES`]).
-    /// Sampled around an operation, it distinguishes a memo that is really being
-    /// used from one that is silently dropped — the answers cannot, since the
-    /// cold walk gives the same ones.
+    /// Seeks that have resumed from the memo on this thread (see
+    /// [`MEMO_RESUMES`]).  Sampled around an operation, it distinguishes a memo
+    /// that is really being used from one that is silently dropped — the
+    /// answers cannot, since the cold walk gives the same ones.
     fn memo_resumes() -> usize {
         MEMO_RESUMES.with(|c| c.get())
     }
 
-    /// Query `q` at each of `positions` IN ORDER — so the seek memo carries from
-    /// one lookup to the next — and assert every answer equals the one a store
-    /// built fresh for that single lookup, which has no memo at all, gives.
+    /// Query `q` at each of `positions` IN ORDER — so the seek memo carries
+    /// from one lookup to the next — and assert every answer equals the one a
+    /// store built fresh for that single lookup, which has no memo at all,
+    /// gives.
     fn assert_seeks_match_fresh(q: &Quire, fresh: &dyn Fn() -> Quire, positions: &[usize]) {
         for &p in positions {
             assert_eq!(
@@ -4285,9 +4328,9 @@ mod tests {
 
     #[test]
     fn seek_memo_resumes_forward_without_changing_answers() {
-        // One whole-file piece and strictly increasing lookups: every seek after
-        // the first resumes the char-mark walk at the memo instead of restarting
-        // at the piece head. The answers must not notice.
+        // One whole-file piece and strictly increasing lookups: every seek
+        // after the first resumes the char-mark walk at the memo instead of
+        // restarting at the piece head. The answers must not notice.
         let text = lorem(40);
         let fresh = || Quire::from_string("t", text.clone());
         let q = fresh();
@@ -4297,10 +4340,10 @@ mod tests {
 
     #[test]
     fn seek_memo_resumes_backward_and_falls_back_to_the_piece_start() {
-        // Decreasing lookups over one whole-file piece: exactly at the memo, one
-        // char before it, a short hop back (the windowed reverse scan), and one
-        // far enough below that the piece start is nearer than the memo — where
-        // the from-start walk runs instead.
+        // Decreasing lookups over one whole-file piece: exactly at the memo,
+        // one char before it, a short hop back (the windowed reverse scan), and
+        // one far enough below that the piece start is nearer than the memo —
+        // where the from-start walk runs instead.
         let text = lorem(40);
         let fresh = || Quire::from_string("t", text.clone());
         let q = fresh();
@@ -4343,15 +4386,15 @@ mod tests {
         assert_seeks_match_fresh(&q, &fresh, &ps);
         std::fs::remove_file(&path).ok();
 
-        // `Quire::open` classifies a whole file as DOS from the byte before
-        // its FIRST `\n`, so a DOS-view file can still hold bytes an actual
-        // `\r\n` never produces: a lone `\r` (not followed by `\n`, "cd\re"
-        // below), a bare `\n` (not preceded by `\r`, "e\nf"), and a `\r\r\n`
-        // run — a lone CR immediately before a real pair ("✓\r\r\ngh"). None
-        // of those fold; only an actual `\r\n` does. Repeat the chunk enough
-        // that the file spans more than one `BACK_WINDOW`, so the forward walk
-        // resumes across every one of them far from the piece start, and the
-        // short backward hops below run far from it too.
+        // `Quire::open` classifies a whole file as DOS from the byte before its
+        // FIRST `\n`, so a DOS-view file can still hold bytes an actual `\r\n`
+        // never produces: a lone `\r` (not followed by `\n`, "cd\re" below), a
+        // bare `\n` (not preceded by `\r`, "e\nf"), and a `\r\r\n` run — a lone
+        // CR immediately before a real pair ("✓\r\r\ngh"). None of those fold;
+        // only an actual `\r\n` does. Repeat the chunk enough that the file
+        // spans more than one `BACK_WINDOW`, so the forward walk resumes across
+        // every one of them far from the piece start, and the short backward
+        // hops below run far from it too.
         let chunk = "ab\r\ncd\re\nfü✓\r\r\ngh\r\n";
         let decoded_chunk = chunk.replace("\r\n", "\n");
         let reps = BACK_WINDOW / chunk.len() + 4;
@@ -4370,8 +4413,8 @@ mod tests {
         assert_eq!(TextStore::text(&q), decoded);
         let b = Buffer::from_string("t", &decoded);
 
-        // 1-based char position of decoded-char index `i` within `decoded_chunk`,
-        // in repeat `rep` (0-based) of the chunk.
+        // 1-based char position of decoded-char index `i` within
+        // `decoded_chunk`, in repeat `rep` (0-based) of the chunk.
         let prefix_chars = "x\n".chars().count();
         let period = decoded_chunk.chars().count();
         let pos = |rep: usize, i: usize| prefix_chars + rep * period + i + 1;
@@ -4388,18 +4431,20 @@ mod tests {
         let last_rep = reps - 1;
         let edge_rep = BACK_WINDOW / chunk.len(); // the repeat straddling a window edge
         let mut ps: Vec<usize> = Vec::new();
-        // Forward: early repeats in increasing order (resumes via `scan_prefix_from`).
+        // Forward: early repeats in increasing order (resumes via
+        // `scan_prefix_from`).
         for rep in [0, 1, 2] {
             for &i in &landmarks {
                 ps.push(pos(rep, i));
             }
         }
-        // Backward: the far end down through the repeats around the window edge,
-        // then back to the start. Each hop within a repeat is a few chars, so it
-        // takes the short `scan_prefix_back` path over these byte patterns; the
-        // jump from `edge_rep - 1` down to the first repeats is nearer the piece
-        // start than the memo and falls back to the from-start walk. A single
-        // hop that itself crosses a `BACK_WINDOW` is the sibling test's job.
+        // Backward: the far end down through the repeats around the window
+        // edge, then back to the start. Each hop within a repeat is a few
+        // chars, so it takes the short `scan_prefix_back` path over these byte
+        // patterns; the jump from `edge_rep - 1` down to the first repeats is
+        // nearer the piece start than the memo and falls back to the from-start
+        // walk. A single hop that itself crosses a `BACK_WINDOW` is the sibling
+        // test's job.
         for rep in [
             last_rep,
             last_rep - 1,
@@ -4434,21 +4479,21 @@ mod tests {
         //
         // "abc\r\n" is 5 bytes and 4 chars, so a char start's byte offset is
         // never ≡ 4 (mod 5) — the LF — but the window edge `bp - BACK_WINDOW`,
-        // measured back from the memo's byte, can be. The shift sweeps that edge
-        // across the line; that it really lands on an LF is checked below rather
-        // than argued here. The hop is one window's worth of chars plus a little,
-        // so the scan always crosses into a second window, and stays shorter than
-        // the distance to the piece start so the backward path (not the from-start
-        // walk) is the one taken.
+        // measured back from the memo's byte, can be. The shift sweeps that
+        // edge across the line; that it really lands on an LF is checked below
+        // rather than argued here. The hop is one window's worth of chars plus
+        // a little, so the scan always crosses into a second window, and stays
+        // shorter than the distance to the piece start so the backward path
+        // (not the from-start walk) is the one taken.
         let path = tmp_path("seek-crlf-window");
         let text = "abc\r\n".repeat(4000);
         std::fs::write(&path, text.as_bytes()).unwrap();
         let bytes = text.as_bytes();
         let fresh = || Quire::open(&path).unwrap();
         let hop = BACK_WINDOW / 5 * 4 + 8;
-        // Four chars to every five bytes: char index `n` starts at byte
-        // `n / 4 * 5 + n % 4` (offset 3 is the `\r` that starts the folded
-        // newline char, so no char starts at offset 4, the LF).
+        // Four chars to every five bytes: char index `n` starts at byte `n / 4
+        // * 5 + n % 4` (offset 3 is the `\r` that starts the folded newline
+        // char, so no char starts at offset 4, the LF).
         let char_byte = |n: usize| n / 4 * 5 + n % 4;
         let mut edge_on_lf = 0usize;
         for shift in 0..10 {
@@ -4460,8 +4505,8 @@ mod tests {
                 TextStore::char_after(&fresh(), anchor),
                 "priming lookup at {anchor}"
             );
-            // Where the hop starts, and therefore where its first window's front
-            // edge falls. The memo is the store's own answer, so the byte
+            // Where the hop starts, and therefore where its first window's
+            // front edge falls. The memo is the store's own answer, so the byte
             // arithmetic above is cross-checked rather than assumed.
             let memo = q.seek_memo.get().expect("the priming lookup leaves a memo");
             assert_eq!(
@@ -4524,9 +4569,10 @@ mod tests {
     #[test]
     fn first_seek_near_the_tail_reads_the_tail_not_the_whole_piece() {
         // A freshly opened file is ONE piece and there is no memo yet — but its
-        // END is an exact anchor the tree summary already holds, in the shape the
-        // reverse scan consumes. So a first lookup a few chars from the tail must
-        // step back over those few chars, not walk every page from the head.
+        // END is an exact anchor the tree summary already holds, in the shape
+        // the reverse scan consumes. So a first lookup a few chars from the
+        // tail must step back over those few chars, not walk every page from
+        // the head.
         let path = tmp_path("seek-tail-anchor");
         let line = "the quick brown fox jumps over the lazy dog\n";
         let pages = 40;
@@ -4545,8 +4591,9 @@ mod tests {
             seek_answers(&fresh(), target),
             "the tail lookup disagrees with a fresh store"
         );
-        // Three chars back from the end: the last page, plus at most one more if
-        // a read straddles its edge. Walking from the head would touch all 40.
+        // Three chars back from the end: the last page, plus at most one more
+        // if a read straddles its edge. Walking from the head would touch all
+        // 40.
         assert!(
             resident_pages(&q) <= 2,
             "a first lookup 3 chars from the end read {} of the file's {pages} pages",
@@ -4565,9 +4612,10 @@ mod tests {
         //
         // Those answers would also come out right if the memo were silently
         // dropped — the from-start walk gives the same ones — so the resume
-        // counter is what pins it as live, in the two places it is observable: a
-        // delete's second cut resuming from its first, and a seek resuming from a
-        // memo taken before an edit that touched no piece the memo names.
+        // counter is what pins it as live, in the two places it is observable:
+        // a delete's second cut resuming from its first, and a seek resuming
+        // from a memo taken before an edit that touched no piece the memo
+        // names.
         let text = "ünï✓x line\n".repeat(60);
         let mut q = Quire::from_string("t", text.clone());
         let mut b = Buffer::from_string("t", &text);
@@ -4650,8 +4698,9 @@ mod tests {
         // byte range of an immutable backing — cannot self-check: `rebase_to`
         // swaps the whole Original, so the same key can name DIFFERENT bytes.
         // Here the rewrite keeps the byte length, the char count and the line
-        // count but moves a 2-byte char, so every byte offset in between shifts.
-        // (Standing in for a save whose bytes differ from the pre-save piece.)
+        // count but moves a 2-byte char, so every byte offset in between
+        // shifts.  (Standing in for a save whose bytes differ from the pre-save
+        // piece.)
         let path = tmp_path("seek-rebase");
         let tail = "filler line\n".repeat(20);
         let before = format!("üab{tail}");

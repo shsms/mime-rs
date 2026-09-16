@@ -3,11 +3,11 @@
 //!
 //! mime-rs exposes no shell, no process spawn, and no network; the only ambient
 //! authority it has is the filesystem, through the two buffer-file call sites
-//! (`open_file` / `save_buffer`). [`check_path`] is the chokepoint that confines
-//! those to a set of allowed roots so an autonomous agent cannot read or write
-//! outside the workspace it was granted. [`audit`] records one JSON line per
-//! program run when `$MIME_AUDIT` names a log file, giving the "what did the
-//! agent change, and why" replay trail.
+//! (`open_file` / `save_buffer`). [`check_path`] is the chokepoint that
+//! confines those to a set of allowed roots so an autonomous agent cannot read
+//! or write outside the workspace it was granted. [`audit`] records one JSON
+//! line per program run when `$MIME_AUDIT` names a log file, giving the "what
+//! did the agent change, and why" replay trail.
 use std::path::{Path, PathBuf};
 
 /// The allowed filesystem roots: the colon-separated absolute paths in
@@ -18,23 +18,25 @@ use std::path::{Path, PathBuf};
 /// agent up front instead of leaving it to discover the bounds by a rejected
 /// write.
 ///
-/// Each entry is canonicalized (symlinks + `.`/`..` resolved) so the containment
-/// check in [`check_path`] compares real paths against real paths. Entries that
-/// don't exist or can't be canonicalized are skipped — a misconfigured root
-/// simply doesn't grant access rather than silently widening it.
+/// Each entry is canonicalized (symlinks + `.`/`..` resolved) so the
+/// containment check in [`check_path`] compares real paths against real paths.
+/// Entries that don't exist or can't be canonicalized are skipped — a
+/// misconfigured root simply doesn't grant access rather than silently widening
+/// it.
 pub fn roots() -> Vec<PathBuf> {
     let cwd = std::env::current_dir().unwrap_or_default();
     parse_roots(std::env::var("MIME_ROOTS").ok(), &cwd)
 }
 
-/// Pure core of [`roots`]: resolve the raw `$MIME_ROOTS` value (already read from
-/// the environment) against `cwd`. Split out so it can be unit-tested without the
-/// process-global env mutation that makes [`roots`] itself racy under the test
-/// harness.
+/// Pure core of [`roots`]: resolve the raw `$MIME_ROOTS` value (already read
+/// from the environment) against `cwd`. Split out so it can be unit-tested
+/// without the process-global env mutation that makes [`roots`] itself racy
+/// under the test harness.
 ///
-/// `raw` unset or whitespace-only => the single canonicalized `cwd` (default-deny
-/// everything outside the working directory). Otherwise each colon-separated,
-/// trimmed, non-empty entry is canonicalized; ones that can't be are dropped.
+/// `raw` unset or whitespace-only => the single canonicalized `cwd`
+/// (default-deny everything outside the working directory). Otherwise each
+/// colon-separated, trimmed, non-empty entry is canonicalized; ones that can't
+/// be are dropped.
 fn parse_roots(raw: Option<String>, cwd: &Path) -> Vec<PathBuf> {
     let raw = raw.unwrap_or_default();
     let raw = raw.trim();
@@ -50,15 +52,15 @@ fn parse_roots(raw: Option<String>, cwd: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Whether the audit journal is active, i.e. `$MIME_AUDIT` is set (to any value,
-/// including empty). Lets the status surfaces report whether runs are being
-/// recorded, without exposing the log path.
+/// Whether the audit journal is active, i.e. `$MIME_AUDIT` is set (to any
+/// value, including empty). Lets the status surfaces report whether runs are
+/// being recorded, without exposing the log path.
 pub fn audit_enabled() -> bool {
     std::env::var_os("MIME_AUDIT").is_some()
 }
 
-/// Verify `path` resolves to a location inside one of the [`roots`] and
-/// return its canonical form; otherwise return a human-readable `Err`.
+/// Verify `path` resolves to a location inside one of the [`roots`] and return
+/// its canonical form; otherwise return a human-readable `Err`.
 ///
 /// Semantics:
 /// * **Existing path** — canonicalized directly (resolving symlinks and `..`),
@@ -92,16 +94,17 @@ pub fn check_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Save to `path` atomically by streaming: write a sibling temp file via `write`,
-/// fsync it, then rename it over `path`. This NEVER mutates `path`'s bytes in place
-/// — essential because a `Quire` may have `path` mmapped as its immutable original,
-/// so an in-place overwrite would change those bytes under the live piece tree and
-/// later reads through the mmap would return shifted garbage. The rename leaves the
-/// old inode (and any mapping of it) intact while swapping the directory entry to
-/// the new content; it is also crash-atomic (a reader sees the whole old file or
-/// the whole new one). `write` receives a buffered writer, so a multi-GB buffer is
-/// streamed piece by piece and never materialized into one allocation just to save
-/// it. `path` should already be vetted by [`check_path`].
+/// Save to `path` atomically by streaming: write a sibling temp file via
+/// `write`, fsync it, then rename it over `path`. This NEVER mutates `path`'s
+/// bytes in place — essential because a `Quire` may have `path` mmapped as its
+/// immutable original, so an in-place overwrite would change those bytes under
+/// the live piece tree and later reads through the mmap would return shifted
+/// garbage. The rename leaves the old inode (and any mapping of it) intact
+/// while swapping the directory entry to the new content; it is also
+/// crash-atomic (a reader sees the whole old file or the whole new one).
+/// `write` receives a buffered writer, so a multi-GB buffer is streamed piece
+/// by piece and never materialized into one allocation just to save it. `path`
+/// should already be vetted by [`check_path`].
 pub fn write_atomic_with<F>(path: &Path, write: F) -> std::io::Result<()>
 where
     F: FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
@@ -179,9 +182,9 @@ impl FileStamp {
         })
     }
 
-    /// The stamp of a path that does NOT exist yet — a new file, visited
-    /// before its first save. Its drift is the file appearing: another writer
-    /// created it, and saving over that would discard their work.
+    /// The stamp of a path that does NOT exist yet — a new file, visited before
+    /// its first save. Its drift is the file appearing: another writer created
+    /// it, and saving over that would discard their work.
     pub fn absent(path: &Path) -> FileStamp {
         FileStamp {
             path: path.to_path_buf(),
@@ -309,8 +312,8 @@ mod tests {
     }
 
     /// A unique temp dir we can use as an allowed root, canonicalized so
-    /// comparisons match `check_path`'s own canonicalization (macOS/CI often put
-    /// the temp dir behind a symlink, e.g. /tmp -> /private/tmp).
+    /// comparisons match `check_path`'s own canonicalization (macOS/CI often
+    /// put the temp dir behind a symlink, e.g. /tmp -> /private/tmp).
     fn temp_root() -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
@@ -401,8 +404,8 @@ mod tests {
         assert!(check_path(Path::new("/etc/passwd")).is_err());
     }
 
-    // `parse_roots` is the pure core — no env, no lock needed. These exercise the
-    // parsing/canonicalization directly, which `roots()` only wraps.
+    // `parse_roots` is the pure core — no env, no lock needed. These exercise
+    // the parsing/canonicalization directly, which `roots()` only wraps.
 
     #[test]
     fn parse_roots_uses_mime_roots_when_set() {
@@ -429,7 +432,8 @@ mod tests {
     #[test]
     fn parse_roots_skips_nonexistent_entries() {
         let root = temp_root();
-        // A bogus path can't be canonicalized and is dropped, leaving the real one.
+        // A bogus path can't be canonicalized and is dropped, leaving the real
+        // one.
         let raw = format!("/no/such/dir/anywhere:{}", root.display());
         let roots = parse_roots(Some(raw), Path::new("/ignored"));
         assert_eq!(roots, vec![root]);
@@ -477,7 +481,8 @@ mod tests {
         write_atomic(&f, b"first").unwrap();
         assert_eq!(std::fs::read(&f).unwrap(), b"first");
         // Overwriting replaces the directory entry (a new inode) rather than
-        // mutating the old file's bytes in place — the property a live mmap relies on.
+        // mutating the old file's bytes in place — the property a live mmap
+        // relies on.
         write_atomic(&f, b"second, longer contents").unwrap();
         assert_eq!(std::fs::read(&f).unwrap(), b"second, longer contents");
         let strays: Vec<_> = std::fs::read_dir(&dir)
@@ -505,7 +510,8 @@ mod tests {
         std::fs::write(&f, "modified in place, longer").unwrap();
         assert!(stamp.check().unwrap().contains("modified"));
 
-        // Replacement via temp+rename (our own atomic save) → new inode → drift.
+        // Replacement via temp+rename (our own atomic save) → new inode →
+        // drift.
         let stamp = FileStamp::capture(&f).unwrap();
         write_atomic(&f, b"replaced by rename").unwrap();
         assert!(stamp.check().unwrap().contains("replaced"));

@@ -1,9 +1,10 @@
 //! Run a tulisp program against a buffer, returning a structured result.
 //!
 //! A [`Workspace`] is the *warm* unit: it owns one `TulispContext` plus the
-//! shared [`Session`] and survives many programs, so buffer/checkpoint/kill-ring
-//! state and agent-defined `defun`s persist across `run` calls. [`run_program`]
-//! is the cold one-shot built on top of it (`Workspace::new(buffer).run(prog)`).
+//! shared [`Session`] and survives many programs, so
+//! buffer/checkpoint/kill-ring state and agent-defined `defun`s persist across
+//! `run` calls. [`run_program`] is the cold one-shot built on top of it
+//! (`Workspace::new(buffer).run(prog)`).
 use crate::result::{RunReport, unified_diff};
 use crate::store::TextStore;
 use std::cell::RefCell;
@@ -12,9 +13,10 @@ use tulisp::TulispContext;
 
 /// State shared between a running program and the editor builtins. The editor
 /// primitives close over an `Rc<RefCell<Session>>` (tulisp is single-threaded,
-/// so interior mutability via `RefCell` is sound for these leaf operations).
-/// A saved workspace snapshot, backed by `TextStore::snapshot` — O(1)/O(log n)
-/// and ~KB for Quire (structural sharing); a full clone for the in-memory Buffer.
+/// so interior mutability via `RefCell` is sound for these leaf operations).  A
+/// saved workspace snapshot, backed by `TextStore::snapshot` — O(1)/O(log n)
+/// and ~KB for Quire (structural sharing); a full clone for the in-memory
+/// Buffer.
 pub struct Checkpoint {
     pub label: String,
     snap: Box<dyn TextStore>,
@@ -47,9 +49,9 @@ pub struct Session {
     /// The non-current buffers, in creation order. `buffer` is always *the
     /// current buffer*; switching (`set_buffer`) swaps one of these into it and
     /// stashes the previous current one back here. A `Vec` + linear scan by
-    /// `.name()` is plenty — buffer counts are tiny — and it gives `buffer-list`
-    /// a stable order. Only the trusted (orchestration) tier ever grows this;
-    /// the sandboxed tier always sees exactly one buffer.
+    /// `.name()` is plenty — buffer counts are tiny — and it gives
+    /// `buffer-list` a stable order. Only the trusted (orchestration) tier ever
+    /// grows this; the sandboxed tier always sees exactly one buffer.
     pub inactive: Vec<Box<dyn TextStore>>,
     pub checkpoints: Vec<Checkpoint>,
     pub kill_ring: Vec<String>,
@@ -58,8 +60,8 @@ pub struct Session {
     /// Program arguments passed in by the trusted CLI: a key→value list in the
     /// order given, read back by the `(arg "KEY")` builtin. A bare `--flag`
     /// stores `(flag, "t")`. Only the trusted (orchestration) tier ever reads
-    /// these; the sandboxed agent-facing tier leaves them empty and has no `arg`
-    /// builtin to reach them anyway.
+    /// these; the sandboxed agent-facing tier leaves them empty and has no
+    /// `arg` builtin to reach them anyway.
     pub args: Vec<(String, String)>,
     /// Per-buffer language overrides for the `treesit-*` builtins, keyed by
     /// buffer name — set by `(treesit-set-language LANG)`, consulted before
@@ -69,27 +71,27 @@ pub struct Session {
     /// Whether any program in this session has touched the filesystem
     /// (find-file, insert-file-contents, write-file, write-region,
     /// revert-buffer). Replay-style consumers (the tui stepper) consult it:
-    /// re-running such forms reads or writes files whose content has moved
-    /// on, so a replay would not be faithful.
+    /// re-running such forms reads or writes files whose content has moved on,
+    /// so a replay would not be faithful.
     pub disk_io: bool,
     /// The persistent tree-sitter parse: the last `Syntax` the `treesit-*`
-    /// builtins built, keyed by (language, store content version). The
-    /// version is globally unique per text state (see `TextStore::version`),
-    /// so it alone identifies the parsed text — no buffer name needed — and
-    /// the language catches `treesit-set-language` / rename-driven detection
+    /// builtins built, keyed by (language, store content version). The version
+    /// is globally unique per text state (see `TextStore::version`), so it
+    /// alone identifies the parsed text — no buffer name needed — and the
+    /// language catches `treesit-set-language` / rename-driven detection
     /// changes. A run of treesit calls parses once; an edit re-stamps the
-    /// version and the next call re-parses. One slot — agents work one
-    /// buffer at a time, and a parse is only worth caching while it's hot.
+    /// version and the next call re-parses. One slot — agents work one buffer
+    /// at a time, and a parse is only worth caching while it's hot.
     pub syntax_cache: Option<(crate::syntax::Lang, u64, Rc<crate::syntax::Syntax>)>,
-    /// The buffer's content [`version`](crate::store::TextStore::version) at the
-    /// last load or save — the point the warm buffer last matched its file on
-    /// disk. The buffer is "modified since load/save" exactly when its current
-    /// version differs; auto-revert only re-reads an *unmodified* drifted buffer
-    /// (a modified one is the genuine conflict the stale-WARN still covers).
-    /// Tracks the session's CURRENT buffer. Auto-revert fires only on the
-    /// sandboxed MCP path, which is single-buffer, so this is sufficient; a
-    /// per-buffer baseline would be needed before extending it to the trusted
-    /// tier's inactive/switched buffers.
+    /// The buffer's content [`version`](crate::store::TextStore::version) at
+    /// the last load or save — the point the warm buffer last matched its file
+    /// on disk. The buffer is "modified since load/save" exactly when its
+    /// current version differs; auto-revert only re-reads an *unmodified*
+    /// drifted buffer (a modified one is the genuine conflict the stale-WARN
+    /// still covers).  Tracks the session's CURRENT buffer. Auto-revert fires
+    /// only on the sandboxed MCP path, which is single-buffer, so this is
+    /// sufficient; a per-buffer baseline would be needed before extending it to
+    /// the trusted tier's inactive/switched buffers.
     pub synced_version: u64,
 }
 
@@ -144,10 +146,10 @@ impl Session {
     }
 
     /// Install an already-built store (e.g. a `Quire` opened from a file) as a
-    /// buffer, the analog of [`generate_new_buffer`] for a store that exists. If
-    /// `make_current`, the present current buffer is stashed into `inactive` and
-    /// `store` becomes current; otherwise `store` joins `inactive`. Returns its
-    /// name. Unlike `generate_new_buffer` the name is taken as-is — callers
+    /// buffer, the analog of [`generate_new_buffer`] for a store that exists.
+    /// If `make_current`, the present current buffer is stashed into `inactive`
+    /// and `store` becomes current; otherwise `store` joins `inactive`. Returns
+    /// its name. Unlike `generate_new_buffer` the name is taken as-is — callers
     /// dedup and uniquify first (the trusted `find-file` reuses via
     /// [`buffer_visiting`] and renames collisions with [`unique_buffer_name`]).
     pub fn install_buffer(&mut self, store: Box<dyn TextStore>, make_current: bool) -> String {
@@ -224,13 +226,13 @@ pub struct Workspace {
     /// "reference material attached unwritable" case). The edit is rolled back
     /// from a pre-run snapshot and `run` returns an error instead of a report.
     read_only: bool,
-    /// The trust tier; `Trusted` additionally registers the orchestration builtin
-    /// group. Fixed at construction — an agent cannot escalate it.
+    /// The trust tier; `Trusted` additionally registers the orchestration
+    /// builtin group. Fixed at construction — an agent cannot escalate it.
     capabilities: Capabilities,
     /// Whether the most recent FAILED program left the buffer changed —
-    /// surfaced by [`failure_context`](Self::failure_context) so a failure
-    /// JSON can say whether partial edits persist (only a `keep_partial` run
-    /// leaves them; the transactional default rolls back).
+    /// surfaced by [`failure_context`](Self::failure_context) so a failure JSON
+    /// can say whether partial edits persist (only a `keep_partial` run leaves
+    /// them; the transactional default rolls back).
     last_failure_dirty: std::cell::Cell<bool>,
     /// Whether the most recent FAILED program's pre-error edits were rolled
     /// back by the transactional default — the front-ends surface it so the
@@ -242,10 +244,10 @@ pub struct Workspace {
     last_used: std::cell::Cell<u64>,
     /// Automatic restore points, newest last — one per distinct text state
     /// captured just before a program runs, so [`undo_last`](Self::undo_last)
-    /// can rewind a misfired edit in one call without any checkpoint
-    /// discipline up front. Held apart from the session's user checkpoints:
-    /// it neither shows in `list-checkpoints` nor is touched by rehearse's
-    /// rollback. Bounded to [`UNDO_RING_CAP`]; no redo.
+    /// can rewind a misfired edit in one call without any checkpoint discipline
+    /// up front. Held apart from the session's user checkpoints: it neither
+    /// shows in `list-checkpoints` nor is touched by rehearse's rollback.
+    /// Bounded to [`UNDO_RING_CAP`]; no redo.
     undo_ring: Vec<Checkpoint>,
 }
 
@@ -277,8 +279,9 @@ impl Workspace {
         Workspace::with_mode(buffer, true, Capabilities::Sandboxed)
     }
 
-    /// A trusted, writable workspace — the local `mime` CLI tier, which also gets
-    /// the orchestration builtin group (multiple buffers, file I/O, arguments).
+    /// A trusted, writable workspace — the local `mime` CLI tier, which also
+    /// gets the orchestration builtin group (multiple buffers, file I/O,
+    /// arguments).
     pub fn new_trusted(buffer: Box<dyn TextStore>) -> Workspace {
         Workspace::with_mode(buffer, false, Capabilities::Trusted)
     }
@@ -298,8 +301,8 @@ impl Workspace {
     }
 
     /// Run `f` on the session behind this workspace — for tool code that
-    /// resolves positions in Rust instead of through a program. A Lisp
-    /// error is rendered the way a failed program's is.
+    /// resolves positions in Rust instead of through a program. A Lisp error is
+    /// rendered the way a failed program's is.
     pub fn with_session<R>(
         &self,
         f: impl FnOnce(&mut Session) -> Result<R, tulisp::Error>,
@@ -384,8 +387,8 @@ impl Workspace {
     /// empty.
     pub fn undo_last(&mut self) -> Result<(), String> {
         // The top may BE the current state — captured before a read or a
-        // program that ended up clean; rewinding to it would be a no-op
-        // that burns a step, so skip those first.
+        // program that ended up clean; rewinding to it would be a no-op that
+        // burns a step, so skip those first.
         let cur = self.session.borrow().buffer.version();
         while self.undo_ring.last().is_some_and(|c| c.version() == cur) {
             self.undo_ring.pop();
@@ -417,9 +420,9 @@ impl Workspace {
         self.run_value(program).map(|(report, _value)| report)
     }
 
-    /// Like [`run`], but also returns the program's final value rendered the way
-    /// tulisp prints it (strings quoted, lists as `(a b c)`, `nil` for nil) —
-    /// the warm interactive path the `mimectl repl` verb prints alongside the
+    /// Like [`run`], but also returns the program's final value rendered the
+    /// way tulisp prints it (strings quoted, lists as `(a b c)`, `nil` for nil)
+    /// — the warm interactive path the `mimectl repl` verb prints alongside the
     /// diff. The buffer effects persist exactly as in [`run`]; only the extra
     /// return value distinguishes the two.
     pub fn run_value(&mut self, program: &str) -> Result<(RunReport, String), String> {
@@ -439,12 +442,11 @@ impl Workspace {
         keep_partial: bool,
     ) -> Result<(RunReport, String), String> {
         self.last_failure_rolled_back.set(false);
-        // Cheap pre-run snapshots (structural sharing for Quire) so a
-        // mutating program that dies — or mutates a read-only session — can
-        // be rolled back. EVERY buffer is captured: a trusted-tier program
-        // can set-buffer elsewhere, edit there, create or kill buffers, and
-        // "nothing happened" must cover all of it, not just the buffer that
-        // was current at start.
+        // Cheap pre-run snapshots (structural sharing for Quire) so a mutating
+        // program that dies — or mutates a read-only session — can be rolled
+        // back. EVERY buffer is captured: a trusted-tier program can set-buffer
+        // elsewhere, edit there, create or kill buffers, and "nothing happened"
+        // must cover all of it, not just the buffer that was current at start.
         let guard = (self.read_only || !keep_partial).then(|| {
             let s = self.session.borrow();
             let mut snaps = vec![(
@@ -534,8 +536,8 @@ impl Workspace {
 
     /// Roll the whole session back to the pre-run snapshots: a buffer whose
     /// text changed is restored, a killed buffer comes back, a buffer the
-    /// program created is dropped, and the buffer that was current at start
-    /// is current again. A buffer that only moved point keeps its motion.
+    /// program created is dropped, and the buffer that was current at start is
+    /// current again. A buffer that only moved point keeps its motion.
     fn rollback_session(&self, current_name: &str, snaps: Vec<(String, u64, Box<dyn TextStore>)>) {
         let mut s = self.session.borrow_mut();
         let placeholder: Box<dyn TextStore> =
@@ -569,34 +571,37 @@ impl Workspace {
         s.inactive = restored;
     }
 
-    /// Dry-run `program` and return the report it *would* produce, then roll the
-    /// session back so nothing persists — the "try before you commit" path. The
-    /// returned [`RunReport`] still shows `dirty`/`diff`/`reports`/`log` for the
-    /// hypothetical edit (with `rehearsed = true`), but afterwards [`text`] is
-    /// unchanged and the kill-ring/checkpoints are exactly as before.
+    /// Dry-run `program` and return the report it *would* produce, then roll
+    /// the session back so nothing persists — the "try before you commit" path.
+    /// The returned [`RunReport`] still shows `dirty`/`diff`/`reports`/`log`
+    /// for the hypothetical edit (with `rehearsed = true`), but afterwards
+    /// [`text`] is unchanged and the kill-ring/checkpoints are exactly as
+    /// before.
     ///
     /// Rollback reuses the [`Checkpoint`] mechanism: a pre-run `snapshot()` of
     /// the buffer (which carries text *and* point/mark/narrowing, since those
     /// live in the store) is swapped back in, undoing every buffer-level effect
     /// in one move. Session-level state a rehearsal must not keep — entries the
-    /// program pushed onto the kill-ring or `checkpoints` — is truncated back to
-    /// its pre-run length. A rehearsal works the same whether or not the session
-    /// is read-only: it never persists, so there is nothing to reject.
+    /// program pushed onto the kill-ring or `checkpoints` — is truncated back
+    /// to its pre-run length. A rehearsal works the same whether or not the
+    /// session is read-only: it never persists, so there is nothing to reject.
     ///
     /// `defun`s the program defined in the `TulispContext` are intentionally
     /// kept: tulisp has no cheap context rollback, the bindings are harmless
-    /// (callable, but inert until something runs them), and keeping them lets an
-    /// agent rehearse a helper definition and then a `run` that uses it.
+    /// (callable, but inert until something runs them), and keeping them lets
+    /// an agent rehearse a helper definition and then a `run` that uses it.
     pub fn rehearse(&mut self, program: &str) -> Result<RunReport, String> {
         self.rehearse_value(program).map(|(report, _value)| report)
     }
 
-    /// Like [`rehearse`], but also returns the program's final value rendered the
-    /// way tulisp prints it — the read-only counterpart of [`run_value`], so an
-    /// inspector run as a dry-run still surfaces what it returned. Everything is
-    /// rolled back exactly as in [`rehearse`]; only the extra value differs.
+    /// Like [`rehearse`], but also returns the program's final value rendered
+    /// the way tulisp prints it — the read-only counterpart of [`run_value`],
+    /// so an inspector run as a dry-run still surfaces what it returned.
+    /// Everything is rolled back exactly as in [`rehearse`]; only the extra
+    /// value differs.
     pub fn rehearse_value(&mut self, program: &str) -> Result<(RunReport, String), String> {
-        // Snapshot everything a rehearsal must restore *before* the program runs.
+        // Snapshot everything a rehearsal must restore *before* the program
+        // runs.
         let (snap, kill_len, cp_len) = {
             let s = self.session.borrow();
             (s.buffer.snapshot(), s.kill_ring.len(), s.checkpoints.len())
@@ -616,23 +621,23 @@ impl Workspace {
         result
     }
 
-    /// Shared core of [`run`]/[`rehearse`]: clear the per-program `reports`/`log`,
-    /// evaluate `program`, and build the [`RunReport`] (diff = buffer-at-start →
-    /// buffer-at-end) plus the program's final value rendered as tulisp prints
-    /// it. Neither rolls back here — the caller decides whether the effects
-    /// persist. `rehearsed` flags the report's origin.
+    /// Shared core of [`run`]/[`rehearse`]: clear the per-program
+    /// `reports`/`log`, evaluate `program`, and build the [`RunReport`] (diff =
+    /// buffer-at-start → buffer-at-end) plus the program's final value rendered
+    /// as tulisp prints it. Neither rolls back here — the caller decides
+    /// whether the effects persist. `rehearsed` flags the report's origin.
     fn eval_and_report(
         &mut self,
         program: &str,
         rehearsed: bool,
     ) -> Result<(RunReport, String), String> {
         // Pre-state: a cheap snapshot (structural sharing for Quire; a clone
-        // for the in-memory Buffer) is the diff baseline, and the version
-        // stamp decides whether any text changed at all — "equal versions
-        // imply equal text" (store.rs) — so a CLEAN run (every view / search /
-        // occur / read_region) never materializes, copies, or diffs the
-        // document. A clean run never grows the add buffer either, so the
-        // snapshot costs no copy-on-write there.
+        // for the in-memory Buffer) is the diff baseline, and the version stamp
+        // decides whether any text changed at all — "equal versions imply equal
+        // text" (store.rs) — so a CLEAN run (every view / search / occur /
+        // read_region) never materializes, copies, or diffs the document. A
+        // clean run never grows the add buffer either, so the snapshot costs no
+        // copy-on-write there.
         let (snap, version_before, len_before, name) = {
             let mut s = self.session.borrow_mut();
             s.reports.clear();
@@ -647,11 +652,11 @@ impl Workspace {
 
         let value = match self.ctx.eval_string(program) {
             Ok(v) => v.to_string(),
-            // Record whether the dying program left edits behind in the
-            // primary buffer (a warm run does not roll back), so the failure
-            // JSON can say so. An unmoved version proves clean without
-            // touching the text; a moved one falls back to the exact compare
-            // (an edit-then-revert program is NOT dirty — nothing persists).
+            // Record whether the dying program left edits behind in the primary
+            // buffer (a warm run does not roll back), so the failure JSON can
+            // say so. An unmoved version proves clean without touching the
+            // text; a moved one falls back to the exact compare (an
+            // edit-then-revert program is NOT dirty — nothing persists).
             Err(e) => {
                 let s = self.session.borrow();
                 let b = primary_buffer(&s, &name);
@@ -665,8 +670,8 @@ impl Workspace {
         let s = self.session.borrow();
         let primary = primary_buffer(&s, &name);
         // Same ladder as the failure path: version unmoved ⇒ clean fast path;
-        // moved ⇒ exact compare, and only a real text change pays for the
-        // diff + the final_text copy.
+        // moved ⇒ exact compare, and only a real text change pays for the diff
+        // + the final_text copy.
         let (dirty, diff, final_text) = if primary.version() == version_before {
             (false, String::new(), None)
         } else {
@@ -739,23 +744,23 @@ impl Workspace {
 
     /// Whether the visited file changed on disk since open/rebase (the
     /// stale-read guard's view); `false` for an unvisited buffer. A current
-    /// stat catches drift now; the store's sticky `drifted` flag keeps reporting
-    /// it after a fresh read already saw the change (so an mtime reset can't
-    /// make a corrupted read look clean again).
+    /// stat catches drift now; the store's sticky `drifted` flag keeps
+    /// reporting it after a fresh read already saw the change (so an mtime
+    /// reset can't make a corrupted read look clean again).
     pub fn is_stale(&self) -> bool {
         let s = self.session.borrow();
         s.buffer.drifted() || s.buffer.file_stamp().is_some_and(|st| st.check().is_some())
     }
 
-    /// Whether the buffer has unsaved edits since its last load/save (its content
-    /// version moved off the synced baseline).
+    /// Whether the buffer has unsaved edits since its last load/save (its
+    /// content version moved off the synced baseline).
     pub fn is_modified(&self) -> bool {
         let s = self.session.borrow();
         s.buffer.version() != s.synced_version
     }
 
-    /// The current buffer's content version ("equal versions imply equal
-    /// text") — a cheap change indicator for status displays.
+    /// The current buffer's content version ("equal versions imply equal text")
+    /// — a cheap change indicator for status displays.
     pub fn version(&self) -> u64 {
         self.session.borrow().buffer.version()
     }
@@ -778,11 +783,12 @@ impl Workspace {
     }
 
     /// Auto-revert (Emacs `auto-revert-mode`): if the visited file drifted on
-    /// disk and the buffer has NO unsaved edits, silently re-read it so the next
-    /// read/edit sees the current file instead of stale-or-corrupt bytes. Returns
-    /// whether it reverted. A read-only or MODIFIED buffer is never touched — a
-    /// read-only buffer is an unwritable reference the engine must not swap, and
-    /// a modified one is the genuine conflict the stale-WARN path covers.
+    /// disk and the buffer has NO unsaved edits, silently re-read it so the
+    /// next read/edit sees the current file instead of stale-or-corrupt bytes.
+    /// Returns whether it reverted. A read-only or MODIFIED buffer is never
+    /// touched — a read-only buffer is an unwritable reference the engine must
+    /// not swap, and a modified one is the genuine conflict the stale-WARN path
+    /// covers.
     pub fn auto_revert_if_clean(&mut self) -> bool {
         if self.is_read_only() || self.is_modified() || !self.is_stale() {
             return false;
@@ -808,21 +814,21 @@ impl Workspace {
             .map(|b| b.text().to_string())
     }
 
-    /// Whether any program in this workspace has touched the filesystem —
-    /// see [`Session::disk_io`].
+    /// Whether any program in this workspace has touched the filesystem — see
+    /// [`Session::disk_io`].
     pub fn did_disk_io(&self) -> bool {
         self.session.borrow().disk_io
     }
 
-    /// Persist the buffer to `path` atomically (temp file + rename), then re-base
-    /// the store onto the just-written file so the pre-save mmap backing and the
-    /// add buffer are reclaimed (a no-op for the in-memory `Buffer`). Returns the
-    /// byte count written. The rebase is best-effort: if re-opening the saved file
-    /// fails, the (still correct) pre-save backing is kept and the save stands.
-    /// Refuses (`Err`) if `path` is the visited file and it changed externally
-    /// since open/rebase — see [`stale_visit`]. A failed rebase also leaves the
-    /// stamp unrefreshed, so a later save to the same path is conservatively
-    /// refused too.
+    /// Persist the buffer to `path` atomically (temp file + rename), then
+    /// re-base the store onto the just-written file so the pre-save mmap
+    /// backing and the add buffer are reclaimed (a no-op for the in-memory
+    /// `Buffer`). Returns the byte count written. The rebase is best-effort: if
+    /// re-opening the saved file fails, the (still correct) pre-save backing is
+    /// kept and the save stands.  Refuses (`Err`) if `path` is the visited file
+    /// and it changed externally since open/rebase — see [`stale_visit`]. A
+    /// failed rebase also leaves the stamp unrefreshed, so a later save to the
+    /// same path is conservatively refused too.
     pub fn save_to(&mut self, path: &std::path::Path) -> std::io::Result<usize> {
         let bytes = {
             let s = self.session.borrow();
@@ -869,12 +875,12 @@ impl Workspace {
 }
 
 /// Re-read the buffer's visited file from disk, discarding the warm buffer's
-/// edits — the body shared by the `revert-buffer` builtin and auto-revert. Point
-/// is kept by position (clamped to the new content); narrowing and markers are
-/// dropped with the old text (the fresh registry is padded so old marker handles
-/// read nil rather than aliasing new ones). The buffer keeps its (possibly
-/// uniquified) name, and the load/save baseline is reset so the reverted buffer
-/// reads as unmodified.
+/// edits — the body shared by the `revert-buffer` builtin and auto-revert.
+/// Point is kept by position (clamped to the new content); narrowing and
+/// markers are dropped with the old text (the fresh registry is padded so old
+/// marker handles read nil rather than aliasing new ones). The buffer keeps its
+/// (possibly uniquified) name, and the load/save baseline is reset so the
+/// reverted buffer reads as unmodified.
 pub(crate) fn revert_in_place(sess: &mut Session) -> Result<(), String> {
     let path = sess
         .buffer
@@ -898,15 +904,15 @@ pub(crate) fn revert_in_place(sess: &mut Session) -> Result<(), String> {
 }
 
 /// The PRIMARY buffer of a run — the one current when the program started,
-/// found again by name at exit. The closing report (`diff` / `dirty` /
-/// `len_*` / `final_text`) describes IT, not whatever buffer happens to be
-/// current when the program ends: a trusted program finishing on another
-/// buffer (a find-file'd document, a scratch buffer) used to get the
-/// primary's before-text diffed against that other buffer — an --infile run
-/// ending on a find-file'd document rendered the whole document as one giant
-/// insertion unless the script set-buffer'd home first. A primary killed
-/// mid-program falls back to the buffer current at exit rather than diffing
-/// against nothing.
+/// found again by name at exit. The closing report (`diff` / `dirty` / `len_*`
+/// / `final_text`) describes IT, not whatever buffer happens to be current when
+/// the program ends: a trusted program finishing on another buffer (a
+/// find-file'd document, a scratch buffer) used to get the primary's
+/// before-text diffed against that other buffer — an --infile run ending on a
+/// find-file'd document rendered the whole document as one giant insertion
+/// unless the script set-buffer'd home first. A primary killed mid-program
+/// falls back to the buffer current at exit rather than diffing against
+/// nothing.
 fn primary_buffer<'a>(s: &'a Session, name: &str) -> &'a dyn TextStore {
     if s.buffer.name() == name {
         return s.buffer.as_ref();
@@ -932,10 +938,10 @@ fn stale_visit(store: &dyn TextStore, path: &std::path::Path) -> Option<String> 
     }
 }
 
-/// One notion of path identity for the whole engine: canonical when both
-/// sides resolve (symlinks, `..`), exact otherwise (e.g. a deleted visited
-/// file). `find-file` dedup and the stale-save guard MUST agree on this, or a
-/// buffer could dedup as visiting a file the guard treats as a different one.
+/// One notion of path identity for the whole engine: canonical when both sides
+/// resolve (symlinks, `..`), exact otherwise (e.g. a deleted visited file).
+/// `find-file` dedup and the stale-save guard MUST agree on this, or a buffer
+/// could dedup as visiting a file the guard treats as a different one.
 pub(crate) fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(ca), Ok(cb)) => ca == cb,
@@ -962,17 +968,18 @@ mod tests {
 
     #[test]
     fn warm_quire_matches_oracle_across_separate_runs() {
-        // Warm-Quire consistency guard: a session that snapshots between programs
-        // (the diff baseline) must stay byte-for-byte equal to the in-memory
-        // oracle — both the spine (full_text) and a windowed readout
-        // (collect_range, behind buffer-substring/read_region), over a realistic
-        // multibyte, mmap-backed document and several snapshot-bracketed edits.
-        // NOTE: an *intermittent*, save-safe readout discrepancy was observed
-        // editing plan.org through the warm MCP server (buffer-substring/read_region
-        // returning the wrong window while full_text/save stayed correct) that this
-        // synthetic case does not yet reproduce — tracked in the friction log.
-        // Multibyte content throughout (em dashes, tildes) so char positions and
-        // byte offsets diverge — the regime where a piece-tree offset bug bites.
+        // Warm-Quire consistency guard: a session that snapshots between
+        // programs (the diff baseline) must stay byte-for-byte equal to the
+        // in-memory oracle — both the spine (full_text) and a windowed readout
+        // (collect_range, behind buffer-substring/read_region), over a
+        // realistic multibyte, mmap-backed document and several
+        // snapshot-bracketed edits.  NOTE: an *intermittent*, save-safe readout
+        // discrepancy was observed editing plan.org through the warm MCP server
+        // (buffer-substring/read_region returning the wrong window while
+        // full_text/save stayed correct) that this synthetic case does not yet
+        // reproduce — tracked in the friction log.  Multibyte content
+        // throughout (em dashes, tildes) so char positions and byte offsets
+        // diverge — the regime where a piece-tree offset bug bites.
         let mut text = String::new();
         for i in 0..800 {
             text.push_str(&format!("line {i:04} — körner ~filler~ ‸content here\n"));
@@ -983,9 +990,10 @@ mod tests {
         }
         text.push_str("UNIQUE-TAIL-END-SENTINEL\n");
 
-        // Each program is its own warm run, so the Workspace snapshots the buffer
-        // between them (sharing Quire's Arc backings), then the next edit grows the
-        // add buffer (must copy-on-write off the snapshot's share).
+        // Each program is its own warm run, so the Workspace snapshots the
+        // buffer between them (sharing Quire's Arc backings), then the next
+        // edit grows the add buffer (must copy-on-write off the snapshot's
+        // share).
         let progs = [
             r#"(goto-char (point-min)) (search-forward "line 0100" nil t) (insert " INSERTED-ONE ")"#,
             "(buffer-string)", // mirrors save_buffer materializing text()
@@ -995,8 +1003,9 @@ mod tests {
             r#"(goto-char (point-min)) (search-forward "line 0700" nil t) (insert " INSERTED-THREE ")"#,
         ];
 
-        // Quire opened from a real file → mmap-backed original (the open_file path
-        // the MCP server uses), which from_string-based tests don't exercise.
+        // Quire opened from a real file → mmap-backed original (the open_file
+        // path the MCP server uses), which from_string-based tests don't
+        // exercise.
         let path =
             std::env::temp_dir().join(format!("mime-warm-regression-{}.txt", std::process::id()));
         std::fs::write(&path, &text).unwrap();
@@ -1008,7 +1017,8 @@ mod tests {
             quire.run(p).unwrap();
         }
         // The spine (full_text) and a windowed readout (collect_range, the path
-        // behind buffer-substring/read_region/search) must both match the oracle.
+        // behind buffer-substring/read_region/search) must both match the
+        // oracle.
         let (q, o) = (quire.text().to_string(), oracle.text().to_string());
         let probe = "(message (buffer-substring (max 1 (- (point-max) 300)) (point-max)))";
         let qr = quire
@@ -1073,8 +1083,8 @@ mod tests {
         assert_eq!(r.buffer_name, "main");
         assert!(!r.dirty, "main untouched");
         assert_eq!(r.diff, "");
-        // A clean run carries no final_text (the fast path never
-        // materializes the document); the workspace still has it.
+        // A clean run carries no final_text (the fast path never materializes
+        // the document); the workspace still has it.
         assert_eq!(r.final_text, None);
         ws.run(r#"(set-buffer "main")"#).unwrap();
         assert_eq!(ws.text(), "primary text!");
@@ -1110,8 +1120,8 @@ mod tests {
         // The deliberate exception to narrowing composition: the structural
         // layer parses the FULL document (a restriction cutting a function in
         // half must not change what the tree says the function is), while
-        // motion clamps into the accessible region and narrow-to-defun
-        // REPLACES the restriction like Emacs narrowing commands do.
+        // motion clamps into the accessible region and narrow-to-defun REPLACES
+        // the restriction like Emacs narrowing commands do.
         let text = "fn one() {\n    1;\n}\n\nfn two() {\n    2;\n}\n";
         let mut ws = Workspace::new(Box::new(crate::Buffer::from_string("t.rs", text)));
         let r = ws
@@ -1142,9 +1152,10 @@ mod tests {
 
     #[test]
     fn bom_survives_insert_and_delete_at_the_start() {
-        // The BOM must stay at offset 0 regardless of edits at the buffer start:
-        // inserting before the first char keeps the BOM first (not relocated),
-        // and deleting the first char keeps the signature (not dropped).
+        // The BOM must stay at offset 0 regardless of edits at the buffer
+        // start: inserting before the first char keeps the BOM first (not
+        // relocated), and deleting the first char keeps the signature (not
+        // dropped).
         let tmp = std::env::temp_dir().join(format!("mime-bom-edge-{}.txt", std::process::id()));
 
         // Insert at point-min.
@@ -1229,9 +1240,9 @@ mod tests {
 
     #[test]
     fn cr_only_file_is_unix_and_kept_byte_exact() {
-        // Classic-Mac CR endings are NOT a coding: a CR-only file is plain unix,
-        // its `\r` kept literal in the buffer, and it round-trips byte-for-byte
-        // (never mangled to `\r\r`).
+        // Classic-Mac CR endings are NOT a coding: a CR-only file is plain
+        // unix, its `\r` kept literal in the buffer, and it round-trips
+        // byte-for-byte (never mangled to `\r\r`).
         let tmp = std::env::temp_dir().join(format!("mime-cr-{}.txt", std::process::id()));
         std::fs::write(&tmp, b"a\rb\rc").unwrap();
         let mut ws = Workspace::new(Box::new(Quire::open(&tmp).unwrap()));
@@ -1268,9 +1279,10 @@ mod tests {
 
     #[test]
     fn save_to_persists_rebases_and_edits_again() {
-        // save_to writes the buffer and re-bases the Quire onto the new file; the
-        // buffer is unchanged, and editing the rebased buffer + saving again keeps
-        // disk and buffer in sync (the "keep editing with the saved file as base").
+        // save_to writes the buffer and re-bases the Quire onto the new file;
+        // the buffer is unchanged, and editing the rebased buffer + saving
+        // again keeps disk and buffer in sync (the "keep editing with the saved
+        // file as base").
         let tmp = std::env::temp_dir().join(format!("mime-saveto-{}.txt", std::process::id()));
         std::fs::write(&tmp, "alpha\nbeta\ngamma\n").unwrap();
         let mut ws = Workspace::new(Box::new(Quire::open(&tmp).unwrap()));
@@ -1303,8 +1315,9 @@ mod tests {
 
     #[test]
     fn write_copy_to_does_not_rebind_the_session() {
-        // save-as to a different path writes a copy but leaves the session bound
-        // to its original file, so a later plain save still targets the original.
+        // save-as to a different path writes a copy but leaves the session
+        // bound to its original file, so a later plain save still targets the
+        // original.
         let pid = std::process::id();
         let orig = std::env::temp_dir().join(format!("mime-copy-orig-{pid}.txt"));
         let other = std::env::temp_dir().join(format!("mime-copy-other-{pid}.txt"));
@@ -1449,9 +1462,9 @@ mod tests {
             Ok(_) => panic!("program must fail"),
         };
         assert!(e.contains("boom"), "got: {e}");
-        // The diagnostics the program emitted before dying survive the error;
-        // a navigate-and-report program leaves no edits → not dirty, and
-        // there was nothing to roll back.
+        // The diagnostics the program emitted before dying survive the error; a
+        // navigate-and-report program leaves no edits → not dirty, and there
+        // was nothing to roll back.
         let (reports, log, dirty, rolled_back) = ws.failure_context();
         assert_eq!(reports, vec![("step".to_string(), "1".to_string())]);
         assert_eq!(log, vec!["got here".to_string()]);
@@ -1481,9 +1494,9 @@ mod tests {
 
     #[test]
     fn failure_rolls_back_edits_in_every_buffer() {
-        // A trusted-tier program can set-buffer elsewhere and edit there —
-        // the transactional rollback must cover that buffer too, and drop
-        // buffers the dying program created.
+        // A trusted-tier program can set-buffer elsewhere and edit there — the
+        // transactional rollback must cover that buffer too, and drop buffers
+        // the dying program created.
         let mut ws = Workspace::new_trusted(Box::new(Buffer::from_string("main", "x")));
         let program = "(generate-new-buffer \"b\") (set-buffer \"b\") \
                        (insert \"stray\") (error \"boom\")";
@@ -1592,7 +1605,8 @@ mod tests {
             .run(r#"(goto-char (point-max)) (insert " world")"#)
             .unwrap();
         assert_eq!(r1.final_text.as_deref(), Some("hello world"));
-        // The 2nd run sees the 1st's edit and diffs against it (not the original).
+        // The 2nd run sees the 1st's edit and diffs against it (not the
+        // original).
         let r2 = ws.run(r#"(upcase-region 1 6)"#).unwrap();
         assert_eq!(r2.final_text.as_deref(), Some("HELLO world"));
         assert_eq!(r2.len_before, 11);
@@ -1616,7 +1630,8 @@ mod tests {
         let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "x")));
         let r1 = ws.run(r#"(report "a" 1)"#).unwrap();
         assert_eq!(r1.reports.len(), 1);
-        // 2nd run reports nothing — the report list is per-program, not cumulative.
+        // 2nd run reports nothing — the report list is per-program, not
+        // cumulative.
         let r2 = ws.run(r#"(goto-char 1)"#).unwrap();
         assert!(r2.reports.is_empty());
     }
@@ -1671,7 +1686,8 @@ mod tests {
         ws.run(r#"(goto-char 3) (set-mark 5)"#).unwrap();
         ws.rehearse(r#"(narrow-to-region 1 4) (goto-char 2) (insert "XYZ")"#)
             .unwrap();
-        // Point, mark, and the (un-narrowed) bounds are all back to pre-rehearsal.
+        // Point, mark, and the (un-narrowed) bounds are all back to
+        // pre-rehearsal.
         let r = ws
             .run(r#"(report "point" (point)) (report "pmax" (point-max)) (report "mark" (mark))"#)
             .unwrap();
@@ -1694,15 +1710,16 @@ mod tests {
             .unwrap();
         // Only the pre-rehearsal checkpoint remains.
         assert_eq!(report(&r, "cps"), "(\"keep\")");
-        // The yank pulled the pre-rehearsal kill ("hello "), not the rehearsal's.
+        // The yank pulled the pre-rehearsal kill ("hello "), not the
+        // rehearsal's.
         assert_eq!(r.final_text.as_deref(), Some("worldhello "));
     }
 
     #[test]
     fn rehearse_rolls_back_even_when_the_program_errors() {
         let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "keep")));
-        // A program that mutates then errors: the rehearsal returns Err, but the
-        // buffer is still rolled back to its pre-rehearsal text.
+        // A program that mutates then errors: the rehearsal returns Err, but
+        // the buffer is still rolled back to its pre-rehearsal text.
         let res = ws.rehearse(r#"(erase-buffer) (insert "gone") (error "boom")"#);
         assert!(res.is_err());
         assert_eq!(ws.text(), "keep");
@@ -1711,7 +1728,8 @@ mod tests {
     #[test]
     fn rehearse_on_read_only_session_still_reports() {
         // A rehearsal never persists, so it is allowed (and useful) even on a
-        // read-only session — the agent can preview an edit it could not commit.
+        // read-only session — the agent can preview an edit it could not
+        // commit.
         let mut ws = Workspace::new_read_only(Box::new(Buffer::from_string("ref", "keep me")));
         let r = ws
             .rehearse(r#"(goto-char (point-max)) (insert " EDITED")"#)
@@ -1787,8 +1805,8 @@ mod tests {
     #[test]
     fn restriction_edges_are_line_boundaries_and_empty_matches_count_once() {
         // Emacs: point-min counts as a line beginning even mid-line, and a
-        // zero-width anchor match counts once per position (no truncation,
-        // no double count).
+        // zero-width anchor match counts once per position (no truncation, no
+        // double count).
         let r = run(
             "xxfoo\nfoo bar\n",
             r#"(narrow-to-region 3 11)
@@ -1811,8 +1829,8 @@ mod tests {
 
     #[test]
     fn count_matches_with_an_end_beyond_point_max_terminates() {
-        // The zero-width step limit must clamp to point-max — an oversized
-        // END used to make `(count-matches "$" 1 BIG)` loop forever.
+        // The zero-width step limit must clamp to point-max — an oversized END
+        // used to make `(count-matches "$" 1 BIG)` loop forever.
         let r = run("abc", r#"(report "n" (count-matches "$" 1 100))"#);
         assert_eq!(report(&r, "n"), "1");
     }
@@ -2012,9 +2030,9 @@ mod tests {
 
     #[test]
     fn checkpoint_and_restore() {
-        // Restoring the pre-edit checkpoint reinstates the snapshot's
-        // version stamp, so the run as a whole reports CLEAN: no diff,
-        // no final_text — and the buffer text is back to the original.
+        // Restoring the pre-edit checkpoint reinstates the snapshot's version
+        // stamp, so the run as a whole reports CLEAN: no diff, no final_text —
+        // and the buffer text is back to the original.
         let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "original")));
         let r = ws
             .run(r#"(checkpoint "c1") (erase-buffer) (insert "changed") (restore-checkpoint "c1")"#)
@@ -2082,15 +2100,16 @@ mod tests {
     fn treesit_root_type_is_document() {
         let r = run(MD, "(report \"root\" (treesit-root-type))");
         // `report` stringifies the returned tulisp value, so a string return
-        // renders quoted; the builtin's own self-report (a raw key/value) does not.
+        // renders quoted; the builtin's own self-report (a raw key/value) does
+        // not.
         assert_eq!(report(&r, "root"), "\"document\"");
         assert_eq!(report(&r, "treesit-root-type"), "document");
     }
 
     #[test]
     fn treesit_node_at_reports_type_and_char_span() {
-        // Point inside "Title" (char 4) → the heading's inline content,
-        // char span [3, 8).
+        // Point inside "Title" (char 4) → the heading's inline content, char
+        // span [3, 8).
         let r = run(MD, "(goto-char 4) (treesit-node-at)");
         assert_eq!(report(&r, "treesit-node-type"), "inline");
         assert_eq!(report(&r, "treesit-node-start"), "3");
@@ -2139,8 +2158,8 @@ mod tests {
 
     #[test]
     fn treesit_beginning_of_defun_outside_section_keeps_point() {
-        // A buffer that opens with blank lines: point 1 is before any section, so
-        // navigation is a no-op and returns point unchanged.
+        // A buffer that opens with blank lines: point 1 is before any section,
+        // so navigation is a no-op and returns point unchanged.
         let r = run(
             "\n\n# H\n\nbody\n",
             "(goto-char 1) (treesit-beginning-of-defun)",
@@ -2191,7 +2210,7 @@ mod tests {
             r#"(report "p" (treesit-goto-defun "beta")) (report "name" (treesit-defun-name))
                (report "missing" (treesit-goto-defun "gamma"))"#,
         );
-        // "fn alpha() -> i64 {\n    1\n}\n\n" is 29 chars; beta starts at 30.
+        // "fn alpha() -> i64 {\n 1\n}\n\n" is 29 chars; beta starts at 30.
         assert_eq!(report(&r, "p"), "30");
         assert_eq!(report(&r, "name"), "\"beta\"");
         assert_eq!(report(&r, "missing"), "nil");
@@ -2247,7 +2266,8 @@ mod tests {
             r#"(report "n" (length (treesit-query "(function_definition name: (identifier) @fn)")))"#,
         );
         assert_eq!(report(&r, "n"), "2");
-        // Captures self-report as "@CAPTURE KIND START END"; `f` is char [5, 6).
+        // Captures self-report as "@CAPTURE KIND START END"; `f` is char [5,
+        // 6).
         assert_eq!(report(&r, "capture"), "@fn identifier 5 6");
         // A bad pattern is a lisp error, not a panic.
         let e = run_program(
@@ -2259,10 +2279,9 @@ mod tests {
 
     #[test]
     fn clean_runs_report_no_diff_and_no_final_text() {
-        // The version-stamp fast path: a run that only navigates / reads
-        // must not report a diff or carry final_text — for a warm Quire
-        // this is what keeps view/search/occur O(viewport) instead of
-        // O(document).
+        // The version-stamp fast path: a run that only navigates / reads must
+        // not report a diff or carry final_text — for a warm Quire this is what
+        // keeps view/search/occur O(viewport) instead of O(document).
         let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "hello world")));
         let r = ws
             .run(r#"(goto-char 4) (report "found" (if (search-forward "world" nil t) 1 0))"#)
@@ -2276,9 +2295,9 @@ mod tests {
 
     #[test]
     fn edit_then_revert_within_one_run_reports_clean() {
-        // The version moves (two mutations) but the text round-trips —
-        // the exact-compare fallback must report clean, like the old
-        // full-text compare did.
+        // The version moves (two mutations) but the text round-trips — the
+        // exact-compare fallback must report clean, like the old full-text
+        // compare did.
         let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "stable")));
         let r = ws
             .run(r#"(goto-char (point-max)) (insert "x") (delete-region (- (point) 1) (point))"#)
@@ -2347,8 +2366,8 @@ mod tests {
                (goto-char 3)
                (report "miss" (if (re-search-backward "zz" nil t) 1 0))"#,
         );
-        // BOUND is the lower limit of the window [5, point): the latest
-        // match inside it starts at 7.
+        // BOUND is the lower limit of the window [5, point): the latest match
+        // inside it starts at 7.
         assert_eq!(report(&r, "hit"), "7");
         assert_eq!(report(&r, "miss"), "0");
     }
@@ -2441,8 +2460,8 @@ mod tests {
         );
         assert_eq!(report(&r, "indent"), "4");
         assert_eq!(report(&r, "bti"), "5");
-        // The paragraph boundary is the start of the blank line after
-        // "indented line" (char 19: 17 line chars + its newline).
+        // The paragraph boundary is the start of the blank line after "indented
+        // line" (char 19: 17 line chars + its newline).
         assert_eq!(report(&r, "para"), "19");
     }
 

@@ -1,7 +1,7 @@
-//! The MCP protocol layer: JSON-RPC 2.0 framing, the `initialize`
-//! handshake and version negotiation. Transport-agnostic — the stdio loop
-//! (`mcp::run`) feeds lines to [`handle_line`]; the HTTP front end parses its
-//! own body and calls [`handle_request`]. This file never touches a buffer: every buffer-touching
+//! The MCP protocol layer: JSON-RPC 2.0 framing, the `initialize` handshake and
+//! version negotiation. Transport-agnostic — the stdio loop (`mcp::run`) feeds
+//! lines to [`handle_line`]; the HTTP front end parses its own body and calls
+//! [`handle_request`]. This file never touches a buffer: every buffer-touching
 //! tool lives in `mcp`. The two exceptions dispatched here are the workspace
 //! tools `open_workspace` and `close_workspace`, because they act on the
 //! [`WorkspaceStore`] itself rather than on any one session map.
@@ -17,8 +17,8 @@ use crate::mcp::{
 use serde_json::{Value, json};
 
 /// Every protocol version mime implements, newest first. `2026-07-28` is the
-/// stateless "modern" era (per-request `_meta`, no handshake); the rest are
-/// the `initialize`-based legacy era. A dual-era server in the spec's sense.
+/// stateless "modern" era (per-request `_meta`, no handshake); the rest are the
+/// `initialize`-based legacy era. A dual-era server in the spec's sense.
 pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 5] = [
     "2026-07-28",
     "2025-11-25",
@@ -38,8 +38,8 @@ pub const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabi
 pub const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 
 /// Freshness hint on `tools/list` and `server/discover`: the catalogue is
-/// static for the life of the process, so a long TTL lets clients keep the
-/// list in their prompt cache.
+/// static for the life of the process, so a long TTL lets clients keep the list
+/// in their prompt cache.
 pub const LIST_TTL_MS: u64 = 86_400_000;
 
 /// Which of the two protocol eras a request speaks.
@@ -117,7 +117,8 @@ fn server_identity() -> Value {
 }
 
 /// Extend an object result with more keys. Output order is unaffected —
-/// serde_json sorts map keys — so the two callers can build theirs in any order.
+/// serde_json sorts map keys — so the two callers can build theirs in any
+/// order.
 fn extend(mut base: Value, more: Value) -> Value {
     if let (Some(b), Some(m)) = (base.as_object_mut(), more.as_object()) {
         for (k, v) in m {
@@ -139,8 +140,8 @@ fn discover_result() -> Value {
     )
 }
 
-/// One client's warm-session map: session id -> that session's engine
-/// state (a `Workspace` buffer, not the handle-scoped workspace above).
+/// One client's warm-session map: session id -> that session's engine state (a
+/// `Workspace` buffer, not the handle-scoped workspace above).
 pub type Sessions = HashMap<String, Workspace>;
 
 /// Soft cap on concurrent workspaces: making room for a new one evicts the
@@ -156,9 +157,9 @@ pub const WORKSPACE_CAP: usize = 256;
 pub struct WorkspaceStore {
     map: HashMap<String, Sessions>,
     order: VecDeque<String>,
-    /// A handle eviction must never take: stdio's implicit workspace, which
-    /// is minted first and would otherwise be the first thing an
-    /// `open_workspace` flood dropped — taking the agent's warm buffers with it.
+    /// A handle eviction must never take: stdio's implicit workspace, which is
+    /// minted first and would otherwise be the first thing an `open_workspace`
+    /// flood dropped — taking the agent's warm buffers with it.
     pinned: Option<String>,
 }
 
@@ -256,9 +257,9 @@ impl WorkspaceStore {
     }
 }
 
-/// A 128-bit random handle (hex). The handle is the client's bearer token
-/// for its warm state, so it must not be guessable — read it from the OS
-/// CSPRNG, failing closed if that is somehow unavailable.
+/// A 128-bit random handle (hex). The handle is the client's bearer token for
+/// its warm state, so it must not be guessable — read it from the OS CSPRNG,
+/// failing closed if that is somehow unavailable.
 pub fn new_handle() -> String {
     let mut buf = [0u8; 16];
     match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)) {
@@ -285,10 +286,10 @@ pub struct CallContext<'a> {
     pub implicit_workspace: Option<&'a str>,
 }
 
-/// Parse one JSON-RPC request line and dispatch it. Returns `Some(response)` for
-/// requests (those with an `id`) and `None` for notifications. A transport that
-/// has already parsed the body (the HTTP front end reads its era from it) calls
-/// [`handle_request`] directly instead of re-serialising it.
+/// Parse one JSON-RPC request line and dispatch it. Returns `Some(response)`
+/// for requests (those with an `id`) and `None` for notifications. A transport
+/// that has already parsed the body (the HTTP front end reads its era from it)
+/// calls [`handle_request`] directly instead of re-serialising it.
 pub fn handle_line(line: &str, store: &mut WorkspaceStore, ctx: &CallContext) -> Option<Value> {
     match serde_json::from_str(line) {
         Ok(req) => handle_request(req, store, ctx),
@@ -312,8 +313,8 @@ pub fn handle_request(req: Value, store: &mut WorkspaceStore, ctx: &CallContext)
     let is_notification = id.is_none();
     let err_id = || id.clone().unwrap_or(Value::Null);
 
-    // A modern request must carry a well-formed, supported `_meta` before it
-    // is dispatched; a malformed notification is still silently dropped.
+    // A modern request must carry a well-formed, supported `_meta` before it is
+    // dispatched; a malformed notification is still silently dropped.
     let era = era_of(&params);
     if era == Era::Modern
         && let Err((code, message, data)) = validate_modern_meta(&params)
@@ -363,8 +364,8 @@ pub fn handle_request(req: Value, store: &mut WorkspaceStore, ctx: &CallContext)
 fn tools_call(params: &Value, store: &mut WorkspaceStore, ctx: &CallContext, era: Era) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     // Borrowed, not cloned: the arguments can be a whole buffer's worth of
-    // text, and `mcp::tools_call_result` makes the one copy that is needed
-    // (it rewrites alias spellings in place).
+    // text, and `mcp::tools_call_result` makes the one copy that is needed (it
+    // rewrites alias spellings in place).
     let no_args = json!({});
     let args = params.get("arguments").unwrap_or(&no_args);
     // The two workspace tools act on the store, not on a session map, so they
@@ -409,8 +410,9 @@ fn tools_call(params: &Value, store: &mut WorkspaceStore, ctx: &CallContext, era
             (out, Some(h))
         }
         // Lazy insertion: run against a map that is not in the store, and keep
-        // it — minting this call's handle — only if the tool left something warm
-        // in it. A `session_status` poll opens nothing, so nothing is kept.
+        // it — minting this call's handle — only if the tool left something
+        // warm in it. A `session_status` poll opens nothing, so nothing is
+        // kept.
         None => {
             let mut fresh = Sessions::new();
             let out = tools_call_result(params, &mut fresh, None);
@@ -424,10 +426,10 @@ fn tools_call(params: &Value, store: &mut WorkspaceStore, ctx: &CallContext, era
     {
         // The handle is machine-readable too, so a client need not parse it
         // back out of the text. Nothing is padded on to carry it: the handle
-        // joins whatever structured value the tool itself supplied — its result,
-        // or its own failure JSON. A text-only tool has none and reports the
-        // handle on the trailing line below only; a prose-rendered tool with
-        // data (grep, outline) gets both.
+        // joins whatever structured value the tool itself supplied — its
+        // result, or its own failure JSON. A text-only tool has none and
+        // reports the handle on the trailing line below only; a prose-rendered
+        // tool with data (grep, outline) gets both.
         map.insert("workspace".to_string(), json!(h));
     }
     // Text and structured value must keep saying the same thing: a tool whose
@@ -524,8 +526,8 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
 }
 
 /// The `_meta` object of a well-formed modern request, as the JSON-body
-/// fragment the transport tests splice into a request line. Built from the
-/// real key constants so a renamed key breaks compilation, not assertions.
+/// fragment the transport tests splice into a request line. Built from the real
+/// key constants so a renamed key breaks compilation, not assertions.
 #[cfg(test)]
 pub(crate) fn modern_meta_json() -> String {
     format!(
@@ -601,7 +603,8 @@ mod tests {
         let h = store.mint();
         let ctx = stdio_ctx(&h);
 
-        // initialize: a supported version is echoed; capabilities + instructions present.
+        // initialize: a supported version is echoed; capabilities +
+        // instructions present.
         let init = call(
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
             &mut store,
@@ -721,8 +724,8 @@ mod tests {
     #[test]
     fn eviction_skips_workspaces_with_unsaved_edits() {
         // Boundedness must not cost an agent its work: the oldest workspace is
-        // the eviction candidate, but one holding an unsaved edit is passed over
-        // for the oldest CLEAN one.
+        // the eviction candidate, but one holding an unsaved edit is passed
+        // over for the oldest CLEAN one.
         let mut store = WorkspaceStore::new();
         let dirty = store.insert(dirty_sessions());
         let clean = store.mint();
@@ -1060,8 +1063,8 @@ mod tests {
         assert_eq!(boom["result"]["isError"], true, "{}", text_of(&boom));
         assert_eq!(boom["result"]["structuredContent"]["ok"], false);
 
-        // Modern HTTP: a failed call on a held workspace still REPORTS it —
-        // the client's warm state is right there — but the report is the only
+        // Modern HTTP: a failed call on a held workspace still REPORTS it — the
+        // client's warm state is right there — but the report is the only
         // structured key it gets; the `{}` default stays off an error.
         let http = CallContext {
             transport: Transport::Http,
@@ -1176,8 +1179,9 @@ mod tests {
     #[test]
     fn a_failed_handle_free_call_that_created_nothing_reports_none() {
         // The other half: a handle-free call that fails before opening anything
-        // has no workspace at all. Nothing is inserted, so there is no handle to
-        // report — and no unreachable workspace counting against WORKSPACE_CAP.
+        // has no workspace at all. Nothing is inserted, so there is no handle
+        // to report — and no unreachable workspace counting against
+        // WORKSPACE_CAP.
         let mut store = WorkspaceStore::new();
         let ctx = CallContext {
             transport: Transport::Http,
@@ -1432,7 +1436,8 @@ mod tests {
         assert_eq!(unsupported["error"]["code"], -32022);
         assert_eq!(unsupported["error"]["data"]["requested"], "2030-01-01");
         assert_eq!(unsupported["error"]["data"]["supported"][0], "2026-07-28");
-        // A legacy version inside modern _meta is served (the client chose the shape).
+        // A legacy version inside modern _meta is served (the client chose the
+        // shape).
         let legacy_in_meta = call(
             r#"{"jsonrpc":"2.0","id":4,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-06-18","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
             &mut store,

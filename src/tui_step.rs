@@ -13,11 +13,11 @@ pub struct Form {
     pub line: usize,
 }
 
-/// Split tulisp source into top-level forms without evaluating anything:
-/// parens tracked outside strings (`"…"` with `\` escapes), `;` comments, and
-/// `?c` / `?\c` character literals (recognized only where a char literal can
-/// start — after whitespace or an opening paren — so `foo?` symbols survive).
-/// A bare top-level atom counts as a form too.
+/// Split tulisp source into top-level forms without evaluating anything: parens
+/// tracked outside strings (`"…"` with `\` escapes), `;` comments, and `?c` /
+/// `?\c` character literals (recognized only where a char literal can start —
+/// after whitespace or an opening paren — so `foo?` symbols survive).  A bare
+/// top-level atom counts as a form too.
 pub fn split_forms(src: &str) -> Vec<Form> {
     let bytes = src.as_bytes();
     let mut forms = Vec::new();
@@ -55,7 +55,8 @@ pub fn split_forms(src: &str) -> Vec<Form> {
         }
         match c {
             b';' => {
-                // Comment to end of line. At depth 0 a comment ends a bare atom.
+                // Comment to end of line. At depth 0 a comment ends a bare
+                // atom.
                 if depth == 0
                     && let Some((s, l)) = start.take()
                 {
@@ -187,10 +188,10 @@ impl Stepper {
         })
     }
 
-    /// `Some(reason)` when replay (restart / step-back) is refused: an
-    /// executed form already touched the filesystem, so re-running the
-    /// script would read or write files whose content has moved on — the
-    /// replay would not be faithful.
+    /// `Some(reason)` when replay (restart / step-back) is refused: an executed
+    /// form already touched the filesystem, so re-running the script would read
+    /// or write files whose content has moved on — the replay would not be
+    /// faithful.
     pub fn replay_blocked(&self) -> Option<&'static str> {
         self.ws.did_disk_io().then_some(
             "a form did file I/O (find-file / write-file …) — a replay would \
@@ -199,8 +200,8 @@ impl Stepper {
     }
 
     /// Back to before the first form: a fresh workspace over the origin
-    /// snapshot, so interpreter state (defuns, variables) resets along with
-    /// the buffer. Refused after any form touched the filesystem — see
+    /// snapshot, so interpreter state (defuns, variables) resets along with the
+    /// buffer. Refused after any form touched the filesystem — see
     /// [`Stepper::replay_blocked`].
     pub fn restart(&mut self) -> Result<(), &'static str> {
         if let Some(reason) = self.replay_blocked() {
@@ -247,8 +248,8 @@ impl Stepper {
         self.ws.text()
     }
 
-    /// The PRIMARY buffer's text — what a write-back must persist. Falls
-    /// back to the current buffer if the script killed the primary.
+    /// The PRIMARY buffer's text — what a write-back must persist. Falls back
+    /// to the current buffer if the script killed the primary.
     pub fn primary_text(&self) -> String {
         self.ws
             .text_of(&self.primary)

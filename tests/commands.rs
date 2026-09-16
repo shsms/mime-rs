@@ -15,7 +15,8 @@ fn kill_line_kills_to_end_of_line() {
 
 #[test]
 fn kill_line_at_eol_kills_the_newline() {
-    // point after "foo" (position 4) is end-of-line; kill-line removes the newline.
+    // point after "foo" (position 4) is end-of-line; kill-line removes the
+    // newline.
     assert_eq!(run("foo\nbar", "(goto-char 4) (kill-line)"), "foobar");
 }
 
@@ -29,8 +30,8 @@ fn delete_trailing_whitespace_cleans_lines() {
 
 // ---- filling ----
 
-/// Run `program` over `text` in a buffer named `name` (its extension picks
-/// the language) and return the final text (the input when nothing changed).
+/// Run `program` over `text` in a buffer named `name` (its extension picks the
+/// language) and return the final text (the input when nothing changed).
 fn run_as(name: &str, text: &str, program: &str) -> String {
     run_program(Box::new(Buffer::from_string(name, text)), program)
         .expect("program should run")
@@ -254,8 +255,8 @@ fn a_file_type_without_a_grammar_is_refused() {
         run_as("scratch", "aaa\nbbb\n", "(fill-paragraph)"),
         "aaa bbb\n"
     );
-    // A treesit-set-language override wins, and a uniquified name keeps
-    // its extension.
+    // A treesit-set-language override wins, and a uniquified name keeps its
+    // extension.
     assert_eq!(
         run_as(
             "Foo.java",

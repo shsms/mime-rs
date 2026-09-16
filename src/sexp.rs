@@ -1,27 +1,27 @@
-//! The sexp scanner: Emacs's syntax-table notion of a balanced expression,
-//! over a [`TextStore`], for the sexp and list motions and the MCP `thing`
-//! selector. A sexp is a bracket group (`()` `[]` `{}`), a string, a run of
-//! symbol characters (see `Lang::is_symbol_char`), or one punctuation
-//! character, with any expression-prefix characters before it (`'` in
-//! `'(a b)`). Comments are skipped. The per-language quotes, comment
-//! openers and prefixes come from `Lang::sexp_rule`.
+//! The sexp scanner: Emacs's syntax-table notion of a balanced expression, over
+//! a [`TextStore`], for the sexp and list motions and the MCP `thing` selector.
+//! A sexp is a bracket group (`()` `[]` `{}`), a string, a run of symbol
+//! characters (see `Lang::is_symbol_char`), or one punctuation character, with
+//! any expression-prefix characters before it (`'` in `'(a b)`). Comments are
+//! skipped. The per-language quotes, comment openers and prefixes come from
+//! `Lang::sexp_rule`.
 //!
 //! Forward scans stream tokens from the start position through a windowed
-//! reader, so a walk holds one bounded `substring` window at a time (the
-//! same discipline as `motion.rs`). Backward scans lex the accessible region
-//! from its start up to the position once per [`Scanner`] and walk the token
-//! list in reverse: that is the only way to know whether a quote seen
-//! backward opens or closes a string, or a `(` sits inside a comment.
+//! reader, so a walk holds one bounded `substring` window at a time (the same
+//! discipline as `motion.rs`). Backward scans lex the accessible region from
+//! its start up to the position once per [`Scanner`] and walk the token list in
+//! reverse: that is the only way to know whether a quote seen backward opens or
+//! closes a string, or a `(` sits inside a comment.
 //!
 //! Known misreads, by design (not an Emacs syntax table): a Rust `'('` char
 //! literal reads as punctuation, an open bracket and punctuation, so the
-//! bracket counts, and a `'"'` one opens a string that runs to the next
-//! quote; Rust and Python raw strings (their backslashes still escape),
-//! Python f-strings and JS regex literals read as plain strings or symbols;
-//! a TOML `"""` string reads as short strings back to back; a nested block
-//! comment (`/* /* */ */`) closes at the first closer, leaving the rest as
-//! stray text. Files that hit these have a tree-sitter grammar; the node
-//! tools are the fallback.
+//! bracket counts, and a `'"'` one opens a string that runs to the next quote;
+//! Rust and Python raw strings (their backslashes still escape), Python
+//! f-strings and JS regex literals read as plain strings or symbols; a TOML
+//! `"""` string reads as short strings back to back; a nested block comment
+//! (`/* /* */ */`) closes at the first closer, leaving the rest as stray text.
+//! Files that hit these have a tree-sitter grammar; the node tools are the
+//! fallback.
 
 use std::cell::RefCell;
 
@@ -56,8 +56,8 @@ pub struct Token {
     pub kind: TokenKind,
 }
 
-/// Why a scan could not finish. The position is where the offending
-/// construct starts: the stray closer, the unclosed opener, the quote.
+/// Why a scan could not finish. The position is where the offending construct
+/// starts: the stray closer, the unclosed opener, the quote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanError {
     Unbalanced { at: usize },
@@ -211,11 +211,11 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// The backward lexer's memo: the tokens of `[bound, upto)` in order,
-/// comments included, plus at most one token that starts before `upto` and
-/// may run past it, as the last element: a string or block comment cut by
-/// the position is lexed to its real end; a symbol or line comment cut by it
-/// is cut off at `upto`.
+/// The backward lexer's memo: the tokens of `[bound, upto)` in order, comments
+/// included, plus at most one token that starts before `upto` and may run past
+/// it, as the last element: a string or block comment cut by the position is
+/// lexed to its real end; a symbol or line comment cut by it is cut off at
+/// `upto`.
 struct Lexed {
     bound: usize,
     upto: usize,
@@ -355,18 +355,18 @@ impl<'a> Scanner<'a> {
     }
 
     /// The next sexp at or after `from`: a balanced group to its matching
-    /// closer, a string, a symbol run, or one punctuation character, with
-    /// the expression prefixes before it. `Ok(None)` when only whitespace
-    /// and comments remain before `bound`. A closer at depth zero is
-    /// `Unbalanced` at the closer, as in Emacs.
+    /// closer, a string, a symbol run, or one punctuation character, with the
+    /// expression prefixes before it. `Ok(None)` when only whitespace and
+    /// comments remain before `bound`. A closer at depth zero is `Unbalanced`
+    /// at the closer, as in Emacs.
     pub fn sexp_forward(&self, from: usize, bound: usize) -> Result<Option<Sexp>, ScanError> {
         let mut r = Reader::new(self.store, from, bound);
         let Some(mut first) = self.token(&mut r)? else {
             return Ok(None);
         };
         let start = first.start;
-        // Prefixes are skipped like whitespace on the way to the sexp; a
-        // prefix with nothing after it is a sexp of its own.
+        // Prefixes are skipped like whitespace on the way to the sexp; a prefix
+        // with nothing after it is a sexp of its own.
         while first.kind == TokenKind::Punct && self.is_prefix(first.start) {
             match self.token(&mut r)? {
                 Some(t) => first = t,
@@ -393,9 +393,8 @@ impl<'a> Scanner<'a> {
         }))
     }
 
-    /// Finish a group whose opener `open` the reader has consumed; `start`
-    /// is where the sexp began (an expression prefix may sit before the
-    /// opener).
+    /// Finish a group whose opener `open` the reader has consumed; `start` is
+    /// where the sexp began (an expression prefix may sit before the opener).
     fn group_from(
         &self,
         r: &mut Reader,
@@ -429,10 +428,10 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// The next bracket group at or after `from`, skipping atoms. A closer
-    /// at depth zero is `Unbalanced` unless `cross_closers`, when it is
-    /// stepped over (the `thing: {after}` resolution wants the first group
-    /// after a line, whatever depth the line sits at).
+    /// The next bracket group at or after `from`, skipping atoms. A closer at
+    /// depth zero is `Unbalanced` unless `cross_closers`, when it is stepped
+    /// over (the `thing: {after}` resolution wants the first group after a
+    /// line, whatever depth the line sits at).
     pub fn list_forward(
         &self,
         from: usize,
@@ -472,8 +471,8 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// The position after the next opener at or after `from`, skipping
-    /// atoms; `Unbalanced` at a closer met first, `Ok(None)` at the bound.
+    /// The position after the next opener at or after `from`, skipping atoms;
+    /// `Unbalanced` at a closer met first, `Ok(None)` at the bound.
     pub fn down_forward(&self, from: usize, bound: usize) -> Result<Option<usize>, ScanError> {
         let mut r = Reader::new(self.store, from, bound);
         loop {
@@ -488,11 +487,11 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// Lex `[bound, upto)` into the memo unless it already covers that
-    /// range. A string or comment cut by `upto` is lexed to its real end (a
-    /// string that never closes is `UnterminatedString`) and kept as the
-    /// last token, so a caller can tell "inside a string" from "at a token
-    /// boundary". A symbol cut by `upto` is simply cut.
+    /// Lex `[bound, upto)` into the memo unless it already covers that range. A
+    /// string or comment cut by `upto` is lexed to its real end (a string that
+    /// never closes is `UnterminatedString`) and kept as the last token, so a
+    /// caller can tell "inside a string" from "at a token boundary". A symbol
+    /// cut by `upto` is simply cut.
     fn lex_upto(&self, upto: usize, bound: usize) -> Result<(), ScanError> {
         if self
             .memo
@@ -543,9 +542,9 @@ impl<'a> Scanner<'a> {
     }
 
     /// The sexp that ends at or before `from`, matching a closer back to its
-    /// opener and absorbing the prefixes before it. `Ok(None)` at the
-    /// bound. An opener met first is `Unbalanced` (backward over `(` would
-    /// leave the group), as is a closer with no opener.
+    /// opener and absorbing the prefixes before it. `Ok(None)` at the bound. An
+    /// opener met first is `Unbalanced` (backward over `(` would leave the
+    /// group), as is a closer with no opener.
     pub fn sexp_backward(&self, from: usize, bound: usize) -> Result<Option<Sexp>, ScanError> {
         self.with_tokens(from, bound, |before, cut| {
             match cut {
@@ -665,8 +664,8 @@ impl<'a> Scanner<'a> {
         })?
     }
 
-    /// The opener of the innermost group containing `from`, or `Ok(None)`
-    /// at depth zero.
+    /// The opener of the innermost group containing `from`, or `Ok(None)` at
+    /// depth zero.
     pub fn up_backward(&self, from: usize, bound: usize) -> Result<Option<usize>, ScanError> {
         self.with_tokens(from, bound, |before, _cut| {
             let mut depth = 0usize;
@@ -682,10 +681,10 @@ impl<'a> Scanner<'a> {
         })
     }
 
-    /// The span of the `kind` thing at `pos`, widened by `up` enclosing
-    /// groups (sexp and list only), or `Ok(None)` when there is none. A
-    /// `pos` at point-max probes the character before it, so the thing at
-    /// the end of the region is the last one, as in Emacs.
+    /// The span of the `kind` thing at `pos`, widened by `up` enclosing groups
+    /// (sexp and list only), or `Ok(None)` when there is none. A `pos` at
+    /// point-max probes the character before it, so the thing at the end of the
+    /// region is the last one, as in Emacs.
     pub fn bounds_of(
         &self,
         kind: Kind,
@@ -737,8 +736,8 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// `span` widened to its `up`-th enclosing group; `Unbalanced` at the
-    /// span start when the groups run out.
+    /// `span` widened to its `up`-th enclosing group; `Unbalanced` at the span
+    /// start when the groups run out.
     pub fn widen(&self, span: (usize, usize), up: usize) -> Result<(usize, usize), ScanError> {
         let mut span = span;
         for _ in 0..up {
@@ -753,8 +752,8 @@ impl<'a> Scanner<'a> {
         Ok(span)
     }
 
-    /// The token containing `probe` (a string or a symbol also when the
-    /// probe is inside it), or `None` on whitespace.
+    /// The token containing `probe` (a string or a symbol also when the probe
+    /// is inside it), or `None` on whitespace.
     fn token_at(&self, probe: usize, min: usize) -> Result<Option<Token>, ScanError> {
         let t = self.with_tokens(probe + 1, min, |before, cut| {
             cut.or_else(|| {
@@ -764,9 +763,9 @@ impl<'a> Scanner<'a> {
                     .filter(|t| t.start <= probe && t.end == probe + 1)
             })
         })?;
-        // A symbol may have been cut by the lex bound at `probe + 1`, same
-        // as `before`'s last token was; extend it to its real end (a no-op
-        // when it already reached its real end there).
+        // A symbol may have been cut by the lex bound at `probe + 1`, same as
+        // `before`'s last token was; extend it to its real end (a no-op when it
+        // already reached its real end there).
         Ok(match t {
             Some(mut t) if t.kind == TokenKind::Symbol && t.end == probe + 1 => {
                 t.end = skip_forward(self.store, t.end, self.store.point_max(), &|c| {
@@ -778,8 +777,8 @@ impl<'a> Scanner<'a> {
         })
     }
 
-    /// The sexp at `probe`: the whole group when the probe is on a bracket,
-    /// the prefixed sexp when it is on a prefix.
+    /// The sexp at `probe`: the whole group when the probe is on a bracket, the
+    /// prefixed sexp when it is on a prefix.
     fn sexp_at(
         &self,
         probe: usize,
@@ -815,9 +814,9 @@ impl<'a> Scanner<'a> {
     }
 
     /// `pos`, or the end of the string or comment `pos` sits inside: a forward
-    /// scan started inside one would read its text as code. A string or
-    /// comment left unterminated before `pos` means no context is known, and
-    /// `pos` stands.
+    /// scan started inside one would read its text as code. A string or comment
+    /// left unterminated before `pos` means no context is known, and `pos`
+    /// stands.
     pub fn out_of_string_or_comment(&self, pos: usize) -> usize {
         self.with_tokens(pos + 1, self.store.point_min(), |before, cut| {
             cut.or_else(|| before.last().copied())
@@ -886,7 +885,8 @@ mod tests {
             toks(Lang::Python, "'a' \"b\""),
             vec![(1, 4, Str), (5, 8, Str)]
         );
-        // `'` is not a string quote in Rust: a lifetime is punctuation + symbol.
+        // `'` is not a string quote in Rust: a lifetime is punctuation +
+        // symbol.
         assert_eq!(toks(Lang::Rust, "'a"), vec![(1, 2, Punct), (2, 3, Symbol)]);
         assert_eq!(toks(Lang::Go, "`x`"), vec![(1, 4, Str)]);
         assert_eq!(
@@ -1121,7 +1121,7 @@ mod tests {
         let x = s.sexp_backward(18, 1).unwrap().unwrap();
         assert_eq!((x.start, x.end), (16, 18), "mid-symbol: the symbol so far");
         // A multi-line string: the closing quote on line 2 is a closer.
-        //             123456789012 3
+        // 123456789012 3
         let (b, l) = sc("x \"one\ntwo\" y");
         let s = Scanner::new(&b, l);
         let x = s.sexp_backward(12, 1).unwrap().unwrap();
@@ -1174,7 +1174,8 @@ mod tests {
 
     #[test]
     fn the_backward_lexer_is_memoised_per_scanner() {
-        // Twelve thousand tokens, a hundred backward hops: linear, not quadratic.
+        // Twelve thousand tokens, a hundred backward hops: linear, not
+        // quadratic.
         let text = "(a b) ".repeat(2000);
         let b = Buffer::from_string("t.rs", &text);
         let s = Scanner::new(&b, Lang::Rust);
@@ -1258,8 +1259,8 @@ mod tests {
             Some((4, 18)),
             "sexp widened"
         );
-        // Fixture is 19 chars (point-max 20): pos 21 clamps to 20, probing
-        // the last char at 19 -- the symbol `x` at (19, 20).
+        // Fixture is 19 chars (point-max 20): pos 21 clamps to 20, probing the
+        // last char at 19 -- the symbol `x` at (19, 20).
         assert_eq!(
             bounds(t, Kind::Sexp, 21, 0).unwrap(),
             Some((19, 20)),

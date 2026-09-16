@@ -61,8 +61,9 @@ pub(crate) fn translate(pat: &str) -> Result<String, String> {
                             .to_string());
                     }
                     // Emacs `\s`/`\S` take a syntax-code argument (\sw, \s-, …)
-                    // that RE2 can't express; passing them through would silently
-                    // leak the code char as a literal, so reject them outright.
+                    // that RE2 can't express; passing them through would
+                    // silently leak the code char as a literal, so reject them
+                    // outright.
                     's' | 'S' => {
                         return Err(format!(
                             "\\{n} (syntax classes) are not supported; use a character class \
@@ -71,18 +72,18 @@ pub(crate) fn translate(pat: &str) -> Result<String, String> {
                     }
                     // \w \W \b \B \< \> \A \z and metachar escapes (\. \* \\ …)
                     // mean the same in both dialects. C-style escapes (\t \n \r
-                    // \f \v \a …) follow RE2 — they are the control char, NOT the
-                    // strict-Emacs "backslash before an ordinary letter is that
-                    // letter". Kept verbatim either way.
+                    // \f \v \a …) follow RE2 — they are the control char, NOT
+                    // the strict-Emacs "backslash before an ordinary letter is
+                    // that letter". Kept verbatim either way.
                     _ => {
                         out.push('\\');
                         out.push(n);
                     }
                 }
             }
-            // A standalone inline-flag group — `(?i)`, `(?s)`, `(?im-s)` — is the
-            // one RE2 form we keep verbatim (see module docs); any other `(` is
-            // an Emacs literal and gets escaped for RE2.
+            // A standalone inline-flag group — `(?i)`, `(?s)`, `(?im-s)` — is
+            // the one RE2 form we keep verbatim (see module docs); any other
+            // `(` is an Emacs literal and gets escaped for RE2.
             '(' => {
                 if let Some(end) = inline_flag_token(&cs, i) {
                     out.extend(&cs[i..=end]);
@@ -143,12 +144,13 @@ fn inline_flag_token(cs: &[char], at: usize) -> Option<usize> {
 }
 
 /// Copy a `[...]` character class, translating Emacs class semantics to RE2.
-/// Emacs has NO backslash escapes inside a class — `\` is a literal member —
-/// so each interior `\` is doubled to `\\` (RE2's literal backslash); otherwise
+/// Emacs has NO backslash escapes inside a class — `\` is a literal member — so
+/// each interior `\` is doubled to `\\` (RE2's literal backslash); otherwise
 /// `[\d]` (Emacs: the set `{\, d}`) would become an RE2 digit class. Handles a
 /// leading `^`, a `]` as the first member, and POSIX classes like `[:alpha:]`
 /// whose inner `:]` must not be mistaken for the class close. The POSIX-class
-/// body is copied verbatim (no `\` there). Returns the index of the closing `]`.
+/// body is copied verbatim (no `\` there). Returns the index of the closing
+/// `]`.
 fn copy_class(cs: &[char], open: usize, out: &mut String) -> Result<usize, String> {
     out.push('[');
     let mut i = open + 1;

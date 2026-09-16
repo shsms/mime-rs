@@ -1,28 +1,28 @@
-//! Foundation motions: the `skip-chars` character-set parser and the
-//! position walkers (skip, word/symbol unit, paragraph) the motion builtins
-//! are written on. Every walker is a pure function over `&dyn TextStore`:
-//! it reads in bounded windows via `substring`, never `text()` — so a
-//! file-backed buffer never materializes more than one [`WINDOW`]-char
-//! window at a time, however long the walk — and returns a position; the
-//! builtin does the `goto_char` / `set_mark`.
+//! Foundation motions: the `skip-chars` character-set parser and the position
+//! walkers (skip, word/symbol unit, paragraph) the motion builtins are written
+//! on. Every walker is a pure function over `&dyn TextStore`: it reads in
+//! bounded windows via `substring`, never `text()` — so a file-backed buffer
+//! never materializes more than one [`WINDOW`]-char window at a time, however
+//! long the walk — and returns a position; the builtin does the `goto_char` /
+//! `set_mark`.
 //!
 //! The window is what keeps a walk linear. Reaching a position costs a store
-//! O(distance) — `Buffer::byte_of` seeks from its byte hint, `Quire` scans
-//! the piece holding the position — so stepping one `char_after` /
-//! `char_before` at a time is quadratic in the distance walked. One
-//! `substring` per window amortizes that seek over the whole window, and the
-//! window starts at [`FIRST_WINDOW`] and doubles, so a short hop pays for a
-//! handful of characters and only a long run grows to [`WINDOW`].
+//! O(distance) — `Buffer::byte_of` seeks from its byte hint, `Quire` scans the
+//! piece holding the position — so stepping one `char_after` / `char_before` at
+//! a time is quadratic in the distance walked. One `substring` per window
+//! amortizes that seek over the whole window, and the window starts at
+//! [`FIRST_WINDOW`] and doubles, so a short hop pays for a handful of
+//! characters and only a long run grows to [`WINDOW`].
 
 use crate::store::TextStore;
 
-/// One `[:name:]` class of the Emacs `skip-chars` spec syntax. Membership
-/// uses Rust's Unicode predicates, except for `[:digit:]`, which is ASCII
-/// `0`-`9` as in Emacs, so a `[:digit:]` skip is narrower than a
-/// `forward-word` hop. `[:alnum:]` uses `is_alphanumeric`, which also
-/// accepts numeric forms such as `½` that Emacs's `[:alnum:]` rejects (and
-/// `[:punct:]` therefore excludes them where Emacs includes them), because
-/// the standard library has no decimal-digit category test.
+/// One `[:name:]` class of the Emacs `skip-chars` spec syntax. Membership uses
+/// Rust's Unicode predicates, except for `[:digit:]`, which is ASCII `0`-`9` as
+/// in Emacs, so a `[:digit:]` skip is narrower than a `forward-word` hop.
+/// `[:alnum:]` uses `is_alphanumeric`, which also accepts numeric forms such as
+/// `½` that Emacs's `[:alnum:]` rejects (and `[:punct:]` therefore excludes
+/// them where Emacs includes them), because the standard library has no
+/// decimal-digit category test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Class {
     Alpha,
@@ -158,15 +158,15 @@ impl CharSet {
 }
 
 /// The largest `substring` a skip walker asks for: big enough that the
-/// per-fetch position seek is amortized away over a long run, small enough
-/// that a walk over a multi-gigabyte file holds only kilobytes at a time.
+/// per-fetch position seek is amortized away over a long run, small enough that
+/// a walk over a multi-gigabyte file holds only kilobytes at a time.
 pub(crate) const WINDOW: usize = 4096;
 
 /// The first window of a walk, doubling toward [`WINDOW`] as the walk runs on.
 /// A store prices a `substring` in characters crossed (the byte offset of its
-/// far edge has to be found), so a walk that stops after a few characters —
-/// the line and word hops the paragraph and unit walkers make — must not pay
-/// for a full window to read them.
+/// far edge has to be found), so a walk that stops after a few characters — the
+/// line and word hops the paragraph and unit walkers make — must not pay for a
+/// full window to read them.
 pub(crate) const FIRST_WINDOW: usize = 64;
 
 /// The first position in `[from, bound]` whose char fails `pred`, or `bound`.
@@ -179,9 +179,9 @@ pub fn skip_forward(
     bound: usize,
     pred: &dyn Fn(char) -> bool,
 ) -> usize {
-    // `char_after` reads nothing at or past point-max, so clamp `bound`
-    // there to match: a bound beyond the accessible region stops the walk at
-    // its edge.
+    // `char_after` reads nothing at or past point-max, so clamp `bound` there
+    // to match: a bound beyond the accessible region stops the walk at its
+    // edge.
     let bound = bound.min(store.point_max());
     let mut p = from;
     let mut span = FIRST_WINDOW;
@@ -211,9 +211,9 @@ pub fn skip_backward(
     bound: usize,
     pred: &dyn Fn(char) -> bool,
 ) -> usize {
-    // The mirror of the `skip_forward` clamp: `char_before` reads nothing at
-    // or below point-min, so clamp `bound` there; and nothing above
-    // point-max, so a `from` past it has no character to walk over.
+    // The mirror of the `skip_forward` clamp: `char_before` reads nothing at or
+    // below point-min, so clamp `bound` there; and nothing above point-max, so
+    // a `from` past it has no character to walk over.
     let bound = bound.max(store.point_min());
     if from > store.point_max() {
         return from;
@@ -238,8 +238,8 @@ pub fn skip_backward(
     p
 }
 
-/// `forward-word`'s notion of a word character. `_` is deliberately not one:
-/// in Emacs it has symbol syntax, not word syntax, in every programming mode.
+/// `forward-word`'s notion of a word character. `_` is deliberately not one: in
+/// Emacs it has symbol syntax, not word syntax, in every programming mode.
 pub fn is_word_char(c: char) -> bool {
     c.is_alphanumeric()
 }
@@ -295,9 +295,9 @@ fn repeat_hop(
     p
 }
 
-/// Where `n` unit hops (words, symbols) from `from` land — forward for
-/// positive `n`, backward for negative — bounded by the accessible region.
-/// Never mutates the store. `is_constituent` decides what a unit is made of.
+/// Where `n` unit hops (words, symbols) from `from` land — forward for positive
+/// `n`, backward for negative — bounded by the accessible region.  Never
+/// mutates the store. `is_constituent` decides what a unit is made of.
 pub fn move_units(
     store: &dyn TextStore,
     from: usize,
@@ -327,9 +327,9 @@ fn prev_bol(store: &dyn TextStore, line: usize, min: usize) -> usize {
     bol(store, line - 1, min)
 }
 
-/// One pass over the line starting at `line`: whether it holds only spaces
-/// and tabs (an empty line, and the empty line at `bound`, count as blank),
-/// and the start of the line after it, or `bound`.
+/// One pass over the line starting at `line`: whether it holds only spaces and
+/// tabs (an empty line, and the empty line at `bound`, count as blank), and the
+/// start of the line after it, or `bound`.
 ///
 /// The blank run and the run to the newline are one walk — the second skip
 /// starts where the first stopped — so a paragraph walk reads each line once.
@@ -361,9 +361,9 @@ fn paragraph_forward(store: &dyn TextStore, from: usize, bound: usize) -> usize 
     l
 }
 
-/// Backward paragraph hop: from a blank line, step up into the paragraph
-/// above; then run to the paragraph's first line and land on the blank line
-/// before it, or `bound`. Never mutates the store.
+/// Backward paragraph hop: from a blank line, step up into the paragraph above;
+/// then run to the paragraph's first line and land on the blank line before it,
+/// or `bound`. Never mutates the store.
 fn paragraph_backward(store: &dyn TextStore, from: usize, bound: usize) -> usize {
     let max = store.point_max();
     let mut l = bol(store, from, bound);
@@ -385,8 +385,8 @@ fn paragraph_backward(store: &dyn TextStore, from: usize, bound: usize) -> usize
 }
 
 /// Where `n` paragraph hops from `from` land — forward for positive `n`,
-/// backward for negative — bounded by the accessible region. Never mutates
-/// the store.
+/// backward for negative — bounded by the accessible region. Never mutates the
+/// store.
 pub fn move_paragraphs(store: &dyn TextStore, from: usize, n: i64) -> usize {
     repeat_hop(store, from, n, &paragraph_forward, &paragraph_backward)
 }
@@ -471,9 +471,9 @@ mod tests {
 
     use crate::buffer::Buffer;
 
-    // `Buffer` has inherent `point_min` / `point_max` / `narrow_to_region`,
-    // and `&Buffer` coerces to `&dyn TextStore` at the call sites, so the
-    // trait needs no import here (an unused import fails the clippy gate).
+    // `Buffer` has inherent `point_min` / `point_max` / `narrow_to_region`, and
+    // `&Buffer` coerces to `&dyn TextStore` at the call sites, so the trait
+    // needs no import here (an unused import fails the clippy gate).
     fn buf(text: &str) -> Buffer {
         Buffer::from_string("t", text)
     }
@@ -551,15 +551,15 @@ mod tests {
 
     #[test]
     fn paragraph_forward_lands_on_the_next_blank_line_or_the_bound() {
-        // "one\n" = 1-4, "two\n" = 5-8, "\n" = 9, "three\n" = 10-15,
-        // "  \n" = 16-18, "four" = 19-22, point_max = 23.
+        // "one\n" = 1-4, "two\n" = 5-8, "\n" = 9, "three\n" = 10-15, " \n" =
+        // 16-18, "four" = 19-22, point_max = 23.
         let b = buf("one\ntwo\n\nthree\n  \nfour");
         let max = b.point_max();
         assert_eq!(paragraph_forward(&b, 1, max), 9);
         // From mid-paragraph, same answer.
         assert_eq!(paragraph_forward(&b, 6, max), 9);
-        // Starting ON the blank line: skip it, then run to the next one.
-        // The whitespace-only line starts at 16.
+        // Starting ON the blank line: skip it, then run to the next one.  The
+        // whitespace-only line starts at 16.
         assert_eq!(paragraph_forward(&b, 9, max), 16);
         // The last paragraph has no separator after it: the bound.
         assert_eq!(paragraph_forward(&b, 19, max), max);

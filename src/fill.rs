@@ -6,8 +6,7 @@ use crate::syntax::{ProseKind, SexpRule};
 /// Layout knobs for one fill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fill {
-    /// The last column a line may reach, prefix included (Emacs
-    /// `fill-column`).
+    /// The last column a line may reach, prefix included (Emacs `fill-column`).
     pub column: usize,
     /// Two spaces after a sentence end when joining lines (Emacs
     /// `sentence-end-double-space`).
@@ -21,21 +20,21 @@ fn width(s: &str) -> usize {
         .fold(0, |w, c| if c == '\t' { w + 8 - w % 8 } else { w + 1 })
 }
 
-/// Does `word` end a sentence: `.`, `?` or `!`, optionally followed by
-/// closing punctuation (`)`, `]`, `}`, `"`, `'`), as Emacs's `sentence-end`.
+/// Does `word` end a sentence: `.`, `?` or `!`, optionally followed by closing
+/// punctuation (`)`, `]`, `}`, `"`, `'`), as Emacs's `sentence-end`.
 fn ends_sentence(word: &str) -> bool {
     let core = word.trim_end_matches(['\'', '"', ')', ']', '}']);
     core.ends_with(['.', '?', '!'])
 }
 
-/// The words of `body` with the gap each one wants after it: two spaces
-/// after a sentence end that the source marked with a line break or two
-/// spaces (Emacs's `sentence-end-double-space`), one otherwise. A single
-/// space after a period ("e.g. x") stays single, since the source did not
-/// treat it as a sentence end.
+/// The words of `body` with the gap each one wants after it: two spaces after a
+/// sentence end that the source marked with a line break or two spaces (Emacs's
+/// `sentence-end-double-space`), one otherwise. A single space after a period
+/// ("e.g. x") stays single, since the source did not treat it as a sentence
+/// end.
 fn words(body: &str, double_space: bool) -> Vec<(&str, usize)> {
-    // A no-break space (and its narrow and figure forms) is part of its
-    // word; every other whitespace separates words.
+    // A no-break space (and its narrow and figure forms) is part of its word;
+    // every other whitespace separates words.
     let gap = |c: char| c.is_whitespace() && !matches!(c, '\u{a0}' | '\u{202f}' | '\u{2007}');
     let mut out = Vec::new();
     let mut rest = body;
@@ -57,10 +56,10 @@ fn words(body: &str, double_space: bool) -> Vec<(&str, usize)> {
     out
 }
 
-/// Reflow `body` — prose whose prefix is already stripped — into lines that
-/// fit `opts.column` once `first` is put in front of the first line and
-/// `rest` in front of every other. A word wider than the room left stands
-/// on its own line, whole: a URL never breaks.
+/// Reflow `body` — prose whose prefix is already stripped — into lines that fit
+/// `opts.column` once `first` is put in front of the first line and `rest` in
+/// front of every other. A word wider than the room left stands on its own
+/// line, whole: a URL never breaks.
 pub fn fill_paragraph(body: &str, first: &str, rest: &str, opts: &Fill) -> String {
     let mut out = String::new();
     let mut line = String::from(first);
@@ -84,9 +83,9 @@ pub fn fill_paragraph(body: &str, first: &str, rest: &str, opts: &Fill) -> Strin
     out
 }
 
-/// The text that leads every line of a unit and is not prose: a comment
-/// marker with its indentation, a docstring's opening quotes. `first` leads
-/// the first line, `rest` every other one.
+/// The text that leads every line of a unit and is not prose: a comment marker
+/// with its indentation, a docstring's opening quotes. `first` leads the first
+/// line, `rest` every other one.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Frame {
     pub first: String,
@@ -106,8 +105,8 @@ impl Frame {
         Frame::new(prefix, prefix)
     }
 
-    /// This frame placed inside `outer`, for a block whose first line is
-    /// output line `n` of the unit.
+    /// This frame placed inside `outer`, for a block whose first line is output
+    /// line `n` of the unit.
     fn under(&self, outer: &Frame, n: usize) -> Frame {
         Frame::new(
             &format!("{}{}", outer.prefix(n), self.first),
@@ -120,10 +119,10 @@ impl Frame {
         if n == 0 { &self.first } else { &self.rest }
     }
 
-    /// `line` with `prefix` taken off: the marker must match exactly, then
-    /// up to the prefix's own trailing whitespace is dropped, so text
-    /// indented past the marker keeps its extra indent. A line that does
-    /// not carry the marker is body as it stands.
+    /// `line` with `prefix` taken off: the marker must match exactly, then up
+    /// to the prefix's own trailing whitespace is dropped, so text indented
+    /// past the marker keeps its extra indent. A line that does not carry the
+    /// marker is body as it stands.
     fn strip<'a>(prefix: &str, line: &'a str) -> &'a str {
         let core = prefix.trim_end();
         let Some(mut after) = line.strip_prefix(core) else {
@@ -140,12 +139,12 @@ impl Frame {
 }
 
 /// The Emacs `adaptive-fill` guess for a run of comment lines: the shared
-/// indentation plus the shared run of marker punctuation (`//`, `///`,
-/// `//!`, `#`, `;;`), and one space when the first line has one after it.
-/// The marker must begin with one of the language's comment `openers`, so
-/// a Markdown `#` heading or `-` bullet is never taken for a comment
-/// marker. Lines that do not share the first line's marker shrink it to
-/// what every line has; an empty string means "no comment marker".
+/// indentation plus the shared run of marker punctuation (`//`, `///`, `//!`,
+/// `#`, `;;`), and one space when the first line has one after it.  The marker
+/// must begin with one of the language's comment `openers`, so a Markdown `#`
+/// heading or `-` bullet is never taken for a comment marker. Lines that do not
+/// share the first line's marker shrink it to what every line has; an empty
+/// string means "no comment marker".
 pub fn detect_frame(text: &str, openers: &[&str]) -> String {
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
     let Some(line0) = lines.next() else {
@@ -157,8 +156,8 @@ pub fn detect_frame(text: &str, openers: &[&str]) -> String {
         .chain(['!'])
         .collect();
     let (indent, after) = split_indent(line0);
-    // A marker run stops at the first non-marker char; the run of the
-    // first line seeds it and every later line can only shorten it.
+    // A marker run stops at the first non-marker char; the run of the first
+    // line seeds it and every later line can only shorten it.
     let run_of = |s: &str| -> usize {
         s.chars()
             .take_while(|c| marker_chars.contains(c))
@@ -175,8 +174,8 @@ pub fn detect_frame(text: &str, openers: &[&str]) -> String {
     if !openers.iter().any(|o| marker.starts_with(o)) {
         return String::new();
     }
-    // One space after the marker unless every line runs straight on from
-    // it (`//a`), so a `/// a` + `// b` pair still frames as `// `.
+    // One space after the marker unless every line runs straight on from it
+    // (`//a`), so a `/// a` + `// b` pair still frames as `// `.
     let bare = text
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -201,8 +200,8 @@ fn split_indent(line: &str) -> (&str, &str) {
     line.split_at(n)
 }
 
-/// Length of a Markdown list marker (`- `, `* `, `+ `, `1. `, `1) `) with
-/// the whitespace after it at the start of `s`, or `None`.
+/// Length of a Markdown list marker (`- `, `* `, `+ `, `1. `, `1) `) with the
+/// whitespace after it at the start of `s`, or `None`.
 fn list_marker(s: &str) -> Option<usize> {
     let digits = s.chars().take_while(char::is_ascii_digit).count();
     let mark = if digits > 0 && digits <= 9 {
@@ -234,8 +233,8 @@ fn is_heading(s: &str) -> bool {
     ((1..=6).contains(&hashes) && spaced) || (hashes > 0 && s.len() == hashes)
 }
 
-/// A setext underline or thematic break: three or more of one of `-=*_`,
-/// spaces allowed between.
+/// A setext underline or thematic break: three or more of one of `-=*_`, spaces
+/// allowed between.
 fn is_rule(s: &str) -> bool {
     let mut chars = s.chars().filter(|c| *c != ' ');
     let Some(first) = chars.next() else {
@@ -244,8 +243,8 @@ fn is_rule(s: &str) -> bool {
     "-=*_".contains(first) && chars.clone().all(|c| c == first) && chars.count() >= 2
 }
 
-/// The hard line break `line` ends with — a backslash, or two spaces — as
-/// the text to put back after filling.
+/// The hard line break `line` ends with — a backslash, or two spaces — as the
+/// text to put back after filling.
 fn hard_break(line: &str) -> Option<&'static str> {
     if line.ends_with('\\') {
         Some("\\")
@@ -266,11 +265,11 @@ enum Kind {
     Blank,
     /// Copied through unchanged; the text says what it is, for a refusal.
     Verbatim(&'static str),
-    /// Prose behind its own frame: the indent, a list marker with the
-    /// hanging indent under it.
+    /// Prose behind its own frame: the indent, a list marker with the hanging
+    /// indent under it.
     Prose(Frame),
-    /// A block quote, behind its `>` marker: its lines, less one `>` each,
-    /// are a body of their own, split by the same rules.
+    /// A block quote, behind its `>` marker: its lines, less one `>` each, are
+    /// a body of their own, split by the same rules.
     Quote(Frame),
 }
 
@@ -281,9 +280,9 @@ struct Block {
 }
 
 /// Cut `body` (frame-stripped lines) into blocks by Markdown's block rules:
-/// blank lines separate; fences, headings, tables, rules and indented code
-/// are verbatim; a list item or block quote is its own prose block with
-/// its marker as the frame; anything else is a paragraph.
+/// blank lines separate; fences, headings, tables, rules and indented code are
+/// verbatim; a list item or block quote is its own prose block with its marker
+/// as the frame; anything else is a paragraph.
 fn split_blocks(body: &[&str]) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut i = 0;
@@ -330,14 +329,14 @@ fn split_blocks(body: &[&str]) -> Vec<Block> {
             }
             Kind::Verbatim("an indented code block")
         } else if let Some(after) = rest.strip_prefix('>') {
-            // The quote runs over the lines that start with `>` (up to
-            // three spaces in); what follows each line's own `>` is a body
-            // of its own, so nested quotes, lists and fences inside it
-            // follow the same rules. The marker is the first line's `>` and
-            // the one space (or tab) after it, which `unquote` then takes
-            // off every line along with the line's own indent; text glued
-            // to the `>` makes a bare marker, and then no line loses a
-            // space. A bare `>` first line frames as `> `.
+            // The quote runs over the lines that start with `>` (up to three
+            // spaces in); what follows each line's own `>` is a body of its
+            // own, so nested quotes, lists and fences inside it follow the same
+            // rules. The marker is the first line's `>` and the one space (or
+            // tab) after it, which `unquote` then takes off every line along
+            // with the line's own indent; text glued to the `>` makes a bare
+            // marker, and then no line loses a space. A bare `>` first line
+            // frames as `> `.
             let space = after.chars().next().filter(|c| matches!(c, ' ' | '\t'));
             let marker = match space {
                 Some(c) => format!("{indent}>{c}"),
@@ -357,16 +356,16 @@ fn split_blocks(body: &[&str]) -> Vec<Block> {
             i += 1;
             while i < body.len() {
                 let (ind, r) = split_indent(body[i]);
-                // A block starter indented past the marker is still the
-                // item's text.
+                // A block starter indented past the marker is still the item's
+                // text.
                 if r.is_empty() || (starts_block(r) && width(ind) < 4) {
                     break;
                 }
                 i += 1;
             }
-            // The hanging indent is the width of the marker as it is put
-            // back — a bare one without its trailing whitespace — plus one
-            // space when the marker carries none.
+            // The hanging indent is the width of the marker as it is put back —
+            // a bare one without its trailing whitespace — plus one space when
+            // the marker carries none.
             let core = if rest[n..].is_empty() {
                 first.trim_end()
             } else {
@@ -397,8 +396,8 @@ fn split_blocks(body: &[&str]) -> Vec<Block> {
     blocks
 }
 
-/// The prose content of one body line of a block: its frame prefix
-/// removed, a trailing hard break kept aside.
+/// The prose content of one body line of a block: its frame prefix removed, a
+/// trailing hard break kept aside.
 fn content<'a>(prefix: &str, line: &'a str) -> (&'a str, Option<&'static str>) {
     let s = Frame::strip(prefix, line).trim_start();
     let brk = hard_break(s);
@@ -459,11 +458,10 @@ fn fill_block(
 /// Refill the prose of one unit — a comment run, a docstring, a Markdown
 /// paragraph — whose every line `frame` leads. Blocks inside it follow
 /// Markdown: blank lines separate paragraphs, list items hang, quotes keep
-/// their `>`, and fenced code, headings, tables, rules and indented code
-/// pass through untouched. `only_line` (0-based, within the unit) refills
-/// just the block holding that line — the one after it when the line is
-/// blank — and errors when that line is not prose; `None` refills every
-/// block.
+/// their `>`, and fenced code, headings, tables, rules and indented code pass
+/// through untouched. `only_line` (0-based, within the unit) refills just the
+/// block holding that line — the one after it when the line is blank — and
+/// errors when that line is not prose; `None` refills every block.
 pub fn fill_unit(
     text: &str,
     frame: &Frame,
@@ -503,9 +501,9 @@ fn fill_unit_lf(
     Ok(joined)
 }
 
-/// The output lines for `body` — `raw` with `frame` stripped — every one
-/// led by `frame`. A quote block recurses: its lines, less one `>` each,
-/// are a body under the quote's marker composed onto `frame`.
+/// The output lines for `body` — `raw` with `frame` stripped — every one led by
+/// `frame`. A quote block recurses: its lines, less one `>` each, are a body
+/// under the quote's marker composed onto `frame`.
 fn fill_body(
     raw: &[&str],
     body: &[&str],
@@ -541,13 +539,13 @@ fn fill_body(
         let raw_lines = &raw[block.start..block.end];
         match &block.kind {
             Kind::Prose(block) if target.is_none_or(|t| t == bi) => {
-                // The unit's frame is part of every line's width: the
-                // block fills against the composed prefixes.
+                // The unit's frame is part of every line's width: the block
+                // fills against the composed prefixes.
                 let composed = block.under(frame, out.len());
                 fill_block(lines, block, &composed, opts, &mut out);
             }
-            // Past the depth cap a quote is left as it is, like any block
-            // the filler does not touch; asking for it by line is an error.
+            // Past the depth cap a quote is left as it is, like any block the
+            // filler does not touch; asking for it by line is an error.
             Kind::Quote(_) if depth >= MAX_QUOTE_DEPTH && target == Some(bi) => {
                 return Err("block quotes nested too deep to fill".to_string());
             }
@@ -555,8 +553,8 @@ fn fill_body(
                 let spaced = marker.first.ends_with([' ', '\t']);
                 let inner: Vec<&str> = lines.iter().map(|l| unquote(l, spaced)).collect();
                 let composed = marker.under(frame, out.len());
-                // A target line before the block (a blank line) means its
-                // first block.
+                // A target line before the block (a blank line) means its first
+                // block.
                 let inner_line = only_line.map(|t| t.saturating_sub(block.start));
                 out.extend(fill_body(
                     raw_lines,
@@ -569,9 +567,9 @@ fn fill_body(
             }
             // A blank line is its frame prefix less trailing spaces: plain
             // indent goes entirely, a marker keeps the tab that holds it off
-            // the text, so the next fill re-derives the same marker (while
-            // the tab survives). One outside the one block being filled is
-            // left as it is.
+            // the text, so the next fill re-derives the same marker (while the
+            // tab survives). One outside the one block being filled is left as
+            // it is.
             Kind::Blank if target.is_none() => {
                 let p = frame.prefix(out.len());
                 let kept = if p.trim_end().is_empty() {
@@ -589,12 +587,12 @@ fn fill_body(
     Ok(out)
 }
 
-/// Quotes nested deeper than this are not filled: each level is a
-/// recursion of [`fill_body`].
+/// Quotes nested deeper than this are not filled: each level is a recursion of
+/// [`fill_body`].
 const MAX_QUOTE_DEPTH: usize = 64;
 
-/// A quote line less its indent, its own `>` and, when the block's marker
-/// has one, the one space (or tab) after it.
+/// A quote line less its indent, its own `>` and, when the block's marker has
+/// one, the one space (or tab) after it.
 fn unquote(line: &str, spaced: bool) -> &str {
     let r = split_indent(line).1;
     let r = r.strip_prefix('>').unwrap_or(r);
@@ -605,12 +603,10 @@ fn unquote(line: &str, spaced: bool) -> &str {
     }
 }
 
-/// `text` with `\r\n` line ends made `\n`, and whether every line end
-/// was one.
+/// `text` with `\r\n` line ends made `\n`, and whether every line end was one.
 fn lf_only(text: &str) -> (std::borrow::Cow<'_, str>, bool) {
-    // Only a unit whose every line end is `\r\n` is a CRLF unit. In a
-    // mixed one, verbatim lines keep their ending and refilled lines end
-    // with `\n`.
+    // Only a unit whose every line end is `\r\n` is a CRLF unit. In a mixed
+    // one, verbatim lines keep their ending and refilled lines end with `\n`.
     let crlf = text.contains("\r\n") && text.matches('\n').count() == text.matches("\r\n").count();
     if crlf {
         (text.replace("\r\n", "\n").into(), true)
@@ -639,8 +635,8 @@ fn common_indent<'a>(lines: &[&'a str]) -> &'a str {
     })
 }
 
-/// Where a unit's closer (`*/`, `-->`, `"""`) sits, so it can be put back
-/// after the fill.
+/// Where a unit's closer (`*/`, `-->`, `"""`) sits, so it can be put back after
+/// the fill.
 enum Closer<'a> {
     /// On its own line, copied through as it stands.
     Line(&'a str),
@@ -649,10 +645,10 @@ enum Closer<'a> {
 }
 
 /// Refill a prose unit of `kind` — the whole-line text
-/// [`crate::syntax::Syntax::prose_unit_at`] found — framing it by what it
-/// is: a comment run by its adaptive marker, a block comment or docstring
-/// by its opener on the first line and the margin its later lines share,
-/// with the closer kept where it was; a Markdown paragraph has no frame.
+/// [`crate::syntax::Syntax::prose_unit_at`] found — framing it by what it is: a
+/// comment run by its adaptive marker, a block comment or docstring by its
+/// opener on the first line and the margin its later lines share, with the
+/// closer kept where it was; a Markdown paragraph has no frame.
 pub fn fill_prose(
     text: &str,
     kind: ProseKind,
@@ -701,8 +697,8 @@ fn fill_prose_lf(
     let ws = &after[opener.len()..];
     let ws = &ws[..ws.len() - ws.trim_start_matches([' ', '\t']).len()];
     let first = format!("{indent}{opener}{ws}");
-    // Detach the closer: alone on the last line it is copied through;
-    // ending the last text line it goes back after the fill.
+    // Detach the closer: alone on the last line it is copied through; ending
+    // the last text line it goes back after the fill.
     let last = *lines.last().expect("split yields one line");
     let closer_at = if lines.len() > 1 && last.trim() == closer {
         lines.pop();
@@ -1019,8 +1015,8 @@ mod tests {
 
     #[test]
     fn a_quote_below_the_first_line_of_a_docstring_frame() {
-        // The frame's first line is the quotes; the quote block sits under
-        // the rest prefix.
+        // The frame's first line is the quotes; the quote block sits under the
+        // rest prefix.
         let text = "    \"\"\"Summary.\n\n    > aa\n    > bb\n";
         assert_eq!(
             unit(text, "    \"\"\"", "    ", None, 80),
@@ -1071,8 +1067,8 @@ mod tests {
     #[test]
     fn a_marker_with_no_text_keeps_its_line() {
         assert_eq!(unit("- \n- a\n", "", "", None, 80), "-\n- a\n");
-        // With text on the lines below it, the marker still stands alone,
-        // and its trailing whitespace does not widen the hanging indent.
+        // With text on the lines below it, the marker still stands alone, and
+        // its trailing whitespace does not widen the hanging indent.
         assert_eq!(unit("aa\n-\n b\n c\n", "", "", None, 40), "aa\n-\n  b c\n");
         assert_eq!(unit("- \n b\n", "", "", None, 40), "-\n  b\n");
         assert_eq!(unit("-\t\n b\n", "", "", None, 40), "-\n  b\n");
@@ -1098,8 +1094,8 @@ mod tests {
 
     #[test]
     fn mixed_line_ends_are_not_made_uniform() {
-        // One CRLF line among LF ones: the refilled text ends with `\n`, and
-        // a verbatim line keeps its own ending.
+        // One CRLF line among LF ones: the refilled text ends with `\n`, and a
+        // verbatim line keeps its own ending.
         let text = "aa\r\nbb\n\n```\nx\r\n```\n";
         assert_eq!(unit(text, "", "", None, 80), "aa bb\n\n```\nx\r\n```\n");
         // A `\r`-ended blank line still separates paragraphs.
