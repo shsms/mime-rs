@@ -1172,6 +1172,49 @@ fn occur_overviews_matches_without_moving_point() {
     assert!(ci.contains("4 matches on 3 lines"), "got: {ci}");
 }
 
+/// The `fill` default reaches the git tools end to end: a long body committed
+/// through the server comes back at 72 columns, and `fill: false` keeps it.
+#[test]
+fn git_tools_fill_message_bodies_by_default() {
+    let dir = temp_dir("msg-fill");
+    let repo = git2::Repository::init(&dir).unwrap();
+    let mut config = repo.config().unwrap();
+    config.set_str("user.name", "T").unwrap();
+    config.set_str("user.email", "t@example.invalid").unwrap();
+    config.set_bool("commit.gpgsign", false).unwrap();
+    drop(config);
+    std::fs::write(dir.join("f.txt"), "1\n").unwrap();
+    let long = "subject\n\nThis body line is written well past the fill column and should wrap when the tool fills it.\n";
+    let filled = "subject\n\nThis body line is written well past the fill column and should wrap when\nthe tool fills it.\n";
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let repo_arg = dir.to_string_lossy().into_owned();
+
+    let out = s.call_ok(
+        1,
+        "git_commit",
+        json!({ "repo": repo_arg, "paths": ["f.txt"], "message": long }),
+    );
+    assert!(out.contains("body filled at 72 columns"), "{out}");
+    let tip = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(tip.message(), Some(filled));
+
+    let out = s.call_ok(
+        2,
+        "git_reword",
+        json!({ "repo": repo_arg, "commit": "HEAD", "message": long, "fill": false }),
+    );
+    assert!(!out.contains("filled"), "{out}");
+    let tip = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(tip.message(), Some(long));
+
+    let err = s.call_err(
+        3,
+        "git_reword",
+        json!({ "repo": repo_arg, "commit": "HEAD", "fill": 0 }),
+    );
+    assert!(err.contains("`fill` must be a positive integer"), "{err}");
+}
+
 fn temp_dir(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!("mime-mcp-it-{tag}-{}", std::process::id()));

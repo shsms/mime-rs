@@ -550,6 +550,31 @@ fn strict_bool_arg(args: &Value, key: &str) -> Result<bool, String> {
     }
 }
 
+/// The `fill` knob of the message-authoring git tools: the column the message
+/// body is filled at, `None` for "as written". Absent or `true` is 72 (git's
+/// convention), `false` is off, and a positive integer is the column; anything
+/// else is an error.
+fn fill_arg(args: &Value, tool: &str) -> Result<Option<usize>, String> {
+    match args.get("fill") {
+        None | Some(Value::Bool(true)) => Ok(Some(DEFAULT_MSG_COLUMN)),
+        Some(Value::Bool(false)) => Ok(None),
+        Some(v) => positive_int(v, tool, "fill").map(Some),
+    }
+}
+
+/// The column commit message bodies fill at unless a call says otherwise.
+const DEFAULT_MSG_COLUMN: usize = 72;
+
+/// A column argument's value: a positive integer, anything else an error.
+fn positive_int(v: &Value, tool: &str, key: &str) -> Result<usize, String> {
+    match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
+        Some(n) if n >= 1 => Ok(n),
+        _ => Err(format!(
+            "{tool}: `{key}` must be a positive integer, got {v}"
+        )),
+    }
+}
+
 /// Resolve which session a tool call addresses. With `path`, the file is
 /// auto-opened (`check_path`-confined) into a session KEYED BY ITS CANONICAL
 /// PATH unless already warm — the one-call alternative to a separate
@@ -1457,14 +1482,8 @@ fn tool_fill_text(
     let target = fill_target(args)?;
     let mut bindings = String::new();
     if let Some(v) = args.get("column") {
-        match v.as_i64() {
-            Some(n) if n >= 1 => bindings.push_str(&format!("(fill-column {n}) ")),
-            _ => {
-                return Err(format!(
-                    "fill_text: `column` must be a positive integer, got {v}"
-                ));
-            }
-        }
+        let n = positive_int(v, "fill_text", "column")?;
+        bindings.push_str(&format!("(fill-column {n}) "));
     }
     if let Some(v) = args.get("prefix") {
         match v.as_str() {
@@ -3887,6 +3906,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
                 &hunk_sels_arg(args, "hunks")?,
                 &str_arg(args, "message")?,
                 args.get("after").and_then(Value::as_str),
+                fill_arg(args, "git_commit")?,
             )
         }
         "git_cherry_pick" => seq::cmd_cherry_pick(&repo, &str_list_arg(args, "commits")?),
@@ -3954,6 +3974,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
                 &str_arg(args, "commit")?,
                 args.get("message").and_then(Value::as_str),
                 &edits,
+                fill_arg(args, "git_reword")?,
                 bool_arg(args, "rehearse"),
             )
         }
@@ -3989,6 +4010,14 @@ fn git_tool_schemas() -> Vec<Value> {
         "items": { "type": "string" },
         "description": "Commits to apply, in order — each an oid, ref, or revspec (e.g. HEAD~2)."
     });
+    // The `fill` knob of every message-authoring tool: `lead` says which
+    // message, the rest is the same everywhere.
+    let fill = |lead: &str| {
+        json!({
+            "type": ["boolean", "integer"],
+            "description": format!("{lead} at 72 columns (default true): the subject paragraph and the trailer blocks stay as written (the Key: value paragraph at the end, and mid-message a block of several such lines, a lone dashed key like Signed-off-by or one-word value like Fixes: <url>, or a cherry-pick note; a lone Note: sentence there is prose; trailers glued under a paragraph follow the same rule), the paragraphs between re-wrap like fill-paragraph, a list re-wraps under its hanging indent, and indented or fenced code passes through. false keeps the text exactly as given; an integer sets the column.")
+        })
+    };
     vec![
         json!({
             "name": "git_rebase",
@@ -4104,7 +4133,8 @@ fn git_tool_schemas() -> Vec<Value> {
                         }
                     },
                     "message": { "type": "string", "description": "The commit message." },
-                    "after": { "type": "string", "description": "Optional placement: an ancestor commit (oid/ref/revspec) the new commit should sit directly after, instead of at the branch tip. Not combinable with `hunks`." }
+                    "after": { "type": "string", "description": "Optional placement: an ancestor commit (oid/ref/revspec) the new commit should sit directly after, instead of at the branch tip. Not combinable with `hunks`." },
+                    "fill": fill("Fill the message body before committing")
                 },
                 "required": ["repo", "message"],
             },
@@ -4327,7 +4357,8 @@ fn git_tool_schemas() -> Vec<Value> {
                             }
                         }
                     },
-                    "rehearse": { "type": "boolean", "description": "Preview the new message without applying." }
+                    "rehearse": { "type": "boolean", "description": "Preview the new message without applying." },
+                    "fill": fill("Fill the resulting message body — with neither `message` nor `message_edits`, the call just fills the commit's own body —")
                 },
                 "required": ["repo", "commit"],
             },
@@ -5295,6 +5326,22 @@ fn build_tool_schemas() -> Vec<Value> {
 #[cfg(test)]
 mod git_tool_tests {
     use super::*;
+
+    #[test]
+    fn fill_arg_defaults_to_72_and_rejects_nonsense() {
+        assert_eq!(fill_arg(&json!({}), "t").unwrap(), Some(72));
+        assert_eq!(fill_arg(&json!({"fill": true}), "t").unwrap(), Some(72));
+        assert_eq!(fill_arg(&json!({"fill": false}), "t").unwrap(), None);
+        assert_eq!(fill_arg(&json!({"fill": 80}), "t").unwrap(), Some(80));
+        for bad in [
+            json!({"fill": 0}),
+            json!({"fill": -1}),
+            json!({"fill": "72"}),
+        ] {
+            let err = fill_arg(&bad, "t").unwrap_err();
+            assert!(err.starts_with("t: `fill` must be"), "{err}");
+        }
+    }
 
     /// Minimal JSON-schema conformance: type, required, declared keys only,
     /// recursing through properties/items. Enough to keep an outputSchema

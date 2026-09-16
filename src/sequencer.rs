@@ -984,6 +984,23 @@ fn pick_step(commit: Oid) -> Step {
     }
 }
 
+/// The report fragment for a message the fill changed: `before` is the message
+/// as authored, `after` the one written. `None` when the body already fit or no
+/// column was set.
+fn fill_note(before: &str, after: &str, fill: Option<usize>) -> Option<String> {
+    let column = fill?;
+    (before != after).then(|| format!("body filled at {column} columns"))
+}
+
+/// `msg` filled at `fill` columns ([`crate::fill::fill_message`]), or as it is
+/// when there is no column.
+fn filled(msg: &str, fill: Option<usize>) -> String {
+    match fill {
+        Some(column) => crate::fill::fill_message(msg, column),
+        None => msg.to_string(),
+    }
+}
+
 fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
     if let Some(first) = plan.steps.iter().find(|s| s.action != Action::Drop)
         && matches!(first.action, Action::Squash | Action::Fixup)
@@ -4325,10 +4342,11 @@ pub fn cmd_reword(
     commit: &str,
     message: Option<&str>,
     specs: &[MsgEditSpec],
+    fill: Option<usize>,
     rehearse_only: bool,
 ) -> Result<String, String> {
     let repo = open(repo_path)?;
-    if message.is_none() && specs.is_empty() {
+    if message.is_none() && specs.is_empty() && fill.is_none() {
         return Err("git_reword: pass `message` (wholesale) and/or `message_edits`".to_string());
     }
     let edits: Vec<MsgEdit> = specs
@@ -4336,7 +4354,7 @@ pub fn cmd_reword(
         .map(MsgEdit::from_spec)
         .collect::<Result<_, _>>()?;
     let target = resolve_s(&repo, commit)?;
-    reword(&repo, target, message, &edits, rehearse_only).map_err(gerr)
+    reword(&repo, target, message, &edits, fill, rehearse_only).map_err(gerr)
 }
 
 fn reword(
@@ -4344,6 +4362,7 @@ fn reword(
     target: Oid,
     message: Option<&str>,
     edits: &[MsgEdit],
+    fill: Option<usize>,
     rehearse_only: bool,
 ) -> Result<String, Error> {
     let head_ref = repo.head()?;
@@ -4365,7 +4384,8 @@ fn reword(
     let base = message
         .map(str::to_string)
         .unwrap_or_else(|| tc.message().unwrap_or("").to_string());
-    let new_msg = apply_msg_edits(base, edits)?;
+    let edited = apply_msg_edits(base, edits)?;
+    let new_msg = filled(&edited, fill);
     if new_msg == tc.message().unwrap_or("") {
         return Err(estr("reword: the message is unchanged — nothing to do"));
     }
@@ -4423,10 +4443,11 @@ fn reword(
     }
     repo.reference(&branch, tip, true, "mime reword")?;
     Ok(format!(
-        "reworded {} → {}; every tree is byte-identical{}",
+        "reworded {} → {}; every tree is byte-identical{}{}",
         short(target),
         short(reworded),
-        backup_note(repo)
+        backup_note(repo),
+        fill_note(&edited, &new_msg, fill).map_or_else(String::new, |n| format!("\n  {n}"))
     ))
 }
 
@@ -5388,6 +5409,7 @@ pub fn cmd_commit(
     hunks: &[HunkSel],
     message: &str,
     after: Option<&str>,
+    fill: Option<usize>,
 ) -> Result<String, String> {
     let repo = open(repo_path)?;
     require_signing_ready(&repo).map_err(gerr)?;
@@ -5591,11 +5613,12 @@ pub fn cmd_commit(
     let sig = repo
         .signature()
         .map_err(|e| format!("git_commit: no committer identity — {}", e.message()))?;
-    let msg = if message.ends_with('\n') {
+    let written = if message.ends_with('\n') {
         message.to_string()
     } else {
         format!("{message}\n")
     };
+    let msg = filled(&written, fill);
     let parents: Vec<&git2::Commit> = head_commit.iter().collect();
     let new = create_commit(&repo, Some("HEAD"), &sig, &sig, &msg, &tree, &parents, true)
         .map_err(gerr)?;
@@ -5607,11 +5630,14 @@ pub fn cmd_commit(
         index.read_tree(&tree).map_err(gerr)?;
     }
     index.write().map_err(gerr)?;
-    let out = format!(
+    let mut out = format!(
         "committed {} {}",
         short(new),
         msg.lines().next().unwrap_or("")
     );
+    if let Some(note) = fill_note(&written, &msg, fill) {
+        out.push_str(&format!("\n  {note}"));
+    }
 
     let Some(after_oid) = after_oid else {
         return Ok(out);
@@ -6889,6 +6915,7 @@ mod tests {
             &c1.to_string(),
             Some("change a, better\n"),
             &[],
+            None,
             false,
         )
         .unwrap();
@@ -6913,7 +6940,7 @@ mod tests {
 
         // A pure message rewrite: trees identical bottom line.
         let before2 = repo.head().unwrap().target().unwrap();
-        cmd_reword(&dir, "HEAD", Some("add b, renamed\n"), &[], false).unwrap();
+        cmd_reword(&dir, "HEAD", Some("add b, renamed\n"), &[], None, false).unwrap();
         let out = cmd_range_diff(&dir, &before2.to_string(), "HEAD").unwrap();
         assert!(
             out.contains("final trees identical"),
@@ -6980,6 +7007,7 @@ mod tests {
                 replace: Some("middle".into()),
                 append: None,
             }],
+            None,
             true,
         )
         .unwrap();
@@ -6995,6 +7023,7 @@ mod tests {
                 replace: Some("middle".into()),
                 append: None,
             }],
+            None,
             false,
         )
         .unwrap();
@@ -7021,6 +7050,7 @@ mod tests {
             &tip.to_string(),
             Some("new tip message\n"),
             &[],
+            None,
             false,
         )
         .unwrap();
@@ -7028,10 +7058,11 @@ mod tests {
         assert_eq!(now.summary(), Some("new tip message"));
 
         // Unchanged message / off-branch commit are loud errors.
-        let err = cmd_reword(&dir, "HEAD", Some("new tip message\n"), &[], false).unwrap_err();
+        let err =
+            cmd_reword(&dir, "HEAD", Some("new tip message\n"), &[], None, false).unwrap_err();
         assert!(err.contains("unchanged"), "{err}");
         let side = commit(&repo, &[base], &[("z", "9\n")], "side");
-        let err = cmd_reword(&dir, &side.to_string(), Some("x\n"), &[], false).unwrap_err();
+        let err = cmd_reword(&dir, &side.to_string(), Some("x\n"), &[], None, false).unwrap_err();
         assert!(err.contains("not on the current branch"), "{err}");
     }
 
@@ -7504,9 +7535,9 @@ mod tests {
             }
             drop(cfg);
             std::fs::write(repo.workdir().unwrap().join("f.txt"), "one\n").unwrap();
-            cmd_commit(&dir, &["f.txt".to_string()], &[], "root", None).unwrap();
+            cmd_commit(&dir, &["f.txt".to_string()], &[], "root", None, None).unwrap();
             std::fs::write(repo.workdir().unwrap().join("f.txt"), "two\n").unwrap();
-            cmd_commit(&dir, &["f.txt".to_string()], &[], "more", None).unwrap();
+            cmd_commit(&dir, &["f.txt".to_string()], &[], "more", None, None).unwrap();
             // Subjects that diverge from the first physical line: a wrapped
             // subject (folded into one line) and a leading blank line (skipped)
             // — git_commit_summary handles both.
@@ -7517,10 +7548,19 @@ mod tests {
                 &[],
                 "wrapped subject\ncontinued here\n\nbody",
                 None,
+                None,
             )
             .unwrap();
             std::fs::write(repo.workdir().unwrap().join("f.txt"), "four\n").unwrap();
-            cmd_commit(&dir, &["f.txt".to_string()], &[], "\nleading blank", None).unwrap();
+            cmd_commit(
+                &dir,
+                &["f.txt".to_string()],
+                &[],
+                "\nleading blank",
+                None,
+                None,
+            )
+            .unwrap();
             repo
         };
         let signed = mk("reflog-signed", true);
@@ -10254,7 +10294,7 @@ mod tests {
         std::fs::write(wd.join("f.txt"), "changed\n").unwrap();
         std::fs::write(wd.join("stray.txt"), "stray\n").unwrap();
 
-        let out = cmd_commit(&dir, &["f.txt".to_string()], &[], "tweak f", None).unwrap();
+        let out = cmd_commit(&dir, &["f.txt".to_string()], &[], "tweak f", None, None).unwrap();
         assert!(out.contains("tweak f"), "{out}");
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.summary().unwrap(), "tweak f");
@@ -10272,21 +10312,29 @@ mod tests {
 
         // A listed-but-missing file stages its deletion.
         std::fs::remove_file(wd.join("g.txt")).unwrap();
-        cmd_commit(&dir, &["g.txt".to_string()], &[], "drop g", None).unwrap();
+        cmd_commit(&dir, &["g.txt".to_string()], &[], "drop g", None, None).unwrap();
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert!(head.tree().unwrap().get_path(Path::new("g.txt")).is_err());
 
         // Refusals: no paths, a typo'd path, nothing to commit, a directory.
-        cmd_commit(&dir, &[], &[], "x", None).unwrap_err();
-        cmd_commit(&dir, &["nope.txt".to_string()], &[], "x", None).unwrap_err();
-        cmd_commit(&dir, &["f.txt".to_string()], &[], "x", None).unwrap_err();
+        cmd_commit(&dir, &[], &[], "x", None, None).unwrap_err();
+        cmd_commit(&dir, &["nope.txt".to_string()], &[], "x", None, None).unwrap_err();
+        cmd_commit(&dir, &["f.txt".to_string()], &[], "x", None, None).unwrap_err();
         std::fs::create_dir(wd.join("sub")).unwrap();
-        let err = cmd_commit(&dir, &["sub".to_string()], &[], "x", None).unwrap_err();
+        let err = cmd_commit(&dir, &["sub".to_string()], &[], "x", None, None).unwrap_err();
         assert!(err.contains("directory"), "{err}");
 
         // "./f.txt" is the same file as "f.txt" — normalized, not refused.
         std::fs::write(wd.join("f.txt"), "again\n").unwrap();
-        cmd_commit(&dir, &["./f.txt".to_string()], &[], "dot spelled", None).unwrap();
+        cmd_commit(
+            &dir,
+            &["./f.txt".to_string()],
+            &[],
+            "dot spelled",
+            None,
+            None,
+        )
+        .unwrap();
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.summary().unwrap(), "dot spelled");
 
@@ -10295,7 +10343,7 @@ mod tests {
         let mut idx = repo.index().unwrap();
         idx.add_path(Path::new("stray.txt")).unwrap();
         idx.write().unwrap();
-        let err = cmd_commit(&dir, &["f.txt".to_string()], &[], "x", None).unwrap_err();
+        let err = cmd_commit(&dir, &["f.txt".to_string()], &[], "x", None, None).unwrap_err();
         assert!(err.contains("stray.txt"), "{err}");
     }
 
@@ -10332,18 +10380,27 @@ mod tests {
         // staged content (hunk mode commits worktree content and would drop
         // it).
         let sel = [HunkSel::contains("f", "Y")];
-        let err = cmd_commit(&dir, &[], &[HunkSel::contains("f", "nope")], "x", None).unwrap_err();
+        let err = cmd_commit(
+            &dir,
+            &[],
+            &[HunkSel::contains("f", "nope")],
+            "x",
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("no hunk of f contains"), "{err}");
         // h's removed "b" and added "c" carry no newline: still two lines,
         // never the fused "bc".
-        let err = cmd_commit(&dir, &[], &[HunkSel::contains("h", "bc")], "x", None).unwrap_err();
+        let err =
+            cmd_commit(&dir, &[], &[HunkSel::contains("h", "bc")], "x", None, None).unwrap_err();
         assert!(err.contains("no hunk of h contains"), "{err}");
-        let err = cmd_commit(&dir, &[], &sel, "x", Some("HEAD")).unwrap_err();
+        let err = cmd_commit(&dir, &[], &sel, "x", Some("HEAD"), None).unwrap_err();
         assert!(err.contains("`after` cannot be combined"), "{err}");
         let mut index = repo.index().unwrap();
         index.add_path(Path::new("g")).unwrap();
         index.write().unwrap();
-        let err = cmd_commit(&dir, &[], &sel, "x", None).unwrap_err();
+        let err = cmd_commit(&dir, &[], &sel, "x", None, None).unwrap_err();
         assert!(err.contains("staged changes (g)"), "{err}");
         assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), base);
         index
@@ -10353,7 +10410,7 @@ mod tests {
 
         // An untracked file has no hunks to select from: it goes in whole, by
         // `paths` alone.
-        let err = cmd_commit(&dir, &["new".to_string()], &sel, "x", None).unwrap_err();
+        let err = cmd_commit(&dir, &["new".to_string()], &sel, "x", None, None).unwrap_err();
         assert!(err.contains("new is untracked"), "{err}");
         assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), base);
 
@@ -10364,6 +10421,7 @@ mod tests {
             &["g".to_string()],
             &[HunkSel::contains(&abs_f, "Y"), HunkSel::contains("h", "c")],
             "bottom and g",
+            None,
             None,
         )
         .unwrap();
@@ -10389,7 +10447,7 @@ mod tests {
         assert_eq!(dirty, vec!["f".to_string()]);
 
         // The rest goes by line span; the tree is clean afterwards.
-        cmd_commit(&dir, &[], &[HunkSel::lines("f", 1, 1)], "top", None).unwrap();
+        cmd_commit(&dir, &[], &[HunkSel::lines("f", 1, 1)], "top", None, None).unwrap();
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.summary().unwrap(), "top");
         assert_eq!(head.parent(0).unwrap().summary().unwrap(), "bottom and g");
@@ -10409,21 +10467,29 @@ mod tests {
 
         // Unborn branch: the commit becomes the root.
         std::fs::write(repo.workdir().unwrap().join("f.txt"), "one\n").unwrap();
-        cmd_commit(&dir, &["f.txt".to_string()], &[], "root", None).unwrap();
+        cmd_commit(&dir, &["f.txt".to_string()], &[], "root", None, None).unwrap();
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.parent_count(), 0);
         assert_eq!(head.summary().unwrap(), "root");
 
         // after = HEAD: the new commit already sits directly after it.
         std::fs::write(repo.workdir().unwrap().join("g.txt"), "g\n").unwrap();
-        let out = cmd_commit(&dir, &["g.txt".to_string()], &[], "add g", Some("HEAD")).unwrap();
+        let out = cmd_commit(
+            &dir,
+            &["g.txt".to_string()],
+            &[],
+            "add g",
+            Some("HEAD"),
+            None,
+        )
+        .unwrap();
         assert!(out.contains("already sits directly after"), "{out}");
 
         // Detached HEAD refuses before touching anything.
         let tip = repo.head().unwrap().peel_to_commit().unwrap().id();
         repo.set_head_detached(tip).unwrap();
         std::fs::write(repo.workdir().unwrap().join("h.txt"), "h\n").unwrap();
-        let err = cmd_commit(&dir, &["h.txt".to_string()], &[], "x", None).unwrap_err();
+        let err = cmd_commit(&dir, &["h.txt".to_string()], &[], "x", None, None).unwrap_err();
         assert!(err.contains("detached"), "{err}");
     }
 
@@ -10444,7 +10510,15 @@ mod tests {
         on_branch(&repo, "main", b);
         std::fs::write(repo.workdir().unwrap().join("h.txt"), "h\n").unwrap();
 
-        let out = cmd_commit(&dir, &["h.txt".to_string()], &[], "add h", Some("HEAD~1")).unwrap();
+        let out = cmd_commit(
+            &dir,
+            &["h.txt".to_string()],
+            &[],
+            "add h",
+            Some("HEAD~1"),
+            None,
+        )
+        .unwrap();
         assert!(out.contains("relocated after"), "{out}");
         let log = cmd_log(&dir, None, false).unwrap();
         let lines: Vec<&str> = log.lines().collect();
@@ -10461,6 +10535,7 @@ mod tests {
             &[],
             "x",
             Some(&other.to_string()),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("not HEAD or an ancestor"), "{err}");
@@ -10565,5 +10640,57 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("git_split"), "{err}");
+    }
+
+    const LONG_BODY: &str = "subject\n\nThis body line is written well past the fill column and should wrap when the tool fills it.\n\nSigned-off-by: T <t@example.com>\n";
+    const FILLED_BODY: &str = "subject\n\nThis body line is written well past the fill column and should wrap when\nthe tool fills it.\n\nSigned-off-by: T <t@example.com>\n";
+
+    #[test]
+    fn reword_fills_by_column_and_a_bare_call_fills_the_own_body() {
+        let dir = tmp("reword-fill");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let c = commit(&repo, &[base], &[("a", "2\n")], LONG_BODY);
+        on_branch(&repo, "main", c);
+        // Nothing but the column: the commit's own body is filled.
+        let out = cmd_reword(&dir, "HEAD", None, &[], Some(72), false).unwrap();
+        assert!(out.contains("body filled at 72 columns"), "{out}");
+        let tip = repo.head().unwrap().target().unwrap();
+        assert_eq!(repo.find_commit(tip).unwrap().message(), Some(FILLED_BODY));
+        // Again: it already fits, so there is nothing to do.
+        let err = cmd_reword(&dir, "HEAD", None, &[], Some(72), false).unwrap_err();
+        assert!(err.contains("unchanged"), "{err}");
+        // Off: a wholesale message lands as written, however long.
+        cmd_reword(&dir, "HEAD", Some(LONG_BODY), &[], None, false).unwrap();
+        let tip = repo.head().unwrap().target().unwrap();
+        assert_eq!(repo.find_commit(tip).unwrap().message(), Some(LONG_BODY));
+        // Without a column, nothing to do is still an error.
+        let err = cmd_reword(&dir, "HEAD", None, &[], None, false).unwrap_err();
+        assert!(err.contains("pass `message`"), "{err}");
+    }
+
+    #[test]
+    fn commit_fills_the_body_and_says_so() {
+        let dir = tmp("commit-fill");
+        let repo = Repository::init(&dir).unwrap();
+        let root = commit(&repo, &[], &[("f.txt", "1\n")], "root");
+        on_branch(&repo, "main", root);
+        std::fs::write(dir.join("f.txt"), "2\n").unwrap();
+        let out = cmd_commit(&dir, &["f.txt".to_string()], &[], LONG_BODY, None, Some(72)).unwrap();
+        assert!(out.contains("body filled at 72 columns"), "{out}");
+        let tip = repo.head().unwrap().target().unwrap();
+        assert_eq!(repo.find_commit(tip).unwrap().message(), Some(FILLED_BODY));
+        // A body that fits gets no note.
+        std::fs::write(dir.join("f.txt"), "3\n").unwrap();
+        let out = cmd_commit(
+            &dir,
+            &["f.txt".to_string()],
+            &[],
+            FILLED_BODY,
+            None,
+            Some(72),
+        )
+        .unwrap();
+        assert!(!out.contains("filled"), "{out}");
     }
 }

@@ -1685,6 +1685,13 @@
               "description": "Optional placement: an ancestor commit (oid/ref/revspec) the new commit should sit directly after, instead of at the branch tip. Not combinable with `hunks`.",
               "type": "string"
             },
+            "fill": {
+              "description": "Fill the message body before committing at 72 columns (default true): the subject paragraph and the trailer blocks stay as written (the Key: value paragraph at the end, and mid-message a block of several such lines, a lone dashed key like Signed-off-by or one-word value like Fixes: <url>, or a cherry-pick note; a lone Note: sentence there is prose; trailers glued under a paragraph follow the same rule), the paragraphs between re-wrap like fill-paragraph, a list re-wraps under its hanging indent, and indented or fenced code passes through. false keeps the text exactly as given; an integer sets the column.",
+              "type": [
+                "boolean",
+                "integer"
+              ]
+            },
             "hunks": {
               "description": "Specific uncommitted hunks to commit — each {path, lines: [start, end]} takes every worktree diff-hunk of `path` whose current-file line range overlaps [start, end] (1-based inclusive); {path, contains: TEXT} takes every hunk one of whose added or removed lines contains TEXT. The file's other hunks stay in the worktree, unstaged. Tracked files only (a new file goes in whole, by a `paths`-only call); nothing may be staged; not combinable with `after`.",
               "items": {
@@ -2274,6 +2281,13 @@
             "commit": {
               "description": "The commit to reword (oid/ref/revspec); must be on the current branch.",
               "type": "string"
+            },
+            "fill": {
+              "description": "Fill the resulting message body — with neither `message` nor `message_edits`, the call just fills the commit's own body — at 72 columns (default true): the subject paragraph and the trailer blocks stay as written (the Key: value paragraph at the end, and mid-message a block of several such lines, a lone dashed key like Signed-off-by or one-word value like Fixes: <url>, or a cherry-pick note; a lone Note: sentence there is prose; trailers glued under a paragraph follow the same rule), the paragraphs between re-wrap like fill-paragraph, a list re-wraps under its hanging indent, and indented or fenced code passes through. false keeps the text exactly as given; an integer sets the column.",
+              "type": [
+                "boolean",
+                "integer"
+              ]
             },
             "message": {
               "description": "The full replacement message. Omit to edit the commit's own message via message_edits.",
