@@ -421,9 +421,19 @@ Change ONE commit's message — `message` replaces it wholesale, `message_edits`
 
 Apply one message_edits vocabulary to EVERY commit of `range` (which must end at HEAD) — the bulk trailer strip/add, or the s/old-symbol/new/ sweep after a rename. A sparse rewrite touching only messages: each commit is re-created with its OWN tree (byte-identical by construction, nothing can conflict) and re-parented; an untouched prefix keeps its identical oids. Other branches/tags left on the old history — at a rewritten commit or ahead of one — are named in the report, in a rehearsal too. The report carries per-commit replacement counts, so zero application in one commit is visible; a `find` matching NOWHERE in the range is an error and nothing changes. rehearse:true previews the counts. For one commit's message use git_reword.
 
+- `fill` — Also fill every rewritten message's body — the report marks each commit whose body changed; for the fill alone, without edits, use git_msg_fill — at 72 columns (default true): the subject paragraph and the trailer blocks stay as written (the Key: value paragraph at the end, and mid-message a block of several such lines, a lone dashed key like Signed-off-by or one-word value like Fixes: <url>, or a cherry-pick note; a lone Note: sentence there is prose; trailers glued under a paragraph follow the same rule), the paragraphs between re-wrap like fill-paragraph, a list re-wraps under its hanging indent, and indented or fenced code passes through. false keeps the text exactly as given; an integer sets the column.
 - `message_edits` (required) — Edits applied in order to EVERY message: {find, replace?} replaces every occurrence (omit replace — or say delete: true — to delete); {append} adds a trailing line.
 - `range` (required) — Revision range whose commit messages to rewrite, e.g. main..HEAD, or a bare rev like HEAD to cover every commit from the root; must end at HEAD, and the history it covers must be linear (a merge is refused).
 - `rehearse` — Preview the per-commit replacement counts without applying.
+- `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+
+## git_msg_fill
+
+Fill the BODY of every commit message in `range` (which must end at HEAD) at `column`, 72 by default — the pre-PR sweep that brings agent-written messages to git's width. Each message's subject paragraph and trailer blocks stay as written (the Key: value paragraph at the end, and mid-message a block of several such lines, a lone dashed key like Signed-off-by or one-word value like Fixes: <url>, or a cherry-pick note; trailers glued under a paragraph follow the same rule); the paragraphs between re-wrap like fill-paragraph, a list re-wraps under its hanging indent, and indented or fenced code passes through. The same sparse rewrite as git_msg_rewrite: trees byte-identical, the commits below the first one that needs filling keep their oids (from there up the chain is re-created; under commit signing every commit is re-created and re-signed), and when every body fits nothing is created. rehearse:true lists which commits would change. The message-authoring tools (git_commit, git_reword, git_rebase, git_split, git_msg_rewrite) fill by default as they go, so this is for history written elsewhere.
+
+- `column` — The fill column. Default 72.
+- `range` (required) — Revision range whose messages to fill, e.g. main..HEAD, or a bare rev like HEAD for the whole history; must end at HEAD, linear history only.
+- `rehearse` — Report which commits would change without applying.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 
 ## git_exec_over

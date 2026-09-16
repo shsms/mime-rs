@@ -4319,6 +4319,7 @@ pub fn cmd_msg_rewrite(
     repo_path: &std::path::Path,
     range: &str,
     specs: &[MsgEditSpec],
+    fill: Option<usize>,
     rehearse_only: bool,
 ) -> Result<String, String> {
     let repo = open(repo_path)?;
@@ -4329,7 +4330,22 @@ pub fn cmd_msg_rewrite(
         .iter()
         .map(MsgEdit::from_spec)
         .collect::<Result<_, _>>()?;
-    msg_rewrite(&repo, range, &edits, rehearse_only).map_err(gerr)
+    msg_rewrite(&repo, range, &edits, fill, rehearse_only).map_err(gerr)
+}
+
+/// Fill the body of EVERY commit message of `range` at `column` — the sweep
+/// that brings a branch's messages to 72 columns before a PR. The same sparse
+/// rewrite as [`cmd_msg_rewrite`] with no edits: trees byte-identical, the
+/// commits below the first one that needs filling keep their oids, and when
+/// every body fits nothing is created at all.
+pub fn cmd_msg_fill(
+    repo_path: &std::path::Path,
+    range: &str,
+    column: usize,
+    rehearse_only: bool,
+) -> Result<String, String> {
+    let repo = open(repo_path)?;
+    msg_rewrite(&repo, range, &[], Some(column), rehearse_only).map_err(gerr)
 }
 
 /// Reword ONE commit's message — `message` replaces it wholesale, or
@@ -4451,28 +4467,10 @@ fn reword(
     ))
 }
 
-/// The oid `c` gets when re-created unsigned with `msg` and its own tree,
-/// parents, author and committer — what msg_rewrite writes for a commit whose
-/// parents did not move.
-fn recreated_oid(repo: &Repository, c: &git2::Commit, msg: &str) -> Result<Oid, Error> {
-    let parents: Vec<git2::Commit> = c.parents().collect();
-    let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-    let buf =
-        repo.commit_create_buffer(&c.author(), &c.committer(), msg, &c.tree()?, &parent_refs)?;
-    Oid::hash_object(git2::ObjectType::Commit, &buf)
-}
-
 /// Branches and tags other than `branch` that msg_rewrite leaves on the old
-/// history: those at `first_changed` (the oldest commit whose oid changes) or
-/// at a descendant of it. Empty when nothing is left behind.
-fn stranded_refs(
-    repo: &Repository,
-    branch: &str,
-    first_changed: Option<Oid>,
-) -> Result<String, Error> {
-    let Some(first) = first_changed else {
-        return Ok(String::new());
-    };
+/// history: those at `first` (the oldest commit re-created) or at a descendant
+/// of it. Empty when nothing is left behind.
+fn stranded_refs(repo: &Repository, branch: &str, first: Oid) -> Result<String, Error> {
     let mut out = String::new();
     for r in repo.references()? {
         let r = r?;
@@ -4504,6 +4502,7 @@ fn msg_rewrite(
     repo: &Repository,
     range: &str,
     edits: &[MsgEdit],
+    fill: Option<usize>,
     rehearse_only: bool,
 ) -> Result<String, Error> {
     let head_ref = repo.head()?;
@@ -4533,16 +4532,12 @@ fn msg_rewrite(
 
     // First pass: compute every new message + its per-edit counts, so a
     // range-wide miss aborts before anything is created.
-    let mut new_msgs: Vec<(Oid, String, Vec<usize>)> = Vec::new();
+    let mut new_msgs: Vec<(Oid, String, Vec<usize>, Option<String>)> = Vec::new();
     let mut totals = vec![0usize; edits.len()];
-    // The oldest commit whose oid will change: the first that re-creates to a
-    // different object (a rewritten message, or a header libgit2 does not
-    // reproduce) — or the first of the range when commits are signed, since a
-    // fresh signature changes the oid by itself. Everything after it is
-    // re-parented, so it changes too.
-    let mut first_changed: Option<Oid> = None;
-    let resigned = signing_required(repo)?;
-    for oid in &commits {
+    // The index of the oldest commit whose message changes. Everything after it
+    // is re-parented, so it changes too.
+    let mut first_msg: Option<usize> = None;
+    for (i, oid) in commits.iter().enumerate() {
         let c = repo.find_commit(*oid)?;
         if c.parent_count() > 1 {
             return Err(estr(&format!(
@@ -4551,14 +4546,16 @@ fn msg_rewrite(
                 short(*oid)
             )));
         }
-        let (msg, counts) = apply_msg_edits_counted(c.message().unwrap_or(""), edits);
-        if first_changed.is_none() && (resigned || recreated_oid(repo, &c, &msg)? != *oid) {
-            first_changed = Some(*oid);
+        let (edited, counts) = apply_msg_edits_counted(c.message().unwrap_or(""), edits);
+        let msg = filled(&edited, fill);
+        let note = fill_note(&edited, &msg, fill);
+        if first_msg.is_none() && msg != c.message().unwrap_or("") {
+            first_msg = Some(i);
         }
         for (t, n) in totals.iter_mut().zip(&counts) {
             *t += n;
         }
-        new_msgs.push((*oid, msg, counts));
+        new_msgs.push((*oid, msg, counts, note));
     }
     for (e, t) in edits.iter().zip(&totals) {
         if let (MsgEdit::Replace { find, .. }, 0) = (e, *t) {
@@ -4568,9 +4565,26 @@ fn msg_rewrite(
             )));
         }
     }
+    // Nothing would change: a success that creates nothing, in a rehearsal or
+    // for real.
+    let Some(first_msg) = first_msg else {
+        return Ok(if edits.is_empty() {
+            format!("every commit message in {range} already fits — nothing to change")
+        } else {
+            format!("the edits leave every commit message in {range} as it is — nothing to change")
+        });
+    };
+    // Where the re-creation starts: with signing, a fresh signature changes
+    // every oid, so at the range's first commit.
+    let start = if signing_required(repo)? {
+        0
+    } else {
+        first_msg
+    };
+    let stranded = stranded_refs(repo, &branch, commits[start])?;
 
-    let stranded = stranded_refs(repo, &branch, first_changed)?;
-
+    // What happened to commit `i`: kept as it is, or re-created — for the
+    // per-edit counts, the fill, a new parent, or a fresh signature.
     let counts_line = |counts: &[usize]| {
         counts
             .iter()
@@ -4578,18 +4592,34 @@ fn msg_rewrite(
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let what = |i: usize, counts: &[usize], note: &Option<String>| -> String {
+        if i < start {
+            return "unchanged".to_string();
+        }
+        if i < first_msg {
+            return "re-signed".to_string();
+        }
+        let parts: Vec<String> = [
+            (!counts.is_empty()).then(|| format!("replacements per edit: {}", counts_line(counts))),
+            note.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if parts.is_empty() {
+            "already fits, re-parented".to_string()
+        } else {
+            parts.join("; ")
+        }
+    };
     if rehearse_only {
         let mut out = format!(
             "rehearse: would rewrite the messages of {} commit(s) in {range} \
              (trees byte-identical by construction)\n",
             commits.len()
         );
-        for (oid, _, counts) in &new_msgs {
-            out.push_str(&format!(
-                "  {}  replacements per edit: {}\n",
-                short(*oid),
-                counts_line(counts)
-            ));
+        for (i, (oid, _, counts, note)) in new_msgs.iter().enumerate() {
+            out.push_str(&format!("  {}  {}\n", short(*oid), what(i, counts, note)));
         }
         out.push_str(&stranded);
         out.push_str(&signing_rehearsal_note(repo));
@@ -4597,18 +4627,22 @@ fn msg_rewrite(
     }
     require_signing_ready(repo)?;
 
-    // Second pass: re-create each commit with its own tree and the rewritten
-    // message, chaining parents. An untouched prefix reproduces identical
-    // objects (same message, tree, parents ⇒ same oid), so it is a no-op.
+    // Second pass: from `start` on, re-create each commit with its own tree and
+    // the rewritten message, chaining parents; the commits before it are kept
+    // as they are, signature and all.
     rotate_backup_ring(repo, &branch, head)?;
-    let mut new_parent: Option<Oid> = None;
     let mut out = String::new();
     let mut tip = head;
-    for (oid, msg, counts) in &new_msgs {
+    for (i, (oid, msg, counts, note)) in new_msgs.iter().enumerate() {
+        if i < start {
+            out.push_str(&format!("  {}  {}\n", short(*oid), what(i, counts, note)));
+            continue;
+        }
         let c = repo.find_commit(*oid)?;
-        let parents: Vec<git2::Commit> = match new_parent {
-            Some(p) => vec![repo.find_commit(p)?],
-            None => c.parents().collect(),
+        let parents: Vec<git2::Commit> = if i == start {
+            c.parents().collect()
+        } else {
+            vec![repo.find_commit(tip)?]
         };
         let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
         let new = create_commit(
@@ -4621,17 +4655,12 @@ fn msg_rewrite(
             &parent_refs,
             true,
         )?;
-        out.push_str(&if new == *oid {
-            format!("  {}  unchanged\n", short(*oid))
-        } else {
-            format!(
-                "  {} → {}  replacements per edit: {}\n",
-                short(*oid),
-                short(new),
-                counts_line(counts)
-            )
-        });
-        new_parent = Some(new);
+        out.push_str(&format!(
+            "  {} → {}  {}\n",
+            short(*oid),
+            short(new),
+            what(i, counts, note)
+        ));
         tip = new;
     }
     repo.reference(&branch, tip, true, "mime msg_rewrite")?;
@@ -7102,11 +7131,11 @@ mod tests {
                 append: None,
             },
         ];
-        let out = cmd_msg_rewrite(&dir, "HEAD~2..HEAD", &specs, true).unwrap();
+        let out = cmd_msg_rewrite(&dir, "HEAD~2..HEAD", &specs, None, true).unwrap();
         assert!(out.contains("rehearse"), "{out}");
         assert_eq!(repo.head().unwrap().target(), Some(c2), "nothing moved");
 
-        let out = cmd_msg_rewrite(&dir, "HEAD~2..HEAD", &specs, false).unwrap();
+        let out = cmd_msg_rewrite(&dir, "HEAD~2..HEAD", &specs, None, false).unwrap();
         assert!(out.contains("byte-identical"), "{out}");
         let branch = commits_since(&repo, base).unwrap();
         assert_eq!(branch.len(), 2);
@@ -7129,12 +7158,12 @@ mod tests {
             replace: Some("x".into()),
             append: None,
         }];
-        let err = cmd_msg_rewrite(&dir, "HEAD~2..HEAD", &miss, false).unwrap_err();
+        let err = cmd_msg_rewrite(&dir, "HEAD~2..HEAD", &miss, None, false).unwrap_err();
         assert!(err.contains("matches no commit message"), "{err}");
         assert_eq!(repo.head().unwrap().target(), Some(branch[1]));
 
         // The range must end at HEAD.
-        let err = cmd_msg_rewrite(&dir, "HEAD~2..HEAD~1", &specs, false).unwrap_err();
+        let err = cmd_msg_rewrite(&dir, "HEAD~2..HEAD~1", &specs, None, false).unwrap_err();
         assert!(err.contains("end at HEAD"), "{err}");
     }
 
@@ -7154,11 +7183,11 @@ mod tests {
         }];
 
         // The bare form does not bypass the end-at-HEAD guard.
-        let err = cmd_msg_rewrite(&dir, "HEAD~1", &specs, false).unwrap_err();
+        let err = cmd_msg_rewrite(&dir, "HEAD~1", &specs, None, false).unwrap_err();
         assert!(err.contains("end at HEAD"), "{err}");
 
         // A bare HEAD reaches every commit, the root included.
-        let out = cmd_msg_rewrite(&dir, "HEAD", &specs, false).unwrap();
+        let out = cmd_msg_rewrite(&dir, "HEAD", &specs, None, false).unwrap();
         assert!(out.contains("3 commit(s)"), "{out}");
         let mut walk = repo.revwalk().unwrap();
         walk.push_head().unwrap();
@@ -7199,11 +7228,11 @@ mod tests {
             replace: Some("new_name".into()),
             append: None,
         }];
-        let err = cmd_msg_rewrite(&dir, "HEAD", &specs, false).unwrap_err();
+        let err = cmd_msg_rewrite(&dir, "HEAD", &specs, None, false).unwrap_err();
         assert!(err.contains("is a merge"), "{err}");
         assert_eq!(repo.head().unwrap().target(), Some(tip), "nothing moved");
         // Below the merge, an A..B range still works.
-        let out = cmd_msg_rewrite(&dir, "HEAD~1..HEAD", &specs, false).unwrap();
+        let out = cmd_msg_rewrite(&dir, "HEAD~1..HEAD", &specs, None, false).unwrap();
         assert!(out.contains("1 commit(s)"), "{out}");
     }
 
@@ -7232,12 +7261,12 @@ mod tests {
         }];
 
         // The rehearsal names the refs before anything moves.
-        let out = cmd_msg_rewrite(&dir, "HEAD", &specs, true).unwrap();
+        let out = cmd_msg_rewrite(&dir, "HEAD", &specs, None, true).unwrap();
         assert!(out.contains("left behind"), "{out}");
         assert!(out.contains("refs/heads/dev"), "{out}");
         assert_eq!(repo.head().unwrap().target(), Some(c2));
 
-        let out = cmd_msg_rewrite(&dir, "HEAD", &specs, false).unwrap();
+        let out = cmd_msg_rewrite(&dir, "HEAD", &specs, None, false).unwrap();
         for stranded in ["refs/tags/v1", "refs/heads/dev", "refs/heads/feature"] {
             assert!(out.contains(stranded), "{stranded} missing: {out}");
         }
@@ -7248,12 +7277,12 @@ mod tests {
     }
 
     #[test]
-    fn msg_rewrite_counts_a_dropped_header_as_a_changed_commit() {
+    fn msg_rewrite_keeps_a_signed_root_whose_message_stays() {
         let dir = tmp("strand-header");
         let repo = Repository::init(&dir).unwrap();
-        // A signed root in a repository that no longer signs: re-creating it
-        // drops the gpgsig header, so its oid changes although its message does
-        // not, and a tag on it is left behind.
+        // A signed root in a repository that no longer signs: its message does
+        // not change, so it is kept — signature, oid and the tag on it — and
+        // only the tip is re-created.
         let sig = Signature::now("test", "test@example.invalid").unwrap();
         let tree = repo
             .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
@@ -7272,8 +7301,16 @@ mod tests {
             replace: Some("new_name".into()),
             append: None,
         }];
-        let out = cmd_msg_rewrite(&dir, "HEAD", &specs, false).unwrap();
-        assert!(out.contains("refs/tags/v0"), "{out}");
+        let out = cmd_msg_rewrite(&dir, "HEAD", &specs, None, false).unwrap();
+        assert!(
+            out.contains(&format!("{}  unchanged", short(base))),
+            "{out}"
+        );
+        assert!(!out.contains("refs/tags/v0"), "{out}");
+        assert_eq!(repo.refname_to_id("refs/tags/v0").unwrap(), base);
+        let branch = commits_since(&repo, base).unwrap();
+        assert_eq!(branch.len(), 1);
+        assert_ne!(branch[0], tip);
     }
 
     #[test]
@@ -7291,7 +7328,7 @@ mod tests {
             replace: Some("new_name".into()),
             append: None,
         }];
-        let out = cmd_msg_rewrite(&dir, "HEAD~1..HEAD", &specs, false).unwrap();
+        let out = cmd_msg_rewrite(&dir, "HEAD~1..HEAD", &specs, None, false).unwrap();
         assert!(out.contains("refs/tags/inside"), "{out}");
         assert!(!out.contains("refs/tags/below"), "{out}");
     }
@@ -10644,6 +10681,169 @@ mod tests {
 
     const LONG_BODY: &str = "subject\n\nThis body line is written well past the fill column and should wrap when the tool fills it.\n\nSigned-off-by: T <t@example.com>\n";
     const FILLED_BODY: &str = "subject\n\nThis body line is written well past the fill column and should wrap when\nthe tool fills it.\n\nSigned-off-by: T <t@example.com>\n";
+
+    #[test]
+    fn msg_fill_wraps_every_body_and_keeps_trees_and_fitting_oids() {
+        let dir = tmp("msgfill");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let fits = commit(&repo, &[base], &[("a", "2\n")], "short\n\nFits already.\n");
+        let long = commit(&repo, &[fits], &[("a", "3\n")], LONG_BODY);
+        let top = commit(&repo, &[long], &[("a", "4\n")], "top\n\nFits too.\n");
+        on_branch(&repo, "main", top);
+        let tree_of = |o: Oid| repo.find_commit(o).unwrap().tree_id();
+        let old_tree = tree_of(long);
+
+        let out = cmd_msg_fill(&dir, "HEAD~3..HEAD", 72, true).unwrap();
+        assert!(
+            out.contains("rehearse") && out.contains("body filled"),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("{}  unchanged", short(fits))),
+            "{out}"
+        );
+        assert_eq!(repo.head().unwrap().target(), Some(top), "nothing moved");
+
+        let out = cmd_msg_fill(&dir, "HEAD~3..HEAD", 72, false).unwrap();
+        assert!(out.contains("byte-identical"), "{out}");
+        assert!(
+            out.contains(&format!("{}  unchanged", short(fits))),
+            "the prefix is kept, not re-created: {out}"
+        );
+        assert!(
+            out.contains(&format!("{} → ", short(top)))
+                && out.contains("already fits, re-parented"),
+            "a fitting commit above the filled one moves: {out}"
+        );
+        let branch = commits_since(&repo, base).unwrap();
+        assert_eq!(branch[0], fits, "a fitting body keeps its oid");
+        let filled = branch[1];
+        assert_ne!(filled, long);
+        assert_eq!(
+            repo.find_commit(filled).unwrap().message(),
+            Some(FILLED_BODY)
+        );
+        assert_eq!(tree_of(filled), old_tree);
+        let new_tip = branch[2];
+        assert_ne!(new_tip, top);
+        assert_eq!(
+            repo.find_commit(new_tip).unwrap().message(),
+            Some("top\n\nFits too.\n")
+        );
+
+        // A second sweep has nothing to do and creates nothing.
+        let out = cmd_msg_fill(&dir, "HEAD~3..HEAD", 72, false).unwrap();
+        assert!(out.contains("already fits — nothing to change"), "{out}");
+        assert_eq!(repo.head().unwrap().target(), Some(new_tip));
+        assert!(
+            repo.refname_to_id("refs/mime-backup/main/1").is_err(),
+            "no backup ring rotation for a no-op"
+        );
+    }
+
+    #[test]
+    fn msg_rewrite_fills_the_bodies_it_edits_unless_told_not_to() {
+        let dir = tmp("msgrewrite-fill");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let c = commit(&repo, &[base], &[("a", "2\n")], LONG_BODY);
+        on_branch(&repo, "main", c);
+        let specs = vec![MsgEditSpec {
+            find: Some("subject".into()),
+            replace: Some("title".into()),
+            append: None,
+        }];
+        let out = cmd_msg_rewrite(&dir, "HEAD~1..HEAD", &specs, None, false).unwrap();
+        assert!(!out.contains("body filled"), "{out}");
+        let tip = repo.head().unwrap().target().unwrap();
+        let msg = repo
+            .find_commit(tip)
+            .unwrap()
+            .message()
+            .unwrap()
+            .to_string();
+        assert_eq!(msg, LONG_BODY.replacen("subject", "title", 1));
+
+        let specs = vec![MsgEditSpec {
+            find: Some("title".into()),
+            replace: Some("subject".into()),
+            append: None,
+        }];
+        let out = cmd_msg_rewrite(&dir, "HEAD~1..HEAD", &specs, Some(72), false).unwrap();
+        assert!(
+            out.contains("replacements per edit: 1; body filled"),
+            "{out}"
+        );
+        let tip = repo.head().unwrap().target().unwrap();
+        assert_eq!(repo.find_commit(tip).unwrap().message(), Some(FILLED_BODY));
+    }
+
+    #[test]
+    fn msg_fill_under_signing_re_signs_the_prefix_and_still_no_ops_when_all_fit() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set("MIME_EXEC", Some("1"));
+        let dir = tmp("msgfill-signed");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let fits = commit(&repo, &[base], &[("a", "2\n")], "short\n\nFits already.\n");
+        let long = commit(&repo, &[fits], &[("a", "3\n")], LONG_BODY);
+        on_branch(&repo, "main", long);
+        repo.reference("refs/tags/on-fits", fits, true, "t")
+            .unwrap();
+        let signer = fake_signer(&dir);
+        let mut config = repo.config().unwrap();
+        config.set_bool("commit.gpgsign", true).unwrap();
+        config
+            .set_str("gpg.openpgp.program", signer.to_str().unwrap())
+            .unwrap();
+        config.set_str("user.signingkey", "test-key").unwrap();
+        drop(config);
+
+        // A fresh signature changes every oid, so the fitting prefix is
+        // re-created too, and the report says why.
+        let out = cmd_msg_fill(&dir, "HEAD~2..HEAD", 72, false).unwrap();
+        assert!(
+            out.contains(&format!("{} → ", short(fits))) && out.contains("re-signed"),
+            "{out}"
+        );
+        assert!(
+            out.contains("refs/tags/on-fits"),
+            "a tag on the re-signed prefix is left behind: {out}"
+        );
+        let branch = commits_since(&repo, base).unwrap();
+        assert_ne!(branch[0], fits);
+        let header = repo
+            .find_commit(branch[0])
+            .unwrap()
+            .raw_header()
+            .unwrap()
+            .to_string();
+        assert!(header.contains("gpgsig"), "{header}");
+        assert_eq!(
+            repo.find_commit(branch[1]).unwrap().message(),
+            Some(FILLED_BODY)
+        );
+        // Signed history whose bodies all fit is left alone, signatures and
+        // all, and the backup ring does not turn.
+        let out = cmd_msg_fill(&dir, "HEAD~2..HEAD", 72, false).unwrap();
+        assert!(out.contains("nothing to change"), "{out}");
+        assert_eq!(commits_since(&repo, base).unwrap(), branch);
+        assert!(repo.refname_to_id("refs/mime-backup/main/1").is_err());
+        // With edits that touch only the tip, the re-signed prefix is labelled
+        // as such, not as zero replacements.
+        let specs = vec![MsgEditSpec {
+            find: Some("subject".into()),
+            replace: Some("title".into()),
+            append: None,
+        }];
+        let out = cmd_msg_rewrite(&dir, "HEAD~2..HEAD", &specs, None, false).unwrap();
+        assert!(
+            out.contains(&format!("{} → ", short(branch[0]))) && out.contains("re-signed"),
+            "{out}"
+        );
+        assert!(out.contains("replacements per edit: 1"), "{out}");
+    }
 
     #[test]
     fn reword_fills_by_column_and_a_bare_call_fills_the_own_body() {

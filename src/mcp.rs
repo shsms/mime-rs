@@ -565,6 +565,14 @@ fn fill_arg(args: &Value, tool: &str) -> Result<Option<usize>, String> {
 /// The column commit message bodies fill at unless a call says otherwise.
 const DEFAULT_MSG_COLUMN: usize = 72;
 
+/// The optional `column` of git_msg_fill, 72 when absent.
+fn column_arg(args: &Value, tool: &str) -> Result<usize, String> {
+    match args.get("column") {
+        None => Ok(DEFAULT_MSG_COLUMN),
+        Some(v) => positive_int(v, tool, "column"),
+    }
+}
+
 /// A column argument's value: a positive integer, anything else an error.
 fn positive_int(v: &Value, tool: &str, key: &str) -> Result<usize, String> {
     match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
@@ -3961,9 +3969,16 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
                 &repo,
                 &str_arg(args, "range")?,
                 &msg_edit_specs(edits)?,
+                fill_arg(args, "git_msg_rewrite")?,
                 bool_arg(args, "rehearse"),
             )
         }
+        "git_msg_fill" => seq::cmd_msg_fill(
+            &repo,
+            &str_arg(args, "range")?,
+            column_arg(args, "git_msg_fill")?,
+            bool_arg(args, "rehearse"),
+        ),
         "git_reword" => {
             let edits = match args.get("message_edits").and_then(Value::as_array) {
                 Some(a) => msg_edit_specs(a)?,
@@ -4384,9 +4399,24 @@ fn git_tool_schemas() -> Vec<Value> {
                             }
                         }
                     },
-                    "rehearse": { "type": "boolean", "description": "Preview the per-commit replacement counts without applying." }
+                    "rehearse": { "type": "boolean", "description": "Preview the per-commit replacement counts without applying." },
+                    "fill": fill("Also fill every rewritten message's body — the report marks each commit whose body changed; for the fill alone, without edits, use git_msg_fill —")
                 },
                 "required": ["repo", "range", "message_edits"],
+            },
+        }),
+        json!({
+            "name": "git_msg_fill",
+            "description": "Fill the BODY of every commit message in `range` (which must end at HEAD) at `column`, 72 by default — the pre-PR sweep that brings agent-written messages to git's width. Each message's subject paragraph and trailer blocks stay as written (the Key: value paragraph at the end, and mid-message a block of several such lines, a lone dashed key like Signed-off-by or one-word value like Fixes: <url>, or a cherry-pick note; trailers glued under a paragraph follow the same rule); the paragraphs between re-wrap like fill-paragraph, a list re-wraps under its hanging indent, and indented or fenced code passes through. The same sparse rewrite as git_msg_rewrite: trees byte-identical, the commits below the first one that needs filling keep their oids (from there up the chain is re-created; under commit signing every commit is re-created and re-signed), and when every body fits nothing is created. rehearse:true lists which commits would change. The message-authoring tools (git_commit, git_reword, git_rebase, git_split, git_msg_rewrite) fill by default as they go, so this is for history written elsewhere.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": repo,
+                    "range": { "type": "string", "description": "Revision range whose messages to fill, e.g. main..HEAD, or a bare rev like HEAD for the whole history; must end at HEAD, linear history only." },
+                    "column": { "type": "integer", "description": "The fill column. Default 72." },
+                    "rehearse": { "type": "boolean", "description": "Report which commits would change without applying." }
+                },
+                "required": ["repo", "range"],
             },
         }),
         json!({
@@ -4710,6 +4740,11 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             Git,
             A::destructive(),
             "apply message edits to every commit of a range (trees untouched)",
+        ),
+        "git_msg_fill" => (
+            Git,
+            A::destructive(),
+            "fill every commit message body of a range at a column (trees untouched)",
         ),
         "git_reword" => (
             Git,
@@ -5341,6 +5376,9 @@ mod git_tool_tests {
             let err = fill_arg(&bad, "t").unwrap_err();
             assert!(err.starts_with("t: `fill` must be"), "{err}");
         }
+        assert_eq!(column_arg(&json!({}), "t").unwrap(), 72);
+        assert_eq!(column_arg(&json!({"column": 80}), "t").unwrap(), 80);
+        assert!(column_arg(&json!({"column": 0}), "t").is_err());
     }
 
     /// Minimal JSON-schema conformance: type, required, declared keys only,
@@ -6057,6 +6095,7 @@ mod git_tool_tests {
             "git_absorb",
             "git_exec_over",
             "git_msg_rewrite",
+            "git_msg_fill",
             "git_reword",
             "git_discard",
             "git_range_diff",
