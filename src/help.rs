@@ -250,6 +250,14 @@ into git_fixup, or let git_absorb fold them all).
     strip/add or symbol sweep. Only messages change — every tree stays
     byte-identical; the report carries per-commit replacement counts and
     names other branches/tags left on the old history.
+  git_msg_fill {range, column?}  fill the BODY of every commit message in
+    the range at column (72): subject and trailer blocks untouched,
+    paragraphs re-wrapped, lists hang under their marker, code kept; the
+    commits below the first one that needs filling keep their oids (under
+    commit signing every commit is re-created and re-signed).
+    git_commit, git_reword, git_rebase, git_split and git_msg_rewrite fill
+    the messages they author the same way by default — fill: false keeps a
+    message exactly as written, fill: N sets the column.
   git_exec_over {range, command}  run a shell command at every commit of
     the range, oldest-first (the pr-prep "does every commit build?" gate);
     a bare HEAD covers the whole history from the root. Stops on the

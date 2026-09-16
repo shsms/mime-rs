@@ -207,13 +207,15 @@ helpers: `git_commit` creates a commit from explicitly listed files only (no
 into several with the descendants replayed unchanged, `git_fixup` and
 `git_absorb` fold uncommitted changes into the commits that own them, `git_move`
 relocates a change between two adjacent commits, `git_reword` and
-`git_msg_rewrite` edit commit messages (one commit / a whole range),
-`git_discard` drops selected uncommitted hunks (recoverably), and
-`git_range_diff` compares a branch before and after a rewrite. A conflicted step
-stops with diff3 markers in the worktree; resolve them with the conflict tools
-above, then `git_continue` (or `git_skip` / `git_abort`). Repos are confined to
-`$MIME_ROOTS`, and each op stamps a `refs/mime-backup/<branch>` ref so the
-pre-op state is recoverable.
+`git_msg_rewrite` edit commit messages (one commit / a whole range), and those
+two plus `git_commit`, `git_rebase` and `git_split` fill the message bodies they
+author at 72 columns unless told not to (`fill: false`), `git_msg_fill` runs
+that fill over a range of existing commits, `git_discard` drops selected
+uncommitted hunks (recoverably), and `git_range_diff` compares a branch before
+and after a rewrite. A conflicted step stops with diff3 markers in the worktree;
+resolve them with the conflict tools above, then `git_continue` (or `git_skip` /
+`git_abort`). Repos are confined to `$MIME_ROOTS`, and each op stamps a
+`refs/mime-backup/<branch>` ref so the pre-op state is recoverable.
 
 ## How it works
 
