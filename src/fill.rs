@@ -752,6 +752,134 @@ fn fill_prose_lf(
     Ok(out)
 }
 
+/// The key of `line` when it is a commit-message trailer — a `Key:` token, as
+/// `git interpret-trailers` reads it (`Signed-off-by: A`, `Fixes:#1`).
+fn trailer_key(line: &str) -> Option<&str> {
+    let key = line
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        .count();
+    let shaped = key > 0
+        && line.as_bytes()[0].is_ascii_alphabetic()
+        && line.as_bytes().get(key) == Some(&b':');
+    shaped.then(|| &line[..key])
+}
+
+/// Is `line` a commit-message trailer?
+fn is_trailer(line: &str) -> bool {
+    trailer_key(line).is_some()
+}
+
+/// Is `line` git's own `(cherry picked from commit …)` note?
+fn is_cherry_note(line: &str) -> bool {
+    line.starts_with("(cherry picked from commit ")
+}
+
+/// A line a trailer block holds besides its trailers: an indented continuation,
+/// or a cherry-pick note.
+fn is_trailer_extra(line: &str) -> bool {
+    line.starts_with([' ', '\t']) || is_cherry_note(line)
+}
+
+/// Is `para` (the lines of one paragraph) a trailer block, to keep as it is:
+/// trailers, continuations and cherry-pick notes only, with at least one
+/// trailer or note among them. A lone `Key: value` line that is not the
+/// message's `last` paragraph stays only when wrapping could not improve it:
+/// its key is dashed the way attribution trailers are (`Signed-off-by`, which a
+/// squash meld carries mid-message) or its value is a single word (`Fixes:
+/// <url>`); a lone `Note: …` sentence there is prose.
+fn is_trailer_block(para: &[&str], last: bool) -> bool {
+    let shaped = para.iter().all(|l| is_trailer(l) || is_trailer_extra(l))
+        && para.iter().any(|l| is_trailer(l) || is_cherry_note(l));
+    let kept_alone = |l: &str| {
+        trailer_key(l).is_some_and(|k| {
+            k.contains('-') || !l[k.len() + 1..].trim().contains(char::is_whitespace)
+        })
+    };
+    shaped && (last || para.len() > 1 || is_cherry_note(para[0]) || kept_alone(para[0]))
+}
+
+/// Reflow the body of a commit message to `column`. The subject paragraph (the
+/// first non-blank paragraph, with any blank lines before it) and the trailer
+/// blocks stay as they are: the `Key: value` paragraph the message ends with,
+/// and mid-message — a squash meld carries one — a block of several such lines,
+/// a lone dashed key (`Signed-off-by:`) or one-word value (`Fixes: <url>`), or
+/// a cherry-pick note; a lone `Note:` sentence there is prose. Trailers glued
+/// under a paragraph's prose are kept by the same rule. The rest follows
+/// [`fill_unit`]'s Markdown rules, so a list hangs and indented or fenced code
+/// passes through; the blocks are cut by `split_blocks` itself, so a `Key:`
+/// line inside a fence is code and a fence is never split. An already-filled
+/// message comes back unchanged.
+pub fn fill_message(msg: &str, column: usize) -> String {
+    let (text, crlf) = lf_only(msg);
+    with_crlf(fill_message_lf(&text, column), crlf)
+}
+
+/// [`fill_message`] on text whose line ends are `\n`.
+fn fill_message_lf(msg: &str, column: usize) -> String {
+    let (core, nl) = match msg.strip_suffix('\n') {
+        Some(c) => (c, "\n"),
+        None => (msg, ""),
+    };
+    let lines: Vec<&str> = core.split('\n').collect();
+    let Some(first) = lines.iter().position(|l| !l.trim().is_empty()) else {
+        return msg.to_string();
+    };
+    let subject_end = lines[first..]
+        .iter()
+        .position(|l| l.trim().is_empty())
+        .map_or(lines.len(), |n| first + n);
+    // The output, in pieces of one or more lines each.
+    let mut out: Vec<String> = vec![lines[..subject_end].join("\n")];
+    let opts = Fill {
+        column,
+        double_space: true,
+    };
+    // The body: runs of everything that is not a trailer block, filled as a
+    // whole, around the trailer blocks copied through.
+    let flush = |run: &mut Vec<&str>, out: &mut Vec<String>| {
+        if run.is_empty() {
+            return;
+        }
+        let text = run.join("\n");
+        out.push(fill_unit(&text, &Frame::default(), None, &opts).unwrap_or(text));
+        run.clear();
+    };
+    let body = &lines[subject_end..];
+    let blocks = split_blocks(body);
+    let last_text = blocks.iter().rposition(|b| b.kind != Kind::Blank);
+    let mut run: Vec<&str> = Vec::new();
+    for (bi, block) in blocks.iter().enumerate() {
+        let para = &body[block.start..block.end];
+        if !matches!(block.kind, Kind::Prose(_)) {
+            run.extend(para);
+            continue;
+        }
+        // The trailers to keep: the paragraph as a whole, or the ones glued
+        // under its prose. The tail starts at a trailer or note: an indented
+        // line above the first one is the prose's own continuation.
+        let mut tail = para
+            .iter()
+            .rposition(|l| !is_trailer(l) && !is_trailer_extra(l))
+            .map_or(0, |k| k + 1);
+        while tail < para.len() && !is_trailer(para[tail]) && !is_cherry_note(para[tail]) {
+            tail += 1;
+        }
+        let prose = if is_trailer_block(&para[tail..], Some(bi) == last_text) {
+            tail
+        } else {
+            para.len()
+        };
+        run.extend(&para[..prose]);
+        if prose < para.len() {
+            flush(&mut run, &mut out);
+            out.push(para[prose..].join("\n"));
+        }
+    }
+    flush(&mut run, &mut out);
+    out.join("\n") + nl
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1305,5 +1433,179 @@ mod tests {
             80,
         );
         assert_eq!(out, "- aaa bbb\n");
+    }
+
+    #[test]
+    fn a_message_body_fills_between_subject_and_trailers() {
+        let msg = "subject line that is long enough to pass the column and must stay\n\
+                   \n\
+                   The body is one paragraph.\n\
+                   It wraps.\n\
+                   \n\
+                   - a list item that runs on past the column and hangs under its marker\n\
+                   \n\
+                   Fixes: #1\n\
+                   Signed-off-by: A <a@example.com>\n";
+        let out = fill_message(msg, 30);
+        assert_eq!(
+            out,
+            "subject line that is long enough to pass the column and must stay\n\
+             \n\
+             The body is one paragraph.  It\n\
+             wraps.\n\
+             \n\
+             - a list item that runs on\n\
+             \x20 past the column and hangs\n\
+             \x20 under its marker\n\
+             \n\
+             Fixes: #1\n\
+             Signed-off-by: A <a@example.com>\n"
+        );
+        assert_eq!(
+            fill_message(&out, 30),
+            out,
+            "a filled message is a fixed point"
+        );
+    }
+
+    #[test]
+    fn a_trailer_glued_under_the_last_paragraph_stays_a_trailer() {
+        let msg = "s\n\nSome words here\nand more words.\nFixes: #1\n";
+        assert_eq!(
+            fill_message(msg, 72),
+            "s\n\nSome words here and more words.\nFixes: #1\n"
+        );
+    }
+
+    #[test]
+    fn subject_only_messages_and_code_blocks_pass_through() {
+        assert_eq!(fill_message("just a subject\n", 20), "just a subject\n");
+        assert_eq!(
+            fill_message("subject\nsecond subject line\n", 5),
+            "subject\nsecond subject line\n"
+        );
+        assert_eq!(fill_message("", 20), "");
+        let code = "s\n\nRun:\n\n    cargo test --locked -- --nocapture\n\n```\nlong fenced line that stays\n```\n";
+        assert_eq!(fill_message(code, 10), code);
+        // A key: line inside the body, not at the end, is prose.
+        assert_eq!(
+            fill_message("s\n\nNote: one two\nthree\n\nmore\n", 72),
+            "s\n\nNote: one two three\n\nmore\n"
+        );
+    }
+
+    #[test]
+    fn trailer_blocks_stay_wherever_they_sit() {
+        // A squash meld: the first message's trailers land mid-message.
+        let meld = "s\n\nbody one\n\nSigned-off-by: A <a@x>\nReviewed-by: R <r@x>\n\n\
+                    second subject\n\nsecond body that is long enough to wrap\n\n\
+                    Signed-off-by: B <b@x>";
+        assert_eq!(
+            fill_message(meld, 30),
+            "s\n\nbody one\n\nSigned-off-by: A <a@x>\nReviewed-by: R <r@x>\n\n\
+             second subject\n\nsecond body that is long\nenough to wrap\n\n\
+             Signed-off-by: B <b@x>"
+        );
+        // git's own shapes: `Key:value`, a cherry-pick note after the sign-off.
+        let picked = "s\n\nbody\nFixes:#12\nSigned-off-by: A <a@x>\n\
+                      (cherry picked from commit 1234abcd)\n";
+        assert_eq!(fill_message(picked, 20), picked);
+        let block = "s\n\nbody\n\nSigned-off-by: A <a@x>\n(cherry picked from commit 1234abcd)\n";
+        assert_eq!(fill_message(block, 20), block);
+    }
+
+    #[test]
+    fn a_key_paragraph_in_a_fence_and_a_lone_note_are_prose() {
+        // Inside a fence, `key: value` lines are code and the fence stays whole.
+        let code = "s\n\n```ini\n[server]\nport = 8080\n\nname: demo\nowner: ops\n\n\
+                    [client]\nendpoint = https://example.invalid/a/very/long/path\n```\n\n";
+        let msg = format!(
+            "{code}The parser used to drop the last key when the file ended without a newline.\n"
+        );
+        assert_eq!(
+            fill_message(&msg, 40),
+            format!(
+                "{code}The parser used to drop the last key\nwhen the file ended without a newline.\n"
+            )
+        );
+        // A lone `Note:` paragraph wraps like prose; a dashed key mid-message
+        // and a cherry-pick note on their own stay.
+        assert_eq!(
+            fill_message(
+                "s\n\nNote: this explanation is far longer than the fill column and should wrap.\n\nmore\n",
+                30
+            ),
+            "s\n\nNote: this explanation is far\nlonger than the fill column\nand should wrap.\n\nmore\n"
+        );
+        let signed =
+            "s\n\nSigned-off-by: Someone With A Long Name <someone@example.invalid>\n\nmore\n";
+        assert_eq!(fill_message(signed, 30), signed);
+        let picked = "s\n\nbody\n\n(cherry picked from commit 0123456789abcdef0123456789abcdef01234567)\n\nmore\n";
+        assert_eq!(fill_message(picked, 30), picked);
+        // A one-word value is kept too — wrapping would only part it from its
+        // key — and a trailer glued under mid-message prose stays a trailer,
+        // while the prose's own indented continuation above it still fills.
+        let fixes = "s\n\nFixes: https://example.invalid/issues/1234567890\n\nmore\n";
+        assert_eq!(fill_message(fixes, 30), fixes);
+        assert_eq!(
+            fill_message(
+                "s\n\nsome prose here\nSigned-off-by: A Very Long Name <a@example.invalid>\n\nmore\n",
+                30
+            ),
+            "s\n\nsome prose here\nSigned-off-by: A Very Long Name <a@example.invalid>\n\nmore\n"
+        );
+        assert_eq!(
+            fill_message("s\n\n- item one\n  two\nSigned-off-by: A <a@b.c>\n", 30),
+            "s\n\n- item one two\nSigned-off-by: A <a@b.c>\n"
+        );
+        // Blank lines after the last trailer block do not make it mid-message.
+        let trailing = "s\n\nbody\n\nAcked: someone with a long name here\n\n\n";
+        assert_eq!(fill_message(trailing, 20), trailing);
+    }
+
+    #[test]
+    fn fences_are_read_as_the_filler_reads_them_and_close_before_glued_trailers() {
+        let sig = "Signed-off-by: A Very Long Name Indeed <a@example.invalid>";
+        // A marker inside an indented code block is code; one starting a block
+        // opens a fence at any indent. Either way the trailer block after it is
+        // still one.
+        let deep = format!("subject\n\n    cfg:\n    ```yaml\n    a: 1\n\n{sig}\n");
+        assert_eq!(fill_message(&deep, 30), deep);
+        let opener = format!("subject\n\n    ```\n    an indented example\n```\n\n{sig}\n");
+        assert_eq!(fill_message(&opener, 30), opener);
+        // A trailer glued under the closer is outside the fence.
+        let glued = format!("subject\n\n```\ncode\n\nmore\n```\n{sig}\n");
+        assert_eq!(fill_message(&glued, 30), glued);
+        // A `~~~` fence works the same, and once closed the prose after it
+        // fills while a trailer block stays.
+        let tilde =
+            format!("subject\n\n~~~\nkey: value\n~~~\n\nsome words that wrap here\n\n{sig}\n");
+        assert_eq!(
+            fill_message(&tilde, 20),
+            format!("subject\n\n~~~\nkey: value\n~~~\n\nsome words that wrap\nhere\n\n{sig}\n")
+        );
+    }
+
+    #[test]
+    fn fill_message_is_stable_on_common_shapes() {
+        let column = 20;
+        for msg in [
+            "subject\n\n",
+            "\nleading blank line, then a subject past the column\n\nbody words here\n",
+            "subject\n\n\n\nSigned-off-by: A <a@x>\n\n",
+            "subject\n\nsome body words that wrap\nFixes: #1\n",
+            "  \n",
+        ] {
+            let once = fill_message(msg, column);
+            assert_eq!(fill_message(&once, column), once, "{msg:?}");
+        }
+        // A leading blank line does not make the subject body.
+        assert_eq!(
+            fill_message(
+                "\nsubject past the column here\n\nbody words that wrap\n",
+                15
+            ),
+            "\nsubject past the column here\n\nbody words that\nwrap\n"
+        );
     }
 }
