@@ -3857,6 +3857,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
                 args.get("from").and_then(Value::as_str),
                 plan_arg(args)?,
                 autosquash_arg(args)?,
+                fill_arg(args, "git_rebase")?,
                 bool_arg(args, "rehearse"),
                 bool_arg(args, "reapply_cherry_picks"),
             )
@@ -3899,6 +3900,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
             )?,
+            fill_arg(args, "git_split")?,
             bool_arg(args, "rehearse"),
         ),
         "git_commit" => {
@@ -4083,7 +4085,8 @@ fn git_tool_schemas() -> Vec<Value> {
                         }
                     },
                     "rehearse": { "type": "boolean", "description": "Dry-run: preview the resulting commits and whether the tree is unchanged (a pure reorder/fold), applying nothing. Unlike a real run, the rehearsal does NOT stop at the first conflict: it lists EVERY step that would conflict, each with the commit that last reshaped the conflicted lines (usually the right fold target) — repair the whole plan in one pass. Default false." },
-                    "reapply_cherry_picks": { "type": "boolean", "description": "Plan-less pick-all only: keep commits already present in `onto` by patch-id instead of dropping them. Default false — like `git rebase`, a commit whose change already sits in the new base (e.g. after the base was reordered/amended below the merge-base) is skipped so a stacked branch isn't duplicated; the skipped commits are reported. Set true to replay them anyway. Ignored when an explicit `plan` or `autosquash` is given." }
+                    "reapply_cherry_picks": { "type": "boolean", "description": "Plan-less pick-all only: keep commits already present in `onto` by patch-id instead of dropping them. Default false — like `git rebase`, a commit whose change already sits in the new base (e.g. after the base was reordered/amended below the merge-base) is skipped so a stacked branch isn't duplicated; the skipped commits are reported. Set true to replay them anyway. Ignored when an explicit `plan` or `autosquash` is given." },
+                    "fill": fill("Fill the body of every message a step authors — a reword's message, a squash meld, an edit's or a fixup's when it brings a message change; a pick and a bare edit or fixup keep their message either way —")
                 },
                 "required": ["repo", "onto"],
             },
@@ -4121,7 +4124,8 @@ fn git_tool_schemas() -> Vec<Value> {
                             "required": ["message"]
                         }
                     },
-                    "rehearse": { "type": "boolean", "description": "Preview the resulting commits without applying. Default false." }
+                    "rehearse": { "type": "boolean", "description": "Preview the resulting commits without applying. Default false." },
+                    "fill": fill("Fill each part's message body")
                 },
                 "required": ["repo", "commit", "into"],
             },

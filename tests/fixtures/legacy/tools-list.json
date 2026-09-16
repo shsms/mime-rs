@@ -1503,6 +1503,13 @@
                 "boolean"
               ]
             },
+            "fill": {
+              "description": "Fill the body of every message a step authors — a reword's message, a squash meld, an edit's or a fixup's when it brings a message change; a pick and a bare edit or fixup keep their message either way — at 72 columns (default true): the subject paragraph and the trailer blocks stay as written (the Key: value paragraph at the end, and mid-message a block of several such lines, a lone dashed key like Signed-off-by or one-word value like Fixes: <url>, or a cherry-pick note; a lone Note: sentence there is prose; trailers glued under a paragraph follow the same rule), the paragraphs between re-wrap like fill-paragraph, a list re-wraps under its hanging indent, and indented or fenced code passes through. false keeps the text exactly as given; an integer sets the column.",
+              "type": [
+                "boolean",
+                "integer"
+              ]
+            },
             "from": {
               "description": "Three-arg --onto (git's <upstream>): replay only from..HEAD onto `onto`, so a stacked branch transplants its own commits without hand-dropping the ones already in the new base. Defaults to `onto`. Bounds the plan-less and autosquash enumeration; not combinable with an explicit `plan` (which already lists its commits).",
               "type": "string"
@@ -1602,6 +1609,13 @@
             "commit": {
               "description": "oid/ref/revspec of the commit to split — any non-merge, non-root commit on the current branch.",
               "type": "string"
+            },
+            "fill": {
+              "description": "Fill each part's message body at 72 columns (default true): the subject paragraph and the trailer blocks stay as written (the Key: value paragraph at the end, and mid-message a block of several such lines, a lone dashed key like Signed-off-by or one-word value like Fixes: <url>, or a cherry-pick note; a lone Note: sentence there is prose; trailers glued under a paragraph follow the same rule), the paragraphs between re-wrap like fill-paragraph, a list re-wraps under its hanging indent, and indented or fenced code passes through. false keeps the text exactly as given; an integer sets the column.",
+              "type": [
+                "boolean",
+                "integer"
+              ]
             },
             "into": {
               "description": "The output commits, in order. Each is {message, paths?, hunks?}: `paths` takes whole files, `hunks` takes specific hunks of a file by post-commit line range or by a text their changed lines contain. One part may omit both to be the catch-all collecting every change no other part claims. Every change the commit makes must be covered exactly once; tracked files can be split across parts by hunk.",

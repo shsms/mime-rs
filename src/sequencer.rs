@@ -383,6 +383,30 @@ pub struct Step {
     pub message: Option<String>,
     pub message_edits: Vec<MsgEdit>,
     pub split_into: Vec<SplitPart>,
+    /// The column the message is filled at ([`crate::fill::fill_message`]) when
+    /// this step authors it — see `Step::authors_message`; `None` keeps the
+    /// text as written.
+    pub fill: Option<usize>,
+}
+
+impl Step {
+    /// Does this step author its commit's message, so the fill applies? A
+    /// reword, a squash meld and a split's parts do; an edit or a fixup only
+    /// when it brings a message change; a pick keeps the message as it is.
+    fn authors_message(&self) -> bool {
+        match self.action {
+            Action::Reword | Action::Squash | Action::Split => true,
+            Action::Edit => self.message.is_some() || !self.message_edits.is_empty(),
+            Action::Fixup => !self.message_edits.is_empty(),
+            Action::Pick | Action::Drop => false,
+        }
+    }
+
+    /// The column this step's message is filled at: `fill` when the step
+    /// authors it.
+    fn fill_column(&self) -> Option<usize> {
+        self.fill.filter(|_| self.authors_message())
+    }
 }
 
 /// A rebase plan: replay `steps` (in order) onto `onto`.
@@ -776,7 +800,7 @@ fn save_state(repo: &Repository, st: &State) -> Result<(), Error> {
                     json!({"message": p.message, "paths": p.paths, "hunks": hunks, "rest": p.rest})
                 })
                 .collect();
-            json!({"commit": s.commit.to_string(), "action": s.action.as_str(), "message": s.message, "message_edits": edits, "split_into": split})
+            json!({"commit": s.commit.to_string(), "action": s.action.as_str(), "message": s.message, "message_edits": edits, "split_into": split, "fill": s.fill})
         })
         .collect();
     let v = json!({
@@ -816,6 +840,8 @@ fn load_state(repo: &Repository) -> Result<State, Error> {
                 action: Action::parse(s["action"].as_str().unwrap_or(""))
                     .ok_or_else(|| estr("corrupt step action"))?,
                 message: s["message"].as_str().map(str::to_string),
+                // An older state file has no `fill`: as written.
+                fill: s["fill"].as_u64().map(|n| n as usize),
                 message_edits: s["message_edits"]
                     .as_array()
                     .map(|a| {
@@ -981,6 +1007,7 @@ fn pick_step(commit: Oid) -> Step {
         message: None,
         message_edits: Vec::new(),
         split_into: Vec::new(),
+        fill: None,
     }
 }
 
@@ -1451,7 +1478,15 @@ fn rehearse(repo: &Repository, plan: &Plan, mode: Mode) -> Result<Preview, Error
         if step.action == Action::Split {
             // Preview the split's output commits (real objects, left dangling).
             let pick = repo.find_commit(step.commit)?;
-            for c in build_split(repo, &pick, current, &tree, &step.split_into, false)? {
+            for c in build_split(
+                repo,
+                &pick,
+                current,
+                &tree,
+                &step.split_into,
+                step.fill_column(),
+                false,
+            )? {
                 let summary = repo.find_commit(c)?.summary().unwrap_or("").to_string();
                 commits.push((c, summary));
                 current = c;
@@ -1829,6 +1864,7 @@ fn make_commit(
     let current = repo.find_commit(current_oid)?;
     let pick = repo.find_commit(step.commit)?;
     let pick_msg = || pick.message().unwrap_or("").to_string();
+    let fill = step.fill_column();
     if mode == Mode::Revert {
         // A revert always appends on `current` with a generated message; the
         // forward-action vocabulary (reword/squash/fixup) does not apply.
@@ -1866,7 +1902,7 @@ fn make_commit(
         // continue, once the agent has changed the worktree.
         Action::Reword | Action::Edit => {
             let msg = step.message.clone().unwrap_or_else(pick_msg);
-            let msg = apply_msg_edits(msg, &step.message_edits)?;
+            let msg = filled(&apply_msg_edits(msg, &step.message_edits)?, fill);
             create_commit(
                 repo,
                 None,
@@ -1890,7 +1926,7 @@ fn make_commit(
                     format!("{}\n\n{}", cur_msg.trim_end(), pick_msg().trim_end())
                 }),
             };
-            let msg = apply_msg_edits(msg, &step.message_edits)?;
+            let msg = filled(&apply_msg_edits(msg, &step.message_edits)?, fill);
             create_commit(
                 repo,
                 None,
@@ -2014,6 +2050,7 @@ fn split_commits(
     base: Oid,
     target: &git2::Tree,
     parts: &[SplitPart],
+    fill: Option<usize>,
     sign: bool,
 ) -> Result<Vec<Oid>, Error> {
     let base_tree = repo.find_commit(base)?.tree()?;
@@ -2061,7 +2098,7 @@ fn split_commits(
             None,
             &pick.author(),
             &pick.committer(),
-            &part.message,
+            &filled(&part.message, fill),
             &tree,
             &[&cur],
             sign,
@@ -2081,12 +2118,13 @@ fn build_split(
     base: Oid,
     target: &git2::Tree,
     parts: &[SplitPart],
+    fill: Option<usize>,
     sign: bool,
 ) -> Result<Vec<Oid>, Error> {
     if parts.iter().any(|p| !p.hunks.is_empty()) {
-        split_commits_hunked(repo, pick, base, target, parts, sign)
+        split_commits_hunked(repo, pick, base, target, parts, fill, sign)
     } else {
-        split_commits(repo, pick, base, target, parts, sign)
+        split_commits(repo, pick, base, target, parts, fill, sign)
     }
 }
 
@@ -2271,6 +2309,7 @@ fn split_commits_hunked(
     base: Oid,
     target: &git2::Tree,
     parts: &[SplitPart],
+    fill: Option<usize>,
     sign: bool,
 ) -> Result<Vec<Oid>, Error> {
     let base_tree = repo.find_commit(base)?.tree()?;
@@ -2308,7 +2347,7 @@ fn split_commits_hunked(
             None,
             &pick.author(),
             &pick.committer(),
-            &part.message,
+            &filled(&part.message, fill),
             &tree,
             &[&parent],
             sign,
@@ -2580,7 +2619,15 @@ fn land_split(
     target: &git2::Tree,
 ) -> Result<Oid, Error> {
     let pick = repo.find_commit(step.commit)?;
-    let made = build_split(repo, &pick, st.current, target, &step.split_into, true)?;
+    let made = build_split(
+        repo,
+        &pick,
+        st.current,
+        target,
+        &step.split_into,
+        step.fill_column(),
+        true,
+    )?;
     let last = *made.last().expect("split produced at least one commit");
     repo.set_head_detached(last)?;
     Ok(last)
@@ -5075,12 +5122,14 @@ fn run_plan_over_parked_worktree(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // One MCP call's knobs, in the tool's own order.
 pub fn cmd_rebase(
     repo_path: &std::path::Path,
     onto: &str,
     from: Option<&str>,
     plan: Option<Vec<PlanItem>>,
     autosquash: Option<Autosquash>,
+    fill: Option<usize>,
     rehearse_only: bool,
     reapply_cherry_picks: bool,
 ) -> Result<String, String> {
@@ -5106,7 +5155,7 @@ pub fn cmd_rebase(
     // A bare replay leaves fixup!/squash! commits as they are — the note below
     // points at autosquash:true, which is usually what such a branch wants.
     let plan_less = plan.is_none() && autosquash.is_none();
-    let steps = if let Some(Autosquash::Markers) = autosquash {
+    let mut steps = if let Some(Autosquash::Markers) = autosquash {
         let derived = marker_directives(&repo, from_oid).map_err(gerr)?;
         autosquash_steps(&repo, from_oid, &derived).map_err(gerr)?
     } else if let Some(Autosquash::Directives(directives)) = autosquash {
@@ -5153,6 +5202,7 @@ pub fn cmd_rebase(
                         message: message.clone(),
                         message_edits,
                         split_into: Vec::new(),
+                        fill: None,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?,
@@ -5169,6 +5219,11 @@ pub fn cmd_rebase(
             }
         }
     };
+    // The one place the column is set: a plan step, an autosquash meld and a
+    // pick all carry it (a pick ignores it).
+    for s in &mut steps {
+        s.fill = fill;
+    }
     let mark_note = if plan_less {
         marker_note(&repo, &steps)
     } else {
@@ -5715,6 +5770,7 @@ pub fn cmd_split(
     repo_path: &std::path::Path,
     commit: &str,
     parts: Vec<SplitPart>,
+    fill: Option<usize>,
     rehearse_only: bool,
 ) -> Result<String, String> {
     let repo = open(repo_path)?;
@@ -5754,6 +5810,7 @@ pub fn cmd_split(
         message: None,
         message_edits: Vec::new(),
         split_into: parts,
+        fill,
     }];
     steps.extend(
         commits_since(&repo, target)
@@ -5954,6 +6011,7 @@ mod tests {
         Step {
             commit,
             action,
+            fill: None,
             message: message.map(str::to_string),
             message_edits: Vec::new(),
             split_into: Vec::new(),
@@ -6257,7 +6315,7 @@ mod tests {
 
         // Default plan (onto..HEAD) via the path-facing wrapper, onto by oid
         // string.
-        let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, false, false).unwrap();
+        let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, None, false, false).unwrap();
         assert!(out.starts_with("done"), "{out}");
         // `add b` and `change a` are distinct patches, so cherry-pick detection
         // drops nothing — a plain rebase onto a diverged base is unaffected.
@@ -6328,6 +6386,7 @@ mod tests {
             Some(&l1.to_string()),
             None,
             None,
+            None,
             true,
             false,
         )
@@ -6342,6 +6401,7 @@ mod tests {
             &dir,
             &l1p.to_string(),
             Some(&l1.to_string()),
+            None,
             None,
             None,
             false,
@@ -6369,6 +6429,7 @@ mod tests {
             &base.to_string(),
             Some(&base.to_string()),
             Some(vec![(f1.to_string(), "pick".to_string(), None, Vec::new())]),
+            None,
             None,
             false,
             false,
@@ -6416,16 +6477,16 @@ mod tests {
 
         // rehearse, default: the two already-applied commits are reported
         // dropped.
-        let pre = cmd_rebase(&dir, &a1p.to_string(), None, None, None, true, false).unwrap();
+        let pre = cmd_rebase(&dir, &a1p.to_string(), None, None, None, None, true, false).unwrap();
         assert!(pre.contains("dropped 2 commit(s)"), "{pre}");
         assert!(pre.contains("add x") && pre.contains("add y"), "{pre}");
 
         // rehearse, reapply_cherry_picks: keeps them — no drop note.
-        let keep = cmd_rebase(&dir, &a1p.to_string(), None, None, None, true, true).unwrap();
+        let keep = cmd_rebase(&dir, &a1p.to_string(), None, None, None, None, true, true).unwrap();
         assert!(!keep.contains("dropped"), "{keep}");
 
         // apply, default: topic ends as base→add y→add x→add z — no duplicates.
-        let out = cmd_rebase(&dir, &a1p.to_string(), None, None, None, false, false).unwrap();
+        let out = cmd_rebase(&dir, &a1p.to_string(), None, None, None, None, false, false).unwrap();
         assert!(out.starts_with("done"), "{out}");
         assert!(out.contains("dropped 2 commit(s)"), "{out}");
         let tip = repo.head().unwrap().peel_to_commit().unwrap();
@@ -6744,7 +6805,7 @@ mod tests {
         std::fs::write(dir.join("notes"), "scratch\n").unwrap();
 
         // m1 adds b; rebase f1 onto m1. `notes` is untouched.
-        let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, false, false).unwrap();
+        let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, None, false, false).unwrap();
         assert!(out.starts_with("done"), "{out}");
         assert_eq!(
             read(&repo, "notes"),
@@ -6767,7 +6828,8 @@ mod tests {
         let m1 = commit(&repo, &[base], &[("a", "1\n"), ("b", "1\n")], "m1");
         on_branch(&repo, "topic", f1);
         std::fs::write(dir.join("a"), "uncommitted\n").unwrap();
-        let err = cmd_rebase(&dir, &m1.to_string(), None, None, None, false, false).unwrap_err();
+        let err =
+            cmd_rebase(&dir, &m1.to_string(), None, None, None, None, false, false).unwrap_err();
         assert!(err.contains("uncommitted changes"), "{err}");
         assert!(err.contains('a'), "names the clashing path: {err}");
         assert_eq!(read(&repo, "a"), "uncommitted\n", "nothing destroyed");
@@ -6784,7 +6846,7 @@ mod tests {
         std::fs::write(dir.join("notes"), "scratch\n").unwrap();
 
         // f1 conflicts with m1 on `a`; `notes` rides the autostash.
-        let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, false, false).unwrap();
+        let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, None, false, false).unwrap();
         assert!(out.contains("conflict"), "{out}");
         assert!(out.contains("autostashed"), "the pause says where: {out}");
         assert_ne!(
@@ -6810,7 +6872,7 @@ mod tests {
         std::fs::write(dir.join("notes"), "scratch\n").unwrap();
 
         // f1 conflicts with m1 on `a`; `notes` rides the autostash.
-        let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, false, false).unwrap();
+        let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, None, false, false).unwrap();
         assert!(out.contains("conflict"), "{out}");
         // During the pause the user writes `notes` again — the later edit must
         // win over the parked bytes.
@@ -6851,7 +6913,7 @@ mod tests {
         let mut perm = std::fs::metadata(&abs).unwrap().permissions();
         perm.set_mode(perm.mode() | 0o111);
         std::fs::set_permissions(&abs, perm).unwrap();
-        let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, false, false).unwrap();
+        let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, None, false, false).unwrap();
         assert!(out.starts_with("done"), "{out}");
         let mode = std::fs::metadata(&abs).unwrap().permissions().mode();
         assert_ne!(mode & 0o111, 0, "the exec bit came back");
@@ -6913,7 +6975,8 @@ mod tests {
         let mut index = repo.index().unwrap();
         index.add_path(Path::new("notes")).unwrap();
         index.write().unwrap();
-        let err = cmd_rebase(&dir, &m1.to_string(), None, None, None, false, false).unwrap_err();
+        let err =
+            cmd_rebase(&dir, &m1.to_string(), None, None, None, None, false, false).unwrap_err();
         assert!(err.contains("staged changes"), "{err}");
         assert!(err.contains("notes"), "{err}");
         // Nothing moved: branch tip and the staged bytes are untouched.
@@ -7888,6 +7951,7 @@ mod tests {
             Some(&stale.to_string()),
             None,
             Some(Autosquash::Markers),
+            None,
             false,
             false,
         )
@@ -7919,6 +7983,7 @@ mod tests {
                 c1.to_string(),
                 "fixup".to_string(),
             )])),
+            None,
             false,
             false,
         )
@@ -7954,6 +8019,7 @@ mod tests {
                 (c3.to_string(), c2.to_string(), "fixup".to_string()),
                 (c2.to_string(), c1.to_string(), "fixup".to_string()),
             ])),
+            None,
             false,
             false,
         )
@@ -7995,6 +8061,7 @@ mod tests {
             None,
             None,
             Some(Autosquash::Markers),
+            None,
             false,
             false,
         )
@@ -8040,6 +8107,7 @@ mod tests {
             None,
             None,
             Some(Autosquash::Markers),
+            None,
             false,
             false,
         )
@@ -8078,6 +8146,7 @@ mod tests {
             None,
             None,
             Some(Autosquash::Markers),
+            None,
             false,
             false,
         )
@@ -8125,6 +8194,7 @@ mod tests {
             None,
             None,
             Some(Autosquash::Markers),
+            None,
             false,
             false,
         )
@@ -8177,6 +8247,7 @@ mod tests {
             None,
             None,
             Some(Autosquash::Markers),
+            None,
             false,
             false,
         )
@@ -8207,13 +8278,23 @@ mod tests {
 
         // A bare replay leaves the marker unfolded — the result must say so and
         // name the argument that folds it (rehearse and real run alike).
-        let pre = cmd_rebase(&dir, &base.to_string(), None, None, None, true, false).unwrap();
+        let pre = cmd_rebase(&dir, &base.to_string(), None, None, None, None, true, false).unwrap();
         assert!(
             pre.contains("1 fixup!/squash! commit(s) replayed as-is"),
             "{pre}"
         );
         assert!(pre.contains("autosquash:true"), "{pre}");
-        let out = cmd_rebase(&dir, &base.to_string(), None, None, None, false, false).unwrap();
+        let out = cmd_rebase(
+            &dir,
+            &base.to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
         assert!(out.contains("autosquash:true"), "{out}");
         // The autosquash run itself must NOT carry the note.
         let out = cmd_rebase(
@@ -8222,6 +8303,7 @@ mod tests {
             None,
             None,
             Some(Autosquash::Markers),
+            None,
             false,
             false,
         )
@@ -8243,6 +8325,7 @@ mod tests {
             None,
             None,
             Some(Autosquash::Directives(vec![])),
+            None,
             false,
             false,
         )
@@ -8270,6 +8353,7 @@ mod tests {
             None,
             None,
             Some(Autosquash::Markers),
+            None,
             false,
             false,
         )
@@ -8312,6 +8396,7 @@ mod tests {
             None,
             None,
             Some(Autosquash::Markers),
+            None,
             false,
             false,
         )
@@ -8333,6 +8418,7 @@ mod tests {
             None,
             None,
             Some(Autosquash::Markers),
+            None,
             false,
             false,
         )
@@ -8354,6 +8440,7 @@ mod tests {
             None,
             None,
             Some(Autosquash::Markers),
+            None,
             false,
             false,
         )
@@ -8545,6 +8632,7 @@ mod tests {
                 Step {
                     commit: base,
                     action: Action::Reword,
+                    fill: Some(72),
                     message: Some("hi".to_string()),
                     message_edits: vec![
                         MsgEdit::Replace {
@@ -8560,6 +8648,7 @@ mod tests {
                 Step {
                     commit: base,
                     action: Action::Split,
+                    fill: None,
                     message: None,
                     message_edits: Vec::new(),
                     split_into: vec![
@@ -8584,6 +8673,12 @@ mod tests {
         save_state(&repo, &st).unwrap();
         let back = load_state(&repo).unwrap();
         assert_eq!(back.committed_untracked, vec!["new.txt"]);
+        assert_eq!(
+            back.steps[0].fill,
+            Some(72),
+            "the fill column survives a pause"
+        );
+        assert_eq!(back.steps[1].fill, None);
 
         match &back.steps[0].message_edits[0] {
             MsgEdit::Replace { find, with } => {
@@ -9426,6 +9521,7 @@ mod tests {
         let s = Step {
             commit: f1,
             action: Action::Reword,
+            fill: None,
             message: None,
             message_edits: vec![MsgEdit::Replace {
                 find: "Subject line".to_string(),
@@ -9497,6 +9593,7 @@ mod tests {
         let s = Step {
             commit: f1,
             action: Action::Reword,
+            fill: None,
             message: None,
             message_edits: vec![MsgEdit::Append {
                 text: "Acked-by: Z <z@e.invalid>".to_string(),
@@ -9528,6 +9625,7 @@ mod tests {
         let s = Step {
             commit: f1,
             action: Action::Reword,
+            fill: None,
             message: None,
             message_edits: vec![MsgEdit::Replace {
                 find: "not present".to_string(),
@@ -9569,6 +9667,7 @@ mod tests {
         let s = Step {
             commit: f1,
             action: Action::Reword,
+            fill: None,
             message: Some("brand new subject".to_string()),
             message_edits: vec![MsgEdit::Replace {
                 find: "new".to_string(),
@@ -9603,6 +9702,7 @@ mod tests {
         let s = Step {
             commit: f1,
             action: Action::Pick,
+            fill: None,
             message: None,
             message_edits: vec![MsgEdit::Append {
                 text: "Note".to_string(),
@@ -9643,6 +9743,7 @@ mod tests {
         let s = Step {
             commit: f_ok,
             action: Action::Reword,
+            fill: None,
             message: None,
             message_edits: vec![
                 MsgEdit::Replace {
@@ -9687,6 +9788,7 @@ mod tests {
         let s2 = Step {
             commit: f_bad,
             action: Action::Reword,
+            fill: None,
             message: None,
             message_edits: vec![
                 MsgEdit::Replace {
@@ -9765,6 +9867,7 @@ mod tests {
         Step {
             commit,
             action: Action::Split,
+            fill: None,
             message: None,
             message_edits: Vec::new(),
             split_into: parts,
@@ -10619,11 +10722,11 @@ mod tests {
         };
 
         // Rehearse first: previews the parts, mutates nothing.
-        let preview = cmd_split(&dir, &b.to_string(), parts(), true).unwrap();
+        let preview = cmd_split(&dir, &b.to_string(), parts(), None, true).unwrap();
         assert!(preview.contains("rehearsal"), "{preview}");
         assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), c);
 
-        let out = cmd_split(&dir, &b.to_string(), parts(), false).unwrap();
+        let out = cmd_split(&dir, &b.to_string(), parts(), None, false).unwrap();
         assert!(out.contains("tree identical"), "{out}");
         let log = cmd_log(&dir, None, false).unwrap();
         let lines: Vec<&str> = log.lines().collect();
@@ -10633,14 +10736,14 @@ mod tests {
         assert!(lines[3].contains("base"), "{log}");
 
         // Fewer than two parts is a reword, not a split.
-        let err = cmd_split(&dir, "HEAD", Vec::new(), false).unwrap_err();
+        let err = cmd_split(&dir, "HEAD", Vec::new(), None, false).unwrap_err();
         assert!(err.contains("at least two"), "{err}");
 
         // Root commit, off-branch commit, and merge commit all refuse.
-        let err = cmd_split(&dir, &a.to_string(), parts(), false).unwrap_err();
+        let err = cmd_split(&dir, &a.to_string(), parts(), None, false).unwrap_err();
         assert!(err.contains("root commit"), "{err}");
         let stray = commit(&repo, &[], &[("z.txt", "z\n")], "unrelated");
-        let err = cmd_split(&dir, &stray.to_string(), parts(), false).unwrap_err();
+        let err = cmd_split(&dir, &stray.to_string(), parts(), None, false).unwrap_err();
         assert!(err.contains("not on the current branch"), "{err}");
         let tip = repo.head().unwrap().peel_to_commit().unwrap().id();
         let merge = commit(
@@ -10655,7 +10758,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let err = cmd_split(&dir, &merge.to_string(), parts(), false).unwrap_err();
+        let err = cmd_split(&dir, &merge.to_string(), parts(), None, false).unwrap_err();
         assert!(err.contains("is a merge"), "{err}");
     }
 
@@ -10671,6 +10774,7 @@ mod tests {
             &a.to_string(),
             None,
             Some(vec![(b.to_string(), "split".to_string(), None, Vec::new())]),
+            None,
             None,
             false,
             false,
@@ -10892,5 +10996,165 @@ mod tests {
         )
         .unwrap();
         assert!(!out.contains("filled"), "{out}");
+    }
+
+    #[test]
+    fn rebase_and_split_fill_the_messages_their_steps_author() {
+        let dir = tmp("plan-fill");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n"), ("b", "1\n")], "base");
+        let c1 = commit(&repo, &[base], &[("a", "2\n"), ("b", "1\n")], LONG_BODY);
+        let c2 = commit(&repo, &[c1], &[("a", "3\n"), ("b", "2\n")], "two");
+        on_branch(&repo, "main", c2);
+        // A plain pick keeps a long body; a reword step fills it.
+        let plan = vec![
+            (c1.to_string(), "pick".to_string(), None, Vec::new()),
+            (
+                c2.to_string(),
+                "reword".to_string(),
+                Some(LONG_BODY.to_string()),
+                Vec::new(),
+            ),
+        ];
+        let out = cmd_rebase(
+            &dir,
+            &base.to_string(),
+            None,
+            Some(plan),
+            None,
+            Some(72),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        let branch = commits_since(&repo, base).unwrap();
+        assert_eq!(
+            repo.find_commit(branch[0]).unwrap().message(),
+            Some(LONG_BODY)
+        );
+        assert_eq!(
+            repo.find_commit(branch[1]).unwrap().message(),
+            Some(FILLED_BODY)
+        );
+        // A split part's message fills too — by hunk, the other split path.
+        let parts = vec![
+            SplitPart {
+                message: LONG_BODY.to_string(),
+                paths: Vec::new(),
+                hunks: vec![HunkSel::lines("a", 1, 1)],
+                rest: false,
+            },
+            SplitPart {
+                message: "rest\n".to_string(),
+                paths: Vec::new(),
+                hunks: Vec::new(),
+                rest: true,
+            },
+        ];
+        let out = cmd_split(&dir, &branch[1].to_string(), parts, Some(72), false).unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        let branch = commits_since(&repo, base).unwrap();
+        assert_eq!(
+            repo.find_commit(branch[1]).unwrap().message(),
+            Some(FILLED_BODY)
+        );
+        assert_eq!(
+            repo.find_commit(branch[2]).unwrap().message(),
+            Some("rest\n")
+        );
+    }
+
+    #[test]
+    fn squash_melds_fill_and_fixups_and_bare_edits_keep_the_message() {
+        let dir = tmp("meld-fill");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let c1 = commit(&repo, &[base], &[("a", "2\n")], LONG_BODY);
+        let c2 = commit(&repo, &[c1], &[("a", "3\n")], "two");
+        on_branch(&repo, "main", c2);
+        let plan = |action: &str| {
+            Some(vec![
+                (c1.to_string(), "pick".to_string(), None, Vec::new()),
+                (c2.to_string(), action.to_string(), None, Vec::new()),
+            ])
+        };
+        let reset_to = |tip: Oid| {
+            repo.reset(&repo.find_object(tip, None).unwrap(), ResetType::Hard, None)
+                .unwrap()
+        };
+        let tip_msg = || {
+            let tip = repo.head().unwrap().target().unwrap();
+            repo.find_commit(tip)
+                .unwrap()
+                .message()
+                .unwrap()
+                .to_string()
+        };
+        let rebase = |plan| {
+            cmd_rebase(
+                &dir,
+                &base.to_string(),
+                None,
+                plan,
+                None,
+                Some(72),
+                false,
+                false,
+            )
+        };
+        // The meld is authored: both bodies fill, the first's trailers stay.
+        let out = rebase(plan("squash")).unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        assert_eq!(tip_msg(), format!("{}\n\ntwo", FILLED_BODY.trim_end()));
+        // A fixup keeps the target's message, however long.
+        reset_to(c2);
+        rebase(plan("fixup")).unwrap();
+        assert_eq!(tip_msg(), LONG_BODY);
+        // An edit that pauses for the tree keeps the message too …
+        let c3 = commit(&repo, &[c1], &[("a", "3\n")], LONG_BODY);
+        reset_to(c3);
+        let plan_c3 = |action: &str| {
+            Some(vec![
+                (c1.to_string(), "pick".to_string(), None, Vec::new()),
+                (c3.to_string(), action.to_string(), None, Vec::new()),
+            ])
+        };
+        let out = rebase(plan_c3("edit")).unwrap();
+        assert!(out.contains("paused"), "{out}");
+        cmd_continue(&dir, false, &[]).unwrap();
+        assert_eq!(tip_msg(), LONG_BODY);
+        // … while a reword with nothing else fills the commit's own body.
+        reset_to(c3);
+        rebase(plan_c3("reword")).unwrap();
+        assert_eq!(tip_msg(), FILLED_BODY);
+        // A fixup that edits the kept message authors it, so it fills.
+        reset_to(c3);
+        let edits = vec![MsgEditSpec {
+            find: Some("subject".into()),
+            replace: Some("subject!".into()),
+            append: None,
+        }];
+        let plan = Some(vec![
+            (c1.to_string(), "pick".to_string(), None, Vec::new()),
+            (c3.to_string(), "fixup".to_string(), None, edits),
+        ]);
+        rebase(plan).unwrap();
+        assert_eq!(tip_msg(), FILLED_BODY.replacen("subject", "subject!", 1));
+        // An edit that brings a message authors it, so it fills.
+        reset_to(c3);
+        let plan = Some(vec![
+            (c1.to_string(), "pick".to_string(), None, Vec::new()),
+            (
+                c3.to_string(),
+                "edit".to_string(),
+                Some(LONG_BODY.to_string()),
+                Vec::new(),
+            ),
+        ]);
+        let out = rebase(plan).unwrap();
+        assert!(out.contains("paused"), "{out}");
+        cmd_continue(&dir, false, &[]).unwrap();
+        assert_eq!(tip_msg(), FILLED_BODY);
     }
 }
