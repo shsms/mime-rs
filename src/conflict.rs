@@ -29,6 +29,24 @@
 
 use crate::store::TextStore;
 
+tulisp::AsSymbol! {
+    /// A side of a hunk to read or keep.
+    #[lisp(strings)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Side {
+        /// The ours section.
+        Ours<"ours">,
+        /// The theirs section.
+        Theirs<"theirs">,
+        /// The base section; only a diff3 hunk has one.
+        Base<"base">,
+        /// Ours, then theirs.
+        Both<"both">,
+        /// Ours, base and theirs, as `smerge-keep-all` keeps them.
+        All<"all">,
+    }
+}
+
 /// One conflict hunk, in 1-based char positions, half-open spans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hunk {
@@ -208,22 +226,21 @@ pub fn pick(hunks: &[Hunk], n: Option<i64>, point: usize) -> Result<&Hunk, Strin
 /// sections (`base` errs on a non-diff3 hunk); `both` keeps ours then theirs
 /// (smerge has no name for it); `all` keeps ours, base, theirs in order
 /// (`smerge-keep-all`).
-pub fn side_text(b: &dyn TextStore, h: &Hunk, side: &str) -> Result<String, String> {
+pub fn side_text(b: &dyn TextStore, h: &Hunk, side: Side) -> Result<String, String> {
     // Lazy per side: only the sections the request names are materialized.
     let ours = || b.substring(h.ours.0, h.ours.1);
     let theirs = || b.substring(h.theirs.0, h.theirs.1);
     let base = || h.base.map(|(s, e)| b.substring(s, e));
     match side {
-        "ours" => Ok(ours()),
-        "theirs" => Ok(theirs()),
-        "base" => base().ok_or_else(|| "no base section (not a diff3 conflict)".to_string()),
+        Side::Ours => Ok(ours()),
+        Side::Theirs => Ok(theirs()),
+        Side::Base => base().ok_or_else(|| "no base section (not a diff3 conflict)".to_string()),
         // `both`/`all` concatenate the sections `joined_parts` materializes —
         // the one source of truth `side_text_with_warning` also counts danglers
         // across, so the two can't drift on which sections a side means.
-        "both" | "all" => Ok(joined_parts(b, h, side)
+        Side::Both | Side::All => Ok(joined_parts(b, h, side)
             .expect("joined_parts covers both/all")
             .concat()),
-        other => Err(format!("unknown side: {other} (ours|theirs|base|both|all)")),
     }
 }
 
@@ -231,14 +248,14 @@ pub fn side_text(b: &dyn TextStore, h: &Hunk, side: &str) -> Result<String, Stri
 /// theirs]; `all` → [ours, base?, theirs] (base omitted on a non-diff3 hunk,
 /// like `smerge-keep-all`). `None` for the single-section sides, which never
 /// join.
-fn joined_spans(h: &Hunk, side: &str) -> Option<Vec<(usize, usize)>> {
+fn joined_spans(h: &Hunk, side: Side) -> Option<Vec<(usize, usize)>> {
     match side {
-        "both" => Some(vec![h.ours, h.theirs]),
-        "all" => Some(match h.base {
+        Side::Both => Some(vec![h.ours, h.theirs]),
+        Side::All => Some(match h.base {
             Some(base) => vec![h.ours, base, h.theirs],
             None => vec![h.ours, h.theirs],
         }),
-        _ => None,
+        Side::Ours | Side::Theirs | Side::Base => None,
     }
 }
 
@@ -247,7 +264,7 @@ fn joined_spans(h: &Hunk, side: &str) -> Option<Vec<(usize, usize)>> {
 /// source both `side_text` (joins them) and `side_text_with_warning` (joins +
 /// counts danglers) draw from, so a `both`/`all` keep reads the sides only
 /// once.
-fn joined_parts(b: &dyn TextStore, h: &Hunk, side: &str) -> Option<Vec<String>> {
+fn joined_parts(b: &dyn TextStore, h: &Hunk, side: Side) -> Option<Vec<String>> {
     joined_spans(h, side).map(|spans| spans.iter().map(|&(s, e)| b.substring(s, e)).collect())
 }
 
@@ -297,7 +314,7 @@ fn fused_keep_warning(parts: &[String]) -> Option<String> {
 pub fn side_text_with_warning(
     b: &dyn TextStore,
     h: &Hunk,
-    side: &str,
+    side: Side,
 ) -> Result<(String, Option<String>), String> {
     match joined_parts(b, h, side) {
         Some(parts) => Ok((parts.concat(), fused_keep_warning(&parts))),

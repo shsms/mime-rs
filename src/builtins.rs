@@ -87,10 +87,10 @@ fn err(msg: &str) -> Error {
     Error::lisp_error(msg.to_string())
 }
 
-/// Accept a name-like argument — a conflict side, language token, coding
-/// system, checkpoint label, report key — as either a string (`"rust"`) or a
-/// quoted symbol (`'rust`), matching how Lisp callers naturally spell token
-/// values. Free text, paths and regexes stay strings only.
+/// Accept a name-like argument — a language token, coding system, checkpoint
+/// label, report key — as either a string (`"rust"`) or a quoted symbol
+/// (`'rust`), matching how Lisp callers naturally spell token values. Free
+/// text, paths and regexes stay strings only.
 fn name_arg(what: &str, v: &TulispObject) -> Result<String, Error> {
     // Any string passes verbatim — the MCP layer generates string spellings
     // from free-form JSON values, colons and all.
@@ -2204,13 +2204,12 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         ctx.defun(
             "conflict-text",
-            move |side: TulispObject, n: Option<i64>| -> Result<String, Error> {
-                let side = name_arg("conflict side (\"ours\", 'theirs, …)", &side)?;
+            move |side: crate::conflict::Side, n: Option<i64>| -> Result<String, Error> {
                 let mut sess = s.borrow_mut();
                 let b = sess.buffer.as_mut();
                 let hunks = crate::conflict::scan(b);
                 let h = crate::conflict::pick(&hunks, n, b.point()).map_err(|e| err(&e))?;
-                crate::conflict::side_text(&*b, h, &side).map_err(|e| err(&e))
+                crate::conflict::side_text(&*b, h, side).map_err(|e| err(&e))
             },
         );
     }
@@ -2299,10 +2298,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         ctx.defun(
             "conflict-keep",
-            move |side: TulispObject, n: Option<i64>| -> Result<i64, Error> {
-                let side = name_arg("conflict side (\"ours\", 'theirs, …)", &side)?;
+            move |side: crate::conflict::Side, n: Option<i64>| -> Result<i64, Error> {
                 conflict_splice(&s, n, |b, h| {
-                    crate::conflict::side_text_with_warning(b, h, &side).map_err(|e| err(&e))
+                    crate::conflict::side_text_with_warning(b, h, side).map_err(|e| err(&e))
                 })
             },
         );
@@ -2317,8 +2315,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         ctx.defun(
             "conflict-keep-all",
-            move |side: TulispObject| -> Result<i64, Error> {
-                let side = name_arg("conflict side (\"ours\", 'theirs, …)", &side)?;
+            move |side: crate::conflict::Side| -> Result<i64, Error> {
                 let mut sess = s.borrow_mut();
                 let (remaining, warnings) = {
                     let b = sess.buffer.as_mut();
@@ -2326,9 +2323,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                     let mut warnings = Vec::new();
                     let mut plan = Vec::with_capacity(hunks.len());
                     for h in &hunks {
-                        let (text, warning) =
-                            crate::conflict::side_text_with_warning(&*b, h, &side)
-                                .map_err(|e| err(&e))?;
+                        let (text, warning) = crate::conflict::side_text_with_warning(&*b, h, side)
+                            .map_err(|e| err(&e))?;
                         if let Some(w) = warning {
                             warnings.push(w);
                         }
@@ -5326,15 +5322,25 @@ mod tests {
         assert_eq!(report(&r, "left"), "0");
         assert_eq!(report(&r, "text"), "\"o\\n\"");
 
-        // A wrong-typed side names BOTH accepted spellings, not just one.
+        // A wrong-typed side names both accepted types, and it and an unknown
+        // side both name the valid sides.
         let mut ws = trusted(text);
         let e = match ws.run("(conflict-keep 5)") {
             Err(e) => e.to_string(),
             Ok(_) => panic!("wrong-typed side must error"),
         };
-        assert!(e.contains("string or symbol"), "{e}");
-        assert!(e.contains("'theirs"), "names valid spellings: {e}");
+        assert!(e.contains("a symbol or a string for Side"), "{e}");
+        assert!(e.contains("ours, theirs, base, both, all"), "{e}");
         assert!(e.contains("got: 5"), "{e}");
+        let mut ws = trusted(text);
+        let e = match ws.run("(conflict-keep 'mine)") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("unknown side must error"),
+        };
+        assert!(
+            e.contains("unknown Side 'mine'") && e.contains("ours, theirs, base, both, all"),
+            "{e}"
+        );
     }
 
     #[test]
