@@ -1553,7 +1553,7 @@ fn tool_view(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result<
             let (la, lb, body) = read_span(sessions, &session, a, b, Some(version))?;
             format!(
                 "{} @{a}-{b} (lines {la}-{lb}):\n{}{}",
-                spec.kind,
+                spec.thing,
                 number_lines(&body, la),
                 stale_note(sessions, &session)
             )
@@ -1722,7 +1722,7 @@ fn tool_insert_text(
             reject_with_thing(args, "insert_text", &["pos", "anchor"])?;
             let (a, b, version) = resolve_thing(sessions, &session, spec)?;
             thing_version = Some(version);
-            placed = format!(" {where_} the {} @{a}-{b}", spec.kind);
+            placed = format!(" {where_} the {} @{a}-{b}", spec.thing);
             Some(if where_ == "before" { a } else { b })
         }
         None => None,
@@ -2225,7 +2225,7 @@ fn tool_replace_text(
 /// The `thing` selector: `{kind, at | after | before, up?}` names a region by
 /// structure. Parsed once here, resolved by [`resolve_thing`].
 struct ThingSpec {
-    kind: String,
+    thing: crate::builtins::Thing,
     at: ThingAt,
     up: usize,
 }
@@ -2246,7 +2246,7 @@ fn thing_spec(args: &Value, tool: &str) -> Result<Option<ThingSpec>, String> {
     let Some(v) = args.get("thing") else {
         return Ok(None);
     };
-    let kinds = crate::builtins::THING_KINDS.join(", ");
+    let kinds = crate::builtins::Thing::SYMBOL_NAMES.join(", ");
     let Some(obj) = v.as_object() else {
         return Err(format!(
             "{tool}: `thing` must be an object {{kind, at | after | before, up?}}"
@@ -2256,11 +2256,9 @@ fn thing_spec(args: &Value, tool: &str) -> Result<Option<ThingSpec>, String> {
         .get("kind")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{tool}: thing.kind is required — one of {kinds}"))?;
-    if !crate::builtins::THING_KINDS.contains(&kind) {
-        return Err(format!(
-            "{tool}: unknown thing.kind {kind:?} — one of {kinds}"
-        ));
-    }
+    let thing: crate::builtins::Thing = kind
+        .parse()
+        .map_err(|_| format!("{tool}: unknown thing.kind {kind:?} — one of {kinds}"))?;
     let locators: Vec<&str> = ["at", "after", "before"]
         .into_iter()
         .filter(|k| obj.contains_key(*k))
@@ -2295,16 +2293,17 @@ fn thing_spec(args: &Value, tool: &str) -> Result<Option<ThingSpec>, String> {
             .ok_or_else(|| format!("{tool}: thing.up must be a non-negative integer"))?
             as usize,
     };
-    if up > 0 && !matches!(kind, "sexp" | "list") {
+    if up > 0
+        && !matches!(
+            thing,
+            crate::builtins::Thing::Sexp | crate::builtins::Thing::List
+        )
+    {
         return Err(format!(
-            "{tool}: thing.up applies to sexp and list only, not {kind}"
+            "{tool}: thing.up applies to sexp and list only, not {thing}"
         ));
     }
-    Ok(Some(ThingSpec {
-        kind: kind.to_string(),
-        at,
-        up,
-    }))
+    Ok(Some(ThingSpec { thing, at, up }))
 }
 
 fn line_text(
@@ -2324,7 +2323,7 @@ fn line_text(
 /// `lead` says what the tool does with the span; `tail` continues the last
 /// sentence and names the keys the selector excludes.
 fn thing_schema(lead: &str, tail: &str) -> Value {
-    let kinds = crate::builtins::THING_KINDS;
+    let kinds = crate::builtins::Thing::SYMBOL_NAMES;
     let description = format!(
         r#"{lead} {{"kind": "list", "after": "fn main() {{"}} is the block that line opens. With "after", kind `list` takes the LAST list beginning on the line (else the first one after it), while every other kind takes the FIRST thing at or after the line — {{"kind": "sexp", "after": "old(1, 2);"}} is `old`, and a line of the doc comment, attributes or decorators above a defun, or the line its definition starts on, names that defun (a docstring inside the body does not). {{"kind": "sexp", "at": 1234}} is the expression containing a position; "before" the last one ending before the line. kind: {}. "up": N widens a sexp/list by N enclosing groups. Balanced brackets, strings and comments follow the file's language{tail}"#,
         kinds.join(" | ")
@@ -2419,21 +2418,21 @@ fn resolve_thing(
         ws.auto_revert_if_clean();
         ws.version()
     };
-    let kind = spec.kind.as_str();
+    let thing = spec.thing;
     let found = match &spec.at {
         ThingAt::Pos(p) => with_session_of(sessions, session, |s| {
-            crate::builtins::thing_bounds(s, kind, *p, spec.up)
+            crate::builtins::thing_bounds(s, thing, *p, spec.up)
         })?,
         ThingAt::After(pat) => {
             let bol = anchor_line(sessions, session, pat)?;
             with_session_of(sessions, session, |s| {
-                crate::builtins::thing_after(s, kind, bol, spec.up)
+                crate::builtins::thing_after(s, thing, bol, spec.up)
             })?
         }
         ThingAt::Before(pat) => {
             let bol = anchor_line(sessions, session, pat)?;
             with_session_of(sessions, session, |s| {
-                crate::builtins::thing_before(s, kind, bol, spec.up)
+                crate::builtins::thing_before(s, thing, bol, spec.up)
             })?
         }
     };
@@ -2443,7 +2442,7 @@ fn resolve_thing(
             ThingAt::After(t) => format!("after the line {:?}", truncate_for_error(t)),
             ThingAt::Before(t) => format!("before the line {:?}", truncate_for_error(t)),
         };
-        format!("thing: no {kind} {where_}")
+        format!("thing: no {thing} {where_}")
     })?;
     Ok((a, b, version))
 }
@@ -2475,7 +2474,7 @@ fn replace_thing(
     let diff = diff_echo(args, &report.diff);
     Ok(format!(
         "replaced the {} @{a}-{b} (line {line}) with {} chars; point is now {point}{saved}{unsaved}{stale}{view}{diff}",
-        spec.kind,
+        spec.thing,
         replacement.chars().count()
     ))
 }

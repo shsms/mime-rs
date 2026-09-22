@@ -2841,11 +2841,10 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // paragraph defun.
         ctx.defun(
             "bounds-of-thing-at-point",
-            move |thing: TulispObject| -> Result<TulispObject, Error> {
-                let kind = name_arg("THING", &thing)?;
+            move |thing: Thing| -> Result<TulispObject, Error> {
                 let mut sess = s.borrow_mut();
                 let p = sess.buffer.point();
-                Ok(match thing_bounds(&mut sess, &kind, p, 0)? {
+                Ok(match thing_bounds(&mut sess, thing, p, 0)? {
                     Some((a, b)) => TulispObject::cons(
                         TulispObject::from(a as i64),
                         TulispObject::from(b as i64),
@@ -2860,14 +2859,11 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // (thing-at-point THING) — the text of the THING at point, or nil.
         ctx.defun(
             "thing-at-point",
-            move |thing: TulispObject| -> Result<TulispObject, Error> {
-                let kind = name_arg("THING", &thing)?;
+            move |thing: Thing| -> Result<Option<String>, Error> {
                 let mut sess = s.borrow_mut();
                 let p = sess.buffer.point();
-                Ok(match thing_bounds(&mut sess, &kind, p, 0)? {
-                    Some((a, b)) => TulispObject::from(sess.buffer.substring(a, b)),
-                    None => TulispObject::nil(),
-                })
+                let bounds = thing_bounds(&mut sess, thing, p, 0)?;
+                Ok(bounds.map(|(a, b)| sess.buffer.substring(a, b)))
             },
         );
     }
@@ -3225,33 +3221,54 @@ fn scan_err(e: ScanError) -> Error {
     err(&e.to_string())
 }
 
-/// The names `bounds-of-thing-at-point` and the MCP `thing` selector accept.
-pub const THING_KINDS: [&str; 8] = [
-    "sexp",
-    "list",
-    "string",
-    "word",
-    "symbol",
-    "line",
-    "paragraph",
-    "defun",
-];
+tulisp::AsSymbol! {
+    /// A thing to find at a position, as `thing-at-point` and the MCP `thing`
+    /// selector name it: a scanner kind, or a defun from the syntax tree.
+    #[lisp(strings)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Thing {
+        Sexp<"sexp">,
+        List<"list">,
+        Str<"string">,
+        Word<"word">,
+        Symbol<"symbol">,
+        Line<"line">,
+        Paragraph<"paragraph">,
+        Defun<"defun">,
+    }
+}
 
-/// The span of the `kind` thing at `pos` — see `sexp::Scanner::bounds_of` —
-/// with `defun` resolved through the tree-sitter parse as the decorated span of
-/// the enclosing defun. `up` widens a sexp or list by enclosing groups.
+impl Thing {
+    /// The scanner kind that finds this thing; `None` for a defun, which the
+    /// syntax tree finds instead.
+    pub fn kind(self) -> Option<Kind> {
+        Some(match self {
+            Thing::Sexp => Kind::Sexp,
+            Thing::List => Kind::List,
+            Thing::Str => Kind::Str,
+            Thing::Word => Kind::Word,
+            Thing::Symbol => Kind::Symbol,
+            Thing::Line => Kind::Line,
+            Thing::Paragraph => Kind::Paragraph,
+            Thing::Defun => return None,
+        })
+    }
+}
+
+/// The span of the `thing` at `pos` — see `sexp::Scanner::bounds_of` — with
+/// `defun` resolved through the tree-sitter parse as the decorated span of the
+/// enclosing defun. `up` widens a sexp or list by enclosing groups.
 pub fn thing_bounds(
     sess: &mut crate::engine::Session,
-    kind: &str,
+    thing: Thing,
     pos: usize,
     up: usize,
 ) -> Result<Option<(usize, usize)>, Error> {
-    if kind == "defun" {
+    let Some(k) = thing.kind() else {
         return Ok(syntax_of(sess)
             .enclosing_defun(pos)
             .map(|d| (d.start, d.end)));
-    }
-    let k = Kind::parse(kind).ok_or_else(|| unknown_thing(kind))?;
+    };
     // The scanner clamps a position into the accessible region, which would
     // quietly name the LAST thing for a typo'd position; point-max stays valid
     // as the probe for the thing at the region's end.
@@ -3266,29 +3283,22 @@ pub fn thing_bounds(
         .map_err(scan_err)
 }
 
-fn unknown_thing(kind: &str) -> Error {
-    err(&format!(
-        "unknown thing: {kind} (one of {})",
-        THING_KINDS.join(" ")
-    ))
-}
-
-/// The `kind` thing an `after:` anchor names, widened by `up`. `pos` is the
-/// anchor line's start. `list` takes the LAST one beginning on the anchor line,
-/// or — when none begins on it — the first one beginning after the line: an
-/// anchor like `fn main() {` names the block it opens, not the `()` earlier on
-/// the same line. EVERY other kind, `sexp` included, takes the first thing at
-/// or after `pos`, so `old(1, 2);` names `old` rather than the trailing `;` —
+/// The `thing` an `after:` anchor names, widened by `up`. `pos` is the anchor
+/// line's start. `list` takes the LAST one beginning on the anchor line, or —
+/// when none begins on it — the first one beginning after the line: an anchor
+/// like `fn main() {` names the block it opens, not the `()` earlier on the
+/// same line. EVERY other kind, `sexp` included, takes the first thing at or
+/// after `pos`, so `old(1, 2);` names `old` rather than the trailing `;` —
 /// except that a `defun` whose definition starts at or after `pos` counts even
 /// when its decoration (doc comment, attributes) starts above it. Depth-zero
 /// closers on the way are stepped over: the anchor line may sit at any depth.
 pub fn thing_after(
     sess: &mut crate::engine::Session,
-    kind: &str,
+    thing: Thing,
     pos: usize,
     up: usize,
 ) -> Result<Option<(usize, usize)>, Error> {
-    if kind == "defun" {
+    let Some(k) = thing.kind() else {
         // The first defun whose definition starts at or after the line: a
         // line of its decoration, or the line it starts on, names that defun;
         // a line in a body names the next one.
@@ -3298,8 +3308,7 @@ pub fn thing_after(
             .filter(|d| d.node_start >= pos)
             .min_by_key(|d| d.start)
             .map(|d| (d.start, d.end)));
-    }
-    let k = Kind::parse(kind).ok_or_else(|| unknown_thing(kind))?;
+    };
     let lang = lang_of(sess);
     let store = &*sess.buffer;
     let max = store.point_max();
@@ -3377,23 +3386,22 @@ fn constituent(k: Kind, lang: Lang) -> Box<dyn Fn(char) -> bool> {
     }
 }
 
-/// The last `kind` thing ending at or before `pos` (an anchor line's start),
-/// widened by `up`. An opener met on the way back is stepped over.
+/// The last `thing` ending at or before `pos` (an anchor line's start), widened
+/// by `up`. An opener met on the way back is stepped over.
 pub fn thing_before(
     sess: &mut crate::engine::Session,
-    kind: &str,
+    thing: Thing,
     pos: usize,
     up: usize,
 ) -> Result<Option<(usize, usize)>, Error> {
-    if kind == "defun" {
+    let Some(k) = thing.kind() else {
         return Ok(syntax_of(sess)
             .defuns()
             .into_iter()
             .filter(|d| d.end <= pos)
             .max_by_key(|d| d.end)
             .map(|d| (d.start, d.end)));
-    }
-    let k = Kind::parse(kind).ok_or_else(|| unknown_thing(kind))?;
+    };
     let lang = lang_of(sess);
     let store = &*sess.buffer;
     let min = store.point_min();
@@ -4151,12 +4159,14 @@ mod tests {
     /// `thing_after`/`thing_before` driven straight, the way `resolve_thing`
     /// drives them: `pos` is the anchor line's start.
     fn thing_after(ws: &Workspace, kind: &str, pos: usize, up: usize) -> Option<(usize, usize)> {
-        ws.with_session(|s| super::thing_after(s, kind, pos, up))
+        let thing = kind.parse().expect("thing kind");
+        ws.with_session(|s| super::thing_after(s, thing, pos, up))
             .expect("thing_after")
     }
 
     fn thing_before(ws: &Workspace, kind: &str, pos: usize, up: usize) -> Option<(usize, usize)> {
-        ws.with_session(|s| super::thing_before(s, kind, pos, up))
+        let thing = kind.parse().expect("thing kind");
+        ws.with_session(|s| super::thing_before(s, thing, pos, up))
             .expect("thing_before")
     }
 
@@ -6716,7 +6726,7 @@ mod tests {
             Ok(_) => panic!("an unknown thing must fail"),
         };
         assert!(
-            e.contains("unknown thing") && e.contains("paragraph"),
+            e.contains("unknown Thing 'sentence'") && e.contains("paragraph"),
             "{e}"
         );
     }

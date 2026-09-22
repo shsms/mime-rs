@@ -108,19 +108,6 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub fn parse(name: &str) -> Option<Kind> {
-        Some(match name {
-            "sexp" => Kind::Sexp,
-            "list" => Kind::List,
-            "string" => Kind::Str,
-            "word" => Kind::Word,
-            "symbol" => Kind::Symbol,
-            "line" => Kind::Line,
-            "paragraph" => Kind::Paragraph,
-            _ => return None,
-        })
-    }
-
     pub fn name(&self) -> &'static str {
         match self {
             Kind::Sexp => "sexp",
@@ -1347,12 +1334,6 @@ mod tests {
             "last line, no newline"
         );
         assert_eq!(bounds(t, Kind::Paragraph, 3, 0).unwrap(), Some((1, 28)));
-        assert_eq!(Kind::parse("string"), Some(Kind::Str));
-        assert_eq!(
-            Kind::parse("defun"),
-            None,
-            "defun is resolved by the caller"
-        );
         assert_eq!(Kind::Str.name(), "string");
     }
 
