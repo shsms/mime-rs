@@ -2090,7 +2090,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                     Some(l) => name_arg("checkpoint label", &l)?,
                     None => format!("auto-{}", sess.checkpoints.len()),
                 };
-                let cp = Checkpoint::capture(label.clone(), &*sess.buffer);
+                let cp = Checkpoint::capture(label.clone(), &sess);
                 sess.checkpoints.push(cp);
                 Ok(TulispValue::from(label).into_ref(None))
             },
@@ -2108,14 +2108,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                     .iter()
                     .rev()
                     .find(|c| c.label == label)
-                    .map(|c| c.restore());
+                    .map(|c| c.restore(&sess));
                 match restored {
-                    Some(mut store) => {
-                        // The session's stamp is the disk state it last
-                        // synced with; the checkpoint's may predate a save
-                        // since.
-                        let stamp = sess.buffer.file_stamp().cloned();
-                        store.set_file_stamp(stamp);
+                    Some(store) => {
                         sess.buffer = store;
                         Ok(TulispObject::t())
                     }
@@ -3157,6 +3152,7 @@ fn find_file_buffer(s: &SharedSession, path: &str, select: bool) -> Result<Strin
     let mut store: Box<dyn crate::store::TextStore> =
         Box::new(crate::Quire::open(p).map_err(|e| err(&format!("find-file {path}: {e}")))?);
     sess.disk_io = true;
+    sess.reread_generation += 1;
     let unique = sess.unique_buffer_name(store.name());
     if unique != store.name() {
         store.set_name(&unique);
@@ -4764,6 +4760,106 @@ mod tests {
         let r = ws.run(r#"(report "stale" (buffer-stale-p))"#).unwrap();
         let stale = report(&r, "stale");
         assert!(stale.contains("modified"), "got: {stale}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn restore_checkpoint_from_another_buffer_keeps_its_own_file() {
+        let dir = temp_dir("restore-other-file");
+        let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
+        std::fs::write(&a, "a body").unwrap();
+        std::fs::write(&b, "b body").unwrap();
+        let (pa, pb) = (a.to_string_lossy(), b.to_string_lossy());
+
+        // A checkpoint taken in a.txt, restored while b.txt is current, still
+        // visits a.txt: saving it to its visited file leaves b.txt alone.
+        let mut ws = trusted("main-body");
+        let r = ws
+            .run(&format!(
+                r#"(find-file "{pa}")
+                   (checkpoint "a")
+                   (find-file "{pb}")
+                   (restore-checkpoint "a")
+                   (report "file" (buffer-file-name))
+                   (write-file (buffer-file-name))"#
+            ))
+            .unwrap();
+        assert_eq!(report(&r, "file"), format!("\"{pa}\""));
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "b body");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "a body");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn restore_checkpoint_across_a_fresh_find_file_keeps_its_own_stamp() {
+        let dir = temp_dir("restore-refind");
+        let a = dir.join("a.txt");
+        std::fs::write(&a, "ours").unwrap();
+        let pa = a.to_string_lossy();
+
+        // A checkpoint taken before the file is killed and found again: the new
+        // buffer read text this session never wrote, so writing the restored
+        // text over it is refused.
+        let mut ws = trusted("main-body");
+        ws.run(&format!(
+            r#"(find-file "{pa}") (checkpoint "c") (set-buffer "main")"#
+        ))
+        .unwrap();
+        crate::safety::write_atomic(&a, b"external").unwrap();
+        let e = match ws.run(&format!(
+            r#"(kill-buffer "a.txt")
+               (find-file "{pa}")
+               (restore-checkpoint "c")
+               (write-file (buffer-file-name))"#
+        )) {
+            Err(e) => e,
+            Ok(_) => panic!("the write over the external change must be refused"),
+        };
+        assert!(e.contains("refusing to write-file"), "{e}");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "external");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_run_puts_the_reread_count_and_the_sync_back() {
+        let dir = temp_dir("reread-rollback");
+        let a = dir.join("a.txt");
+        std::fs::write(&a, "body").unwrap();
+        let mut ws = Workspace::new(Box::new(crate::Quire::open(&a).unwrap()));
+        let before = ws.with_session(|s| Ok(s.reread_generation)).unwrap();
+        assert!(
+            ws.run(r#"(revert-buffer) (insert "x") (error "stop")"#)
+                .is_err()
+        );
+        let after = ws.with_session(|s| Ok(s.reread_generation)).unwrap();
+        assert_eq!(after, before);
+        // The restored buffer matches its file again, so it reads as clean.
+        assert!(!ws.is_modified());
+
+        // A re-read that left the text as it was keeps the re-read buffer,
+        // which is in sync with its file too.
+        let mut ws = Workspace::new_trusted(Box::new(crate::Quire::open(&a).unwrap()));
+        assert!(
+            ws.run(r#"(revert-buffer) (generate-new-buffer "scratch") (error "stop")"#)
+                .is_err()
+        );
+        assert!(!ws.is_modified());
+
+        // A re-read of another buffer leaves the untouched current one clean.
+        let b = dir.join("b.txt");
+        std::fs::write(&b, "other").unwrap();
+        let mut ws = Workspace::new_trusted(Box::new(crate::Quire::open(&a).unwrap()));
+        let pb = b.to_string_lossy();
+        assert!(
+            ws.run(&format!(
+                r#"(find-file "{pb}") (revert-buffer) (error "stop")"#
+            ))
+            .is_err()
+        );
+        assert!(!ws.is_modified());
 
         std::fs::remove_dir_all(&dir).ok();
     }

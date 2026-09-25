@@ -3476,6 +3476,46 @@ fn a_rehearsed_replace_in_files_keeps_a_full_undo_ring() {
 }
 
 #[test]
+fn a_rehearsal_leaves_a_clean_buffer_clean() {
+    let dir = temp_dir("rehearse-clean");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "one\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+    s.call_ok(1, "open_file", json!({ "path": p }));
+
+    // A rehearsed re-read, then a rehearsed edit of a buffer whose file changed
+    // on disk: each re-reads the file and is rolled back.
+    s.call_ok(
+        2,
+        "run_program",
+        json!({ "path": p, "program": "(revert-buffer)", "rehearse": true }),
+    );
+    std::fs::write(&file, "two, longer\n").unwrap();
+    s.call_ok(
+        3,
+        "replace_text",
+        json!({ "path": p, "pattern": "two", "replacement": "three", "rehearse": true }),
+    );
+
+    let st: Value = serde_json::from_str(&s.call_ok(4, "session_status", json!({}))).unwrap();
+    assert!(
+        st["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["unsaved"] == false),
+        "{st}"
+    );
+    s.call_ok(
+        5,
+        "replace_text",
+        json!({ "path": p, "pattern": "two", "replacement": "four" }),
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "four, longer\n");
+}
+
+#[test]
 fn a_read_only_program_does_not_rewrite_the_file() {
     let dir = temp_dir("no-rewrite");
     let file = dir.join("doc.txt");
@@ -3696,6 +3736,90 @@ fn undo_last_writes_the_rewound_text() {
     let out = s.call_ok(4, "undo_last", json!({ "path": p, "save": false }));
     assert!(out.contains("unsaved"), "got: {out}");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "beta\n");
+}
+
+#[test]
+fn undo_last_across_a_re_read_from_disk_does_not_overwrite_the_file() {
+    let dir = temp_dir("undo-reread");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+
+    s.call_ok(
+        1,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "beta" }),
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "beta\n");
+    // An external writer replaces the file; the next read re-reads it.
+    let external = "written by someone else, a different length\n";
+    std::fs::write(&file, external).unwrap();
+    s.call_ok(2, "view", json!({ "path": p }));
+
+    // Rewinding past the re-read must not write the pre-edit text over the
+    // external content.
+    let err = s.call_err(3, "undo_last", json!({ "path": p }));
+    assert!(err.contains("refusing to save"), "got: {err}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), external);
+}
+
+#[test]
+fn restore_checkpoint_across_a_re_read_from_disk_does_not_overwrite_the_file() {
+    let dir = temp_dir("restore-reread");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+
+    s.call_ok(
+        1,
+        "run_program",
+        json!({ "path": p, "program": "(checkpoint \"cp\")" }),
+    );
+    s.call_ok(
+        2,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "beta" }),
+    );
+    let external = "written by someone else, a different length\n";
+    std::fs::write(&file, external).unwrap();
+    s.call_ok(3, "view", json!({ "path": p }));
+
+    let err = s.call_err(
+        4,
+        "run_program",
+        json!({ "path": p, "program": "(restore-checkpoint \"cp\")" }),
+    );
+    assert!(err.contains("refusing to save"), "got: {err}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), external);
+}
+
+#[test]
+fn restore_checkpoint_after_a_saved_edit_writes_the_checkpoint() {
+    let dir = temp_dir("restore-writes");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+
+    s.call_ok(
+        1,
+        "run_program",
+        json!({ "path": p, "program": "(checkpoint \"cp\")" }),
+    );
+    s.call_ok(
+        2,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "beta" }),
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "beta\n");
+    s.call_ok(
+        3,
+        "run_program",
+        json!({ "path": p, "program": "(restore-checkpoint \"cp\")" }),
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n");
 }
 
 #[test]

@@ -20,19 +20,42 @@ use tulisp::TulispContext;
 pub struct Checkpoint {
     pub label: String,
     snap: Box<dyn TextStore>,
+    /// The session's [`reread_generation`](Session::reread_generation) when
+    /// this was captured — whether the buffer has been re-read from disk since,
+    /// which decides the stamp a restore gets.
+    generation: u64,
 }
 
 impl Checkpoint {
-    pub fn capture(label: String, store: &dyn TextStore) -> Self {
+    /// Capture the session's current buffer.
+    pub fn capture(label: String, sess: &Session) -> Self {
         Checkpoint {
             label,
-            snap: store.snapshot(),
+            snap: sess.buffer.snapshot(),
+            generation: sess.reread_generation,
         }
     }
-    /// A fresh, independent store restored from this checkpoint; the checkpoint
-    /// stays reusable.
-    pub fn restore(&self) -> Box<dyn TextStore> {
-        self.snap.snapshot()
+    /// A fresh, independent store restored from this checkpoint, to become
+    /// `sess`'s buffer; the checkpoint stays reusable.
+    ///
+    /// With no re-read from disk since the capture, the restore takes the
+    /// session's current file stamp: the snapshot's own may predate a save of
+    /// ours since, which would refuse the restored text's save. Across a
+    /// re-read the file now holds text this session never wrote, so the
+    /// snapshot keeps its own stamp and the stale guard refuses to save it over
+    /// that text. The snapshot also keeps its own stamp when the current buffer
+    /// visits a different file, so its text is never saved there.
+    pub fn restore(&self, sess: &Session) -> Box<dyn TextStore> {
+        let mut restored = self.snap.snapshot();
+        let current = sess.buffer.file_stamp();
+        let same_visit = restored
+            .file_stamp()
+            .zip(current)
+            .is_some_and(|(own, cur)| same_file(&own.path, &cur.path));
+        if same_visit && self.generation == sess.reread_generation {
+            restored.set_file_stamp(current.cloned());
+        }
+        restored
     }
     /// An independent copy of this checkpoint (`Checkpoint` is not `Clone`
     /// because `Box<dyn TextStore>` isn't) — `TextStore::snapshot` is O(1)/
@@ -41,6 +64,7 @@ impl Checkpoint {
         Checkpoint {
             label: self.label.clone(),
             snap: self.snap.snapshot(),
+            generation: self.generation,
         }
     }
     /// The content version of the captured state ("equal versions imply equal
@@ -102,6 +126,11 @@ pub struct Session {
     /// sufficient; a per-buffer baseline would be needed before extending it to
     /// the trusted tier's inactive/switched buffers.
     pub synced_version: u64,
+    /// How many times the session has read a file from disk after it began:
+    /// `revert_in_place` (auto-revert and `(revert-buffer)`) and `find-file`.
+    /// Checkpoints and undo-ring entries record it; see
+    /// [`Checkpoint::restore`].
+    pub reread_generation: u64,
 }
 
 impl Session {
@@ -220,16 +249,19 @@ impl Session {
 
 pub type SharedSession = Rc<RefCell<Session>>;
 
-/// What a rehearsal rolls back to: the buffer as it was, how long the kill
-/// ring and the checkpoints were, and a full copy of the undo ring — a
-/// length alone cannot restore a ring at capacity, where the rehearsed
-/// program's own `push_undo` calls (e.g. from `view_echo`'s follow-up read)
-/// evict the ring's oldest entries without changing its length.
+/// What a rehearsal rolls back to: the buffer as it was, how long the kill ring
+/// and the checkpoints were, the re-read generation, the synced version, and a
+/// full copy of the undo ring — a length alone cannot restore a ring at
+/// capacity, where the rehearsed program's own `push_undo` calls (e.g. from
+/// `view_echo`'s follow-up read) evict the ring's oldest entries without
+/// changing its length.
 pub struct RehearsalMark {
     buffer: Box<dyn TextStore>,
     kill_len: usize,
     checkpoints_len: usize,
     undo_ring: Vec<Checkpoint>,
+    reread_generation: u64,
+    synced_version: u64,
 }
 
 /// A warm editing session: a long-lived `TulispContext` over a shared
@@ -349,6 +381,7 @@ impl Workspace {
             disk_io: false,
             syntax_cache: None,
             synced_version,
+            reread_generation: 0,
         }));
 
         let mut ctx = TulispContext::new();
@@ -392,10 +425,7 @@ impl Workspace {
         if self.undo_ring.last().is_some_and(|c| c.version() == v) {
             return;
         }
-        let cp = {
-            let s = self.session.borrow();
-            Checkpoint::capture(format!("undo-{v}"), s.buffer.as_ref())
-        };
+        let cp = Checkpoint::capture(format!("undo-{v}"), &self.session.borrow());
         self.undo_ring.push(cp);
         if self.undo_ring.len() > UNDO_RING_CAP {
             self.undo_ring.remove(0);
@@ -418,11 +448,7 @@ impl Workspace {
             .undo_ring
             .pop()
             .ok_or("nothing to undo (no earlier state on the undo ring)")?;
-        // The session's stamp is the disk state it last synced with; the
-        // snapshot's may predate a save since.
-        let stamp = self.session.borrow().buffer.file_stamp().cloned();
-        let mut restored = cp.restore();
-        restored.set_file_stamp(stamp);
+        let restored = cp.restore(&self.session.borrow());
         self.session.borrow_mut().buffer = restored;
         Ok(())
     }
@@ -483,7 +509,8 @@ impl Workspace {
             for b in &s.inactive {
                 snaps.push((b.name().to_string(), b.version(), b.snapshot()));
             }
-            (s.buffer.name().to_string(), snaps)
+            let pre_run = (s.reread_generation, s.synced_version);
+            (s.buffer.name().to_string(), pre_run, snaps)
         });
         // The current buffer, when it matches its file before the run.
         let pre_clean = {
@@ -495,20 +522,20 @@ impl Workspace {
         let (report, value) = match self.eval_and_report(program, false) {
             Ok(rv) => rv,
             Err(e) => {
-                if let Some((current_name, snaps)) = guard {
+                if let Some((current_name, pre_run, snaps)) = guard {
                     let changed = self.session_changed(&snaps);
                     if self.read_only {
                         // A program that mutated and THEN died must not leave
                         // its edits in a read-only session — restore before
                         // propagating, and the failure is clean (not dirty).
                         if changed {
-                            self.rollback_session(&current_name, snaps);
+                            self.rollback_session(&current_name, pre_run, snaps);
                         }
                         self.last_failure_dirty.set(false);
                     } else if changed {
                         // Transactional: the pre-error edits roll back to the
                         // pre-program state — in every buffer.
-                        self.rollback_session(&current_name, snaps);
+                        self.rollback_session(&current_name, pre_run, snaps);
                         self.last_failure_dirty.set(false);
                         self.last_failure_rolled_back.set(true);
                     }
@@ -521,10 +548,10 @@ impl Workspace {
         // changed, restore the snapshots and reject it. (Programs that only
         // navigate/search/report are unaffected.)
         if self.read_only
-            && let Some((current_name, snaps)) = guard
+            && let Some((current_name, pre_run, snaps)) = guard
             && (report.dirty || self.session_changed(&snaps))
         {
-            self.rollback_session(&current_name, snaps);
+            self.rollback_session(&current_name, pre_run, snaps);
             return Err("session is read-only: program modified the buffer".to_string());
         }
         // A run that left the text as it was (an identity replacement, an edit
@@ -580,9 +607,17 @@ impl Workspace {
     /// Roll the whole session back to the pre-run snapshots: a buffer whose
     /// text changed is restored, a killed buffer comes back, a buffer the
     /// program created is dropped, and the buffer that was current at start is
-    /// current again. A buffer that only moved point keeps its motion.
-    fn rollback_session(&self, current_name: &str, snaps: Vec<(String, u64, Box<dyn TextStore>)>) {
+    /// current again, with the re-read count at its pre-run value (and the
+    /// synced version too, unless the run reverted the current buffer and kept
+    /// it). A buffer that only moved point keeps its motion.
+    fn rollback_session(
+        &self,
+        current_name: &str,
+        (generation, synced_version): (u64, u64),
+        snaps: Vec<(String, u64, Box<dyn TextStore>)>,
+    ) {
         let mut s = self.session.borrow_mut();
+        s.reread_generation = generation;
         let placeholder: Box<dyn TextStore> =
             Box::new(crate::Buffer::from_string("", String::new()));
         let mut pool: Vec<Box<dyn TextStore>> = Vec::with_capacity(1 + s.inactive.len());
@@ -591,18 +626,14 @@ impl Workspace {
         let mut restored: Vec<Box<dyn TextStore>> = Vec::with_capacity(snaps.len());
         for (name, version, snap) in snaps {
             let live = pool.iter().position(|b| b.name() == name);
-            match live {
-                // Killed during the run — the snapshot brings it back.
+            // Same rule as session_changed; a killed buffer (None) comes back.
+            let keep_live = live.filter(|&i| {
+                let b = &pool[i];
+                b.version() == version || b.text() == snap.text()
+            });
+            match keep_live {
+                Some(i) => restored.push(pool.swap_remove(i)),
                 None => restored.push(snap),
-                Some(i) => {
-                    let b = pool.swap_remove(i);
-                    // Same rule as session_changed.
-                    if b.version() != version && b.text() != snap.text() {
-                        restored.push(snap);
-                    } else {
-                        restored.push(b);
-                    }
-                }
             }
         }
         // Whatever is left in the pool was created during the run — dropped.
@@ -612,6 +643,11 @@ impl Workspace {
             .expect("the pre-run current buffer is always in the snapshot set");
         s.buffer = restored.swap_remove(current);
         s.inactive = restored;
+        // The synced version stays only while it still describes the current
+        // buffer: one the run reverted and kept.
+        if s.synced_version != s.buffer.version() {
+            s.synced_version = synced_version;
+        }
     }
 
     /// Dry-run `program` and return the report it *would* produce, then roll
@@ -661,15 +697,21 @@ impl Workspace {
             kill_len: s.kill_ring.len(),
             checkpoints_len: s.checkpoints.len(),
             undo_ring: self.undo_ring.iter().map(Checkpoint::duplicate).collect(),
+            reread_generation: s.reread_generation,
+            synced_version: s.synced_version,
         }
     }
 
     /// Put the session back to `mark`: its buffer, and nothing of what the
     /// rehearsed calls pushed onto the kill ring, the checkpoints or the undo
-    /// ring.
+    /// ring. A re-read the rehearsal made is rolled back with the buffer it
+    /// read, so the re-read generation and the synced version return to the
+    /// mark's too.
     pub fn roll_back(&mut self, mark: RehearsalMark) {
         let mut s = self.session.borrow_mut();
         s.buffer = mark.buffer;
+        s.reread_generation = mark.reread_generation;
+        s.synced_version = mark.synced_version;
         s.kill_ring.truncate(mark.kill_len);
         s.checkpoints.truncate(mark.checkpoints_len);
         drop(s);
@@ -955,6 +997,7 @@ pub(crate) fn revert_in_place(sess: &mut Session) -> Result<(), String> {
     let max = sess.buffer.point_max();
     sess.buffer.goto_char(point.min(max));
     sess.synced_version = sess.buffer.version();
+    sess.reread_generation += 1;
     Ok(())
 }
 
