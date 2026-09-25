@@ -4605,7 +4605,7 @@ fn git_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "git_log",
-            "description": "One line per commit (oid + summary), for `range` (e.g. main..HEAD) or from HEAD; capped at 50. Use to build a rebase plan. stat: true adds each commit's changed files with +/- line counts — the review-a-series view (git log --stat) without a git_show per commit.",
+            "description": "One line per commit (oid, the names pointing at it — branches, remote-tracking branches, tags — and summary), for `range` (e.g. main..HEAD) or from HEAD; capped at 50. Use to build a rebase plan and to see where a stack's branches sit. stat: true adds each commit's changed files with +/- line counts — the review-a-series view (git log --stat) without a git_show per commit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5092,7 +5092,7 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
         "git_log" => (
             Git,
             A::read(),
-            "one line per commit for a range (stat: files + line counts)",
+            "commits with their branch names (oid + names + summary; stat: files + line counts)",
         ),
         "git_show" => (
             Git,

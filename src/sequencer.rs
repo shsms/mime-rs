@@ -33,7 +33,7 @@ use git2::{
     RevertOptions, Sort, build::CheckoutBuilder,
 };
 use serde_json::json;
-use std::{io::Write, path::Path};
+use std::{collections::HashMap, io::Write, path::Path};
 
 type Error = git2::Error;
 
@@ -3082,6 +3082,64 @@ fn push_range_or_rev(
     }
 }
 
+/// The names `git log --decorate` shows, per commit, in its form (not its
+/// order): `HEAD -> branch` (or `HEAD` when detached), then local branches,
+/// remote-tracking branches and `tag: NAME` (annotated tags peeled), each group
+/// sorted by name. Symbolic refs (such as `origin/HEAD`), mime's backups, the
+/// stash and notes are left out.
+fn ref_names(repo: &Repository) -> Result<HashMap<Oid, Vec<String>>, Error> {
+    let mut local: Vec<(Oid, String)> = Vec::new();
+    let mut remote: Vec<(Oid, String)> = Vec::new();
+    let mut tags: Vec<(Oid, String)> = Vec::new();
+    // An unreadable ref is left out, not a failed log.
+    for r in repo.references()?.flatten() {
+        if r.kind() != Some(git2::ReferenceType::Direct) {
+            continue;
+        }
+        let Some(name) = r.name() else { continue };
+        let (bucket, short_name) = if let Some(n) = name.strip_prefix("refs/heads/") {
+            (&mut local, n.to_string())
+        } else if let Some(n) = name.strip_prefix("refs/remotes/") {
+            (&mut remote, n.to_string())
+        } else if let Some(n) = name.strip_prefix("refs/tags/") {
+            (&mut tags, format!("tag: {n}"))
+        } else {
+            continue;
+        };
+        if let Ok(c) = r.peel_to_commit() {
+            bucket.push((c.id(), short_name));
+        }
+    }
+    let head = repo.head().ok();
+    let head_branch = head
+        .as_ref()
+        .filter(|h| h.is_branch())
+        .and_then(|h| h.shorthand().map(str::to_string));
+    let head_oid = head.as_ref().and_then(|h| h.target());
+    let mut out: HashMap<Oid, Vec<String>> = HashMap::new();
+    if let Some(oid) = head_oid {
+        out.entry(oid).or_default().push(match &head_branch {
+            Some(b) => format!("HEAD -> {b}"),
+            None => "HEAD".to_string(),
+        });
+    }
+    for bucket in [&mut local, &mut remote, &mut tags] {
+        bucket.sort();
+        for (oid, name) in bucket.drain(..) {
+            if head_branch.as_deref() == Some(name.as_str()) {
+                continue;
+            }
+            out.entry(oid).or_default().push(name);
+        }
+    }
+    Ok(out)
+}
+
+/// ` (a, b)` for a commit with names, `""` for one without.
+fn decorate(names: Option<&Vec<String>>) -> String {
+    names.map_or_else(String::new, |n| format!(" ({})", n.join(", ")))
+}
+
 /// A one-line-per-commit log of `range` (default: from HEAD), capped at
 /// `limit`. With `stat`, each line is followed by the commit's changed files
 /// (mark, path, +/- line counts) and a totals line — the series-review view.
@@ -3096,6 +3154,7 @@ pub fn log(
         Some(r) => push_range_or_rev(repo, &mut walk, r)?,
         None => walk.push_head()?,
     }
+    let names = ref_names(repo)?;
     let mut out = String::new();
     for (n, oid) in walk.enumerate() {
         if n >= limit {
@@ -3104,8 +3163,9 @@ pub fn log(
         }
         let c = repo.find_commit(oid?)?;
         out.push_str(&format!(
-            "{} {}\n",
+            "{}{} {}\n",
             short(c.id()),
+            decorate(names.get(&c.id())),
             c.summary().unwrap_or("")
         ));
         if stat {
@@ -11206,6 +11266,56 @@ mod tests {
             out.contains("base\n   A f.txt +1 -0\n   1 file(s), +1 -0\n"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn log_names_the_refs_at_each_commit() {
+        let dir = tmp("log-names");
+        let repo = Repository::init(&dir).unwrap();
+        let c1 = commit(&repo, &[], &[("f", "1\n")], "one");
+        let c2 = commit(&repo, &[c1], &[("f", "2\n")], "two");
+        let c3 = commit(&repo, &[c2], &[("f", "3\n")], "three");
+        on_branch(&repo, "top", c3);
+        repo.reference("refs/heads/mid", c2, true, "t").unwrap();
+        repo.reference("refs/remotes/origin/mid", c1, true, "t")
+            .unwrap();
+        repo.reference_symbolic(
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/mid",
+            true,
+            "t",
+        )
+        .unwrap();
+        let sig = Signature::now("t", "t@example.invalid").unwrap();
+        repo.tag(
+            "v1",
+            &repo.find_object(c1, None).unwrap(),
+            &sig,
+            "annotated",
+            true,
+        )
+        .unwrap();
+        repo.reference("refs/mime-backup/top/0", c2, true, "t")
+            .unwrap();
+        // A ref that is not a commit is left out.
+        let tree = repo.find_commit(c2).unwrap().tree_id();
+        repo.reference("refs/tags/tree", tree, true, "t").unwrap();
+        let out = log(&repo, None, 50, false).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], format!("{} (HEAD -> top) three", short(c3)));
+        assert_eq!(lines[1], format!("{} (mid) two", short(c2)));
+        assert_eq!(lines[2], format!("{} (origin/mid, tag: v1) one", short(c1)));
+
+        // Detached, as during a paused rewrite: HEAD alone. Range "top" so the
+        // walk still reaches c3 (a descendant of the detached HEAD, so a bare
+        // `None` walk from HEAD would never visit it).
+        repo.set_head_detached(c2).unwrap();
+        let out = log(&repo, Some("top"), 50, false).unwrap();
+        assert!(
+            out.contains(&format!("{} (HEAD, mid) two", short(c2))),
+            "{out}"
+        );
+        assert!(out.contains(&format!("{} (top) three", short(c3))), "{out}");
     }
 
     #[test]

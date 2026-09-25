@@ -196,9 +196,9 @@ const GIT: &str = r#"— git history workflow —
 In-process rebase/cherry-pick/revert: no network or hooks. With
 commit.gpgsign=true, MIME_EXEC=1 permits the configured OpenPGP signer;
 without it write operations refuse rather than create unsigned commits. The
-worktree is the warm buffer set. Plan with git_log (oid + summary over a
-range like main..HEAD, or a bare rev for its whole history; stat:true
-adds each commit's files + line counts — review a series without a
+worktree is the warm buffer set. Plan with git_log (oid, branch names,
+summary over a range like main..HEAD, or a bare rev for its whole history;
+stat:true adds each commit's files + line counts — review a series without a
 git_show per commit) and git_show (a commit's diff + metadata). git_blame
 {path?, lines?, since?, worktree?} reports which commit last touched each line —
 the find-the-commit half for a fixup/edit plan; `since` scopes to your commits,

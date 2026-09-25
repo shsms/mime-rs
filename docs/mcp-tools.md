@@ -308,7 +308,7 @@ Porcelain status: branch, upstream and ahead/behind counts, every dirty path wit
 
 ## git_log
 
-One line per commit (oid + summary), for `range` (e.g. main..HEAD) or from HEAD; capped at 50. Use to build a rebase plan. stat: true adds each commit's changed files with +/- line counts — the review-a-series view (git log --stat) without a git_show per commit.
+One line per commit (oid, the names pointing at it — branches, remote-tracking branches, tags — and summary), for `range` (e.g. main..HEAD) or from HEAD; capped at 50. Use to build a rebase plan and to see where a stack's branches sit. stat: true adds each commit's changed files with +/- line counts — the review-a-series view (git log --stat) without a git_show per commit.
 
 - `range` — A revision range like main..HEAD, or a bare rev like a branch name for its whole history; omit for HEAD's history.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
