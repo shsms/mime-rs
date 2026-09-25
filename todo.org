@@ -300,6 +300,22 @@ that create a temp dir or file remove it only on the success path; a Drop
 guard (as ~a_thing_edit_refuses_a_buffer_that_changed_under_the_resolve~
 now uses) or ~tempfile~ would clean up on panic too.
 
+** TODO The stale-save guard misses a write that keeps size, mtime and inode [#C]
+:LOGBOOK:
+- State "TODO"       from              [2026-09-25 Fr 23:22]
+:END:
+
+The guard that refuses to save over an outside change compares only the
+file's size, modification time, device and inode (and whether it
+exists). An outside program that rewrites the file in place with the
+same size and then sets the modification time back goes unnoticed: a
+save, or a re-read judged "unchanged", treats the file as ours.
+
+undo_last is affected too: a restored state takes the file's current
+stamp, so it saves over such a change as well, including after a
+(revert-buffer) of a file judged unchanged. Possible fix: also keep a
+cheap content hash in the stamp and compare it when the stat matches.
+
 * MCP / agent UX
 
 The agent-facing tool surface. Recurring lens: conveniences that
@@ -1473,6 +1489,19 @@ Small points the update-refs reviews found and left for later.
   skipped) tip, end to end; two branches at one commit that is not
   rewritten; git_move with ~update_refs: false~; end-to-end MCP tests
   cover only git_fixup and git_reword.
+
+** TODO A scoped replace_text reports its line from the scope's start [#C] :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-25 Fr 23:22]
+:END:
+
+A replace_text call with ~scope: {defun: …}~ reports where it landed
+("replaced 1 occurrence at line N") counted from the start of the scope,
+because line-number-at-pos runs inside the narrowing. Its ambiguity
+error lists match lines counted from the top of the file (match_lines
+widens first). An agent that reads the success line and then views the
+file lands on the wrong line. Count from the top of the file here too
+(save-restriction + widen, as match_lines does).
 
 * Structural editing
 
