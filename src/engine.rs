@@ -690,10 +690,9 @@ impl Workspace {
         // Pre-state: a cheap snapshot (structural sharing for Quire; a clone
         // for the in-memory Buffer) is the diff baseline, and the version stamp
         // decides whether any text changed at all — "equal versions imply equal
-        // text" (store.rs) — so a CLEAN run (every view / search / occur /
-        // read_region) never materializes, copies, or diffs the document. A
-        // clean run never grows the add buffer either, so the snapshot costs no
-        // copy-on-write there.
+        // text" (store.rs) — so a CLEAN run (every view / search / occur) never
+        // materializes, copies, or diffs the document. A clean run never grows
+        // the add buffer either, so the snapshot costs no copy-on-write there.
         let (snap, version_before, len_before, name) = {
             let mut s = self.session.borrow_mut();
             s.reports.clear();
@@ -1027,15 +1026,15 @@ mod tests {
         // Warm-Quire consistency guard: a session that snapshots between
         // programs (the diff baseline) must stay byte-for-byte equal to the
         // in-memory oracle — both the spine (full_text) and a windowed readout
-        // (collect_range, behind buffer-substring/read_region), over a
-        // realistic multibyte, mmap-backed document and several
-        // snapshot-bracketed edits.  NOTE: an *intermittent*, save-safe readout
-        // discrepancy was observed editing plan.org through the warm MCP server
-        // (buffer-substring/read_region returning the wrong window while
-        // full_text/save stayed correct) that this synthetic case does not yet
-        // reproduce — tracked in the friction log.  Multibyte content
-        // throughout (em dashes, tildes) so char positions and byte offsets
-        // diverge — the regime where a piece-tree offset bug bites.
+        // (collect_range, behind buffer-substring/view), over a realistic
+        // multibyte, mmap-backed document and several snapshot-bracketed edits.
+        // NOTE: an *intermittent*, save-safe readout discrepancy was observed
+        // editing plan.org through the warm MCP server (buffer-substring/view
+        // returning the wrong window while full_text/save stayed correct) that
+        // this synthetic case does not yet reproduce — tracked in the friction
+        // log.  Multibyte content throughout (em dashes, tildes) so char
+        // positions and byte offsets diverge — the regime where a piece-tree
+        // offset bug bites.
         let mut text = String::new();
         for i in 0..800 {
             text.push_str(&format!("line {i:04} — körner ~filler~ ‸content here\n"));
@@ -1074,8 +1073,7 @@ mod tests {
             quire.run(p).unwrap();
         }
         // The spine (full_text) and a windowed readout (collect_range, the path
-        // behind buffer-substring/read_region/search) must both match the
-        // oracle.
+        // behind buffer-substring/view/search) must both match the oracle.
         let (q, o) = (quire.text().to_string(), oracle.text().to_string());
         let probe = "(message (buffer-substring (max 1 (- (point-max) 300)) (point-max)))";
         let qr = quire

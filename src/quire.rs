@@ -4350,7 +4350,7 @@ mod tests {
         // Regression for the original-aliasing bug. `save_buffer` once
         // overwrote the very file `Quire` read as its immutable original,
         // mutating those bytes under the live pieces — so file-backed reads
-        // (collect_range, behind substring/read_region/search) returned shifted
+        // (collect_range, behind substring/view/search) returned shifted
         // garbage while full_text (served from the text cache) still looked
         // fine. `safety::write_atomic` (temp + rename) leaves the original
         // inode intact. Open a file, edit so the content shifts, save IN PLACE
@@ -4466,9 +4466,8 @@ mod tests {
         assert_eq!(buf, full.as_bytes(), "streamed bytes equal full_text");
     }
 
-    /// Windowed reads (the `collect_range` path behind
-    /// `substring`/`read_region`) must match the oracle for many ranges, not
-    /// just the whole text.
+    /// Windowed reads (the `collect_range` path behind `substring`/`view`) must
+    /// match the oracle for many ranges, not just the whole text.
     fn assert_reads_in_sync(b: &Buffer, q: &Quire, step: usize) {
         let len = TextStore::char_len(b);
         let probes = [

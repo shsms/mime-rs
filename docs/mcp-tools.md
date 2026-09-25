@@ -36,26 +36,19 @@ Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and retu
 - `view` — Add a rendered viewport around point to the report (true = 4 context lines, or a line count).
 - `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
-## read_region
-
-Return the buffer text between two 1-based char positions [start, end) — or a LINE range via lines: [a, b] — or a structural thing via thing: {kind, at | after | before}. Use this to pull context on demand instead of dumping the whole buffer. Char positions are what conflicts/occur output feeds (@N); the lines form fits 'read around this line'.
-
-- `end` — 1-based end position (exclusive).
-- `lines` — [start, end] 1-based INCLUSIVE line numbers (narrowing-relative, like goto-line), e.g. {lines: [313, 322]} — instead of char positions.
-- `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
-- `session` — Warm session id; defaults to "default" when omitted.
-- `start` — 1-based start position (inclusive). Pass start+end OR lines.
-- `thing` — Read a region named by structure instead of positions: {"kind": "list", "after": "fn main() {"} is the block that line opens. With "after", kind `list` takes the LAST list beginning on the line (else the first one after it), while every other kind takes the FIRST thing at or after the line — {"kind": "sexp", "after": "old(1, 2);"} is `old`. {"kind": "sexp", "at": 1234} is the expression containing a position; "before" the last one ending before the line. kind: sexp | list | string | word | symbol | line | paragraph | defun. "up": N widens a sexp/list by N enclosing groups. Balanced brackets, strings and comments follow the file's language; the result starts with `KIND @START-END (lines A-B):` so a wrong pick is visible. Not combinable with start/end/lines.
-- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
-
 ## view
 
-Render a viewport around the cursor (or a given position): a few lines of context on each side, with a gutter, the current line marked, and a header (flagged 'Narrow' when a restriction is active). Read-only. Coordinate convention everywhere: char positions (@N, point) are ABSOLUTE — feed goto-char; line numbers count from the accessible region's start — feed goto-line.
+Read part of a buffer as numbered lines — the one reading tool. Pass ONE of: `lines: [a, b]` (a line range); `line: N` or `pos: N` with optional `context: N` (the lines around that line or char position, the focus line marked with >); `start` + `end` (the chars [start, end) — the @N positions occur and conflicts print); `thing: {kind, at | after | before}` (a structural unit, echoed as `KIND @START-END (lines A-B):`). With none, the lines around the cursor. Read-only: point never moves. The header flags 'Narrow' when a restriction is active. Coordinate convention everywhere: char positions (@N, point) are ABSOLUTE — feed goto-char; line numbers count from the accessible region's start — feed goto-line.
 
-- `lines` — Context lines on EACH SIDE of the cursor line — a count, not a range (worked example: view {path: "f.rs", pos: 3130, lines: 8} renders 17 lines centered on position 3130). For a line RANGE use read_region {lines: [a, b]}.
+- `context` — Lines shown on EACH side of the line, pos or cursor (default 4).
+- `end` — 1-based end char position (exclusive).
+- `line` — 1-based line to center on (narrowing-relative); pair with context.
+- `lines` — [a, b] 1-based INCLUSIVE line numbers (narrowing-relative, like goto-line), e.g. {lines: [313, 322]}.
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
-- `pos` — 1-based CHAR position to center on (default: current point). To center on a line, first find its position via occur, or read_region {lines: [n, n]}.
+- `pos` — 1-based CHAR position to center on; pair with context.
 - `session` — Warm session id; defaults to "default" when omitted.
+- `start` — 1-based start char position (inclusive); pass with end.
+- `thing` — Read a region named by structure instead of positions: {"kind": "list", "after": "fn main() {"} is the block that line opens. With "after", kind `list` takes the LAST list beginning on the line (else the first one after it), while every other kind takes the FIRST thing at or after the line — {"kind": "sexp", "after": "old(1, 2);"} is `old`. {"kind": "sexp", "at": 1234} is the expression containing a position; "before" the last one ending before the line. kind: sexp | list | string | word | symbol | line | paragraph | defun. "up": N widens a sexp/list by N enclosing groups. Balanced brackets, strings and comments follow the file's language; the result starts with `KIND @START-END (lines A-B):` so a wrong pick is visible. Not combinable with the other forms.
 - `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## insert_text

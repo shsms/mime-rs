@@ -106,6 +106,32 @@ impl Server {
             .expect("text content")
             .to_string()
     }
+
+    /// The buffer text of `start`/`end` (the chars [start, end)) or `lines: [a,
+    /// b]` (whole lines, inclusive), read through run_program with `save:
+    /// false`. `args` also carries `path` or `session` when the call needs one.
+    fn read_text(&mut self, id: i64, args: Value) -> String {
+        let mut call = serde_json::Map::new();
+        for key in ["path", "session"] {
+            if let Some(v) = args.get(key) {
+                call.insert(key.to_string(), v.clone());
+            }
+        }
+        let program = match args.get("lines") {
+            Some(l) => format!(
+                "(save-excursion (goto-line {}) (beginning-of-line) \
+                 (let ((s (point))) (goto-line {}) (end-of-line) \
+                 (buffer-substring s (point))))",
+                l[0], l[1]
+            ),
+            None => format!("(buffer-substring {} {})", args["start"], args["end"]),
+        };
+        call.insert("program".to_string(), json!(program));
+        call.insert("save".to_string(), json!(false));
+        let out = self.call_ok(id, "run_program", Value::Object(call));
+        let report: Value = serde_json::from_str(&out).expect("run_program answers JSON");
+        report["value"].as_str().unwrap_or("").to_string()
+    }
 }
 
 impl Drop for Server {
@@ -113,6 +139,16 @@ impl Drop for Server {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// `view`'s numbered body for `text` from line `first`: the gutter `window`
+/// draws, without the focus mark, one trailing newline ending the last line.
+fn numbered(first: usize, text: &str) -> String {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    body.split('\n')
+        .enumerate()
+        .map(|(i, line)| format!("{:>5}   {line}\n", first + i))
+        .collect()
 }
 
 #[test]
@@ -144,7 +180,7 @@ fn full_session_round_trip_over_stdio() {
         "open_file",
         "open_text",
         "run_program",
-        "read_region",
+        "view",
         "replace_text",
         "occur",
         "conflicts",
@@ -190,8 +226,8 @@ fn full_session_round_trip_over_stdio() {
     );
     assert_eq!(report["reports"]["done"], "1");
 
-    // --- read_region pulls text on demand without mutating ---
-    let region = s.call_ok(5, "read_region", json!({ "start": 1, "end": 6 }));
+    // --- read_text pulls text on demand without mutating ---
+    let region = s.read_text(5, json!({ "start": 1, "end": 6 }));
     assert_eq!(region, "hello");
 
     // --- Lisp checkpoint, mutate, restore-checkpoint, confirm the revert ---
@@ -255,7 +291,7 @@ fn rehearse_previews_an_edit_then_rolls_back_over_stdio() {
 
     // But the live buffer is untouched: a follow-up read still sees "hello
     // world".
-    let region = s.call_ok(4, "read_region", json!({ "start": 1, "end": 12 }));
+    let region = s.read_text(4, json!({ "start": 1, "end": 12 }));
     assert_eq!(region, "hello world");
 
     // And a real run_program afterwards persists normally, proving rehearse
@@ -267,7 +303,7 @@ fn rehearse_previews_an_edit_then_rolls_back_over_stdio() {
     );
     let applied: Value = serde_json::from_str(&applied).unwrap();
     assert_eq!(applied["rehearsed"], false);
-    let confirm = s.call_ok(6, "read_region", json!({ "start": 1, "end": 11 }));
+    let confirm = s.read_text(6, json!({ "start": 1, "end": 11 }));
     assert_eq!(confirm, "hello mime");
 }
 
@@ -379,7 +415,7 @@ fn conflicts_overview_and_resolution_round_trip() {
 
     let out = s.call_ok(4, "conflicts", json!({}));
     assert!(out.contains("no conflicts"), "got: {out}");
-    let text = s.call_ok(5, "read_region", json!({ "start": 1, "end": 19 }));
+    let text = s.read_text(5, json!({ "start": 1, "end": 19 }));
     assert_eq!(text, "intro\ntheirs\ntail\n");
 }
 
@@ -408,7 +444,7 @@ fn replace_text_is_literal_counted_and_quote_safe() {
         json!({ "pattern": "a = b;", "replacement": "a = c;", "all": true }),
     );
     assert!(out.contains("replaced 2 occurrence(s)"), "got: {out}");
-    let text = s.call_ok(4, "read_region", json!({ "start": 1, "end": 22 }));
+    let text = s.read_text(4, json!({ "start": 1, "end": 22 }));
     assert_eq!(text, "a = c;\na = c;\na = c;\n");
 
     // The friction case the tool exists for: patterns/replacements full of
@@ -429,11 +465,7 @@ fn replace_text_is_literal_counted_and_quote_safe() {
         }),
     );
     assert!(out.contains("replaced 1 occurrence"), "got: {out}");
-    let text = s.call_ok(
-        7,
-        "read_region",
-        json!({ "start": 1, "end": 31, "session": "q" }),
-    );
+    let text = s.read_text(7, json!({ "start": 1, "end": 31, "session": "q" }));
     assert_eq!(text, "write!(w, \"\\u{2026} occur \\1\")");
 
     // No match is a proper error that names the pattern — and a true no-op: the
@@ -471,7 +503,7 @@ fn insert_text_appends_at_eob_and_anchors_on_a_unique_line() {
 
     // Append at the end of the buffer.
     s.call_ok(2, "insert_text", json!({ "text": "omega\n", "pos": "eob" }));
-    let out = s.call_ok(3, "read_region", json!({ "lines": [1, 4] }));
+    let out = s.read_text(3, json!({ "lines": [1, 4] }));
     assert_eq!(out, "alpha\nbeta\ngamma\nomega");
 
     // Anchor on a literal LINE: insert after the line matching "beta".
@@ -480,7 +512,7 @@ fn insert_text_appends_at_eob_and_anchors_on_a_unique_line() {
         "insert_text",
         json!({ "text": "\nbeta-note", "anchor": { "pattern": "beta" } }),
     );
-    let out = s.call_ok(5, "read_region", json!({ "lines": [1, 5] }));
+    let out = s.read_text(5, json!({ "lines": [1, 5] }));
     assert_eq!(out, "alpha\nbeta\nbeta-note\ngamma\nomega");
     // ...and before it.
     s.call_ok(
@@ -488,7 +520,7 @@ fn insert_text_appends_at_eob_and_anchors_on_a_unique_line() {
         "insert_text",
         json!({ "text": "pre-gamma\n", "anchor": { "pattern": "gamma", "where": "before" } }),
     );
-    let out = s.call_ok(7, "read_region", json!({ "lines": [1, 6] }));
+    let out = s.read_text(7, json!({ "lines": [1, 6] }));
     assert_eq!(out, "alpha\nbeta\nbeta-note\npre-gamma\ngamma\nomega");
 
     // Ambiguity is an error listing the match lines; a miss names the pattern.
@@ -514,32 +546,156 @@ fn insert_text_appends_at_eob_and_anchors_on_a_unique_line() {
 }
 
 #[test]
-fn read_region_takes_line_ranges_and_view_rejects_them_loudly() {
+fn view_reads_each_form_as_numbered_lines_without_moving_point() {
     let mut s = Server::spawn();
-    s.call_ok(1, "open_text", json!({ "text": "l1\nl2\nl3\nl4\nl5\n" }));
+    s.call_ok(
+        1,
+        "open_text",
+        json!({ "text": "l1\nl2\nl3\nl4\nl5\n", "name": "t.txt" }),
+    );
 
-    // The line form: 1-based inclusive.
-    let out = s.call_ok(2, "read_region", json!({ "lines": [2, 4] }));
-    assert_eq!(out, "l2\nl3\nl4");
+    // A line range, 1-based inclusive. The trailing newline puts point-max on
+    // line 6, as in Emacs.
+    let out = s.call_ok(2, "view", json!({ "lines": [2, 4] }));
+    assert_eq!(
+        out,
+        format!(
+            "\u{2014} t.txt  lines 2-4 of 6 \u{2014}\n{}",
+            numbered(2, "l2\nl3\nl4")
+        )
+    );
+    // start_line/end_line are the same range under guessed names.
+    assert_eq!(
+        s.call_ok(3, "view", json!({ "start_line": 2, "end_line": 4 })),
+        out
+    );
 
-    // Wrong shapes fail loudly with the right form in the error.
-    let err = s.call_err(3, "read_region", json!({ "lines": "2-4" }));
-    assert!(err.contains("[start, end]"), "{err}");
-    let err = s.call_err(4, "view", json!({ "lines": [2, 4] }));
+    // Char positions [4, 9) are "l2\nl3".
+    let out = s.call_ok(4, "view", json!({ "start": 4, "end": 9 }));
+    assert_eq!(
+        out,
+        format!(
+            "\u{2014} t.txt  @4-9 (lines 2-3) \u{2014}\n{}",
+            numbered(2, "l2\nl3")
+        )
+    );
+
+    // Around a line: `context` lines each side, the focus line marked.
+    let out = s.call_ok(5, "view", json!({ "line": 3, "context": 1 }));
     assert!(
-        err.contains("COUNT") && err.contains("read_region"),
-        "a range passed to view names the tool that takes ranges: {err}"
+        out.contains("    2   l2\n")
+            && out.contains("    3 > \u{2038}l3\n")
+            && out.contains("    4   l4\n"),
+        "{out}"
     );
-    let err = s.call_err(
-        5,
-        "read_region",
-        json!({ "lines": [2, 4], "start": 1, "end": 3 }),
+    assert!(!out.contains("l1") && !out.contains("l5"), "{out}");
+    // `count` is `context`; a bare number in `lines` is the old view's count.
+    assert_eq!(s.call_ok(6, "view", json!({ "line": 3, "count": 1 })), out);
+    let around = s.call_ok(7, "view", json!({ "lines": 1 }));
+    assert!(
+        around.contains("    1 > \u{2038}l1\n")
+            && around.contains("    2   l2\n")
+            && !around.contains("l3"),
+        "{around}"
     );
-    assert!(err.contains("not both"), "{err}");
+
+    // Reading never moves point.
+    let pt = s.call_ok(
+        8,
+        "run_program",
+        json!({ "program": "(point)", "save": false }),
+    );
+    let pt: Value = serde_json::from_str(&pt).unwrap();
+    assert_eq!(pt["value"], "1", "{pt}");
 }
 
 #[test]
-fn read_region_resolves_a_thing_by_position_or_anchor_line() {
+fn view_names_its_four_forms_when_the_call_is_ambiguous() {
+    let mut s = Server::spawn();
+    s.call_ok(1, "open_text", json!({ "text": "aaa\nbbb\n" }));
+
+    let err = s.call_err(2, "view", json!({ "lines": [1, 2], "pos": 3 }));
+    assert!(
+        err.contains("lines and line/pos given together") && err.contains("thing:"),
+        "{err}"
+    );
+    let err = s.call_err(3, "view", json!({ "lines": "2-4", "start": 1 }));
+    assert!(
+        err.contains("given together"),
+        "the clash is named before the bad shape: {err}"
+    );
+    let err = s.call_err(4, "view", json!({ "line": 2, "pos": 3 }));
+    assert!(err.contains("pass one"), "{err}");
+    let err = s.call_err(5, "view", json!({ "lines": [1, 2], "context": 2 }));
+    assert!(err.contains("context applies"), "{err}");
+    let err = s.call_err(6, "view", json!({ "start": 1 }));
+    assert!(err.contains("\"end\""), "{err}");
+    let err = s.call_err(7, "view", json!({ "lines": "2-4" }));
+    assert!(err.contains("[start, end]"), "{err}");
+    let err = s.call_err(8, "view", json!({ "end_line": 3 }));
+    assert!(err.contains("start_line"), "{err}");
+    let err = s.call_err(9, "view", json!({ "lines": 3, "context": 2 }));
+    assert!(err.contains("pass one"), "{err}");
+    let err = s.call_err(10, "read_region", json!({ "start": 1, "end": 2 }));
+    assert!(err.contains("unknown tool"), "read_region is gone: {err}");
+}
+
+#[test]
+fn view_counts_lines_within_a_narrowing_and_clamps_past_the_end() {
+    let mut s = Server::spawn();
+    s.call_ok(
+        1,
+        "open_text",
+        json!({ "text": "l1\nl2\nl3\n", "name": "n.txt", "session": "n" }),
+    );
+    s.call_ok(
+        2,
+        "run_program",
+        json!({ "session": "n", "program": "(narrow-to-region 4 9)", "save": false }),
+    );
+    // Line 1 is the first ACCESSIBLE line, and the header says so.
+    let out = s.call_ok(3, "view", json!({ "session": "n", "lines": [1, 1] }));
+    assert_eq!(
+        out,
+        format!(
+            "\u{2014} n.txt  lines 1-1 of 2  Narrow \u{2014}\n{}",
+            numbered(1, "l2")
+        )
+    );
+
+    // An end past the buffer reads to the end instead of failing.
+    s.call_ok(
+        4,
+        "open_text",
+        json!({ "text": "a\nb\n", "name": "p.txt", "session": "p" }),
+    );
+    let out = s.call_ok(5, "view", json!({ "session": "p", "start": 1, "end": 999 }));
+    assert!(out.ends_with(&numbered(1, "a\nb\n")), "{out}");
+}
+
+#[test]
+fn view_range_forms_flag_unsaved_edits() {
+    let dir = temp_dir("view-unsaved");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+    s.call_ok(
+        1,
+        "run_program",
+        json!({ "path": p, "program": "(goto-char (point-max)) (insert \"beta\\n\")", "save": false }),
+    );
+    let out = s.call_ok(2, "view", json!({ "path": p, "lines": [1, 2] }));
+    assert!(out.contains("    2   beta\n"), "{out}");
+    assert!(
+        out.contains("unsaved edits"),
+        "a range read of a dirty buffer says so: {out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn view_resolves_a_thing_by_position_or_anchor_line() {
     let mut s = Server::spawn();
     let text =
         "fn main() {\n    let v = vec![1, (2 + 3)];\n    foo(v);\n}\n\nfn foo(v: Vec<i32>) {}\n";
@@ -549,105 +705,106 @@ fn read_region_resolves_a_thing_by_position_or_anchor_line() {
     let block = "{\n    let v = vec![1, (2 + 3)];\n    foo(v);\n}";
     let out = s.call_ok(
         2,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "list", "after": "fn main() {" } }),
     );
     assert_eq!(
         out,
         format!(
-            "list @11-{} (lines 1-4):\n{block}",
-            11 + block.chars().count()
+            "list @11-{} (lines 1-4):\n{}",
+            11 + block.chars().count(),
+            numbered(1, block)
         )
     );
 
     // By position: 30 is the `1` inside `[1, (2 + 3)]`, which spans 29-41.
-    let out = s.call_ok(
-        3,
-        "read_region",
-        json!({ "thing": { "kind": "list", "at": 30 } }),
+    let out = s.call_ok(3, "view", json!({ "thing": { "kind": "list", "at": 30 } }));
+    assert_eq!(
+        out,
+        format!("list @29-41 (lines 2-2):\n{}", numbered(2, "[1, (2 + 3)]"))
     );
-    assert_eq!(out, "list @29-41 (lines 2-2):\n[1, (2 + 3)]");
     let out = s.call_ok(
         4,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "list", "at": 30, "up": 1 } }),
     );
     assert!(out.starts_with("list @11-56"), "{out}");
-    let out = s.call_ok(
-        5,
-        "read_region",
-        json!({ "thing": { "kind": "sexp", "at": 34 } }),
+    let out = s.call_ok(5, "view", json!({ "thing": { "kind": "sexp", "at": 34 } }));
+    assert_eq!(
+        out,
+        format!("sexp @34-35 (lines 2-2):\n{}", numbered(2, "2"))
     );
-    assert_eq!(out, "sexp @34-35 (lines 2-2):\n2");
     let out = s.call_ok(
         6,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "list", "before": "foo(v);" } }),
     );
-    assert_eq!(out, "list @29-41 (lines 2-2):\n[1, (2 + 3)]");
+    assert_eq!(
+        out,
+        format!("list @29-41 (lines 2-2):\n{}", numbered(2, "[1, (2 + 3)]"))
+    );
     let out = s.call_ok(
         7,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "defun", "after": "fn foo" } }),
     );
     assert!(
-        out.starts_with("defun @") && out.ends_with("fn foo(v: Vec<i32>) {}"),
+        out.starts_with("defun @") && out.ends_with("fn foo(v: Vec<i32>) {}\n"),
         "{out}"
     );
     // The anchor line sits inside the block, so the walk crosses the `}` that
     // closes it at depth zero — but `(v)` began on the line, so it wins.
     let out = s.call_ok(
         17,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "list", "after": "foo(v);" } }),
     );
-    assert_eq!(out, "list @50-53 (lines 3-3):\n(v)");
+    assert_eq!(
+        out,
+        format!("list @50-53 (lines 3-3):\n{}", numbered(3, "(v)"))
+    );
 
     // Errors name the problem.
     let err = s.call_err(
         7,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "string", "at": 30 } }),
     );
     assert!(err.contains("no string at 30"), "{err}");
     let err = s.call_err(
         9,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "list", "after": "fn" } }),
     );
     assert!(err.contains("unique") && err.contains("lines"), "{err}");
     let err = s.call_err(
         10,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "list", "after": "absent" } }),
     );
     assert!(err.contains("no line matches"), "{err}");
-    let err = s.call_err(11, "read_region", json!({ "thing": { "at": 30 } }));
+    let err = s.call_err(11, "view", json!({ "thing": { "at": 30 } }));
     assert!(err.contains("kind"), "{err}");
     let err = s.call_err(
         12,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "list", "at": 30, "after": "x" } }),
     );
     assert!(err.contains("one of"), "{err}");
     let err = s.call_err(
         13,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "string", "at": 30, "up": 1 } }),
     );
     assert!(err.contains("sexp and list"), "{err}");
     let err = s.call_err(
         14,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "list", "at": 30 }, "lines": [1, 2] }),
     );
-    assert!(err.contains("not both"), "{err}");
+    assert!(err.contains("given together"), "{err}");
     s.call_ok(15, "open_text", json!({ "text": "(a b", "name": "u.rs" }));
-    let err = s.call_err(
-        16,
-        "read_region",
-        json!({ "thing": { "kind": "list", "at": 2 } }),
-    );
+    let err = s.call_err(16, "view", json!({ "thing": { "kind": "list", "at": 2 } }));
     assert!(err.contains("Unbalanced parentheses at 1"), "{err}");
 }
 
@@ -669,36 +826,51 @@ fn a_sexp_after_a_line_is_the_first_one_a_list_the_last_the_line_opens() {
     // The first sexp at or after the line start is the call's name.
     let out = s.call_ok(
         2,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "sexp", "after": "old(1, 2);" } }),
     );
-    assert_eq!(out, "sexp @14-17 (lines 2-2):\nold");
+    assert_eq!(
+        out,
+        format!("sexp @14-17 (lines 2-2):\n{}", numbered(2, "old"))
+    );
     // The last list beginning on the same line is its argument list.
     let out = s.call_ok(
         3,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "list", "after": "old(1, 2);" } }),
     );
-    assert_eq!(out, "list @17-23 (lines 2-2):\n(1, 2)");
+    assert_eq!(
+        out,
+        format!("list @17-23 (lines 2-2):\n{}", numbered(2, "(1, 2)"))
+    );
 
     // On the defun's own line the two diverge the other way: the sexp is the
     // `fn` keyword, the list the block the line opens.
     let out = s.call_ok(
         4,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "sexp", "after": "fn f() {" } }),
     );
-    assert_eq!(out, "sexp @1-3 (lines 1-1):\nfn");
+    assert_eq!(
+        out,
+        format!("sexp @1-3 (lines 1-1):\n{}", numbered(1, "fn"))
+    );
     let out = s.call_ok(
         5,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "list", "after": "fn f() {" } }),
     );
-    assert_eq!(out, "list @8-26 (lines 1-3):\n{\n    old(1, 2);\n}");
+    assert_eq!(
+        out,
+        format!(
+            "list @8-26 (lines 1-3):\n{}",
+            numbered(1, "{\n    old(1, 2);\n}")
+        )
+    );
 }
 
 #[test]
-fn read_region_thing_after_with_nothing_left_to_find_is_an_error() {
+fn view_thing_after_with_nothing_left_to_find_is_an_error() {
     let mut s = Server::spawn();
     s.call_ok(
         1,
@@ -710,13 +882,13 @@ fn read_region_thing_after_with_nothing_left_to_find_is_an_error() {
     // must say so, not hand back an empty span.
     let err = s.call_err(
         2,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "word", "after": "---" } }),
     );
     assert!(err.contains("no word after the line"), "{err}");
     let err = s.call_err(
         3,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "symbol", "after": "---" } }),
     );
     assert!(err.contains("no symbol after the line"), "{err}");
@@ -741,7 +913,7 @@ fn replace_text_and_insert_text_take_a_thing() {
         "{out}"
     );
     assert_eq!(
-        s.call_ok(3, "read_region", json!({ "lines": [1, 3] })),
+        s.read_text(3, json!({ "lines": [1, 3] })),
         "fn f() {\n    old(3);\n}"
     );
 
@@ -753,7 +925,7 @@ fn replace_text_and_insert_text_take_a_thing() {
     );
     assert!(out.starts_with("replaced the sexp @14-17"), "{out}");
     assert_eq!(
-        s.call_ok(5, "read_region", json!({ "lines": [1, 3] })),
+        s.read_text(5, json!({ "lines": [1, 3] })),
         "fn f() {\n    new(3);\n}"
     );
 
@@ -771,7 +943,7 @@ fn replace_text_and_insert_text_take_a_thing() {
     );
     assert!(out.contains("after the list @"), "{out}");
     assert_eq!(
-        s.call_ok(8, "read_region", json!({ "lines": [1, 4] })),
+        s.read_text(8, json!({ "lines": [1, 4] })),
         "fn f() {\n    pre();\n    new(3) // done;\n}"
     );
 
@@ -843,18 +1015,17 @@ fn replace_text_and_insert_text_take_a_thing() {
     );
     let err = s.call_err(
         17,
-        "read_region",
+        "view",
         json!({ "thing": { "kind": "sexp", "at": 999999 } }),
     );
     assert!(err.contains("outside the accessible region"), "{err}");
     // "fn f() {\n pre();\n new(3) // done;\n}\n" is 42 chars, so point-max is
     // 43 and the thing there is the last one in the buffer.
-    let out = s.call_ok(
-        18,
-        "read_region",
-        json!({ "thing": { "kind": "line", "at": 43 } }),
+    let out = s.call_ok(18, "view", json!({ "thing": { "kind": "line", "at": 43 } }));
+    assert_eq!(
+        out,
+        format!("line @41-43 (lines 4-4):\n{}", numbered(4, "}\n"))
     );
-    assert_eq!(out, "line @41-43 (lines 4-4):\n}\n");
 }
 
 #[test]
@@ -879,7 +1050,7 @@ fn replace_text_regex_mode_expands_backrefs() {
         }),
     );
     assert!(out.contains("replaced 2 occurrence(s)"), "got: {out}");
-    let text = s.call_ok(3, "read_region", json!({ "start": 1, "end": 31 }));
+    let text = s.read_text(3, json!({ "start": 1, "end": 31 }));
     assert_eq!(text, "John Doe\nJane Roe\nplain line\n");
 
     // Single regex replace reports the remaining matches.
@@ -895,11 +1066,7 @@ fn replace_text_regex_mode_expands_backrefs() {
     );
     assert!(out.contains("replaced 1 occurrence"), "got: {out}");
     assert!(out.contains("2 more match(es) remain"), "got: {out}");
-    let text = s.call_ok(
-        6,
-        "read_region",
-        json!({ "start": 1, "end": 10, "session": "q" }),
-    );
+    let text = s.read_text(6, json!({ "start": 1, "end": 10, "session": "q" }));
     assert_eq!(text, "yx1 x2 x3");
 
     // expect_unique keeps its semantics per pattern: an ambiguous regex is an
@@ -916,11 +1083,7 @@ fn replace_text_regex_mode_expands_backrefs() {
         }),
     );
     assert!(err.contains("expect_unique"), "got: {err}");
-    let text = s.call_ok(
-        8,
-        "read_region",
-        json!({ "start": 1, "end": 10, "session": "q" }),
-    );
+    let text = s.read_text(8, json!({ "start": 1, "end": 10, "session": "q" }));
     assert_eq!(text, "yx1 x2 x3", "ambiguity replaced nothing");
 
     // A regex miss errors like the literal one.
@@ -945,11 +1108,7 @@ fn replace_text_regex_mode_expands_backrefs() {
         }),
     );
     assert!(out.contains("applied 2 edit(s)"), "got: {out}");
-    let text = s.call_ok(
-        11,
-        "read_region",
-        json!({ "start": 1, "end": 9, "session": "q" }),
-    );
+    let text = s.read_text(11, json!({ "start": 1, "end": 9, "session": "q" }));
     assert_eq!(text, "x1 x2 do");
 
     // An unknown mode is a loud error.
@@ -964,7 +1123,7 @@ fn replace_text_regex_mode_expands_backrefs() {
 /// Every literal-taking tool escapes user strings into generated tulisp on the
 /// server (lisp_literal; occur adds regexp-quote / regex_dialect::quote
 /// underneath); one missed path is a silent wrong edit or a false miss.
-/// Round-trip a gauntlet of hostile strings through insert_text → read_region,
+/// Round-trip a gauntlet of hostile strings through insert_text → read_text,
 /// occur, replace_text, and the edits batch, requiring byte-exact results
 /// everywhere.
 #[test]
@@ -996,11 +1155,7 @@ fn literal_tools_round_trip_hostile_strings() {
         );
         let n = case.chars().count() as i64;
         id += 1;
-        let txt = s.call_ok(
-            id,
-            "read_region",
-            json!({ "session": sess, "start": 1, "end": n + 3 }),
-        );
+        let txt = s.read_text(id, json!({ "session": sess, "start": 1, "end": n + 3 }));
         assert_eq!(txt, format!("A{case}B"), "insert round trip, case {i}");
         // occur (exact mode) must find the literal — single-line cases only
         // (occur is line-oriented).
@@ -1020,11 +1175,7 @@ fn literal_tools_round_trip_hostile_strings() {
         assert!(ok.contains("replaced 1 occurrence"), "case {i}: {ok}");
         let m = repl.chars().count() as i64;
         id += 1;
-        let txt = s.call_ok(
-            id,
-            "read_region",
-            json!({ "session": sess, "start": 1, "end": m + 3 }),
-        );
+        let txt = s.read_text(id, json!({ "session": sess, "start": 1, "end": m + 3 }));
         assert_eq!(txt, format!("A{repl}B"), "replace round trip, case {i}");
     }
 
@@ -1048,11 +1199,7 @@ fn literal_tools_round_trip_hostile_strings() {
         }),
     );
     id += 1;
-    let txt = s.call_ok(
-        id,
-        "read_region",
-        json!({ "session": "batch", "start": 1, "end": 11 }),
-    );
+    let txt = s.read_text(id, json!({ "session": "batch", "start": 1, "end": 11 }));
     assert_eq!(txt, "x\t\n\"Q\\S\" y", "batch round trip");
 }
 
@@ -1113,7 +1260,7 @@ fn failed_run_carries_the_programs_reports_and_log() {
         failure["error"].as_str().unwrap().contains("rolled back"),
         "got: {failure}"
     );
-    let text = s.call_ok(4, "read_region", json!({ "start": 1, "end": 6 }));
+    let text = s.read_text(4, json!({ "start": 1, "end": 6 }));
     assert_eq!(text, "hello", "the pre-error edit was rolled back");
 
     // keep_partial:true opts out: the edit persists and the error says how to
@@ -1130,7 +1277,7 @@ fn failed_run_carries_the_programs_reports_and_log() {
         failure["error"].as_str().unwrap().contains("undo_last"),
         "got: {failure}"
     );
-    let text = s.call_ok(6, "read_region", json!({ "start": 1, "end": 14 }));
+    let text = s.read_text(6, json!({ "start": 1, "end": 14 }));
     assert_eq!(
         text, "partial hello",
         "keep_partial kept the pre-error edit"
@@ -1245,11 +1392,7 @@ fn path_reuses_a_session_already_visiting_the_file() {
         1,
         "one warm copy: {status}"
     );
-    let txt = s.call_ok(
-        4,
-        "read_region",
-        json!({ "session": "custom", "start": 1, "end": 5 }),
-    );
+    let txt = s.read_text(4, json!({ "session": "custom", "start": 1, "end": 5 }));
     assert_eq!(
         txt, "beta",
         "the custom session sees the path-addressed edit"
@@ -1301,7 +1444,7 @@ fn auto_revert_refreshes_clean_reads_while_modified_reads_warn() {
     // auto-revert-mode silently re-reads the file on the next read, so the read
     // sees the current content with NO drift warning.
     std::fs::write(&file, "ALPHA external\n").unwrap();
-    let txt = s.call_ok(3, "read_region", json!({ "path": p, "start": 1, "end": 6 }));
+    let txt = s.read_text(3, json!({ "path": p, "start": 1, "end": 6 }));
     assert_eq!(
         txt, "ALPHA",
         "clean+stale buffer auto-reverted to the new file"
@@ -1345,11 +1488,7 @@ fn auto_revert_refreshes_clean_reads_while_modified_reads_warn() {
         "run_program",
         json!({ "path": p, "program": "(revert-buffer)" }),
     );
-    let txt = s.call_ok(
-        10,
-        "read_region",
-        json!({ "path": p, "start": 1, "end": 6 }),
-    );
+    let txt = s.read_text(10, json!({ "path": p, "start": 1, "end": 6 }));
     assert_eq!(txt, "THIRD", "fresh content after explicit revert");
     let view = s.call_ok(11, "view", json!({ "path": p }));
     assert!(!view.contains("WARNING"), "stamp re-armed: {view}");
@@ -1442,7 +1581,7 @@ fn rehearse_auto_reverts_a_clean_drifted_buffer_like_a_run_would() {
             .all(|sess| sess["stale"] == false),
         "the clean buffer was re-read: {status}"
     );
-    let txt = s.call_ok(4, "read_region", json!({ "path": p, "start": 1, "end": 8 }));
+    let txt = s.read_text(4, json!({ "path": p, "start": 1, "end": 8 }));
     assert_eq!(txt, "changed", "rollback kept the reverted text");
 }
 
@@ -1838,7 +1977,7 @@ fn read_only_session_rejects_mutation_over_stdio() {
     assert!(err.contains("read-only"), "run_program error was: {err}");
 
     // ...and the buffer is untouched (a read-only report still works).
-    let region = s.call_ok(4, "read_region", json!({ "start": 1, "end": 10 }));
+    let region = s.read_text(4, json!({ "start": 1, "end": 10 }));
     assert_eq!(region, "reference");
 }
 
@@ -1981,16 +2120,16 @@ fn undo_last_rewinds_one_mutating_call_at_a_time() {
         "replace_text",
         json!({ "pattern": "v1", "replacement": "v2" }),
     );
-    let txt = s.call_ok(4, "read_region", json!({ "start": 1, "end": 3 }));
+    let txt = s.read_text(4, json!({ "start": 1, "end": 3 }));
     assert_eq!(txt, "v2");
 
     // First undo: back to v1. Second: back to v0. Then the ring is dry.
     let u1 = s.call_ok(5, "undo_last", json!({}));
     assert!(u1.contains("rewound"), "undo said: {u1}");
-    let txt = s.call_ok(6, "read_region", json!({ "start": 1, "end": 3 }));
+    let txt = s.read_text(6, json!({ "start": 1, "end": 3 }));
     assert_eq!(txt, "v1");
     s.call_ok(7, "undo_last", json!({}));
-    let txt = s.call_ok(8, "read_region", json!({ "start": 1, "end": 3 }));
+    let txt = s.read_text(8, json!({ "start": 1, "end": 3 }));
     assert_eq!(txt, "v0");
     let err = s.call_err(9, "undo_last", json!({}));
     assert!(err.contains("nothing to undo"), "got: {err}");
@@ -2013,7 +2152,7 @@ fn expect_unique_makes_ambiguous_anchors_an_error() {
         json!({ "pattern": "use a;", "replacement": "use z;", "expect_unique": true }),
     );
     assert!(err.contains("matches at lines 1, 3"), "got: {err}");
-    let txt = s.call_ok(3, "read_region", json!({ "start": 1, "end": 8 }));
+    let txt = s.read_text(3, json!({ "start": 1, "end": 8 }));
     assert_eq!(txt, "use a;\n", "nothing replaced: {txt}");
 
     // A genuinely unique anchor goes through and reports its line.
@@ -2045,7 +2184,7 @@ fn expect_unique_makes_ambiguous_anchors_an_error() {
         err.contains("edit 2") && err.contains("expect_unique"),
         "got: {err}"
     );
-    let txt = s.call_ok(7, "read_region", json!({ "start": 8, "end": 15 }));
+    let txt = s.read_text(7, json!({ "start": 8, "end": 15 }));
     assert_eq!(txt, "use y;\n", "batch rolled back: {txt}");
 }
 
@@ -2294,7 +2433,7 @@ fn outline_scope_and_anchor_drive_structural_edits() {
     );
     assert!(ok.contains("replaced 1"), "got: {ok}");
     let end = src.chars().count() + 1;
-    let txt = s.call_ok(4, "read_region", json!({ "start": 1, "end": end }));
+    let txt = s.read_text(4, json!({ "start": 1, "end": end }));
     assert!(
         txt.contains("alpha() -> i64 {\n    let x = 1;"),
         "alpha untouched: {txt}"
@@ -2494,11 +2633,7 @@ fn multi_file_replace_is_atomic_across_the_set() {
         json!({ "files": [pa.clone()], "pattern": "x", "replacement": "y" }),
     );
     assert!(err.contains("unknown argument \"files\""), "got: {err}");
-    let txt = s.call_ok(
-        3,
-        "read_region",
-        json!({ "path": pa, "start": 1, "end": 9 }),
-    );
+    let txt = s.read_text(3, json!({ "path": pa, "start": 1, "end": 9 }));
     assert_eq!(txt, "new_name", "file a's warm buffer was rolled back");
 }
 
@@ -2877,7 +3012,7 @@ fn fill_text_reflows_comments_and_paragraphs_and_refuses_code() {
         json!({ "path": rs_p, "anchor": { "pattern": "/// aaa" } }),
     );
     assert!(out.contains("filled comment @1-17 (lines 1-1)"), "{out}");
-    let txt = s.call_ok(2, "read_region", json!({ "path": rs_p, "lines": [1, 1] }));
+    let txt = s.read_text(2, json!({ "path": rs_p, "lines": [1, 1] }));
     assert_eq!(txt, "/// aaa bbb ccc");
 
     // Code is refused, naming what the position is in.
@@ -2891,7 +3026,7 @@ fn fill_text_reflows_comments_and_paragraphs_and_refuses_code() {
         json!({ "path": rs_p, "lines": [3, 5], "column": 20 }),
     );
     assert!(out.contains("filled 1 of 1"), "{out}");
-    let txt = s.call_ok(5, "read_region", json!({ "path": rs_p, "lines": [2, 4] }));
+    let txt = s.read_text(5, json!({ "path": rs_p, "lines": [2, 4] }));
     assert_eq!(txt, "fn f() {\n    // ddd eee\n}");
 
     // `all` over a Markdown file, saved: fences survive, paragraphs wrap.
@@ -2918,7 +3053,7 @@ fn fill_text_reflows_comments_and_paragraphs_and_refuses_code() {
         json!({ "path": txt_p, "pos": 1, "prefix": ";; " }),
     );
     assert!(out.contains("filled paragraph @1-12"), "{out}");
-    let txt = s.call_ok(8, "read_region", json!({ "path": txt_p, "lines": [1, 2] }));
+    let txt = s.read_text(8, json!({ "path": txt_p, "lines": [1, 2] }));
     assert_eq!(txt, ";; aaa bbb\nplain");
 
     // Two target forms at once is an error, not a guess.
@@ -2946,7 +3081,7 @@ fn fill_text_survives_non_ascii_and_fills_prefixed_regions() {
     // A range ending after a multi-byte char must not take the server down.
     let out = s.call_ok(1, "fill_text", json!({ "path": rs_p, "lines": [1, 1] }));
     assert!(out.contains("filled 1 of 1"), "{out}");
-    let txt_out = s.call_ok(2, "read_region", json!({ "path": rs_p, "lines": [1, 1] }));
+    let txt_out = s.read_text(2, json!({ "path": rs_p, "lines": [1, 1] }));
     assert_eq!(txt_out, "// café au lait");
 
     let out = s.call_ok(
@@ -2955,7 +3090,7 @@ fn fill_text_survives_non_ascii_and_fills_prefixed_regions() {
         json!({ "path": txt_p, "all": true, "prefix": ";; " }),
     );
     assert!(out.contains("filled 2 of 2"), "{out}");
-    let txt_out = s.call_ok(4, "read_region", json!({ "path": txt_p, "lines": [1, 3] }));
+    let txt_out = s.read_text(4, json!({ "path": txt_p, "lines": [1, 3] }));
     assert_eq!(txt_out, ";; aaa bbb ccc\nplain\n;; ddd eee");
 
     // `all` must be a boolean: a string is an error, not a silent point fill.
@@ -2971,25 +3106,6 @@ fn fill_text_survives_non_ascii_and_fills_prefixed_regions() {
     );
     assert!(err.contains("does not carry the fill-prefix"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// `read_region` names the start/end-vs-lines clash before a bad `lines`.
-#[test]
-fn read_region_reports_the_argument_clash_before_a_bad_line_range() {
-    let mut s = Server::spawn();
-    s.call_ok(
-        1,
-        "open_text",
-        json!({ "text": "aaa\nbbb\n", "session": "r" }),
-    );
-    let err = s.call_err(
-        2,
-        "read_region",
-        json!({ "session": "r", "lines": "2-4", "start": 1 }),
-    );
-    assert!(err.contains("not both"), "{err}");
-    let err = s.call_err(3, "read_region", json!({ "session": "r", "lines": "2-4" }));
-    assert!(err.contains("must be [start, end]"), "{err}");
 }
 
 #[test]
@@ -3288,11 +3404,7 @@ fn a_rehearsed_replace_in_files_keeps_a_full_undo_ring() {
             }
             steps += 1;
         }
-        let text = s.call_ok(
-            500 + k as i64,
-            "read_region",
-            json!({ "path": p, "start": 1, "end": 3 }),
-        );
+        let text = s.read_text(500 + k as i64, json!({ "path": p, "start": 1, "end": 3 }));
         reached.push((steps, text));
     }
     assert_eq!(reached[0], reached[1], "rehearsed vs control");

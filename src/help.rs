@@ -361,7 +361,7 @@ Insert above/below the unique line containing a literal text:
   shorthand for {pattern: "LINE", where: "before"}
 Replace the block after a line (structural — nothing to pattern-match):
   replace_text {path, thing: {kind: "list", after: "fn main() {"}, replacement: "{ … }"}
-  read_region {thing: {kind: "sexp", at: 1234, up: 1}}   ; the form one level out
+  view {thing: {kind: "sexp", at: 1234, up: 1}}   ; the form one level out
 Bulk regex sweep with count:
   run_program: (goto-char (point-min)) (report "n" (replace-regexp "PAT" "REP"))
 Per-match logic:

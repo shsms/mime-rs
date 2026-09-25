@@ -163,7 +163,6 @@ pub(crate) fn tools_call_result(
         "session_status" => tool_session_status(sessions, workspace),
         "open_file" => tool_open_file(&args, sessions).map(Into::into),
         "open_text" => tool_open_text(&args, sessions).map(Into::into),
-        "read_region" => tool_read_region(&args, sessions).map(Into::into),
         "view" => tool_view(&args, sessions).map(Into::into),
         "insert_text" => rehearsed(&args, sessions, tool_insert_text).map(Into::into),
         "replace_text" => rehearsed(&args, sessions, tool_replace_text).map(Into::into),
@@ -209,7 +208,7 @@ fn alias_table(tool: &str) -> &'static [(&'static str, &'static str)] {
             ("position", "pos"),
             ("at", "pos"),
         ],
-        "read_region" => &[("from", "start"), ("to", "end")],
+        "view" => &[("from", "start"), ("to", "end"), ("count", "context")],
         "git_rebase" => &[("upstream", "from"), ("path", "repo")],
         // `path` names a FILE in git_blame, and git_commit's explicit `paths`
         // makes a stray singular `path` too ambiguous to absorb — in both it
@@ -227,6 +226,9 @@ fn alias_table(tool: &str) -> &'static [(&'static str, &'static str)] {
 fn normalize_aliases(tool: &str, args: &mut Value) -> Result<(), String> {
     if tool == "insert_text" {
         normalize_insert_sugar(args)?;
+    }
+    if tool == "view" {
+        normalize_view_guesses(args)?;
     }
     let table = alias_table(tool);
     if table.is_empty() {
@@ -330,6 +332,44 @@ fn normalize_insert_sugar(args: &mut Value) -> Result<(), String> {
     }
     anchor.insert("pattern".to_string(), val);
     anchor.insert("where".to_string(), json!(side));
+    Ok(())
+}
+
+/// view's guessed spellings: `lines: N` (a number) is read as `context: N`, and
+/// `start_line`/`end_line` are a line range spelled as two keys (`start_line`
+/// alone is the line to center on). Mixed with the key they stand for, they are
+/// ambiguous — an error, never a silent pick.
+fn normalize_view_guesses(args: &mut Value) -> Result<(), String> {
+    let Some(obj) = args.as_object_mut() else {
+        return Ok(());
+    };
+    if obj.get("lines").is_some_and(Value::is_i64) {
+        if obj.contains_key("context") {
+            return Err("view: `lines: N` is read as `context: N` — pass one".to_string());
+        }
+        let n = obj.remove("lines").expect("checked above");
+        obj.insert("context".to_string(), n);
+    }
+    match (obj.remove("start_line"), obj.remove("end_line")) {
+        (None, None) => {}
+        (Some(a), Some(b)) => {
+            if obj.contains_key("lines") {
+                return Err(
+                    "view: start_line/end_line spell `lines: [a, b]` — pass one".to_string()
+                );
+            }
+            obj.insert("lines".to_string(), json!([a, b]));
+        }
+        (Some(a), None) => {
+            if obj.contains_key("line") {
+                return Err("view: start_line alone is `line` — pass one".to_string());
+            }
+            obj.insert("line".to_string(), a);
+        }
+        (None, Some(_)) => {
+            return Err("view: end_line needs start_line (or pass lines: [a, b])".to_string());
+        }
+    }
     Ok(())
 }
 
@@ -792,7 +832,7 @@ fn make_workspace(store: Box<dyn TextStore>, read_only: bool) -> Workspace {
 
 /// Run a program against an existing session and return the resulting
 /// `RunReport`; an engine error becomes `Err(message)`. The internal tools that
-/// build on this (read_region, view, …) only read, so they always `run`; see
+/// build on this (view, occur, …) only read, so they always `run`; see
 /// [`run_or_rehearse`] for the user-facing rehearse path.
 fn run_in_session(
     sessions: &mut HashMap<String, Workspace>,
@@ -1278,9 +1318,9 @@ fn stale_edit_note(sessions: &HashMap<String, Workspace>, session: &str) -> &'st
 /// Evaluate `(message EXPR)` in the session and hand back the logged string
 /// verbatim. `message` stores its argument *raw* in the log, so rendered text
 /// comes back without tulisp's string re-quoting (`report` would print
-/// \"hello\" rather than hello). The read-only convenience tools — read_region,
-/// view, occur, conflicts — all ride this channel, so the stale warning lands
-/// on each of them here.
+/// \"hello\" rather than hello). The read-only convenience tools — view, occur,
+/// conflicts — all ride this channel, so the stale warning lands on each of
+/// them here.
 fn run_message(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
@@ -1302,100 +1342,217 @@ fn logged_message(report: &crate::RunReport, what: &str) -> Result<String, Strin
         .ok_or_else(|| format!("{what}: no text returned"))
 }
 
-/// `read_region {session?, start, end}` — the substring `[start, end)`, fetched
-/// on demand via `(buffer-substring START END)` so the agent never has to dump
-/// the whole buffer. Reading does not change the buffer text.
-fn tool_read_region(
-    args: &Value,
-    sessions: &mut HashMap<String, Workspace>,
-) -> Result<String, String> {
-    let session = resolve_session(args, sessions)?;
-    // The structural form: `thing: {kind, at | after | before, up?}` — the
-    // region named by syntax rather than by counted positions. It resolves to a
-    // span here, and the echoed `KIND @START-END (lines A-B)` header makes a
-    // wrong pick visible without a second call.
-    if let Some(spec) = thing_spec(args, "read_region")? {
-        reject_with_thing(args, "read_region", &["start", "end", "lines"])?;
-        let (a, b, version) = resolve_thing(sessions, &session, &spec)?;
-        let program = format!(
-            "(progn (report \"la\" (line-number-at-pos {a})) \
-                    (report \"lb\" (line-number-at-pos (max {a} (- {b} 1)))) \
-                    (message (buffer-substring {a} {b})))"
-        );
-        let r = run_in_session_expecting(sessions, &session, &program, Some(version))?;
-        let la = report_value(&r, "la").unwrap_or_default();
-        let lb = report_value(&r, "lb").unwrap_or_default();
-        let text = logged_message(&r, "read_region")?;
-        return Ok(format!(
-            "{} @{a}-{b} (lines {la}-{lb}):\n{text}{}",
-            spec.kind,
-            stale_note(sessions, &session)
-        ));
-    }
-    // The line-based form: `lines: [a, b]` (1-based inclusive, narrowing-
-    // relative like goto-line) — the natural shape for "read around this line";
-    // start/end stay the char-position form conflicts output feeds.
-    if args.get("lines").is_some() && (args.get("start").is_some() || args.get("end").is_some()) {
-        return Err("read_region: pass start/end (char positions) OR lines, not both".into());
-    }
-    if let Some((a, b)) = line_range_arg(args, "read_region")? {
-        return run_message(
-            sessions,
-            &session,
-            &format!(
-                "(save-excursion (goto-line {a}) (beginning-of-line) \
-                 (let ((s (point))) (goto-line {b}) (end-of-line) \
-                 (buffer-substring s (point))))"
-            ),
-            "read_region",
-        );
-    }
-    let start = int_arg(args, "start")?;
-    let end = int_arg(args, "end")?;
-    run_message(
-        sessions,
-        &session,
-        &format!("(buffer-substring {start} {end})"),
-        "read_region",
-    )
+/// Which of view's four addressing forms a call names.
+enum ViewForm {
+    /// `lines: [a, b]` — whole lines a..=b, inclusive.
+    Lines(i64, i64),
+    /// `start`/`end` — the chars [start, end).
+    Chars(i64, i64),
+    /// `thing` — a structural unit.
+    Thing(ThingSpec),
+    /// `line`/`pos`, or neither (the cursor), with `context` lines each side.
+    Around {
+        center: Center,
+        context: Option<i64>,
+    },
 }
 
-/// `view {session?, lines?, pos?}` — a rendered viewport: `lines` rows of
-/// context on each side of the cursor (or of `pos`), with a gutter, the current
-/// line marked, and a header (buffer name, line/col, point/size). The agent's
-/// "look at the screen". Backed by the `window` builtin; like `read_region`, it
-/// only reads.
+/// What an `Around` view centers on.
+enum Center {
+    Point,
+    Line(i64),
+    Pos(i64),
+}
+
+const VIEW_FORMS: &str = "view takes ONE of: lines: [a, b] (a line range); \
+    line: N or pos: N, with optional context: N (the lines around it); \
+    start + end (char positions [start, end)); \
+    thing: {kind, at | after | before} (a structural unit)";
+
+/// Parse view's arguments into its one addressing form, naming all four when
+/// the call mixes them.
+fn view_form(args: &Value) -> Result<ViewForm, String> {
+    let has = |k: &str| args.get(k).is_some();
+    let named: Vec<&str> = [
+        ("lines", has("lines")),
+        ("line/pos", has("line") || has("pos")),
+        ("start/end", has("start") || has("end")),
+        ("thing", has("thing")),
+    ]
+    .into_iter()
+    .filter_map(|(name, on)| on.then_some(name))
+    .collect();
+    if named.len() > 1 {
+        return Err(format!(
+            "view: {} given together — {VIEW_FORMS}",
+            named.join(" and ")
+        ));
+    }
+    if has("line") && has("pos") {
+        return Err(format!(
+            "view: line and pos both name the center — pass one; {VIEW_FORMS}"
+        ));
+    }
+    if has("context")
+        && let Some(form) = named.first().filter(|f| **f != "line/pos")
+    {
+        return Err(format!(
+            "view: context applies to line/pos or the cursor, not {form}"
+        ));
+    }
+    if let Some(spec) = thing_spec(args, "view")? {
+        return Ok(ViewForm::Thing(spec));
+    }
+    if let Some((a, b)) = line_range_arg(args, "view")? {
+        return Ok(ViewForm::Lines(a, b));
+    }
+    if has("start") || has("end") {
+        let (a, b) = (int_arg(args, "start")?, int_arg(args, "end")?);
+        if b < a {
+            return Err(format!("view: start {a} is after end {b}"));
+        }
+        return Ok(ViewForm::Chars(a, b));
+    }
+    let context = match args.get("context") {
+        None => None,
+        Some(v) => Some(
+            v.as_i64()
+                .filter(|n| *n >= 0)
+                .ok_or("view: `context` is a line count (a non-negative integer)")?,
+        ),
+    };
+    let center = match (args.get("line"), args.get("pos")) {
+        (Some(v), _) => Center::Line(
+            v.as_i64()
+                .filter(|n| *n >= 1)
+                .ok_or("view: `line` is a 1-based line number")?,
+        ),
+        (None, Some(v)) => Center::Pos(
+            v.as_i64()
+                .ok_or("view: `pos` must be a 1-based char position (an integer)")?,
+        ),
+        (None, None) => Center::Point,
+    };
+    Ok(ViewForm::Around { center, context })
+}
+
+/// `view {session?|path?, lines: [a, b] | line/pos (+ context) | start + end
+/// | thing}` — the one reading tool: buffer text as numbered lines. `lines`
+/// is a line range; `line`/`pos` (or neither: the cursor) renders `context`
+/// lines each side of a marked focus line through the `window` builtin;
+/// `start`/`end` are the @N char positions occur and conflicts print; `thing`
+/// names a structural unit, echoed as `KIND @START-END (lines A-B)` so a wrong
+/// pick is visible. Point never moves.
 fn tool_view(args: &Value, sessions: &mut HashMap<String, Workspace>) -> Result<String, String> {
     let session = resolve_session(args, sessions)?;
-    // Both args are optional and map straight onto `(window LINES POS)`; we
-    // build the call positionally, dropping trailing args so `window`'s own
-    // defaults (4 lines, current point) apply when they're omitted.  A wrong
-    // SHAPE must fail loudly, not silently fall back to the default viewport.
-    let lines = match args.get("lines") {
-        None => None,
-        Some(v) => Some(v.as_i64().ok_or_else(|| {
-            "view: `lines` is a context-line COUNT around the cursor (an integer, \
-             e.g. {lines: 8}). To read a LINE RANGE, use read_region {lines: [313, 322]}."
-                .to_string()
-        })?),
-    };
-    let pos = match args.get("pos") {
-        None => None,
-        Some(v) => Some(v.as_i64().ok_or_else(|| {
-            "view: `pos` must be a 1-based char position (an integer)".to_string()
-        })?),
-    };
-    let call = match (lines, pos) {
-        (Some(n), Some(p)) => format!("(window {n} {p})"),
-        (Some(n), None) => format!("(window {n})"),
-        (None, Some(p)) => format!("(window 4 {p})"),
-        (None, None) => "(window)".to_string(),
+    let text = match view_form(args)? {
+        ViewForm::Around { center, context } => {
+            let n = context.unwrap_or(4);
+            let call = match center {
+                Center::Point => format!("(window {n})"),
+                Center::Pos(p) => format!("(window {n} {p})"),
+                Center::Line(l) => {
+                    format!("(window {n} (save-excursion (goto-line {l}) (point)))")
+                }
+            };
+            // run_message carries the stale note itself.
+            run_message(sessions, &session, &call, "view")?
+        }
+        ViewForm::Lines(a, b) => {
+            let program = format!(
+                "(save-excursion (goto-line {a}) (beginning-of-line) \
+                   (let ((s (point))) \
+                     (report \"la\" (line-number-at-pos s)) \
+                     (goto-line {b}) (end-of-line) \
+                     (report \"lb\" (line-number-at-pos (point))) \
+                     (report \"total\" (line-number-at-pos (point-max))) \
+                     (message (buffer-substring s (point)))))"
+            );
+            let r = run_in_session(sessions, &session, &program)?;
+            let (la, lb, total) = (
+                report_usize(&r, "la"),
+                report_usize(&r, "lb"),
+                report_usize(&r, "total"),
+            );
+            let body = logged_message(&r, "view")?;
+            format!(
+                "{}{}{}",
+                view_header(sessions, &session, &format!("lines {la}-{lb} of {total}")),
+                number_lines(&body, la),
+                stale_note(sessions, &session)
+            )
+        }
+        ViewForm::Chars(a, b) => {
+            let (la, lb, body) = read_span(sessions, &session, a, b, None)?;
+            format!(
+                "{}{}{}",
+                view_header(sessions, &session, &format!("@{a}-{b} (lines {la}-{lb})")),
+                number_lines(&body, la),
+                stale_note(sessions, &session)
+            )
+        }
+        ViewForm::Thing(spec) => {
+            let (a, b, version) = resolve_thing(sessions, &session, &spec)?;
+            let (la, lb, body) = read_span(sessions, &session, a, b, Some(version))?;
+            format!(
+                "{} @{a}-{b} (lines {la}-{lb}):\n{}{}",
+                spec.kind,
+                number_lines(&body, la),
+                stale_note(sessions, &session)
+            )
+        }
     };
     // A view of a buffer with unsaved edits says so — an agent alternating mime
-    // reads with shell reads (disk) must see which state it is looking at, at
-    // the moment of looking.
-    let text = run_message(sessions, &session, &call, "view")?;
+    // reads with shell reads (disk) must see which state it is looking at.
     Ok(format!("{text}{}", unsaved_view_note(sessions, &session)))
+}
+
+/// The chars [a, b) of the session's buffer, with the lines its first and last
+/// chars sit on. `expect_version` is [`run_in_session_expecting`]'s.
+fn read_span(
+    sessions: &mut HashMap<String, Workspace>,
+    session: &str,
+    a: impl std::fmt::Display,
+    b: impl std::fmt::Display,
+    expect_version: Option<u64>,
+) -> Result<(usize, usize, String), String> {
+    let program = format!(
+        "(progn (report \"la\" (line-number-at-pos {a})) \
+                (report \"lb\" (line-number-at-pos (max {a} (- {b} 1)))) \
+                (message (buffer-substring {a} {b})))"
+    );
+    let r = run_in_session_expecting(sessions, session, &program, expect_version)?;
+    let body = logged_message(&r, "view")?;
+    Ok((report_usize(&r, "la"), report_usize(&r, "lb"), body))
+}
+
+/// The header line of view's range forms, in `window`'s style: the buffer name,
+/// what is shown, and `Narrow` when a restriction is active (line numbers then
+/// count from the accessible region's start).
+fn view_header(sessions: &HashMap<String, Workspace>, session: &str, what: &str) -> String {
+    let (name, narrowed) = sessions.get(session).map_or((String::new(), false), |ws| {
+        (ws.buffer_name(), ws.is_narrowed())
+    });
+    let narrow = if narrowed { "  Narrow" } else { "" };
+    format!("\u{2014} {name}  {what}{narrow} \u{2014}\n")
+}
+
+/// A numeric report value; 1 (the first line) when absent or not a number.
+fn report_usize(report: &crate::RunReport, key: &str) -> usize {
+    report_value(report, key)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
+/// `text` as numbered lines from line `first`, in the gutter `window` draws (no
+/// focus mark). A trailing newline ends the last line rather than opening an
+/// empty one, so every output line ends in exactly one newline.
+fn number_lines(text: &str, first: usize) -> String {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    body.split('\n')
+        .enumerate()
+        .map(|(i, line)| format!("{:>5}   {line}\n", first + i))
+        .collect()
 }
 
 /// The read-side sibling of [`unsaved_note`]: appended to a viewport when the
@@ -2091,9 +2248,9 @@ fn line_text(
     }
 }
 
-/// The `thing` selector property shared by read_region, insert_text and
-/// replace_text. `lead` says what the tool does with the span; `tail` continues
-/// the last sentence and names the keys the selector excludes.
+/// The `thing` selector property shared by view, insert_text and replace_text.
+/// `lead` says what the tool does with the span; `tail` continues the last
+/// sentence and names the keys the selector excludes.
 fn thing_schema(lead: &str, tail: &str) -> Value {
     let kinds = crate::builtins::THING_KINDS;
     let description = format!(
@@ -4851,12 +5008,11 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             "compare a branch before/after a rewrite, commit by commit",
         ),
 
-        "read_region" => (
+        "view" => (
             Inspection,
             A::read(),
-            "read buffer text between two char positions",
+            "read numbered lines: a range, around a spot, char positions, or a structural thing",
         ),
-        "view" => (Inspection, A::read(), "render a viewport around point"),
         "occur" => (
             Inspection,
             A::read(),
@@ -4918,7 +5074,7 @@ pub(crate) fn instructions() -> String {
          rule-shaped, bulk, regex, structural (tree-sitter), cross-file, or very large \
          changes, plus in-process git rebase/cherry-pick/revert and merge-conflict \
          resolution. For lookup, reach for it where warm state pays: outline to survey a \
-         file, occur to grep an open buffer (narrowing-aware), view / read_region around \
+         file, occur to grep an open buffer (narrowing-aware), view around \
          an edit site, and grep to find the files a cross-file replace_in_files will touch. \
          Opening is implicit: pass `path` to any tool and the \
          file becomes a warm session (or `session` for an in-memory buffer); buffers stay \
@@ -5073,29 +5229,18 @@ fn build_tool_schemas() -> Vec<Value> {
             "outputSchema": run_report_output.clone(),
         }),
         json!({
-            "name": "read_region",
-            "description": "Return the buffer text between two 1-based char positions [start, end) — or a LINE range via lines: [a, b] — or a structural thing via thing: {kind, at | after | before}. Use this to pull context on demand instead of dumping the whole buffer. Char positions are what conflicts/occur output feeds (@N); the lines form fits 'read around this line'.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "start": { "type": "integer", "description": "1-based start position (inclusive). Pass start+end OR lines." },
-                    "end": { "type": "integer", "description": "1-based end position (exclusive)." },
-                    "lines": { "type": "array", "items": { "type": "integer" }, "description": "[start, end] 1-based INCLUSIVE line numbers (narrowing-relative, like goto-line), e.g. {lines: [313, 322]} — instead of char positions." },
-                    "thing": thing_schema("Read a region named by structure instead of positions:", "; the result starts with `KIND @START-END (lines A-B):` so a wrong pick is visible. Not combinable with start/end/lines."),
-                    "session": session,
-                    "path": path,
-                },
-                "required": [],
-            },
-        }),
-        json!({
             "name": "view",
-            "description": "Render a viewport around the cursor (or a given position): a few lines of context on each side, with a gutter, the current line marked, and a header (flagged 'Narrow' when a restriction is active). Read-only. Coordinate convention everywhere: char positions (@N, point) are ABSOLUTE — feed goto-char; line numbers count from the accessible region's start — feed goto-line.",
+            "description": "Read part of a buffer as numbered lines — the one reading tool. Pass ONE of: `lines: [a, b]` (a line range); `line: N` or `pos: N` with optional `context: N` (the lines around that line or char position, the focus line marked with >); `start` + `end` (the chars [start, end) — the @N positions occur and conflicts print); `thing: {kind, at | after | before}` (a structural unit, echoed as `KIND @START-END (lines A-B):`). With none, the lines around the cursor. Read-only: point never moves. The header flags 'Narrow' when a restriction is active. Coordinate convention everywhere: char positions (@N, point) are ABSOLUTE — feed goto-char; line numbers count from the accessible region's start — feed goto-line.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "lines": { "type": "integer", "description": "Context lines on EACH SIDE of the cursor line — a count, not a range (worked example: view {path: \"f.rs\", pos: 3130, lines: 8} renders 17 lines centered on position 3130). For a line RANGE use read_region {lines: [a, b]}." },
-                    "pos": { "type": "integer", "description": "1-based CHAR position to center on (default: current point). To center on a line, first find its position via occur, or read_region {lines: [n, n]}." },
+                    "lines": { "type": "array", "items": { "type": "integer" }, "description": "[a, b] 1-based INCLUSIVE line numbers (narrowing-relative, like goto-line), e.g. {lines: [313, 322]}." },
+                    "line": { "type": "integer", "description": "1-based line to center on (narrowing-relative); pair with context." },
+                    "pos": { "type": "integer", "description": "1-based CHAR position to center on; pair with context." },
+                    "context": { "type": "integer", "description": "Lines shown on EACH side of the line, pos or cursor (default 4)." },
+                    "start": { "type": "integer", "description": "1-based start char position (inclusive); pass with end." },
+                    "end": { "type": "integer", "description": "1-based end char position (exclusive)." },
+                    "thing": thing_schema("Read a region named by structure instead of positions:", "; the result starts with `KIND @START-END (lines A-B):` so a wrong pick is visible. Not combinable with the other forms."),
                     "session": session,
                     "path": path,
                 },
@@ -5886,6 +6031,44 @@ mod git_tool_tests {
         let mut args = json!({ "repo": "/r", "path": "src/a.rs" });
         normalize_aliases("git_blame", &mut args).unwrap();
         assert_eq!(args, json!({ "repo": "/r", "path": "src/a.rs" }));
+    }
+
+    #[test]
+    fn number_lines_ends_every_line_and_drops_one_trailing_newline() {
+        assert_eq!(number_lines("a\nb", 7), "    7   a\n    8   b\n");
+        assert_eq!(number_lines("a\n", 1), "    1   a\n");
+        assert_eq!(number_lines("a\n\n", 1), "    1   a\n    2   \n");
+        assert_eq!(number_lines("", 3), "    3   \n");
+    }
+
+    #[test]
+    fn view_guesses_normalize() {
+        let mut args = json!({ "lines": 3 });
+        normalize_aliases("view", &mut args).unwrap();
+        assert_eq!(args, json!({ "context": 3 }));
+
+        let mut args = json!({ "start_line": 2, "end_line": 5 });
+        normalize_aliases("view", &mut args).unwrap();
+        assert_eq!(args, json!({ "lines": [2, 5] }));
+
+        let mut args = json!({ "start_line": 2 });
+        normalize_aliases("view", &mut args).unwrap();
+        assert_eq!(args, json!({ "line": 2 }));
+
+        let mut args = json!({ "count": 2, "from": 1, "to": 9 });
+        normalize_aliases("view", &mut args).unwrap();
+        assert_eq!(args, json!({ "context": 2, "start": 1, "end": 9 }));
+        validate_args("view", &args).unwrap();
+
+        for bad in [
+            json!({ "end_line": 5 }),
+            json!({ "lines": 3, "context": 2 }),
+            json!({ "start_line": 1, "end_line": 2, "lines": [1, 2] }),
+            json!({ "start_line": 1, "line": 2 }),
+        ] {
+            let mut args = bad.clone();
+            assert!(normalize_aliases("view", &mut args).is_err(), "{bad}");
+        }
     }
 
     #[test]
