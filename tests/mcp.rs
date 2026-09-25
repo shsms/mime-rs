@@ -2253,6 +2253,60 @@ fn expect_unique_makes_ambiguous_anchors_an_error() {
 }
 
 #[test]
+fn ambiguity_errors_name_the_defun_of_each_match() {
+    let dir = temp_dir("ambiguous-defuns");
+    let file = dir.join("lib.rs");
+    std::fs::write(
+        &file,
+        "fn absorb() {\n    step();\n    step();\n}\n\nfn discard() {\n    step();\n}\n\nstatic S: u8 = 0; // step();\n",
+    )
+    .unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+
+    // Each match names its function; one outside any function is a bare line.
+    let err = s.call_err(
+        1,
+        "replace_text",
+        json!({ "path": p, "pattern": "step();", "replacement": "x();", "expect_unique": true }),
+    );
+    assert!(
+        err.contains("matches at lines 2 (absorb), 3 (absorb), 7 (discard), 10 —"),
+        "got: {err}"
+    );
+
+    // A regex is listed the same way.
+    let err = s.call_err(
+        2,
+        "replace_text",
+        json!({ "path": p, "pattern": "st.p();", "mode": "regex", "replacement": "x();",
+                "expect_unique": true }),
+    );
+    assert!(
+        err.contains("matches at lines 2 (absorb), 3 (absorb), 7 (discard), 10 —"),
+        "got: {err}"
+    );
+
+    // Anchors list the defuns too.
+    let err = s.call_err(
+        3,
+        "insert_text",
+        json!({ "path": p, "text": "// here\n", "anchor": { "pattern": "step();" } }),
+    );
+    assert!(
+        err.contains("matches at lines 2 (absorb), 3 (absorb), 7 (discard), 10 —"),
+        "got: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .matches("step();")
+            .count(),
+        4
+    );
+}
+
+#[test]
 fn close_session_releases_and_guards_unsaved_edits() {
     let dir = temp_dir("close");
     let file = dir.join("doc.txt");

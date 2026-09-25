@@ -2594,42 +2594,72 @@ fn regex_mode(args: &Value, what: &str) -> Result<bool, String> {
     }
 }
 
-/// Line numbers of every occurrence of the (already lisp-escaped) pattern
-/// `pat`, as "12, 40, 73" clamped to the first eight — the detail an
-/// expect_unique ambiguity error needs to be actionable. Point is preserved.
-/// The regex form steps over zero-width matches so the sweep terminates.
+/// A Lisp loop running `body` at every occurrence of the (already
+/// lisp-escaped) pattern `pat` from point on. `body` must leave the match data
+/// alone: the loop steps over a zero-width match so the sweep terminates.
+fn each_match(pat: &str, regex: bool, body: &str) -> String {
+    let search = if regex {
+        "re-search-forward"
+    } else {
+        "search-forward"
+    };
+    format!(
+        "(let ((stop nil))\
+           (while (and (not stop) ({search} \"{pat}\" nil t))\
+             {body}\
+             (if (= (match-beginning 0) (match-end 0))\
+                 (if (< (point) (point-max)) (forward-char 1) (setq stop t)))))"
+    )
+}
+
+/// Where every occurrence of the (already lisp-escaped) pattern `pat` is, as
+/// "12 (absorb), 40 (discard), 73" clamped to the first eight: its line and
+/// the defun holding it — the detail an ambiguity error needs to be
+/// actionable. Point is preserved.
 fn match_lines(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
     pat: &str,
     regex: bool,
 ) -> String {
-    let search = if regex {
-        "re-search-forward"
-    } else {
-        "search-forward"
-    };
     let program = format!(
-        "(save-excursion (goto-char (point-min))\
-           (let ((stop nil))\
-             (while (and (not stop) ({search} \"{pat}\" nil t))\
-               (report \"line\" (line-number-at-pos (match-beginning 0)))\
-               (if (= (match-beginning 0) (match-end 0))\
-                   (if (< (point) (point-max)) (forward-char 1) (setq stop t))))))"
+        "(save-excursion (goto-char (point-min)) {})",
+        each_match(
+            pat,
+            regex,
+            "(report \"line\" (line-number-at-pos (match-beginning 0)))\
+             (treesit-defun-name (match-beginning 0))"
+        )
     );
-    let lines: Vec<String> = run_in_session(sessions, session, &program)
-        .map(|r| {
-            r.reports
-                .iter()
-                .filter(|(k, _)| k == "line")
-                .map(|(_, v)| v.clone())
-                .collect()
-        })
+    let reports = run_in_session(sessions, session, &program)
+        .map(|r| r.reports)
         .unwrap_or_default();
-    if lines.len() > 8 {
-        format!("{} … ({} total)", lines[..8].join(", "), lines.len())
+    // `treesit-defun-name` reports the bare name itself, and only for a match
+    // inside a named defun, so a name belongs to the line reported before it.
+    let mut matches: Vec<(String, Option<String>)> = Vec::new();
+    for (key, value) in reports {
+        match key.as_str() {
+            "line" => matches.push((value, None)),
+            "treesit-defun-name" => {
+                if let Some(last) = matches.last_mut() {
+                    last.1 = Some(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    let shown: Vec<String> = matches
+        .iter()
+        .take(8)
+        .map(|(line, defun)| match defun {
+            Some(name) => format!("{line} ({name})"),
+            None => line.clone(),
+        })
+        .collect();
+    if matches.len() > 8 {
+        format!("{} … ({} total)", shown.join(", "), matches.len())
     } else {
-        lines.join(", ")
+        shown.join(", ")
     }
 }
 
