@@ -820,8 +820,11 @@ struct State {
     committed_untracked: Vec<String>,
 }
 
+/// A rewrite's saved state, in each worktree's git dir.
+const STATE_FILE: &str = "mime-sequencer.json";
+
 fn state_path(repo: &Repository) -> std::path::PathBuf {
-    repo.path().join("mime-sequencer.json")
+    repo.path().join(STATE_FILE)
 }
 
 fn save_state(repo: &Repository, st: &State) -> Result<(), Error> {
@@ -2967,6 +2970,265 @@ fn finish(repo: &Repository, st: &State) -> Result<Vec<String>, Error> {
             e.message()
         ))
     })
+}
+
+// ---- branches that move with a rewrite ------------------------------------
+
+/// A branch that moves with a rewrite (a mark): where it was, how many steps
+/// must be processed before its new commit is known (0 = the new base), and
+/// that commit once the replay has passed the boundary.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into begin/finish in the next commit")
+)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BranchMove {
+    branch: String,
+    old: Oid,
+    after: usize,
+    new: Option<Oid>,
+    /// No surviving step replays the branch's own tip: it ends below it.
+    dropped_tip: bool,
+}
+
+/// A ref a rewrite leaves on the old history, and why.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into begin/finish in the next commit")
+)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LeftBehind {
+    /// It has commits of its own on top of `from`, a rewritten commit (or it is
+    /// ahead of the rewritten branch's tip); moving it would drop them.
+    SplitOff {
+        branch: String,
+        from: Oid,
+    },
+    /// Checked out, rewritten, rebased or bisected in another worktree.
+    Busy {
+        branch: String,
+        worktree: String,
+    },
+    Tag {
+        name: String,
+        at: Oid,
+    },
+    /// Would have moved, but the call passed `update_refs: false`.
+    Kept {
+        branch: String,
+        at: Oid,
+    },
+}
+
+/// Where each branch pointing into `base..orig` lands in `steps`: after the
+/// last non-drop step whose commit is the branch's tip or one of its ancestors
+/// in the range, plus the fixup/squash steps folding into that step (stepping
+/// over any drops in between — a no-op for `current`, so they don't break the
+/// fold); with none, on the new base. Returns the marks to move and the refs
+/// left behind. `branch` (the one being rewritten) is never a candidate.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into begin/finish in the next commit")
+)]
+fn place_marks(
+    repo: &Repository,
+    branch: &str,
+    base: Oid,
+    orig: Oid,
+    steps: &[Step],
+    update_refs: bool,
+) -> Result<(Vec<BranchMove>, Vec<LeftBehind>), Error> {
+    let range = range_set(repo, base, orig)?;
+    let busy = busy_branches(repo);
+    let mut marks = Vec::new();
+    let mut left = Vec::new();
+    // A ref that cannot be read, like one that does not peel to a commit, is
+    // not a candidate: it must not fail the rewrite.
+    for r in repo.references()?.flatten() {
+        if r.kind() != Some(git2::ReferenceType::Direct) {
+            continue;
+        }
+        let Some(name) = r.name().map(str::to_string) else {
+            continue;
+        };
+        let tag = name.starts_with("refs/tags/");
+        if !tag && (!name.starts_with("refs/heads/") || name == branch) {
+            continue;
+        }
+        let Ok(tip) = r.peel_to_commit().map(|c| c.id()) else {
+            continue;
+        };
+        if tag {
+            if range.contains(&tip) {
+                left.push(LeftBehind::Tag { name, at: tip });
+            }
+            continue;
+        }
+        if !range.contains(&tip) {
+            // Not in the range: split off from it (or ahead of orig) when its
+            // merge base with orig is a rewritten commit.
+            if let Ok(mb) = repo.merge_base(tip, orig)
+                && range.contains(&mb)
+            {
+                left.push(LeftBehind::SplitOff {
+                    branch: name,
+                    from: mb,
+                });
+            }
+            continue;
+        }
+        if let Some(wt) = busy.get(&name) {
+            left.push(LeftBehind::Busy {
+                branch: name,
+                worktree: wt.clone(),
+            });
+            continue;
+        }
+        if !update_refs {
+            left.push(LeftBehind::Kept {
+                branch: name,
+                at: tip,
+            });
+            continue;
+        }
+        let own = range_set(repo, base, tip)?;
+        let last = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.action != Action::Drop && own.contains(&s.commit))
+            .map(|(i, _)| i)
+            .next_back();
+        let mut after = last.map_or(0, |i| i + 1);
+        if last.is_some() {
+            // Extend through the fixup/squash steps folding into the landing
+            // step, stepping over any drops in between (a no-op for `current`
+            // — `drive` never moves it) without letting a bare drop with no
+            // fold after it drag the boundary past a branch's own dropped tip.
+            let mut probe = after;
+            while probe < steps.len()
+                && matches!(
+                    steps[probe].action,
+                    Action::Fixup | Action::Squash | Action::Drop
+                )
+            {
+                if matches!(steps[probe].action, Action::Fixup | Action::Squash) {
+                    after = probe + 1;
+                }
+                probe += 1;
+            }
+        }
+        let dropped_tip = !steps
+            .iter()
+            .any(|s| s.action != Action::Drop && s.commit == tip);
+        marks.push(BranchMove {
+            branch: name,
+            old: tip,
+            after,
+            new: None,
+            dropped_tip,
+        });
+    }
+    Ok((marks, left))
+}
+
+/// The commits of `base..tip`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into begin/finish in the next commit")
+)]
+fn range_set(
+    repo: &Repository,
+    base: Oid,
+    tip: Oid,
+) -> Result<std::collections::HashSet<Oid>, Error> {
+    let mut walk = repo.revwalk()?;
+    walk.push(tip)?;
+    walk.hide(base)?;
+    walk.collect()
+}
+
+/// Branches another worktree has in use — full refname → that worktree's
+/// path. As git counts them: its HEAD, a rebase or bisect in progress there,
+/// and the branches that rebase will move (`--update-refs`); and the branch of
+/// a mime rewrite in progress there (its state file). The main worktree counts
+/// when `repo` is a linked one. A worktree whose path cannot be read is named
+/// by its name.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into begin/finish in the next commit")
+)]
+fn busy_branches(repo: &Repository) -> HashMap<String, String> {
+    let common = repo.commondir().to_path_buf();
+    let mut gitdirs: Vec<(std::path::PathBuf, String)> = Vec::new();
+    if let Some(main_wt) = common.parent() {
+        gitdirs.push((common.clone(), main_wt.display().to_string()));
+    }
+    // Each linked worktree's gitdir is `<common>/worktrees/<name>`: list the
+    // directory itself, so one libgit2 cannot open (a missing `gitdir` file,
+    // say) still has its HEAD and state files read. Such a worktree is named by
+    // its name, as its path is unknown.
+    if let Ok(entries) = std::fs::read_dir(common.join("worktrees")) {
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = repo.find_worktree(&name).map_or_else(
+                |_| name.clone(),
+                |wt| {
+                    wt.path()
+                        .display()
+                        .to_string()
+                        .trim_end_matches('/')
+                        .to_string()
+                },
+            );
+            gitdirs.push((entry.path(), path));
+        }
+    }
+    let here = repo.path().canonicalize().ok();
+    let read = |p: std::path::PathBuf| std::fs::read_to_string(p).ok();
+    let mut out = HashMap::new();
+    for (gitdir, path) in gitdirs {
+        if gitdir.canonicalize().ok() == here {
+            continue;
+        }
+        let mut names: Vec<String> = Vec::new();
+        if let Some(h) = read(gitdir.join("HEAD"))
+            && let Some(r) = h.trim().strip_prefix("ref: ")
+        {
+            names.push(r.to_string());
+        }
+        if let Some(s) = read(gitdir.join(STATE_FILE))
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&s)
+            && let Some(b) = v["branch"].as_str()
+        {
+            names.push(b.to_string());
+        }
+        for f in ["rebase-merge/head-name", "rebase-apply/head-name"] {
+            if let Some(h) = read(gitdir.join(f)) {
+                names.push(h.trim().to_string());
+            }
+        }
+        // Three lines per branch the rebase will move: its refname, its old
+        // commit and its new one (zeros until the rebase writes it).
+        if let Some(s) = read(gitdir.join("rebase-merge/update-refs")) {
+            names.extend(s.lines().step_by(3).map(|l| l.trim().to_string()));
+        }
+        // The branch bisect started from, or a full commit id when it started
+        // detached. A short hex name such as `cafe` is a branch.
+        if let Some(b) = read(gitdir.join("BISECT_START")) {
+            let b = b.trim();
+            let id = matches!(b.len(), 40 | 64) && b.bytes().all(|c| c.is_ascii_hexdigit());
+            if !id {
+                names.push(format!("refs/heads/{b}"));
+            }
+        }
+        for n in names.into_iter().filter(|n| n.starts_with("refs/heads/")) {
+            out.entry(n).or_insert_with(|| path.clone());
+        }
+    }
+    out
 }
 
 // ---- read-only inspection -------------------------------------------------
@@ -12054,5 +12316,297 @@ mod tests {
         assert!(out.contains("paused"), "{out}");
         cmd_continue(&dir, false, &[]).unwrap();
         assert_eq!(tip_msg(), FILLED_BODY);
+    }
+
+    // ---- branches that move with a rewrite --------------------------------
+
+    /// A linear stack a1 ← a2 ← b1 ← c1 on `base`, with branches a (a2), b (b1)
+    /// and HEAD on c (c1). Returns (repo, base, [a1, a2, b1, c1]).
+    fn stack(tag: &str) -> (Repository, Oid, [Oid; 4]) {
+        let dir = tmp(tag);
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("f", "0\n")], "base");
+        let a1 = commit(&repo, &[base], &[("f", "0\n"), ("a", "1\n")], "a1");
+        let a2 = commit(&repo, &[a1], &[("f", "0\n"), ("a", "2\n")], "a2");
+        let b1 = commit(
+            &repo,
+            &[a2],
+            &[("f", "0\n"), ("a", "2\n"), ("b", "1\n")],
+            "b1",
+        );
+        let c1 = commit(
+            &repo,
+            &[b1],
+            &[("f", "0\n"), ("a", "2\n"), ("b", "1\n"), ("c", "1\n")],
+            "c1",
+        );
+        repo.reference("refs/heads/main", base, true, "t").unwrap();
+        repo.reference("refs/heads/a", a2, true, "t").unwrap();
+        repo.reference("refs/heads/b", b1, true, "t").unwrap();
+        on_branch(&repo, "c", c1);
+        (repo, base, [a1, a2, b1, c1])
+    }
+
+    fn picks(oids: &[Oid]) -> Vec<Step> {
+        oids.iter().map(|o| step(*o, Action::Pick, None)).collect()
+    }
+
+    fn after_of(marks: &[BranchMove], branch: &str) -> usize {
+        marks
+            .iter()
+            .find(|m| m.branch == format!("refs/heads/{branch}"))
+            .unwrap_or_else(|| panic!("no mark for {branch}: {marks:?}"))
+            .after
+    }
+
+    #[test]
+    fn marks_sit_after_each_branchs_last_commit() {
+        let (repo, base, [a1, a2, b1, c1]) = stack("marks-stack");
+        let (marks, left) = place_marks(
+            &repo,
+            "refs/heads/c",
+            base,
+            c1,
+            &picks(&[a1, a2, b1, c1]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(after_of(&marks, "a"), 2);
+        assert_eq!(after_of(&marks, "b"), 3);
+        assert!(
+            marks.iter().all(|m| m.branch != "refs/heads/main"),
+            "the base stays"
+        );
+        assert!(
+            marks.iter().all(|m| m.branch != "refs/heads/c"),
+            "the rewritten branch"
+        );
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn a_fixup_folded_into_a_branch_tip_keeps_the_branch_on_the_fold() {
+        let (repo, base, [a1, a2, b1, c1]) = stack("marks-fixup");
+        // c1 folded into a2 (autosquash moves it right after its target).
+        let steps = vec![
+            step(a1, Action::Pick, None),
+            step(a2, Action::Pick, None),
+            step(c1, Action::Fixup, None),
+            step(b1, Action::Pick, None),
+        ];
+        let (marks, _) = place_marks(&repo, "refs/heads/c", base, c1, &steps, true).unwrap();
+        assert_eq!(after_of(&marks, "a"), 3, "a2 plus the fold");
+        assert_eq!(after_of(&marks, "b"), 4);
+    }
+
+    #[test]
+    fn a_fixup_folds_through_a_dropped_step_in_between() {
+        let (repo, base, [a1, a2, b1, c1]) = stack("marks-fixup-over-drop");
+        // b1 dropped (a no-op for `current`), then c1 folds into a2's result —
+        // the branch still lands on the combined commit, past the drop.
+        let mut steps = picks(&[a1, a2, b1, c1]);
+        steps[2].action = Action::Drop;
+        steps[3].action = Action::Fixup;
+        let (marks, _) = place_marks(&repo, "refs/heads/c", base, c1, &steps, true).unwrap();
+        assert_eq!(after_of(&marks, "a"), 4);
+    }
+
+    #[test]
+    fn a_branch_whose_tip_is_the_folded_fixup_keeps_its_commits() {
+        let (repo, base, [a1, a2, b1, c1]) = stack("marks-fixup-tip");
+        repo.reference("refs/heads/backup", c1, true, "t").unwrap();
+        let steps = vec![
+            step(a1, Action::Pick, None),
+            step(c1, Action::Fixup, None),
+            step(a2, Action::Pick, None),
+            step(b1, Action::Pick, None),
+        ];
+        let (marks, _) = place_marks(&repo, "refs/heads/c", base, c1, &steps, true).unwrap();
+        assert_eq!(
+            after_of(&marks, "backup"),
+            4,
+            "after b1, not on the fold target"
+        );
+    }
+
+    #[test]
+    fn a_dropped_tip_puts_the_branch_below_and_all_dropped_puts_it_on_the_base() {
+        let (repo, base, [a1, a2, b1, c1]) = stack("marks-drop");
+        let mut steps = picks(&[a1, a2, b1, c1]);
+        steps[1].action = Action::Drop;
+        let (marks, _) = place_marks(&repo, "refs/heads/c", base, c1, &steps, true).unwrap();
+        assert_eq!(after_of(&marks, "a"), 1, "on a1's result");
+        assert!(
+            marks
+                .iter()
+                .any(|m| m.branch == "refs/heads/a" && m.dropped_tip)
+        );
+        assert!(
+            marks
+                .iter()
+                .any(|m| m.branch == "refs/heads/b" && !m.dropped_tip)
+        );
+        for s in &mut steps {
+            s.action = Action::Drop;
+        }
+        let (marks, _) = place_marks(&repo, "refs/heads/c", base, c1, &steps, true).unwrap();
+        assert_eq!(after_of(&marks, "a"), 0);
+        assert_eq!(after_of(&marks, "b"), 0);
+    }
+
+    #[test]
+    fn a_reorder_keeps_every_commit_of_the_branch() {
+        let (repo, base, [a1, a2, b1, c1]) = stack("marks-reorder");
+        let steps = picks(&[b1, a1, c1, a2]);
+        let (marks, _) = place_marks(&repo, "refs/heads/c", base, c1, &steps, true).unwrap();
+        assert_eq!(after_of(&marks, "a"), 4, "a2 is last");
+        assert_eq!(after_of(&marks, "b"), 4, "b includes a2");
+    }
+
+    #[test]
+    fn split_offs_tags_and_the_off_switch_are_left_and_reported() {
+        let (repo, base, [a1, a2, b1, c1]) = stack("marks-left");
+        let side = commit(
+            &repo,
+            &[a1],
+            &[("f", "0\n"), ("a", "1\n"), ("s", "1\n")],
+            "side",
+        );
+        repo.reference("refs/heads/side", side, true, "t").unwrap();
+        let ahead = commit(&repo, &[c1], &[("f", "9\n")], "ahead");
+        repo.reference("refs/heads/ahead", ahead, true, "t")
+            .unwrap();
+        repo.reference("refs/tags/v1", a2, true, "t").unwrap();
+        repo.reference("refs/tags/v0", base, true, "t").unwrap();
+        let steps = picks(&[a1, a2, b1, c1]);
+        let (_, left) = place_marks(&repo, "refs/heads/c", base, c1, &steps, true).unwrap();
+        assert!(left.contains(&LeftBehind::SplitOff {
+            branch: "refs/heads/side".into(),
+            from: a1
+        }));
+        assert!(left.contains(&LeftBehind::SplitOff {
+            branch: "refs/heads/ahead".into(),
+            from: c1
+        }));
+        assert!(left.contains(&LeftBehind::Tag {
+            name: "refs/tags/v1".into(),
+            at: a2
+        }));
+        assert!(
+            !left
+                .iter()
+                .any(|l| matches!(l, LeftBehind::Tag { name, .. } if name == "refs/tags/v0"))
+        );
+
+        let (marks, left) = place_marks(&repo, "refs/heads/c", base, c1, &steps, false).unwrap();
+        assert!(marks.is_empty());
+        assert!(left.contains(&LeftBehind::Kept {
+            branch: "refs/heads/a".into(),
+            at: a2
+        }));
+        assert!(left.contains(&LeftBehind::Kept {
+            branch: "refs/heads/b".into(),
+            at: b1
+        }));
+    }
+
+    #[test]
+    fn busy_branches_sees_a_linked_worktree_head() {
+        let (repo, _base, [_a1, _a2, _b1, _c1]) = stack("busy");
+        let wt_path = tmp("busy-wt");
+        let a = repo.find_reference("refs/heads/a").unwrap();
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(&a));
+        repo.worktree("wt-a", &wt_path, Some(&opts)).unwrap();
+        let busy = busy_branches(&repo);
+        assert_eq!(
+            busy.get("refs/heads/a").map(String::as_str),
+            Some(wt_path.to_str().unwrap().trim_end_matches('/'))
+        );
+        assert!(
+            !busy.contains_key("refs/heads/c"),
+            "the current worktree is not 'elsewhere'"
+        );
+        // A mime rewrite in progress there names its branch in its state file.
+        let wt_repo = Repository::open(&wt_path).unwrap();
+        std::fs::write(
+            wt_repo.path().join("mime-sequencer.json"),
+            r#"{"branch":"refs/heads/b"}"#,
+        )
+        .unwrap();
+        assert!(busy_branches(&repo).contains_key("refs/heads/b"));
+        // And the main worktree counts when asked from the linked one.
+        assert!(busy_branches(&wt_repo).contains_key("refs/heads/c"));
+    }
+
+    #[test]
+    fn busy_branches_reads_a_worktree_libgit2_cannot_open() {
+        let (repo, _base, _) = stack("busy-broken");
+        let wt_path = tmp("busy-broken-wt");
+        let a = repo.find_reference("refs/heads/a").unwrap();
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(&a));
+        repo.worktree("wt-a", &wt_path, Some(&opts)).unwrap();
+        // Without its `gitdir` file libgit2 cannot open the worktree.
+        std::fs::remove_file(repo.path().join("worktrees/wt-a/gitdir")).unwrap();
+        assert!(repo.find_worktree("wt-a").is_err());
+        assert_eq!(
+            busy_branches(&repo).get("refs/heads/a").map(String::as_str),
+            Some("wt-a"),
+            "named by its name"
+        );
+    }
+
+    /// A linked worktree `wt-m` on `main`; returns its git dir.
+    fn worktree_on_main(repo: &Repository, tag: &str) -> std::path::PathBuf {
+        let main = repo.find_reference("refs/heads/main").unwrap();
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(&main));
+        repo.worktree("wt-m", &tmp(tag), Some(&opts)).unwrap();
+        repo.path().join("worktrees/wt-m")
+    }
+
+    #[test]
+    fn busy_branches_reads_a_rebases_update_refs_and_a_hex_bisect_branch() {
+        let (repo, _base, [_a1, a2, b1, _c1]) = stack("busy-files");
+        let gitdir = worktree_on_main(&repo, "busy-files-wt");
+        std::fs::create_dir(gitdir.join("rebase-merge")).unwrap();
+        std::fs::write(
+            gitdir.join("rebase-merge/update-refs"),
+            format!(
+                "refs/heads/a\n{a2}\n{z}\nrefs/heads/b\n{b1}\n{z}\n",
+                z = Oid::zero()
+            ),
+        )
+        .unwrap();
+        repo.reference("refs/heads/cafe", a2, true, "t").unwrap();
+        std::fs::write(gitdir.join("BISECT_START"), "cafe\n").unwrap();
+        let busy = busy_branches(&repo);
+        for b in ["a", "b", "cafe"] {
+            assert!(busy.contains_key(&format!("refs/heads/{b}")), "{busy:?}");
+        }
+        // Started detached: a full commit id, not a branch.
+        std::fs::write(gitdir.join("BISECT_START"), format!("{a2}\n")).unwrap();
+        let busy = busy_branches(&repo);
+        assert!(!busy.contains_key(&format!("refs/heads/{a2}")), "{busy:?}");
+    }
+
+    #[test]
+    fn a_ref_that_is_not_a_commit_fails_neither_a_rewrite_nor_the_log_names() {
+        let (repo, base, [a1, a2, b1, c1]) = stack("ur-garbage-ref");
+        let tree = repo.find_commit(a2).unwrap().tree_id();
+        repo.reference("refs/tags/tree", tree, true, "t").unwrap();
+        std::fs::write(repo.path().join("refs/heads/junk"), "not a ref\n").unwrap();
+        let (marks, _) = place_marks(
+            &repo,
+            "refs/heads/c",
+            base,
+            c1,
+            &picks(&[a1, a2, b1, c1]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(marks.len(), 2, "{marks:?}");
+        assert!(ref_names(&repo).unwrap()[&a2].contains(&"a".to_string()));
     }
 }
