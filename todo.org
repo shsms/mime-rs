@@ -1253,8 +1253,9 @@ re-signed, and a commit carrying a header libgit2 does not reproduce
 same message. ~recreated_oid~ already knows; say so in the description and
 the comment.
 
-** TODO ~mime call~: one MCP tool call from the shell [#B]              :mcp:
+** DONE ~mime call~: one MCP tool call from the shell [#B]              :mcp:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-09-25 Fr 16:30]
 - State "TODO"       from              [2026-09-25 Fr 15:39]
 :END:
 
@@ -1265,8 +1266,9 @@ hand-written JSON-RPC into ~target/debug/mime --mcp~ and unpicking the
 reply with python, and reviewers wrote scratch stdio scripts for the
 same reason. Also useful for bug-report reproductions and shell scripts.
 
-** TODO Randomized test of the disk-safety invariants [#B]              :mcp:
+** DONE Randomized test of the disk-safety invariants [#B]              :mcp:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-09-25 Fr 16:30]
 - State "TODO"       from              [2026-09-25 Fr 15:39]
 :END:
 
@@ -1283,8 +1285,9 @@ rehearsal with ~view~ on a full undo ring leaked its edit into undo;
 ~undo_last~ after an auto-revert wrote over an outside change), and only
 cross-task review found them.
 
-** TODO Ambiguous-match errors name the defun of each match [#C]        :mcp:
+** DONE Ambiguous-match errors name the defun of each match [#C]        :mcp:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-09-25 Fr 16:30]
 - State "TODO"       from              [2026-09-25 Fr 15:39]
 :END:
 
@@ -1293,8 +1296,9 @@ enclosing defun of each match next to its line, so the retry with
 ~scope: {defun: …}~ is obvious. Hit on an edit whose line appeared in
 two functions of src/sequencer.rs.
 
-** TODO "Outside the allowed roots" error says how to widen them [#C]   :mcp:
+** DONE "Outside the allowed roots" error says how to widen them [#C]   :mcp:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-09-25 Fr 16:30]
 - State "TODO"       from              [2026-09-25 Fr 15:39]
 :END:
 
@@ -1312,6 +1316,72 @@ the transcripts and in the 0.2.0 session alike; outline/occur/view get
 little use. Spend effort on editing, previews and git history instead of
 making the reading tools more attractive. A standing decision, not work:
 close it once agreed.
+
+** TODO ~thing {kind: defun, after: LINE}~ skips a documented defun named on LINE [#C] :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-25 Fr 16:30]
+:END:
+
+A defun's span starts at its doc comment, so with ~after~ naming the
+~fn~ line itself, "the first defun at or after the line" is the NEXT
+function. Replacing ~match_lines~ in src/mcp.rs with
+~{"kind": "defun", "after": "fn match_lines("}~ rehearsed a replacement
+of ~replace_text_batch~ instead. The defun whose name is on LINE should
+count as the one at LINE.
+
+** TODO A scoped ambiguity error lists matches outside the scope [#C]   :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-25 Fr 16:30]
+:END:
+
+~match_lines~ searches the whole buffer, so a ~replace_text~ with
+~scope: {defun: …}~ and ~expect_unique~ lists the matches in other defuns
+too. It should search within the scope, and still print absolute line
+numbers.
+
+** TODO Refused save of an unedited buffer says "the edit is preserved" [#C] :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-25 Fr 16:30]
+:END:
+
+~save_buffer~ on a buffer with no edits whose file was replaced on disk
+is refused (right: writing would undo the outside change), but the
+message ends "the edit is preserved in warm session …" when there is no
+edit. Say the file changed and that any read re-reads it.
+
+** TODO A replacement with identical text takes an undo step [#C]       :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-25 Fr 16:30]
+:END:
+
+~replace_text {pattern: "w9", replacement: "w9"}~ changes nothing and
+saves nothing, but the buffer's version moves, so it records an undo
+step and can push a real one off a full ring (seen in the randomized
+test's shortened sequences). A step should need a changed text.
+
+** TODO Scope hint can loop for a regex that depends on its context [#C] :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-25 Fr 17:44]
+:END:
+
+~expect_unique~ checks uniqueness by searching on after the replacement,
+in the buffer as the replacement left it. For a regex whose match
+depends on the text around it (~\b~, ~^~), that search can see a
+different set of matches than the listing did, so following the
+suggested ~scope~ can give the same ambiguity error again. Found by
+pr-prep on branch agent-ux-fixes (2026-09-25).
+
+** TODO undo_last after an explicit (revert-buffer) can leave saves refused [#C] :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-25 Fr 17:44]
+:END:
+
+An automatic re-read now empties the undo ring, but a ~(revert-buffer)~
+inside ~run_program~ (saved by default) does not: undo_last then puts
+back text from before the re-read, whose save the guard refuses, and
+later saves stay refused until another revert. Decide whether an
+explicit revert empties the ring too, or undo stops at it. Found by
+pr-prep on branch agent-ux-fixes (2026-09-25).
 
 * Structural editing
 
@@ -1448,3 +1518,13 @@ vectors. (~identity~ and ~number-sequence~ bit a live session on
 needed (concat …) instead); also =\s-= syntax classes in regexes are
 rejected with a good pointer to [[:space:]] — error text fine, worth a
 line in the regex help topic.
+
+** TODO Reader: a symbol directly followed by ( fails to read [#C]
+:LOGBOOK:
+- State "TODO"       from              [2026-09-25 Fr 17:44]
+:END:
+
+~save-restriction(when …)~ is a read error; Emacs reads it as the symbol
+~save-restriction~ followed by the list ~(when …)~. Agents writing Lisp
+in a hurry produce this. Found by pr-prep on mime-rs branch
+agent-ux-fixes (2026-09-25).
