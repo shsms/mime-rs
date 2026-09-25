@@ -13,7 +13,7 @@ dialect, the treesit layer, conflicts, session semantics, and worked recipes
 | Mark & region | `set-mark` `mark` `region-beginning` `region-end` `exchange-point-and-mark` `mark-word` `mark-symbol` `mark-paragraph` `mark-defun` `mark-sexp` |
 | Things | `bounds-of-thing-at-point` `thing-at-point` (THING: `sexp` `list` `string` `word` `symbol` `line` `paragraph` `defun`) |
 | Markers | `make-marker` `point-marker` `copy-marker` `set-marker` `marker-position` `markerp` (durable positions; `goto-char` accepts a marker) |
-| Edit | `insert` `insert-char` `newline` `delete-char` `delete-region` `erase-buffer` `buffer-string` `buffer-substring` `upcase-region` `downcase-region` `delete-trailing-whitespace` `keep-lines` `flush-lines` `sort-lines` |
+| Edit | `insert` `insert-char` `newline` `delete-char` `delete-region` `erase-buffer` `buffer-string` `buffer-substring` `buffer-substring-no-properties` `buffer-size` `count-lines` `upcase-region` `downcase-region` `delete-trailing-whitespace` `keep-lines` `flush-lines` `sort-lines` |
 | Filling | `fill-paragraph` `fill-region` (variables `fill-column` = 80, `fill-prefix` = nil, `sentence-end-double-space` = t; the unit at point is a run of line comments, a block comment, a Python docstring or a Markdown paragraph — the tree-sitter parse says which, code is never reflowed, and a file type without a grammar is refused; comment markers, list hanging indents, fences and tables survive) |
 | Kill ring | `kill-region` `kill-line` `kill-whole-line` `copy-region-as-kill` `yank` `kill-sexp` `backward-kill-sexp` |
 | Search & replace | `re-search-forward` `re-search-backward` `search-forward` `search-backward` `replace-match` `match-string` `match-beginning` `match-end` `replace-string` `replace-regexp` `count-matches` `regexp-quote` |
@@ -25,4 +25,4 @@ dialect, the treesit layer, conflicts, session semantics, and worked recipes
 | Observability | `report` `message` `window` `occur` `buffer-file-name` `buffer-stale-p` `revert-buffer` `float-time` `buffer-file-coding-system` `set-buffer-file-coding-system` |
 | Orchestration (trusted tier only) | `find-file` `find-file-noselect` `insert-file-contents` `write-file` `write-region` `directory-files` `generate-new-buffer` `set-buffer` `with-current-buffer` `current-buffer` `buffer-name` `buffer-list` `get-buffer` `kill-buffer` `arg` `args` |
 | String library | `replace-regexp-in-string` `substring` `split-string` `string-trim`(`-left`/`-right`) `string-prefix-p` `string-suffix-p` `string-search` `string-replace` `string-join` `string-empty-p` `number-to-string` `string-to-number` `upcase` `downcase` `capitalize` `char-to-string` `string-to-char` |
-| Core (subr) | `push` `identity` `delete-dups` (Emacs `subr.el` helpers tulisp lacks) |
+| Core (subr) | `push` `identity` `delete-dups` `nreverse` `butlast` `number-sequence` `fboundp` `seq-remove` `seq-uniq` `format-message` `user-error` (Emacs `subr.el` / `seq.el` helpers tulisp lacks) |

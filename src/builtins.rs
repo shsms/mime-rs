@@ -426,12 +426,42 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                 .substring(sess.buffer.point_min(), sess.buffer.point_max())
         });
     }
-    {
+    // (buffer-substring START END), and buffer-substring-no-properties: mime
+    // text carries no properties, so the two are the same function.
+    for name in ["buffer-substring", "buffer-substring-no-properties"] {
         let s = session.clone();
-        ctx.defun("buffer-substring", move |a: i64, b: i64| -> String {
+        ctx.defun(name, move |a: i64, b: i64| -> String {
             s.borrow()
                 .buffer
                 .substring(a.max(1) as usize, b.max(1) as usize)
+        });
+    }
+    {
+        // (buffer-size) — chars in the whole buffer; a narrowing does not
+        // shrink it (Emacs).
+        let s = session.clone();
+        ctx.defun("buffer-size", move || -> i64 {
+            s.borrow().buffer.char_len() as i64
+        });
+    }
+    {
+        // (count-lines START END) — the lines the region touches: its newlines,
+        // plus one when it is non-empty and does not end in a newline (Emacs).
+        // Either order; a position outside the buffer's TRUE bounds (ignoring
+        // narrowing, like buffer-size — count-lines narrows to [START, END]
+        // internally in Emacs, and narrow-to-region checks against the whole
+        // buffer, not the current restriction) signals args-out-of-range
+        // instead of silently clamping.
+        let s = session.clone();
+        ctx.defun("count-lines", move |a: i64, b: i64| -> Result<i64, Error> {
+            let sess = s.borrow();
+            let max = sess.buffer.char_len() as i64 + 1;
+            if a.min(b) < 1 || a.max(b) > max {
+                return Err(err(&format!("Args out of range: {a}, {b}")));
+            }
+            let text = sess.buffer.substring(a as usize, b as usize);
+            let newlines = text.matches('\n').count();
+            Ok((newlines + usize::from(!text.is_empty() && !text.ends_with('\n'))) as i64)
         });
     }
     {
@@ -6880,5 +6910,60 @@ mod tests {
             elapsed < std::time::Duration::from_secs(10),
             "took {elapsed:?} on both stores"
         );
+    }
+
+    #[test]
+    fn buffer_size_count_lines_and_substring_no_properties_match_emacs() {
+        // Emacs 30, in a buffer holding "a\nb\nc": (buffer-size) is 5 even when
+        // narrowed; count-lines counts newlines plus an unterminated last line,
+        // in either argument order; a position outside the buffer's true bounds
+        // signals args-out-of-range, as Emacs's narrow-to-region (which
+        // count-lines uses internally) does.
+        let mut ws = trusted("a\nb\nc");
+        let r = ws
+            .run(
+                r#"(narrow-to-region 3 4)
+                   (report "size" (buffer-size))
+                   (widen)
+                   (report "all" (count-lines 1 6))
+                   (report "one" (count-lines 1 3))
+                   (report "open" (count-lines 1 4))
+                   (report "none" (count-lines 1 1))
+                   (report "back" (count-lines 4 1))
+                   (report "sub" (buffer-substring-no-properties 1 4))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "size"), "5");
+        assert_eq!(report(&r, "all"), "3");
+        assert_eq!(report(&r, "one"), "1");
+        assert_eq!(report(&r, "open"), "2");
+        assert_eq!(report(&r, "none"), "0");
+        assert_eq!(report(&r, "back"), "2");
+        assert_eq!(report(&r, "sub"), r#""a\nb""#);
+
+        let e = match ws.run("(count-lines 1 999)") {
+            Err(e) => e,
+            Ok(_) => panic!("an end past the buffer's true bounds must signal"),
+        };
+        assert!(e.contains("out of range") && e.contains("999"), "{e}");
+    }
+
+    #[test]
+    fn format_message_curves_quotes_and_user_error_formats() {
+        let mut ws = trusted("");
+        let r = ws
+            .run(
+                r#"(report "q" (format-message "`%s'" "a"))
+                   (report "n" (format-message "x=%d" 3))"#,
+            )
+            .unwrap();
+        // Emacs 30: "‘a’" and "x=3".
+        assert_eq!(report(&r, "q"), "\"\u{2018}a\u{2019}\"");
+        assert_eq!(report(&r, "n"), r#""x=3""#);
+        let e = match ws.run(r#"(user-error "bad %s" "x")"#) {
+            Err(e) => e,
+            Ok(_) => panic!("user-error must signal"),
+        };
+        assert!(e.contains("bad x"), "{e}");
     }
 }

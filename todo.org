@@ -1353,6 +1353,17 @@ rule or an explicit "take control" toggle).
 checkpoint mechanism is too coarse for interactive editing) and keymaps
 (tulisp-dispatched) are the gating engine features./
 
+** TODO [#C] string-match and cl-remove-if
+:LOGBOOK:
+- State "TODO"       from              [2026-09-25 Fr 12:13]
+:END:
+
+~string-match~ needs match data recorded against a string, not the buffer:
+~match-beginning~, ~match-end~ and ~match-string~ read the buffer's
+~last_match~ today. ~cl-remove-if~ is ~seq-remove~ with the cl argument
+order; add it once there is a ~cl-~ corner. Both turned up probing common
+Emacs functions on 2026-09-25.
+
 * tulisp wishlist
 
 ** TODO Incremental reader (one form at a time)
@@ -1369,7 +1380,7 @@ A ~thread-signal~-style interrupt — unblocks per-program resource limits
 above.
 ** TODO Parity odds & ends
 
-~assq plist-put pop remhash mapc elt identity number-sequence~ /
+~assq plist-put pop remhash mapc elt~ /
 vectors. (~identity~ and ~number-sequence~ bit a live session on
 2026-07-15: an innocent ~mapcar~ over conflict numbers died on both.)
 

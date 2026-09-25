@@ -59,6 +59,7 @@ Motion/inspect: point point-min point-max goto-char goto-line forward-line
   backward-symbol forward-paragraph backward-paragraph skip-chars-forward
   skip-chars-backward beginning-of-defun end-of-defun line-number-at-pos
   current-column looking-at char-after buffer-substring buffer-string
+  buffer-substring-no-properties buffer-size count-lines
   forward-sexp backward-sexp forward-list backward-list up-list
   backward-up-list down-list
 Mark: set-mark mark region-beginning region-end exchange-point-and-mark
@@ -84,7 +85,8 @@ Conflicts: conflict-keep conflict-keep-all conflict-replace conflict-resolve-tri
 Atomicity/observe: with-transaction checkpoint report message window
 Strings: replace-regexp-in-string split-string string-trim string-replace
   string-join number-to-string string-prefix-p
-Core (subr): push identity delete-dups
+Core (subr): push identity delete-dups nreverse butlast number-sequence
+  seq-remove seq-uniq fboundp format-message user-error
 
 Gotchas: only the FINAL form's value is returned — wrap earlier results in
 (report "label" …). @N/point are absolute (goto-char); line numbers are
