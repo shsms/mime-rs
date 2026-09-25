@@ -1275,7 +1275,8 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode) -> Result<Outcome, Error> {
     if let Some(diff) = &autostash_diff {
         let head_commit = repo.find_commit(orig)?;
         let head_tree = head_commit.tree()?;
-        let wt_tree_id = apply_subset(repo, &head_tree, diff, |_| true, |_, _, _| true)?;
+        let wt_tree_id =
+            apply_subset_by_old_line(repo, &head_tree, diff, |_| true, |_, _, _| true)?;
         let sig = match repo.signature() {
             Ok(s) => s,
             Err(_) => {
@@ -2475,6 +2476,171 @@ fn apply_subset(
         keep_hunk(&cur.borrow(), h.new_start(), h.new_lines())
     });
     let mut index = repo.apply_to_tree(base_tree, diff, Some(&mut opts))?;
+    index.write_tree_to(repo)
+}
+
+/// One hunk, placed by its old line numbers.
+struct OldLineHunk {
+    /// The first replaced line (1-based); for a pure insertion, the line it
+    /// goes after (0 is the top).
+    old_start: usize,
+    /// How many lines are replaced; 0 for a pure insertion.
+    old_lines: usize,
+    /// What the replaced lines must hold.
+    removed: Vec<u8>,
+    /// The text that takes their place.
+    added: Vec<u8>,
+}
+
+/// Apply `hunks` to `old` by their old line numbers. `hunks` must come from one
+/// diff against `old`, in file order. A hunk whose old lines do not match `old`
+/// is refused.
+fn apply_hunks_by_old_line(old: &[u8], hunks: &[OldLineHunk]) -> Result<Vec<u8>, Error> {
+    // line_starts[i] is the byte offset of line i (0-based); the last entry is
+    // the end of the text.
+    let mut line_starts = vec![0];
+    line_starts.extend(old.split_inclusive(|&b| b == b'\n').scan(0, |at, line| {
+        *at += line.len();
+        Some(*at)
+    }));
+    let line_count = line_starts.len() - 1;
+    let mut out = Vec::with_capacity(old.len());
+    let mut next = 0;
+    for h in hunks {
+        let Some(first) = h.old_start.checked_sub(usize::from(h.old_lines > 0)) else {
+            return Err(estr(&format!(
+                "hunk at old line {} is malformed",
+                h.old_start
+            )));
+        };
+        let end = first + h.old_lines;
+        if first < next || end > line_count {
+            return Err(estr(&format!(
+                "hunk at old line {} is out of order or past the end of the file",
+                h.old_start
+            )));
+        }
+        out.extend_from_slice(&old[line_starts[next]..line_starts[first]]);
+        if old[line_starts[first]..line_starts[end]] != h.removed[..] {
+            return Err(estr(&format!(
+                "the lines at old line {} no longer match the diff",
+                h.old_start
+            )));
+        }
+        out.extend_from_slice(&h.added);
+        next = end;
+    }
+    out.extend_from_slice(&old[line_starts[next]..]);
+    Ok(out)
+}
+
+/// [`apply_subset`] for a diff taken against `base_tree`, placing the kept
+/// hunks of a modified text file by their old line numbers
+/// ([`apply_hunks_by_old_line`]); every other delta (added, deleted, renamed,
+/// binary, mode-only) goes through libgit2. A kept hunk in a submodule is
+/// refused. Use it for every zero-context diff: libgit2 places a zero-context
+/// pure deletion one line early and refuses it.
+fn apply_subset_by_old_line(
+    repo: &Repository,
+    base_tree: &git2::Tree,
+    diff: &git2::Diff,
+    keep_whole: impl Fn(&str) -> bool,
+    keep_hunk: impl Fn(&str, u32, u32) -> bool,
+) -> Result<Oid, Error> {
+    // Keyed by the lossy path the callbacks see; the value holds the real one.
+    let mut rewritten: std::collections::HashMap<
+        String,
+        (std::path::PathBuf, Vec<u8>, git2::FileMode),
+    > = std::collections::HashMap::new();
+    // How many deltas share each lossy path.
+    let mut named: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for d in diff.deltas() {
+        *named.entry(delta_path(Some(d))).or_default() += 1;
+    }
+    for idx in 0..diff.deltas().len() {
+        let Some(patch) = git2::Patch::from_diff(diff, idx)? else {
+            continue;
+        };
+        let delta = patch.delta();
+        if delta.status() != git2::Delta::Modified || delta.flags().is_binary() {
+            continue;
+        }
+        let path = delta_path(Some(patch.delta()));
+        let mut hunks = Vec::new();
+        for h in 0..patch.num_hunks() {
+            let (dh, n) = patch.hunk(h)?;
+            if !keep_hunk(&path, dh.new_start(), dh.new_lines()) {
+                continue;
+            }
+            let (mut removed, mut added) = (Vec::new(), Vec::new());
+            for l in 0..n {
+                let line = patch.line_in_hunk(h, l)?;
+                match line.origin() {
+                    '-' => removed.extend_from_slice(line.content()),
+                    '+' => added.extend_from_slice(line.content()),
+                    ' ' => {
+                        removed.extend_from_slice(line.content());
+                        added.extend_from_slice(line.content());
+                    }
+                    // The "\ No newline at end of file" markers.
+                    '=' | '<' | '>' => {}
+                    other => {
+                        return Err(estr(&format!(
+                            "{path}: unexpected diff line origin {other:?}"
+                        )));
+                    }
+                }
+            }
+            hunks.push(OldLineHunk {
+                old_start: dh.old_start() as usize,
+                old_lines: dh.old_lines() as usize,
+                removed,
+                added,
+            });
+        }
+        if hunks.is_empty() {
+            continue;
+        }
+        if delta.old_file().mode() == git2::FileMode::Commit
+            || delta.new_file().mode() == git2::FileMode::Commit
+        {
+            return Err(estr(&format!(
+                "{path}: a modified submodule is not supported"
+            )));
+        }
+        let real = delta
+            .new_file()
+            .path()
+            .ok_or_else(|| estr(&format!("{path}: the diff names no path")))?
+            .to_path_buf();
+        let bytes = base_tree
+            .get_path(&real)
+            .and_then(|e| repo.find_blob(e.id()))
+            .and_then(|old| apply_hunks_by_old_line(old.content(), &hunks))
+            .map_err(|e| estr(&format!("{path}: {}", e.message())))?;
+        if named[&path] > 1 {
+            return Err(estr(&format!(
+                "{path}: two paths read the same once their non-UTF-8 bytes are replaced"
+            )));
+        }
+        rewritten.insert(path, (real, bytes, delta.new_file().mode()));
+    }
+    let tree_id = apply_subset(repo, base_tree, diff, keep_whole, |p, ns, nl| {
+        !rewritten.contains_key(p) && keep_hunk(p, ns, nl)
+    })?;
+    if rewritten.is_empty() {
+        return Ok(tree_id);
+    }
+    let mut index = git2::Index::new()?;
+    index.read_tree(&repo.find_tree(tree_id)?)?;
+    for (path, (real, bytes, mode)) in rewritten {
+        let mut entry = index
+            .get_path(&real, 0)
+            .ok_or_else(|| estr(&format!("{path} is missing from the applied tree")))?;
+        entry.id = repo.blob(&bytes)?;
+        entry.mode = u32::from(mode);
+        index.add(&entry)?;
+    }
     index.write_tree_to(repo)
 }
 
@@ -4156,7 +4322,7 @@ fn discard(
             )?
         }
     };
-    let wt_tree_id = apply_subset(repo, &head_tree, &diff, |_| true, |_, _, _| true)?;
+    let wt_tree_id = apply_subset_by_old_line(repo, &head_tree, &diff, |_| true, |_, _, _| true)?;
     let wt_backup = repo.commit(
         None,
         &sig,
@@ -4173,7 +4339,7 @@ fn discard(
     // fall back to HEAD content. Touched paths take their bytes from it, and
     // their index entries reset to HEAD (like the other worktree ops, what
     // remains is unstaged).
-    let kept_id = apply_subset(
+    let kept_id = apply_subset_by_old_line(
         repo,
         &head_tree,
         &diff,
@@ -4888,7 +5054,7 @@ fn absorb(repo: &Repository, since: Option<Oid>, rehearse_only: bool) -> Result<
     for (target, hs) in &groups {
         let keys: std::collections::HashSet<(String, u32, u32)> =
             hs.iter().map(|h| (h.path.clone(), h.ns, h.nl)).collect();
-        let tree_id = apply_subset(
+        let tree_id = apply_subset_by_old_line(
             repo,
             &head_tree,
             &diff,
@@ -4959,7 +5125,7 @@ fn absorb(repo: &Repository, since: Option<Oid>, rehearse_only: bool) -> Result<
         ));
     }
     let snap = snapshot_worktree(repo, &diff)?;
-    let wt_tree_id = apply_subset(repo, &head_tree, &diff, |_| true, |_, _, _| true)?;
+    let wt_tree_id = apply_subset_by_old_line(repo, &head_tree, &diff, |_| true, |_, _, _| true)?;
     let done = run_plan_over_parked_worktree(
         repo,
         plan,
@@ -6766,6 +6932,248 @@ mod tests {
     }
 
     #[test]
+    fn absorb_folds_a_pure_deletion() {
+        // A zero-context pure deletion of c2's line 4.
+        let (dir, repo, base, _c1, _c2) = absorb_fixture("absorb-del");
+        std::fs::write(repo.workdir().unwrap().join("f"), b"l1\nl3\nc2\nl5\n").unwrap();
+
+        let out = cmd_absorb(&dir, None, false).unwrap();
+        assert!(out.contains("1 hunk(s) → 1 commit(s)"), "{out}");
+        let branch = commits_since(&repo, base).unwrap();
+        assert_eq!(at_commit(&repo, branch[0], "f"), "l1\nl3\nl4\nl5\n");
+        assert_eq!(at_commit(&repo, branch[1], "f"), "l1\nl3\nc2\nl5\n");
+        assert!(!is_dirty(&repo).unwrap(), "everything folded: {out}");
+    }
+
+    #[test]
+    fn absorb_folds_a_deletion_and_a_change_into_different_commits() {
+        // Each fold applies only its own hunks, so the other group's hunk is
+        // skipped while this one lands.
+        let (dir, repo, base, _c1, _c2) = absorb_fixture("absorb-del-mix");
+        std::fs::write(repo.workdir().unwrap().join("f"), b"l1\nl3\nw2\nl5\n").unwrap();
+
+        let out = cmd_absorb(&dir, None, false).unwrap();
+        assert!(out.contains("2 hunk(s) → 2 commit(s)"), "{out}");
+        let branch = commits_since(&repo, base).unwrap();
+        assert_eq!(at_commit(&repo, branch[0], "f"), "l1\nl3\nl4\nl5\n");
+        assert_eq!(at_commit(&repo, branch[1], "f"), "l1\nl3\nw2\nl5\n");
+        assert!(!is_dirty(&repo).unwrap(), "everything folded: {out}");
+    }
+
+    #[test]
+    fn absorb_folds_deleting_a_last_line_without_a_newline() {
+        let dir = tmp("absorb-del-eof");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("f", "a\nb\nc")], "base");
+        let c1 = commit(&repo, &[base], &[("f", "a\nb\nC")], "edit last");
+        on_branch(&repo, "main", c1);
+        std::fs::write(repo.workdir().unwrap().join("f"), b"a\nb\n").unwrap();
+
+        let out = cmd_absorb(&dir, None, false).unwrap();
+        assert!(out.contains("1 hunk(s) → 1 commit(s)"), "{out}");
+        let branch = commits_since(&repo, base).unwrap();
+        assert_eq!(at_commit(&repo, branch[0], "f"), "a\nb\n");
+        assert!(!is_dirty(&repo).unwrap(), "everything folded: {out}");
+    }
+
+    #[test]
+    fn absorb_folds_a_deletion_in_a_crlf_file() {
+        let dir = tmp("absorb-del-crlf");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("f", "a\r\nb\r\nc\r\n")], "base");
+        let c1 = commit(&repo, &[base], &[("f", "a\r\nB\r\nc\r\n")], "edit two");
+        on_branch(&repo, "main", c1);
+        std::fs::write(repo.workdir().unwrap().join("f"), b"a\r\nc\r\n").unwrap();
+
+        let out = cmd_absorb(&dir, None, false).unwrap();
+        assert!(out.contains("1 hunk(s) → 1 commit(s)"), "{out}");
+        let branch = commits_since(&repo, base).unwrap();
+        assert_eq!(at_commit(&repo, branch[0], "f"), "a\r\nc\r\n");
+        assert!(!is_dirty(&repo).unwrap(), "everything folded: {out}");
+    }
+
+    fn hunk(old_start: usize, old_lines: usize, removed: &str, added: &str) -> OldLineHunk {
+        OldLineHunk {
+            old_start,
+            old_lines,
+            removed: removed.as_bytes().to_vec(),
+            added: added.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn hunks_by_old_line_place_insertions_after_their_old_line() {
+        let old = b"a\nb\nc\n";
+        let top = apply_hunks_by_old_line(old, &[hunk(0, 0, "", "z\n")]).unwrap();
+        assert_eq!(top, b"z\na\nb\nc\n");
+        let mid = apply_hunks_by_old_line(old, &[hunk(2, 0, "", "z\n")]).unwrap();
+        assert_eq!(mid, b"a\nb\nz\nc\n");
+        let end = apply_hunks_by_old_line(old, &[hunk(3, 0, "", "z\n")]).unwrap();
+        assert_eq!(end, b"a\nb\nc\nz\n");
+    }
+
+    #[test]
+    fn hunks_by_old_line_apply_several_by_old_positions() {
+        // Positions never shift: each hunk is placed against the old text.
+        let old = b"a\nb\nc\nd\ne\n";
+        let hunks = [
+            hunk(1, 1, "a\n", ""),
+            hunk(3, 0, "", "x\ny\n"),
+            hunk(4, 2, "d\ne\n", "D\n"),
+        ];
+        assert_eq!(
+            apply_hunks_by_old_line(old, &hunks).unwrap(),
+            b"b\nc\nx\ny\nD\n"
+        );
+    }
+
+    #[test]
+    fn hunks_by_old_line_refuse_a_stale_or_out_of_order_hunk() {
+        let old = b"a\nb\nc\n";
+        let stale = apply_hunks_by_old_line(old, &[hunk(2, 1, "B\n", "")]).unwrap_err();
+        assert!(stale.message().contains("no longer match"), "{stale}");
+        let past = apply_hunks_by_old_line(old, &[hunk(3, 2, "c\nd\n", "")]).unwrap_err();
+        assert!(past.message().contains("past the end"), "{past}");
+        let backwards =
+            apply_hunks_by_old_line(old, &[hunk(3, 1, "c\n", ""), hunk(1, 1, "a\n", "")])
+                .unwrap_err();
+        assert!(backwards.message().contains("out of order"), "{backwards}");
+        let malformed = apply_hunks_by_old_line(old, &[hunk(0, 1, "a\n", "")]).unwrap_err();
+        assert!(malformed.message().contains("malformed"), "{malformed}");
+    }
+
+    #[test]
+    fn subset_by_old_line_matches_libgit2_on_a_diff_with_context() {
+        let (_dir, repo, _base, _c1, c2) = absorb_fixture("by-old-line-context");
+        std::fs::write(repo.workdir().unwrap().join("f"), b"l1\nw1\nl3\nc2\nw5\n").unwrap();
+        let head_tree = repo.find_commit(c2).unwrap().tree().unwrap();
+        let diff = repo
+            .diff_tree_to_workdir_with_index(Some(&head_tree), None)
+            .unwrap();
+        let ours =
+            apply_subset_by_old_line(&repo, &head_tree, &diff, |_| true, |_, _, _| true).unwrap();
+        let theirs = apply_subset(&repo, &head_tree, &diff, |_| true, |_, _, _| true).unwrap();
+        assert_eq!(ours, theirs);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn absorb_folds_a_mode_change_with_a_content_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, repo, base, _c1, _c2) = absorb_fixture("absorb-mode");
+        let f = repo.workdir().unwrap().join("f");
+        std::fs::write(&f, b"l1\nw1\nl3\nc2\nl5\n").unwrap();
+        let mut perm = std::fs::metadata(&f).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&f, perm).unwrap();
+
+        let out = cmd_absorb(&dir, None, false).unwrap();
+        assert!(out.contains("1 hunk(s) → 1 commit(s)"), "{out}");
+        let branch = commits_since(&repo, base).unwrap();
+        let tree = repo.find_commit(branch[0]).unwrap().tree().unwrap();
+        let mode = tree.get_path(Path::new("f")).unwrap().filemode();
+        assert_eq!(mode, 0o100755, "{out}");
+        assert!(!is_dirty(&repo).unwrap(), "everything folded: {out}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn absorb_handles_a_file_with_a_non_utf8_name() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::OsStr::from_bytes(b"n\xff");
+        let dir = tmp("absorb-non-utf8");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("f", "a\nb\n")], "base");
+        let base_commit = repo.find_commit(base).unwrap();
+        let mut tb = repo
+            .treebuilder(Some(&base_commit.tree().unwrap()))
+            .unwrap();
+        tb.insert("f", repo.blob(b"a\nB\n").unwrap(), 0o100644)
+            .unwrap();
+        tb.insert(name, repo.blob(b"x\ny\nz\n").unwrap(), 0o100644)
+            .unwrap();
+        let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+        let sig = Signature::now("test", "test@example.invalid").unwrap();
+        let c1 = repo
+            .commit(None, &sig, &sig, "edit f, add n", &tree, &[&base_commit])
+            .unwrap();
+        on_branch(&repo, "main", c1);
+        std::fs::write(dir.join("f"), b"a\nW\n").unwrap();
+        std::fs::write(dir.join(name), b"x\nz\n").unwrap();
+
+        let out = cmd_absorb(&dir, None, false).unwrap();
+        let branch = commits_since(&repo, base).unwrap();
+        assert_eq!(at_commit(&repo, branch[0], "f"), "a\nW\n", "{out}");
+        assert_eq!(std::fs::read(dir.join(name)).unwrap(), b"x\nz\n", "{out}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn subset_by_old_line_refuses_two_names_that_read_the_same() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tmp("by-old-line-lossy-clash");
+        let repo = Repository::init(&dir).unwrap();
+        let [old, new] = [b"a\xff", b"a\xfe"].map(|n| std::ffi::OsStr::from_bytes(n));
+        let mut tb = repo.treebuilder(None).unwrap();
+        tb.insert(old, repo.blob(b"1\n2\n3\n").unwrap(), 0o100644)
+            .unwrap();
+        let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+        let sig = Signature::now("test", "test@example.invalid").unwrap();
+        let c1 = repo.commit(None, &sig, &sig, "base", &tree, &[]).unwrap();
+        on_branch(&repo, "main", c1);
+        // `old` is modified and `new` is added; both read as "a\u{FFFD}".
+        std::fs::write(dir.join(old), b"1\n3\n").unwrap();
+        std::fs::write(dir.join(new), b"q\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(new)).unwrap();
+        index.write().unwrap();
+
+        let diff = worktree_diff(&repo, None).unwrap();
+        let err =
+            apply_subset_by_old_line(&repo, &tree, &diff, |_| true, |_, _, _| true).unwrap_err();
+        assert!(err.message().contains("read the same"), "{err}");
+    }
+
+    #[test]
+    fn discard_refuses_a_modified_submodule() {
+        let (dir, repo, _base, _c1, c2) = absorb_fixture("discard-submodule");
+        let sub_dir = tmp("discard-submodule-sub");
+        let sub = Repository::init(&sub_dir).unwrap();
+        let x = commit(&sub, &[], &[("s", "1\n")], "x");
+        let y = commit(&sub, &[x], &[("s", "2\n")], "y");
+        on_branch(&sub, "main", y);
+        // HEAD records the submodule at x; its checkout is at y.
+        let head = repo.find_commit(c2).unwrap();
+        let mut tb = repo.treebuilder(Some(&head.tree().unwrap())).unwrap();
+        tb.insert("sub", x, 0o160000).unwrap();
+        let modules = "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n";
+        tb.insert(
+            ".gitmodules",
+            repo.blob(modules.as_bytes()).unwrap(),
+            0o100644,
+        )
+        .unwrap();
+        let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+        let sig = Signature::now("test", "test@example.invalid").unwrap();
+        let c3 = repo
+            .commit(Some("HEAD"), &sig, &sig, "add sub", &tree, &[&head])
+            .unwrap();
+        repo.reset(&repo.find_object(c3, None).unwrap(), ResetType::Hard, None)
+            .unwrap();
+        let _ = std::fs::remove_dir(dir.join("sub"));
+        std::fs::rename(&sub_dir, dir.join("sub")).unwrap();
+        std::fs::write(dir.join("f"), b"l1\nw1\nl3\nc2\nl5\n").unwrap();
+
+        let err = cmd_discard(&dir, &["f".to_string()], &[], false).unwrap_err();
+        assert!(err.contains("sub: a modified submodule"), "{err}");
+        assert_eq!(
+            read(&repo, "f"),
+            "l1\nw1\nl3\nc2\nl5\n",
+            "nothing discarded"
+        );
+    }
+
+    #[test]
     fn absorb_with_nothing_attributable_refuses() {
         let (dir, repo, _base, _c1, _c2) = absorb_fixture("absorb-none");
         // The only dirty hunk has split ownership — nothing to fold.
@@ -6980,6 +7388,29 @@ mod tests {
     }
 
     #[test]
+    fn rebase_autostashes_a_pure_deletion() {
+        let dir = tmp("autostash-del");
+        let repo = Repository::init(&dir).unwrap();
+        let notes = "n1\nn2\nn3\n";
+        let base = commit(&repo, &[], &[("a", "1\n"), ("notes", notes)], "base");
+        let f1 = commit(&repo, &[base], &[("a", "2\n"), ("notes", notes)], "f1");
+        let m1 = commit(
+            &repo,
+            &[base],
+            &[("a", "1\n"), ("b", "1\n"), ("notes", notes)],
+            "m1",
+        );
+        on_branch(&repo, "topic", f1);
+        // A zero-context deletion in a file no step touches.
+        std::fs::write(dir.join("notes"), "n1\nn3\n").unwrap();
+
+        let out = cmd_rebase(&dir, &m1.to_string(), None, None, None, None, false, false).unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        assert_eq!(read(&repo, "notes"), "n1\nn3\n", "the deletion came back");
+        assert_eq!(read(&repo, "a"), "2\n", "the rebase itself landed");
+    }
+
+    #[test]
     fn edit_pause_amend_keeps_autostash_paths_out_of_the_commit() {
         let dir = tmp("autostash-edit-amend");
         let repo = Repository::init(&dir).unwrap();
@@ -7132,6 +7563,31 @@ mod tests {
         assert!(err.contains("select what to drop"), "{err}");
         // Whole-file discard drops the remaining hunk.
         cmd_discard(&dir, &["f".to_string()], &[], false).unwrap();
+        assert_eq!(read(&repo, "f"), "l1\nc1\nl3\nc2\nl5\n");
+        assert!(!is_dirty(&repo).unwrap());
+    }
+
+    #[test]
+    fn discard_works_next_to_a_pure_deletion() {
+        let (dir, repo, _base, _c1, _c2) = absorb_fixture("discard-del");
+        // A change on line 2 and a zero-context deletion of line 4.
+        std::fs::write(repo.workdir().unwrap().join("f"), b"l1\nw1\nl3\nl5\n").unwrap();
+
+        let out = cmd_discard(&dir, &[], &[HunkSel::lines("f", 2, 2)], false).unwrap();
+        assert!(out.contains("discarded 1"), "{out}");
+        assert_eq!(read(&repo, "f"), "l1\nc1\nl3\nl5\n");
+        let backup = repo
+            .refname_to_id("refs/mime-backup/main-worktree")
+            .unwrap();
+        assert_eq!(
+            at_commit(&repo, backup, "f"),
+            "l1\nw1\nl3\nl5\n",
+            "the backup holds the deletion"
+        );
+
+        // Discarding the deletion itself brings the line back.
+        let out = cmd_discard(&dir, &[], &[HunkSel::contains("f", "c2")], false).unwrap();
+        assert!(out.contains("discarded 1"), "{out}");
         assert_eq!(read(&repo, "f"), "l1\nc1\nl3\nc2\nl5\n");
         assert!(!is_dirty(&repo).unwrap());
     }
