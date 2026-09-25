@@ -931,8 +931,9 @@ fn run_or_rehearse(
     } else {
         // Records the pre-program state on the undo ring when the program
         // changes the buffer, so undo_last can rewind a misfired edit without
-        // prior checkpoint discipline. After the auto-revert, so undo never
-        // resurrects bytes an external writer already replaced.
+        // prior checkpoint discipline. This runs after the auto-revert, which
+        // empties the ring, so undo never resurrects bytes an external writer
+        // already replaced.
         ws.run_value_undoable(program, keep_partial)
     }
 }
@@ -3650,7 +3651,16 @@ fn tool_undo_last(
         return Err(no_such_session(sessions, &session));
     }
     let ws = sessions.get_mut(&session).expect("checked above");
-    ws.undo_last()?;
+    // A clean buffer whose file changed on disk is re-read first, as before a
+    // program: the re-read empties the undo ring.
+    let reread = ws.auto_revert_if_clean();
+    ws.undo_last().map_err(|e| {
+        if reread {
+            format!("{e}; the file changed on disk and was just re-read, which empties the ring")
+        } else {
+            e
+        }
+    })?;
     let len = ws.char_len();
     // A rewind always changes the buffer (undo_last skips states equal to the
     // current one).
@@ -5564,7 +5574,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "undo_last",
-            "description": "Rewind the buffer to its state before the most recent mutating call — the automatic safety net for a misfired edit (every mutating tool call captures a restore point first; bounded ring of 8, no redo). Each call steps one mutating call further back, and the rewound text is saved like any edit (save: false rewinds the buffer only).",
+            "description": "Rewind the buffer to its state before the most recent mutating call — the automatic safety net for a misfired edit (every mutating tool call captures a restore point first; bounded ring of 8, no redo). Each call steps one mutating call further back, and the rewound text is saved like any edit (save: false rewinds the buffer only). When a clean buffer re-reads its file after an outside change, the ring empties: its states are older than the file.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

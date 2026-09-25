@@ -3846,10 +3846,49 @@ fn undo_last_across_a_re_read_from_disk_does_not_overwrite_the_file() {
     s.call_ok(2, "view", json!({ "path": p }));
 
     // Rewinding past the re-read must not write the pre-edit text over the
-    // external content.
+    // external content: the re-read emptied the undo ring, since the file no
+    // longer holds any state on it.
     let err = s.call_err(3, "undo_last", json!({ "path": p }));
-    assert!(err.contains("refusing to save"), "got: {err}");
+    assert!(err.contains("nothing to undo"), "got: {err}");
+    // The view did the re-read, not undo_last.
+    assert!(!err.contains("just re-read"), "got: {err}");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), external);
+}
+
+#[test]
+fn undo_last_right_after_an_outside_replace_keeps_saves_working() {
+    let dir = temp_dir("undo-first-after-replace");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+
+    s.call_ok(
+        1,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "beta" }),
+    );
+    // An outside writer replaces the file (a new inode, as git or a formatter
+    // does), and undo_last is the next call: no read re-reads it first.
+    let external = "written by someone else, a different length\n";
+    let tmp = dir.join("doc.txt.new");
+    std::fs::write(&tmp, external).unwrap();
+    std::fs::rename(&tmp, &file).unwrap();
+
+    let err = s.call_err(2, "undo_last", json!({ "path": p }));
+    assert!(err.contains("nothing to undo"), "got: {err}");
+    assert!(err.contains("just re-read"), "got: {err}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), external);
+    // The buffer holds the file as it now is, so saves keep working.
+    s.call_ok(
+        3,
+        "replace_text",
+        json!({ "path": p, "pattern": "someone", "replacement": "somebody" }),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "written by somebody else, a different length\n"
+    );
 }
 
 #[test]

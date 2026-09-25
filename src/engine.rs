@@ -891,11 +891,19 @@ impl Workspace {
     /// touched — a read-only buffer is an unwritable reference the engine must
     /// not swap, and a modified one is the genuine conflict the stale-WARN path
     /// covers.
+    ///
+    /// A re-read clears the undo ring: every state on it is older than the
+    /// file, and the save guard would refuse to write it back, so undo_last
+    /// would only leave the buffer holding it, unsaved and stale.
     pub fn auto_revert_if_clean(&mut self) -> bool {
         if self.is_read_only() || self.is_modified() || !self.is_stale() {
             return false;
         }
-        revert_in_place(&mut self.session.borrow_mut()).is_ok()
+        let reverted = revert_in_place(&mut self.session.borrow_mut()).is_ok();
+        if reverted {
+            self.undo_ring.clear();
+        }
+        reverted
     }
 
     /// The current buffer text — used by the daemon's `save` op.
@@ -1550,6 +1558,25 @@ mod tests {
         );
         assert_eq!(ws.text(), "v2 external\nmine\n", "the edits are preserved");
         assert!(ws.is_stale(), "still flagged for the user to resolve");
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn undo_never_rewinds_across_an_auto_revert() {
+        let tmp = std::env::temp_dir().join(format!("mime-undo-revert-{}.txt", std::process::id()));
+        std::fs::write(&tmp, "v1\n").unwrap();
+        let mut ws = Workspace::new(Box::new(Quire::open(&tmp).unwrap()));
+        ws.run_value_undoable(r#"(goto-char (point-max)) (insert "mine\n")"#, false)
+            .unwrap();
+        ws.save_to(&tmp).unwrap();
+
+        // The file is replaced from outside and re-read: the states on the ring
+        // are text the file no longer holds, so undo has nothing left.
+        crate::safety::write_atomic(&tmp, b"v2 external\n").unwrap();
+        assert!(ws.auto_revert_if_clean());
+        let err = ws.undo_last().expect_err("no undo across a re-read");
+        assert!(err.contains("nothing to undo"), "got: {err}");
+        assert_eq!(ws.text(), "v2 external\n");
         std::fs::remove_file(&tmp).ok();
     }
 

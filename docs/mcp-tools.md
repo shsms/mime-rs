@@ -171,7 +171,7 @@ Overview of the merge-conflict hunks in the buffer: number, position + line, bra
 
 ## undo_last
 
-Rewind the buffer to its state before the most recent mutating call — the automatic safety net for a misfired edit (every mutating tool call captures a restore point first; bounded ring of 8, no redo). Each call steps one mutating call further back, and the rewound text is saved like any edit (save: false rewinds the buffer only).
+Rewind the buffer to its state before the most recent mutating call — the automatic safety net for a misfired edit (every mutating tool call captures a restore point first; bounded ring of 8, no redo). Each call steps one mutating call further back, and the rewound text is saved like any edit (save: false rewinds the buffer only). When a clean buffer re-reads its file after an outside change, the ring empties: its states are older than the file.
 
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `save` — Write the edit to the visited file (atomic; refused if the file changed on disk since mime last read or wrote it; code buffers warn if they no longer parse). Default: saved when this call changed the buffer; save: false holds the edit in the warm buffer for save_buffer later; save: true writes whatever the buffer holds.
