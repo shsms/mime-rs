@@ -1071,8 +1071,9 @@ bounds the plan-less and autosquash enumeration to from..HEAD;
 explicit =plan= + =from= is an error. Cherry-pick detection still
 compares against onto's side.
 
-** TODO [#B] Rewrites carry stacked branch pointers (--update-refs)     :git:
+** DONE [#B] Rewrites carry stacked branch pointers (--update-refs)     :git:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-09-25 Fr 21:33]
 - State "TODO"       from              [2026-07-17 Fr 09:22]
 :END:
 
@@ -1084,6 +1085,10 @@ three-branch stack rebase is ONE call instead of two rebases, a
 cherry-pick and two ~branch -f~. A read-side companion — a stack /
 topology view showing which branches contain which segments — would
 shorten the orientation phase too.
+
+Done on branch update-refs: every rewriting tool moves the stacked
+branches (update_refs, default true), and git_log shows the names at
+each commit. A fuller stack / topology view is still open if wanted.
 
 ** TODO [#C] git ops on a branch that is not checked out                :git:
 :LOGBOOK:
@@ -1218,8 +1223,9 @@ threshold naming the count, walk each tree once against a set of untracked
 paths, and truncate the report the way ~log~ does. ~msg_rewrite~'s report is
 uncapped too.
 
-** TODO [#C] Refs left behind: report from reword and the rebase paths too :git:
+** DONE [#C] Refs left behind: report from reword and the rebase paths too :git:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-09-25 Fr 21:33]
 - State "TODO"       from              [2026-09-07 Mo 11:27]
 :END:
 
@@ -1228,6 +1234,9 @@ it) only runs from ~msg_rewrite~, but the condition holds for ~reword~ and
 every sequencer op that moves one branch (rebase, move, split, absorb,
 fixup). Make it a sibling of ~backup_note~ and call it from the paths that
 move a single branch.
+
+Done on branch update-refs: every rewrite reports the refs it leaves
+on the old history, and ~stranded_refs~ is gone.
 
 ** TODO [#C] git_msg_rewrite wipes a non-UTF-8 commit message           :git:
 :LOGBOOK:
@@ -1382,6 +1391,72 @@ back text from before the re-read, whose save the guard refuses, and
 later saves stay refused until another revert. Decide whether an
 explicit revert empties the ring too, or undo stops at it. Found by
 pr-prep on branch agent-ux-fixes (2026-09-25).
+
+** TODO update-refs follow-ups: sequencer cleanups [#C]                 :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-25 Fr 21:26]
+:END:
+
+Cleanups the update-refs branch left for later. None changes behaviour.
+
+- Merge ~start~ into ~start_with~. Every production caller uses
+  ~start_with~; only tests still call ~start~ (about 50 calls).
+- An ~open_arg~ helper for the ten ~cmd_*~ functions that unpack
+  ~RepoArg~ and open the repo the same way.
+- One loop to fill marks and split-offs instead of four (~begin~,
+  ~fill_marks~, ~fill_sparse~, ~rehearsal_text~), and a lookup of
+  old → new commit pairs instead of ~fill_sparse~'s step-index arithmetic.
+- The ~update_refs~ default (true) is written in two places: the
+  ~From<&Path>~ impls of ~RepoArg~ and ~dispatch_git~'s
+  ~unwrap_or(true)~. Give it one home.
+- Speed: ~ref_names~ (every git_log) and ~place_marks~ (every rewrite
+  and rehearsal) list every ref, though they peel only the ones they
+  show, and ~landing~ walks the history once per branch. List only the
+  namespaces each needs (heads, remotes and tags for ~ref_names~; heads
+  and tags for ~place_marks~), and walk the range once.
+
+** TODO update-refs follow-ups: review minors left open [#C]            :git:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-25 Fr 21:26]
+:END:
+
+Small points the update-refs reviews found and left for later.
+
+- ~busy_branches~ counts a bare main repo's HEAD as checked out (git
+  does not), and ~common.parent()~ is the wrong main worktree path
+  with --separate-git-dir or core.worktree.
+- A branch's backup ring is rotated before its ref is locked; a failed
+  lock rotates the ring for nothing.
+- A branch's old tip is not checked again after ~lock_ref~, so a branch
+  moved in that short window is overwritten (its reflog still has it).
+- ~outcome_report~ reads the old tip back from HEAD's backup ring
+  instead of carrying it in ~RefReport~.
+- ~pub fn preview_text~ has no callers, and ~left_text~ takes a ~repo~
+  it does not use.
+- ~load_mark~ treats a ~new~ that is neither a string nor null as
+  unfilled instead of corrupt.
+- git_reword and git_msg_rewrite repeat the same fill → move → report
+  ending; a shared helper would stop them drifting apart.
+- ~sparse_rehearsal_text~ silently skips a mark with ~after == 0~,
+  which cannot happen; a ~debug_assert~ would say so.
+- The git_reword and git_msg_fill tool descriptions do not say other
+  branches move with the rewrite (git_msg_rewrite's does).
+- The help's "rehearse shows the moves first" means before applying;
+  the move lines come after the preview commits.
+- The git help paragraph is not wrapped at one width.
+- ~merge_base~ runs for every local branch outside the range, which can
+  be slow in a repo with many stale branches.
+- git_move and git_split stop halfway on a libgit2 error (mainline not
+  given) when a merge is among the commits they replay, and leave a
+  rewrite to abort; they should refuse it up front, as git_reword does.
+  git_rebase, git_fixup and git_absorb replay the same way; check them.
+- Test gaps: git_log with no range on a detached HEAD; a linked
+  worktree's own HEAD not counted as busy when asked from it; the
+  rebase-merge and rebase-apply head-name files; a squash (not fixup)
+  after the target in ~place_marks~; the note for a dropped (not
+  skipped) tip, end to end; two branches at one commit that is not
+  rewritten; git_move with ~update_refs: false~; end-to-end MCP tests
+  cover only git_fixup and git_reword.
 
 * Structural editing
 
