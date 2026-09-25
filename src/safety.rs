@@ -76,7 +76,7 @@ pub fn audit_enabled() -> bool {
 pub fn check_path(path: &Path) -> Result<PathBuf, String> {
     let roots = roots();
     if roots.is_empty() {
-        return Err("no allowed roots configured (set $MIME_ROOTS to absolute paths)".to_string());
+        return Err(no_roots_error());
     }
     let canonical = canonicalize_target(path)?;
     if roots.iter().any(|root| canonical.starts_with(root)) {
@@ -88,10 +88,23 @@ pub fn check_path(path: &Path) -> Result<PathBuf, String> {
             .collect::<Vec<_>>()
             .join(", ");
         Err(format!(
-            "path {} is outside the allowed roots ({roots})",
+            "path {} is outside the allowed roots ({roots}). {WIDEN_ROOTS}",
             path.display()
         ))
     }
+}
+
+/// How to change the roots, appended to every error about them: the agent that
+/// hits one can't widen them itself, but it can tell its user how.
+const WIDEN_ROOTS: &str = "The roots are $MIME_ROOTS (colon-separated paths; the \
+     working directory when unset or empty), read from the environment mime was \
+     started with. To widen them, set it where mime is launched — for a stdio \
+     MCP server, the environment of its entry in the client's configuration — \
+     and restart mime.";
+
+/// The error for a `$MIME_ROOTS` none of whose entries exist.
+pub fn no_roots_error() -> String {
+    format!("no allowed roots configured. {WIDEN_ROOTS}")
 }
 
 /// Save to `path` atomically by streaming: write a sibling temp file via
@@ -387,6 +400,16 @@ mod tests {
         let err = check_path(Path::new("/etc/passwd"))
             .expect_err("/etc/passwd must be rejected when root is a temp dir");
         assert!(err.contains("outside the allowed roots"), "got: {err}");
+        // It says how to widen them, not just that they are too narrow.
+        assert!(err.contains("$MIME_ROOTS"), "got: {err}");
+        assert!(err.contains("restart mime"), "got: {err}");
+    }
+
+    #[test]
+    fn the_no_roots_error_says_how_to_set_them() {
+        let err = no_roots_error();
+        assert!(err.contains("no allowed roots"), "got: {err}");
+        assert!(err.contains("restart mime"), "got: {err}");
     }
 
     #[test]

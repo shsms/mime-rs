@@ -3287,7 +3287,7 @@ fn tool_grep(args: &Value, sessions: &HashMap<String, Workspace>) -> Result<Tool
     // Surface the same error every other tool gives on a misconfigured
     // MIME_ROOTS, instead of a silent "no matches" (a false negative).
     if dirs.is_empty() {
-        return Err("no allowed roots configured (set $MIME_ROOTS to absolute paths)".to_string());
+        return Err(crate::safety::no_roots_error());
     }
 
     let mut visited = 0usize;
