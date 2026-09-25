@@ -1253,6 +1253,66 @@ re-signed, and a commit carrying a header libgit2 does not reproduce
 same message. ~recreated_oid~ already knows; say so in the description and
 the comment.
 
+** TODO ~mime call~: one MCP tool call from the shell [#B]              :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-25 Fr 15:39]
+:END:
+
+~mime call TOOL '{json}'~ runs one tool through the same dispatch as
+~--mcp~ and prints its result (text, or the JSON of a structured tool).
+Testing a development build against a reproduction meant piping
+hand-written JSON-RPC into ~target/debug/mime --mcp~ and unpicking the
+reply with python, and reviewers wrote scratch stdio scripts for the
+same reason. Also useful for bug-report reproductions and shell scripts.
+
+** TODO Randomized test of the disk-safety invariants [#B]              :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-25 Fr 15:39]
+:END:
+
+Drive random sequences of MCP calls — edits, ~save: false~,
+~rehearse: true~ (with and without ~view~), ~undo_last~, Lisp
+~checkpoint~ / ~restore-checkpoint~, reads, and writes to the file from
+outside mime — and check after every step:
+- the disk changes only on a call that changed the buffer, or on an
+  explicit save;
+- a change made outside mime is never overwritten silently;
+- a rehearsal leaves the buffer, the undo ring and the disk unchanged.
+Both serious bugs of the 0.2.0 work came from features interacting (a
+rehearsal with ~view~ on a full undo ring leaked its edit into undo;
+~undo_last~ after an auto-revert wrote over an outside change), and only
+cross-task review found them.
+
+** TODO Ambiguous-match errors name the defun of each match [#C]        :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-25 Fr 15:39]
+:END:
+
+When ~expect_unique~ (or an anchor) matches more than once, list the
+enclosing defun of each match next to its line, so the retry with
+~scope: {defun: …}~ is obvious. Hit on an edit whose line appeared in
+two functions of src/sequencer.rs.
+
+** TODO "Outside the allowed roots" error says how to widen them [#C]   :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-25 Fr 15:39]
+:END:
+
+Name ~MIME_ROOTS~ and the durable way to set it (~make claude-exec
+MIME_ROOTS=a:b:c~, which passes it to ~claude mcp add~). Editing
+=~/.claude.json= by hand doesn't last: Claude Code writes its copy back.
+
+** TODO Leave the reading tools lean [#C]                               :mcp:
+:LOGBOOK:
+- State "TODO"       from              [2026-09-25 Fr 15:39]
+:END:
+
+Agents read with the shell (~sed -n~, ~grep~) and edit with mime, in
+the transcripts and in the 0.2.0 session alike; outline/occur/view get
+little use. Spend effort on editing, previews and git history instead of
+making the reading tools more attractive. A standing decision, not work:
+close it once agreed.
+
 * Structural editing
 
 ** TODO Incremental re-parse (~InputEdit~s) [#C]
