@@ -428,11 +428,21 @@ fn replace_text_is_literal_counted_and_quote_safe() {
         json!({ "text": "a = b;\na = b;\na = b;\n" }),
     );
 
-    // Single replace: first occurrence only, with a remaining-match hint.
-    let out = s.call_ok(
+    // By default a repeated pattern is refused, naming the matches; nothing
+    // is replaced.
+    let err = s.call_err(
         2,
         "replace_text",
         json!({ "pattern": "a = b;", "replacement": "a = c;" }),
+    );
+    assert!(err.contains("matches at lines 1, 2, 3"), "got: {err}");
+
+    // expect_unique:false takes the first occurrence, with a remaining-match
+    // hint.
+    let out = s.call_ok(
+        2,
+        "replace_text",
+        json!({ "pattern": "a = b;", "replacement": "a = c;", "expect_unique": false }),
     );
     assert!(out.contains("replaced 1 occurrence"), "got: {out}");
     assert!(out.contains("2 more match(es) remain"), "got: {out}");
@@ -1126,7 +1136,8 @@ fn replace_text_regex_mode_expands_backrefs() {
     let out = s.call_ok(
         5,
         "replace_text",
-        json!({ "pattern": "x[0-9]", "replacement": "y\\&", "mode": "regex", "session": "q" }),
+        json!({ "pattern": "x[0-9]", "replacement": "y\\&", "mode": "regex", "session": "q",
+                "expect_unique": false }),
     );
     assert!(out.contains("replaced 1 occurrence"), "got: {out}");
     assert!(out.contains("2 more match(es) remain"), "got: {out}");
@@ -2395,6 +2406,50 @@ fn expect_unique_makes_ambiguous_anchors_an_error() {
     );
     let txt = s.read_text(7, json!({ "start": 8, "end": 15 }));
     assert_eq!(txt, "use y;\n", "batch rolled back: {txt}");
+}
+
+#[test]
+fn a_repeated_pattern_is_refused_by_default_in_batches_and_across_files() {
+    let dir = temp_dir("unique-default");
+    let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
+    std::fs::write(&a, "x\nx\n").unwrap();
+    std::fs::write(&b, "x\ny\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let (pa, pb) = (
+        a.to_string_lossy().into_owned(),
+        b.to_string_lossy().into_owned(),
+    );
+
+    // An edits entry without expect_unique refuses a repeated pattern.
+    let err = s.call_err(
+        1,
+        "replace_text",
+        json!({ "path": pa, "edits": [{ "pattern": "x", "replacement": "z" }] }),
+    );
+    assert!(err.contains("matches more than once"), "got: {err}");
+
+    // replace_in_files refuses when any file repeats it, and edits none.
+    let err = s.call_err(
+        2,
+        "replace_in_files",
+        json!({ "files": [pa, pb], "pattern": "x", "replacement": "z" }),
+    );
+    assert!(err.contains("a.txt"), "names the file: {err}");
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "x\ny\n");
+
+    // all:true needs no opt-out; expect_unique:false takes the first match.
+    s.call_ok(
+        3,
+        "replace_in_files",
+        json!({ "files": [pa, pb], "pattern": "x", "replacement": "z", "expect_unique": false }),
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "z\nx\n");
+    s.call_ok(
+        4,
+        "replace_text",
+        json!({ "path": pa, "pattern": "x", "replacement": "z", "all": true }),
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "z\nz\n");
 }
 
 #[test]

@@ -433,11 +433,21 @@ the read-only set; gate the destructive set).
 reads ~instructions~, and an agent drives a rule-shaped edit AND a rebase using
 only what the protocol surfaces — no external skill file./
 
-** TODO Consider expect_unique as replace_text's DEFAULT [#B]
+** DONE Consider expect_unique as replace_text's DEFAULT [#B]
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-09-25 Fr 21:57]
+:END:
+
 The flag exists and errors with the match lines; for weaker models
 ambiguity-as-error is arguably the right default. Measure the token
 / ergonomics cost on real sessions before flipping (a default flip
 breaks "replace the first TODO" one-shots).
+
+Done 2026-09-25: on by default for replace_text, its edits entries and
+replace_in_files (off with all:true; expect_unique:false takes the first
+match). Measured first: on this machine 221 of 237 single replace_text
+calls and 180 of 201 edits batches already passed it, and none of the 16
+without it relied on first-match.
 
 ** DONE checkpoint_labels clones every label on each session_status call [#C] :mcp:
 CLOSED: [2026-07-15]

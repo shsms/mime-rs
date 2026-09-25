@@ -630,6 +630,21 @@ fn bool_arg(args: &Value, key: &str) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// Whether an edit must match exactly once: `expect_unique`, true unless the
+/// caller says otherwise — a first match picked among several is a silent
+/// wrong-site edit. `all: true` wants every occurrence, so it turns the default
+/// off; an explicit `expect_unique: true` beside it is an error. `what` starts
+/// that error: the tool or the edit it is about ("replace_text", "edit 2").
+fn unique_arg(item: &Value, all: bool, what: &str) -> Result<bool, String> {
+    match item.get("expect_unique").and_then(Value::as_bool) {
+        Some(true) if all => Err(format!(
+            "{what}: expect_unique contradicts all:true (every occurrence is wanted)"
+        )),
+        Some(unique) => Ok(unique),
+        None => Ok(!all),
+    }
+}
+
 /// `bool_arg`, but strict: a non-boolean value is an error, for a flag that
 /// read as false would change what the call does.
 fn strict_bool_arg(args: &Value, key: &str) -> Result<bool, String> {
@@ -2041,10 +2056,7 @@ fn tool_replace_text(
         return Err("replace_text: pattern must not be empty".to_string());
     }
     let all = bool_arg(args, "all");
-    let unique = bool_arg(args, "expect_unique");
-    if unique && all {
-        return Err("expect_unique contradicts all:true (every occurrence is wanted)".to_string());
-    }
+    let unique = unique_arg(args, all, "replace_text")?;
     let regex = regex_mode(args, "replace_text")?;
     let (pat, rep) = (lisp_literal(&pattern), lisp_literal(&replacement));
     let all_flag = if all { "t" } else { "nil" };
@@ -2151,9 +2163,10 @@ fn tool_replace_text(
         Err(e) if unique && e.contains("__ambiguous__") => {
             let matches = match_lines(sessions, &session, &pat, regex);
             return Err(format!(
-                "replace_text: pattern {:?} matches at lines {} — expect_unique \
-                 requires exactly one; nothing was replaced. Refine the anchor \
-                 (occur shows every match in context).{}",
+                "replace_text: pattern {:?} matches at lines {} — nothing was \
+                 replaced. Make the pattern unique, pass all:true to replace \
+                 every match, or expect_unique:false to take the first (occur \
+                 shows every match in context).{}",
                 truncate_for_error(&pattern),
                 matches.listing,
                 if scope.is_some() {
@@ -2202,8 +2215,7 @@ fn tool_replace_text(
         ),
         (false, more) => format!(
             "replaced 1 occurrence at line {line}; point is now {point}; {more} more \
-             match(es) remain (pass all:true to replace every occurrence, or \
-             expect_unique:true to make ambiguity an error){saved}{unsaved}{stale}{view}{diff}"
+             match(es) remain (pass all:true to replace every occurrence){saved}{unsaved}{stale}{view}{diff}"
         ),
     })
 }
@@ -2792,13 +2804,7 @@ fn run_batch_edits(
             return Err(format!("edit {}: pattern must not be empty", i + 1));
         }
         let all = bool_arg(item, "all");
-        let unique = bool_arg(item, "expect_unique");
-        if unique && all {
-            return Err(format!(
-                "edit {}: expect_unique contradicts all:true",
-                i + 1
-            ));
-        }
+        let unique = unique_arg(item, all, &format!("edit {}", i + 1))?;
         let regex = regex_mode(item, &format!("edit {}", i + 1))?;
         let (pat, rep) = (lisp_literal(&pattern), lisp_literal(&replacement));
         // The error messages that abort (and roll back) the transaction name
@@ -2810,8 +2816,9 @@ fn run_batch_edits(
             truncate_for_error(&pattern)
         ));
         let ambiguous = lisp_escape(&format!(
-            "edit {}: pattern {:?} matches more than once (expect_unique) — \
-             nothing was applied; refine the anchor",
+            "edit {}: pattern {:?} matches more than once — nothing was \
+             applied; make the pattern unique, or pass all:true (every match) \
+             or expect_unique:false (the first) on this edit",
             i + 1,
             truncate_for_error(&pattern)
         ));
@@ -2954,7 +2961,7 @@ fn tool_replace_files(
                 "pattern": pattern,
                 "replacement": str_arg(args, "replacement")?,
                 "all": bool_arg(args, "all"),
-                "expect_unique": bool_arg(args, "expect_unique"),
+                "expect_unique": args.get("expect_unique").cloned().unwrap_or(Value::Null),
                 "mode": args.get("mode").and_then(Value::as_str).unwrap_or("exact"),
             })]
         }
@@ -5243,8 +5250,8 @@ and stays warm between calls.\n\n\
 Edits SAVE to disk by default. `rehearse: true` previews an edit (diff only, nothing kept); \
 `save: false` holds it in the buffer for a later call; undo_last rewinds the last edit, on disk too. \
 A failed edit rolls back; a refused save keeps the edit, but replace_in_files rolls every file back.\n\n\
-Editing: replace_text / insert_text for literal edits — `expect_unique: true` on replace_text errors \
-instead of guessing when the pattern repeats (an insert_text anchor must already be unique); \
+Editing: replace_text / insert_text for literal edits — a pattern or anchor that repeats is refused, \
+not guessed (expect_unique: false takes replace_text's first match); \
 `edits: [...]` batches several into one all-or-nothing call. replace_in_files for a cross-file change. \
 run_program (Emacs Lisp) for regex, per-match logic or structure — skim help {lisp} or help {recipes} \
 before writing one. fill_text reflows a comment, docstring or paragraph you wrote (all: true for a \
@@ -5447,7 +5454,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "replace_text",
-            "description": "Replace the FIRST occurrence of a pattern (searching from the top of the accessible region); pass all:true to replace every occurrence, or `thing` to replace a region named by structure instead of by searching. By default both strings are plain literals — no Lisp escaping, no regex (insert_text's counterpart; the fix for quote-heavy edits). mode:\"regex\" switches the pattern to the Emacs regex dialect (as occur/grep) with \\1..\\9 and \\& backrefs expanding in the replacement — the one-call form of the goto-char/while/re-search-forward/replace-match loop. Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Saved like every edit (save: false holds it; rehearse: true previews). For position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.",
+            "description": "Replace the one occurrence of a pattern — a pattern that matches more than once is refused, listing the matches and the functions they sit in (expect_unique:false takes the first match instead); pass all:true to replace every occurrence, or `thing` to replace a region named by structure instead of by searching. By default both strings are plain literals — no Lisp escaping, no regex (insert_text's counterpart; the fix for quote-heavy edits). mode:\"regex\" switches the pattern to the Emacs regex dialect (as occur/grep) with \\1..\\9 and \\& backrefs expanding in the replacement — the one-call form of the goto-char/while/re-search-forward/replace-match loop. Errors when nothing matches (and leaves point untouched); with expect_unique:false a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Saved like every edit (save: false holds it; rehearse: true previews). For position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5455,8 +5462,8 @@ fn build_tool_schemas() -> Vec<Value> {
                     "replacement": { "type": "string", "description": "The replacement text — literal by default; with mode:\"regex\", \\1..\\9 insert the numbered capture group and \\& the whole match." },
                     "thing": thing_schema("Replace the region named by structure instead of by searching:", ". Pass `replacement` only; the result names the replaced span (`KIND @START-END`) so a wrong pick is visible. Not combinable with pattern/edits/all/mode/expect_unique/scope."),
                     "mode": { "type": "string", "enum": ["exact", "regex"], "description": "exact (default): literal search and replacement. regex: Emacs-dialect pattern with backref expansion in the replacement. With `edits`, acts as the default for entries that don't set their own." },
-                    "all": { "type": "boolean", "description": "Replace every occurrence (default false: first only)." },
-                    "expect_unique": { "type": "boolean", "description": "Require the pattern to match exactly once: more than one match is an error (listing the match lines) and nothing is replaced. RECOMMENDED whenever the anchor text could plausibly repeat — first-match semantics would silently edit the wrong site. Default false." },
+                    "all": { "type": "boolean", "description": "Replace every occurrence (default false: exactly one match; see expect_unique)." },
+                    "expect_unique": { "type": "boolean", "description": "Require the pattern to match exactly once: more than one match is an error (listing the match lines) and nothing is replaced. Default true (false with all:true); pass false to take the first match of several." },
                     "scope": scope,
                     "view": { "type": ["boolean", "integer"], "description": "Append a rendered viewport around point after the edit (true = 4 context lines, or a line count)." },
                     "diff": edit_diff,
@@ -5503,8 +5510,8 @@ fn build_tool_schemas() -> Vec<Value> {
                     "pattern": { "type": "string", "description": "The text to find — literal by default; the Emacs regex dialect with mode:\"regex\"." },
                     "replacement": { "type": "string", "description": "The replacement text — with mode:\"regex\", \\1..\\9/\\& backrefs expand." },
                     "mode": { "type": "string", "enum": ["exact", "regex"], "description": "exact (default): literal. regex: Emacs-dialect pattern with backref expansion. With `edits`, acts as the default for entries that don't set their own." },
-                    "all": { "type": "boolean", "description": "Replace every occurrence per file (default false: first only)." },
-                    "expect_unique": { "type": "boolean", "description": "Require the pattern to match exactly once per file — more is an error and nothing is applied anywhere. Default false." },
+                    "all": { "type": "boolean", "description": "Replace every occurrence per file (default false: exactly one match per file; see expect_unique)." },
+                    "expect_unique": { "type": "boolean", "description": "Require the pattern to match exactly once per file — more is an error and nothing is applied anywhere. Default true (false with all:true); pass false to take the first match in each file." },
                     "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?, mode?}, …] applied in order inside ONE transaction per file — all-or-nothing across the whole call.", "items": { "type": "object", "properties": { "pattern": { "type": "string" }, "replacement": { "type": "string" }, "all": { "type": "boolean" }, "expect_unique": { "type": "boolean" }, "mode": { "type": "string", "enum": ["exact", "regex"] } } } },
                     "scope": scope,
                     "save": save,

@@ -426,11 +426,11 @@
           "openWorldHint": false,
           "readOnlyHint": false
         },
-        "description": "Replace the FIRST occurrence of a pattern (searching from the top of the accessible region); pass all:true to replace every occurrence, or `thing` to replace a region named by structure instead of by searching. By default both strings are plain literals — no Lisp escaping, no regex (insert_text's counterpart; the fix for quote-heavy edits). mode:\"regex\" switches the pattern to the Emacs regex dialect (as occur/grep) with \\1..\\9 and \\& backrefs expanding in the replacement — the one-call form of the goto-char/while/re-search-forward/replace-match loop. Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Saved like every edit (save: false holds it; rehearse: true previews). For position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.",
+        "description": "Replace the one occurrence of a pattern — a pattern that matches more than once is refused, listing the matches and the functions they sit in (expect_unique:false takes the first match instead); pass all:true to replace every occurrence, or `thing` to replace a region named by structure instead of by searching. By default both strings are plain literals — no Lisp escaping, no regex (insert_text's counterpart; the fix for quote-heavy edits). mode:\"regex\" switches the pattern to the Emacs regex dialect (as occur/grep) with \\1..\\9 and \\& backrefs expanding in the replacement — the one-call form of the goto-char/while/re-search-forward/replace-match loop. Errors when nothing matches (and leaves point untouched); with expect_unique:false a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Saved like every edit (save: false holds it; rehearse: true previews). For position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.",
         "inputSchema": {
           "properties": {
             "all": {
-              "description": "Replace every occurrence (default false: first only).",
+              "description": "Replace every occurrence (default false: exactly one match; see expect_unique).",
               "type": "boolean"
             },
             "diff": {
@@ -466,7 +466,7 @@
               "type": "array"
             },
             "expect_unique": {
-              "description": "Require the pattern to match exactly once: more than one match is an error (listing the match lines) and nothing is replaced. RECOMMENDED whenever the anchor text could plausibly repeat — first-match semantics would silently edit the wrong site. Default false.",
+              "description": "Require the pattern to match exactly once: more than one match is an error (listing the match lines) and nothing is replaced. Default true (false with all:true); pass false to take the first match of several.",
               "type": "boolean"
             },
             "full_diff": {
@@ -656,7 +656,7 @@
         "inputSchema": {
           "properties": {
             "all": {
-              "description": "Replace every occurrence per file (default false: first only).",
+              "description": "Replace every occurrence per file (default false: exactly one match per file; see expect_unique).",
               "type": "boolean"
             },
             "edits": {
@@ -688,7 +688,7 @@
               "type": "array"
             },
             "expect_unique": {
-              "description": "Require the pattern to match exactly once per file — more is an error and nothing is applied anywhere. Default false.",
+              "description": "Require the pattern to match exactly once per file — more is an error and nothing is applied anywhere. Default true (false with all:true); pass false to take the first match in each file.",
               "type": "boolean"
             },
             "files": {

@@ -93,6 +93,9 @@ enum Step {
         pattern: String,
         replacement: String,
         all: bool,
+        /// `expect_unique: false`: take the first of several matches rather
+        /// than refuse (the default refuses a repeated pattern).
+        first: bool,
         mode: Mode,
     },
     Insert {
@@ -176,6 +179,7 @@ impl Step {
                     rng.word()
                 },
                 all: rng.below(3) == 0,
+                first: rng.below(2) == 0,
                 mode: mode(rng),
             },
             1 => Step::Insert {
@@ -274,10 +278,15 @@ impl Step {
                 pattern,
                 replacement,
                 all,
+                first,
                 ..
             } => (
                 "replace_text",
-                json!({ "pattern": pattern, "replacement": replacement, "all": all }),
+                if *first && !*all {
+                    json!({ "pattern": pattern, "replacement": replacement, "expect_unique": false })
+                } else {
+                    json!({ "pattern": pattern, "replacement": replacement, "all": all })
+                },
             ),
             Step::Insert { text, at_end, .. } => (
                 "insert_text",

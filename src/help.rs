@@ -360,8 +360,8 @@ persists; (with-transaction …) = all-or-nothing inside a program;
 undo_last = automatic rewind to before the last mutating call, saved like
 any edit (ring of 8, no redo; when a clean buffer re-reads its file after
 an outside change, the ring empties, since its states are older than the
-file). replace_text's expect_unique:true makes a repeated anchor an
-error instead of a silent wrong-site edit. A FAILED
+file). replace_text refuses a repeated pattern instead of making a silent
+wrong-site edit (expect_unique:false takes the first match). A FAILED
 run_program rolls its pre-error edits back (rolled_back:true in the failure
 JSON); pass keep_partial:true to keep them for inspection — dirty:true then
 says they persist, and undo_last reverts them."#;

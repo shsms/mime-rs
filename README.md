@@ -196,7 +196,7 @@ into [docs/mcp-tools.md](docs/mcp-tools.md) (`make docs`), so the docs can't
 drift from the code. The edits that matter:
 
 ```json
-replace_text {path, pattern, replacement, expect_unique: true}
+replace_text {path, pattern, replacement}   // refused if the pattern repeats
 replace_in_files {files: [a, b, c], pattern, replacement, all: true}
 insert_text  {path, text, anchor: {defun: "parse_args", where: "after"}}
 view         {path, thing: {kind: "list", after: "fn main() {"}}   // the block after a line
@@ -208,11 +208,11 @@ help         {topic}           // lisp | regex | treesit | conflicts | git | ses
 ```
 
 The design leans on conveniences that matter most for less capable models:
-`expect_unique` turns an ambiguous anchor into an error (with the candidate
-lines) instead of editing the wrong one; `scope: {defun: "name"}` confines an
-edit to one function with no narrowing dance; multi-file `files:` batches are
-all-or-nothing; and warm sessions are bounded but never evicted while they hold
-unsaved work.
+an ambiguous pattern is an error by default (listing the candidate lines and
+the functions they sit in) instead of an edit to the wrong one;
+`scope: {defun: "name"}` confines an edit to one function with no narrowing
+dance; multi-file `files:` batches are all-or-nothing; and warm sessions are
+bounded but never evicted while they hold unsaved work.
 
 A `git_*` group adds history editing. The core is the sequencer: `git_rebase`
 (with a `rehearse: true` dry-run), `git_cherry_pick`, `git_revert`, and
