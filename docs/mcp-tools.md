@@ -180,7 +180,7 @@ Rewind the buffer to its state before the most recent mutating call — the auto
 
 ## save_buffer
 
-Write the session buffer's text to disk. Without `to`, save back to the session's visited file (atomic write, stale-read guard, parse warning — the same save the edit tools perform); with `to` pointing elsewhere, write a COPY there and leave the session bound to its original file (a later plain save still targets the original — no silent retarget). NOTE: `path` addresses WHICH session, exactly like on every other tool — the destination parameter is `to`.
+Write the session buffer's text to disk. Without `to`, save back to the session's visited file (atomic write, stale-read guard, parse warning — the same save the edit tools perform; a buffer with no edits whose file changed on disk is re-read instead, as there is nothing to save); with `to` pointing elsewhere, write a COPY there and leave the session bound to its original file (a later plain save still targets the original — no silent retarget). NOTE: `path` addresses WHICH session, exactly like on every other tool — the destination parameter is `to`.
 
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `session` — Warm session id; defaults to "default" when omitted.

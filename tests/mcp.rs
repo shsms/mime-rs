@@ -2308,6 +2308,81 @@ fn save_buffer_addresses_by_path_and_saves_as() {
 }
 
 #[test]
+fn saving_an_unedited_buffer_whose_file_changed_re_reads_it() {
+    let dir = temp_dir("save-unedited-stale");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "old\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+    s.call_ok(1, "open_file", json!({ "path": p }));
+
+    // Replaced from outside while the buffer has no edits: nothing to save,
+    // the outside change stays, and the buffer now holds it.
+    let tmp = dir.join("doc.new");
+    std::fs::write(&tmp, "outside\n").unwrap();
+    std::fs::rename(&tmp, &file).unwrap();
+    let out = s.call_ok(2, "save_buffer", json!({ "path": p }));
+    assert!(out.contains("nothing to save"), "got: {out}");
+    assert!(out.contains("the buffer had no edits"), "got: {out}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "outside\n");
+    assert_eq!(
+        s.read_text(3, json!({ "path": p, "start": 1, "end": 9 })),
+        "outside\n"
+    );
+
+    // With edits held back, the refusal (and its message about the edit) stays.
+    s.call_ok(
+        4,
+        "replace_text",
+        json!({ "path": p, "pattern": "outside", "replacement": "mine", "save": false }),
+    );
+    let tmp = dir.join("doc.new");
+    std::fs::write(&tmp, "again\n").unwrap();
+    std::fs::rename(&tmp, &file).unwrap();
+    let err = s.call_err(5, "save_buffer", json!({ "path": p }));
+    assert!(err.contains("refusing to save"), "got: {err}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "again\n");
+}
+
+#[test]
+fn saving_an_unedited_stale_buffer_honours_to_and_a_deleted_file() {
+    let dir = temp_dir("save-unedited-to");
+    let (file, copy) = (dir.join("doc.txt"), dir.join("copy.txt"));
+    std::fs::write(&file, "old\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let (p, c) = (
+        file.to_string_lossy().into_owned(),
+        copy.to_string_lossy().into_owned(),
+    );
+    s.call_ok(1, "open_file", json!({ "path": p }));
+    let replace = |text: &str| {
+        let tmp = dir.join("doc.new");
+        std::fs::write(&tmp, text).unwrap();
+        std::fs::rename(&tmp, &file).unwrap();
+    };
+
+    // `to` naming the visited file is a plain save: nothing to save.
+    replace("second\n");
+    let out = s.call_ok(2, "save_buffer", json!({ "path": p, "to": p }));
+    assert!(out.contains("nothing to save"), "got: {out}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "second\n");
+
+    // `to` naming another file writes the buffer there, as always.
+    replace("third\n");
+    s.call_ok(3, "save_buffer", json!({ "path": p, "to": c }));
+    assert_eq!(std::fs::read_to_string(&copy).unwrap(), "second\n");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "third\n");
+
+    // A deleted file cannot be re-read: refused, without claiming an edit.
+    s.call_ok(4, "save_buffer", json!({ "path": p }));
+    std::fs::remove_file(&file).unwrap();
+    let err = s.call_err(5, "save_buffer", json!({ "path": p }));
+    assert!(err.contains("could not be re-read"), "got: {err}");
+    assert!(!err.contains("edit is preserved"), "got: {err}");
+    assert!(!file.exists(), "not written back");
+}
+
+#[test]
 fn session_miss_error_names_the_warm_sessions() {
     let mut s = Server::spawn();
     s.call_ok(1, "open_text", json!({ "text": "x", "session": "alpha" }));

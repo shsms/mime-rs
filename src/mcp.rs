@@ -3695,6 +3695,31 @@ fn tool_save_buffer(
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
     let session = resolve_session(args, sessions)?;
+    // An unedited buffer whose file changed on disk has nothing to save, and
+    // writing it would put the old text back over the outside change: re-read
+    // it instead, as every other call does, and say so.
+    if let Some(ws) = sessions.get_mut(&session)
+        && let Some(visited) = ws.visited_path()
+        && args
+            .get("to")
+            .and_then(Value::as_str)
+            .is_none_or(|to| crate::engine::same_file(&visited, Path::new(to)))
+        && !ws.is_read_only()
+        && !ws.is_modified()
+        && ws.is_stale()
+    {
+        if ws.auto_revert_if_clean() {
+            return Ok(format!(
+                "nothing to save — {} changed on disk and was re-read; the buffer had no edits",
+                visited.display()
+            ));
+        }
+        return Err(format!(
+            "nothing was saved — {} changed on disk and could not be re-read \
+             (deleted?); the buffer has no edits to lose",
+            visited.display()
+        ));
+    }
     match args.get("to").and_then(Value::as_str) {
         None => save_visited(sessions, &session).map(|n| n.trim_start_matches("; ").to_string()),
         Some(to) => {
@@ -5625,7 +5650,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "save_buffer",
-            "description": "Write the session buffer's text to disk. Without `to`, save back to the session's visited file (atomic write, stale-read guard, parse warning — the same save the edit tools perform); with `to` pointing elsewhere, write a COPY there and leave the session bound to its original file (a later plain save still targets the original — no silent retarget). NOTE: `path` addresses WHICH session, exactly like on every other tool — the destination parameter is `to`.",
+            "description": "Write the session buffer's text to disk. Without `to`, save back to the session's visited file (atomic write, stale-read guard, parse warning — the same save the edit tools perform; a buffer with no edits whose file changed on disk is re-read instead, as there is nothing to save); with `to` pointing elsewhere, write a COPY there and leave the session bound to its original file (a later plain save still targets the original — no silent retarget). NOTE: `path` addresses WHICH session, exactly like on every other tool — the destination parameter is `to`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

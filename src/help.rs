@@ -335,7 +335,8 @@ re-check, then save_buffer elsewhere or (revert-buffer) to discard;
 replace_in_files instead rolls every file back and writes none. A save-as
 copy is atomic but NOT stale-guarded (it writes a different file). A buffer
 from open_text has no file: the default save skips it. A clean-but-drifted
-buffer auto-reverts before reads, programs, and rehearsals.
+buffer auto-reverts before reads, programs, rehearsals and a save_buffer
+back to its own file (which then has nothing to save).
 
 Re-sync after EXTERNAL changes (a git checkout/rebase, another editor):
 nothing to do — passing `path` re-reads a CLEAN drifted buffer from disk

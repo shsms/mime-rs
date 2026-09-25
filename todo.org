@@ -1360,8 +1360,9 @@ count as the one at LINE.
 too. It should search within the scope, and still print absolute line
 numbers.
 
-** TODO Refused save of an unedited buffer says "the edit is preserved" [#C] :mcp:
+** DONE Refused save of an unedited buffer says "the edit is preserved" [#C] :mcp:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-09-25 Fr 22:35]
 - State "TODO"       from              [2026-09-25 Fr 16:30]
 :END:
 
