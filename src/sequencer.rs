@@ -2755,6 +2755,12 @@ fn move_changes(
     } else {
         (fc.clone(), tc.clone())
     };
+    // The tail replayed onto the rebuilt pair is HEAD's commits above `newer`,
+    // so both commits must be on the current branch.
+    let head = repo.head()?.peel_to_commit()?.id();
+    if newer.id() != head && !repo.graph_descendant_of(head, newer.id())? {
+        return Err(estr("move: the commits are not on the current branch"));
+    }
     let base_commit = older.parent(0)?; // older is a child (adjacency), so it has a parent
     let base_tree = base_commit.tree()?;
     let older_tree = older.tree()?;
@@ -8223,6 +8229,52 @@ mod tests {
         assert!(err.contains("worktree"), "{err}");
         let err = cmd_blame(&dir, None, None, None, false, false).unwrap_err();
         assert!(err.contains("path"), "{err}");
+    }
+
+    #[test]
+    fn move_refuses_commits_off_the_current_branch() {
+        let dir = tmp("move-off-branch");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("x", "0\n")], "base");
+        let s1 = commit(&repo, &[base], &[("x", "0\n"), ("s", "1\n")], "s1");
+        let s2 = commit(
+            &repo,
+            &[s1],
+            &[("x", "0\n"), ("s", "1\n"), ("t", "1\n")],
+            "s2",
+        );
+        let c1 = commit(&repo, &[base], &[("x", "0\n"), ("c", "1\n")], "c1");
+        on_branch(&repo, "main", c1);
+        // s1 and s2 sit on a side branch: replaying HEAD's commits above s2
+        // would graft them into main.
+        let err = cmd_move(
+            &dir,
+            &s2.to_string(),
+            &s1.to_string(),
+            &["t".to_string()],
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.contains("not on the current branch"), "{err}");
+        let head = repo.head().unwrap().peel_to_commit().unwrap().id();
+        assert_eq!(head, c1, "nothing moved");
+        // The older commit on the branch is not enough: s2 must be too.
+        let c2 = commit(
+            &repo,
+            &[s1],
+            &[("x", "0\n"), ("s", "1\n"), ("c", "1\n")],
+            "c2",
+        );
+        on_branch(&repo, "c", c2);
+        let err = cmd_move(
+            &dir,
+            &s2.to_string(),
+            &s1.to_string(),
+            &["t".to_string()],
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.contains("not on the current branch"), "{err}");
     }
 
     #[test]
