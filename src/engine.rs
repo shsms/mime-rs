@@ -429,7 +429,13 @@ impl Workspace {
         let before = self.version();
         let step = Checkpoint::capture(format!("undo-{before}"), &self.session.borrow());
         let result = self.run_value_with(program, keep_partial);
-        if self.version() != before {
+        // Changed means the text differs, not that the version moved: an edit
+        // that puts back what it took out takes no undo step.
+        let changed = match &result {
+            Ok((report, _)) => report.dirty,
+            Err(_) => self.last_failure_dirty.get(),
+        };
+        if changed {
             self.undo_ring.push(step);
             if self.undo_ring.len() > UNDO_RING_CAP {
                 self.undo_ring.remove(0);
@@ -1593,6 +1599,16 @@ mod tests {
             ws.undo_last().unwrap();
         }
         assert_eq!(ws.text(), "", "every edit rewound");
+    }
+
+    #[test]
+    fn a_failed_run_that_puts_the_text_back_takes_no_undo_step() {
+        for keep_partial in [false, true] {
+            let mut ws = Workspace::new(Box::new(crate::Buffer::from_string("*t*", "same")));
+            let program = r#"(insert "x") (delete-char -1) (error "stop")"#;
+            assert!(ws.run_value_undoable(program, keep_partial).is_err());
+            assert!(ws.undo_last().is_err(), "keep_partial {keep_partial}");
+        }
     }
 
     #[test]

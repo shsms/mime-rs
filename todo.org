@@ -1370,8 +1370,9 @@ is refused (right: writing would undo the outside change), but the
 message ends "the edit is preserved in warm session …" when there is no
 edit. Say the file changed and that any read re-reads it.
 
-** TODO A replacement with identical text takes an undo step [#C]       :mcp:
+** DONE A replacement with identical text takes an undo step [#C]       :mcp:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-09-25 Fr 22:32]
 - State "TODO"       from              [2026-09-25 Fr 16:30]
 :END:
 

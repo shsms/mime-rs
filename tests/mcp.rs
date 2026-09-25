@@ -2596,6 +2596,39 @@ fn a_context_regex_is_counted_before_the_edit() {
 }
 
 #[test]
+fn an_edit_that_leaves_the_text_unchanged_saves_nothing_and_takes_no_undo_step() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = temp_dir("unchanged-edit");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "keep\nme\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+    s.call_ok(1, "open_file", json!({ "path": p }));
+    let ino = std::fs::metadata(&file).unwrap().ino();
+
+    let out = s.call_ok(
+        2,
+        "replace_text",
+        json!({ "path": p, "pattern": "keep", "replacement": "keep" }),
+    );
+    assert!(
+        out.contains("the text is unchanged, so nothing was saved"),
+        "got: {out}"
+    );
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().ino(),
+        ino,
+        "not rewritten"
+    );
+
+    // The buffer is still clean, and there is nothing to undo.
+    let status = s.call_ok(3, "session_status", json!({}));
+    assert!(status.contains("\"unsaved\":false"), "got: {status}");
+    let err = s.call_err(4, "undo_last", json!({ "path": p }));
+    assert!(err.contains("nothing to undo"), "got: {err}");
+}
+
+#[test]
 fn close_session_releases_and_guards_unsaved_edits() {
     let dir = temp_dir("close");
     let file = dir.join("doc.txt");

@@ -2199,7 +2199,11 @@ fn tool_replace_text(
         .unwrap_or(0);
     let point = report_value(&report, "point").unwrap_or_default();
     let line = report_value(&report, "line").unwrap_or_default();
-    let saved = save_after_edit(args, sessions, &session, report.dirty)?;
+    let mut saved = save_after_edit(args, sessions, &session, report.dirty)?;
+    if !report.dirty && saved.is_empty() {
+        // The replacement equals what it replaced: nothing to write.
+        saved = "; the text is unchanged, so nothing was saved".to_string();
+    }
     let unsaved = unsaved_note(sessions, &session);
     let stale = stale_edit_note(sessions, &session);
     let view = view_echo(args, sessions, &session);
