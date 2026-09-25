@@ -2324,7 +2324,7 @@ fn line_text(
 fn thing_schema(lead: &str, tail: &str) -> Value {
     let kinds = crate::builtins::THING_KINDS;
     let description = format!(
-        r#"{lead} {{"kind": "list", "after": "fn main() {{"}} is the block that line opens. With "after", kind `list` takes the LAST list beginning on the line (else the first one after it), while every other kind takes the FIRST thing at or after the line — {{"kind": "sexp", "after": "old(1, 2);"}} is `old`. {{"kind": "sexp", "at": 1234}} is the expression containing a position; "before" the last one ending before the line. kind: {}. "up": N widens a sexp/list by N enclosing groups. Balanced brackets, strings and comments follow the file's language{tail}"#,
+        r#"{lead} {{"kind": "list", "after": "fn main() {{"}} is the block that line opens. With "after", kind `list` takes the LAST list beginning on the line (else the first one after it), while every other kind takes the FIRST thing at or after the line — {{"kind": "sexp", "after": "old(1, 2);"}} is `old`, and a line of the doc comment, attributes or decorators above a defun, or the line its definition starts on, names that defun (a docstring inside the body does not). {{"kind": "sexp", "at": 1234}} is the expression containing a position; "before" the last one ending before the line. kind: {}. "up": N widens a sexp/list by N enclosing groups. Balanced brackets, strings and comments follow the file's language{tail}"#,
         kinds.join(" | ")
     );
     json!({

@@ -3336,9 +3336,10 @@ fn unknown_thing(kind: &str) -> Error {
 /// or — when none begins on it — the first one beginning after the line: an
 /// anchor like `fn main() {` names the block it opens, not the `()` earlier on
 /// the same line. EVERY other kind, `sexp` included, takes the first thing at
-/// or after `pos`, so `old(1, 2);` names `old` rather than the trailing `;`.
-/// Depth-zero closers on the way are stepped over: the anchor line may sit at
-/// any depth.
+/// or after `pos`, so `old(1, 2);` names `old` rather than the trailing `;` —
+/// except that a `defun` whose definition starts at or after `pos` counts even
+/// when its decoration (doc comment, attributes) starts above it. Depth-zero
+/// closers on the way are stepped over: the anchor line may sit at any depth.
 pub fn thing_after(
     sess: &mut crate::engine::Session,
     kind: &str,
@@ -3346,10 +3347,13 @@ pub fn thing_after(
     up: usize,
 ) -> Result<Option<(usize, usize)>, Error> {
     if kind == "defun" {
+        // The first defun whose definition starts at or after the line: a
+        // line of its decoration, or the line it starts on, names that defun;
+        // a line in a body names the next one.
         return Ok(syntax_of(sess)
             .defuns()
             .into_iter()
-            .filter(|d| d.start >= pos)
+            .filter(|d| d.node_start >= pos)
             .min_by_key(|d| d.start)
             .map(|d| (d.start, d.end)));
     }
@@ -6746,6 +6750,40 @@ mod tests {
             e.contains("unknown thing") && e.contains("paragraph"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn a_defun_after_its_own_signature_or_doc_line_is_that_defun() {
+        let src = "fn a() {\n    x();\n}\n\n/// doc\n/// more\nfn b() {}\n\nfn c() {}\n";
+        let ws = Workspace::new_trusted(Box::new(Buffer::from_string("t.rs", src)));
+        // Positions are 1-based chars; each probe is the start of a line.
+        let line = |n: usize| {
+            1 + src
+                .split_inclusive('\n')
+                .take(n - 1)
+                .map(str::len)
+                .sum::<usize>()
+        };
+        let b = thing_after(&ws, "defun", line(7), 0).expect("b");
+        assert_eq!(b.0, line(5), "the signature line names b, doc and all");
+        assert_eq!(
+            thing_after(&ws, "defun", line(6), 0),
+            Some(b),
+            "a doc line names b"
+        );
+        assert_eq!(
+            thing_after(&ws, "defun", line(5), 0),
+            Some(b),
+            "the first doc line too"
+        );
+        // A line in a body still names the next defun.
+        assert_eq!(
+            thing_after(&ws, "defun", line(2), 0),
+            Some(b),
+            "after a's body line: b"
+        );
+        let c = thing_after(&ws, "defun", line(8), 0).expect("c");
+        assert_eq!(c.0, line(9));
     }
 
     /// `after:` names the first thing at or after the anchor line's start —

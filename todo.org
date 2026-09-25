@@ -1336,8 +1336,9 @@ little use. Spend effort on editing, previews and git history instead of
 making the reading tools more attractive. A standing decision, not work:
 close it once agreed.
 
-** TODO ~thing {kind: defun, after: LINE}~ skips a documented defun named on LINE [#C] :mcp:
+** DONE ~thing {kind: defun, after: LINE}~ skips a documented defun named on LINE [#C] :mcp:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-09-25 Fr 22:29]
 - State "TODO"       from              [2026-09-25 Fr 16:30]
 :END:
 

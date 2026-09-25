@@ -335,8 +335,13 @@ pub struct NodeSpan {
 pub struct Defun {
     pub kind: String,
     pub name: String,
+    /// Where the defun begins, its decoration (doc comment, attributes,
+    /// decorators) included.
     pub start: usize,
     pub end: usize,
+    /// Where the definition itself begins, after its decoration: the line of
+    /// `fn name(` rather than of its doc comment.
+    pub node_start: usize,
 }
 
 /// What the paragraph filler may reflow; see [`Syntax::prose_unit_at`].
@@ -645,6 +650,7 @@ impl Syntax {
                     kind: node.kind().to_string(),
                     start: self.char_of(start_b),
                     end: self.char_of(end_b),
+                    node_start: self.char_of(node.start_byte()),
                 });
             }
             // Push named children in reverse so the stack pops them in document
