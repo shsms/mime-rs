@@ -34,6 +34,15 @@ impl Checkpoint {
     pub fn restore(&self) -> Box<dyn TextStore> {
         self.snap.snapshot()
     }
+    /// An independent copy of this checkpoint (`Checkpoint` is not `Clone`
+    /// because `Box<dyn TextStore>` isn't) — `TextStore::snapshot` is O(1)/
+    /// structural sharing for Quire, so this is cheap.
+    fn duplicate(&self) -> Checkpoint {
+        Checkpoint {
+            label: self.label.clone(),
+            snap: self.snap.snapshot(),
+        }
+    }
     /// The content version of the captured state ("equal versions imply equal
     /// text") — lets the undo ring skip duplicate captures.
     pub fn version(&self) -> u64 {
@@ -210,6 +219,18 @@ impl Session {
 }
 
 pub type SharedSession = Rc<RefCell<Session>>;
+
+/// What a rehearsal rolls back to: the buffer as it was, how long the kill
+/// ring and the checkpoints were, and a full copy of the undo ring — a
+/// length alone cannot restore a ring at capacity, where the rehearsed
+/// program's own `push_undo` calls (e.g. from `view_echo`'s follow-up read)
+/// evict the ring's oldest entries without changing its length.
+pub struct RehearsalMark {
+    buffer: Box<dyn TextStore>,
+    kill_len: usize,
+    checkpoints_len: usize,
+    undo_ring: Vec<Checkpoint>,
+}
 
 /// A warm editing session: a long-lived `TulispContext` over a shared
 /// [`Session`]. The daemon keeps one of these per session id; each
@@ -397,7 +418,12 @@ impl Workspace {
             .undo_ring
             .pop()
             .ok_or("nothing to undo (no earlier state on the undo ring)")?;
-        self.session.borrow_mut().buffer = cp.restore();
+        // The session's stamp is the disk state it last synced with; the
+        // snapshot's may predate a save since.
+        let stamp = self.session.borrow().buffer.file_stamp().cloned();
+        let mut restored = cp.restore();
+        restored.set_file_stamp(stamp);
+        self.session.borrow_mut().buffer = restored;
         Ok(())
     }
 
@@ -459,6 +485,12 @@ impl Workspace {
             }
             (s.buffer.name().to_string(), snaps)
         });
+        // The current buffer, when it matches its file before the run.
+        let pre_clean = {
+            let s = self.session.borrow();
+            (s.buffer.version() == s.synced_version)
+                .then(|| (s.buffer.name().to_string(), s.synced_version))
+        };
 
         let (report, value) = match self.eval_and_report(program, false) {
             Ok(rv) => rv,
@@ -494,6 +526,17 @@ impl Workspace {
         {
             self.rollback_session(&current_name, snaps);
             return Err("session is read-only: program modified the buffer".to_string());
+        }
+        // A run that left the text as it was (an identity replacement, an edit
+        // undone in the same program) keeps a clean buffer clean: its version
+        // moved, but it still matches its file.
+        if let Some((name, synced)) = pre_clean
+            && !report.dirty
+        {
+            let mut s = self.session.borrow_mut();
+            if s.buffer.name() == name && s.synced_version == synced {
+                s.synced_version = s.buffer.version();
+            }
         }
         Ok((report, value))
     }
@@ -600,25 +643,38 @@ impl Workspace {
     /// Everything is rolled back exactly as in [`rehearse`]; only the extra
     /// value differs.
     pub fn rehearse_value(&mut self, program: &str) -> Result<(RunReport, String), String> {
-        // Snapshot everything a rehearsal must restore *before* the program
-        // runs.
-        let (snap, kill_len, cp_len) = {
-            let s = self.session.borrow();
-            (s.buffer.snapshot(), s.kill_ring.len(), s.checkpoints.len())
-        };
-
-        // Run with the same machinery as `run`; on a tulisp error we still roll
-        // back, so a failed rehearsal leaves no trace either.
-        let result = self.eval_and_report(program, true);
-
-        let mut s = self.session.borrow_mut();
-        s.buffer = snap;
-        s.kill_ring.truncate(kill_len);
-        s.checkpoints.truncate(cp_len);
-        // The rollback above means a failed rehearsal never leaves edits; its
+        // Mark everything a rehearsal must restore *before* the program runs; a
+        // failed rehearsal rolls back too, so it leaves no trace either. Its
         // reports/log DO remain readable via `failure_context`, by design.
-        self.last_failure_dirty.set(false);
+        let mark = self.rehearsal_mark();
+        let result = self.eval_and_report(program, true);
+        self.roll_back(mark);
         result
+    }
+
+    /// Mark the state a rehearsal returns to — see
+    /// [`roll_back`](Self::roll_back).
+    pub fn rehearsal_mark(&self) -> RehearsalMark {
+        let s = self.session.borrow();
+        RehearsalMark {
+            buffer: s.buffer.snapshot(),
+            kill_len: s.kill_ring.len(),
+            checkpoints_len: s.checkpoints.len(),
+            undo_ring: self.undo_ring.iter().map(Checkpoint::duplicate).collect(),
+        }
+    }
+
+    /// Put the session back to `mark`: its buffer, and nothing of what the
+    /// rehearsed calls pushed onto the kill ring, the checkpoints or the undo
+    /// ring.
+    pub fn roll_back(&mut self, mark: RehearsalMark) {
+        let mut s = self.session.borrow_mut();
+        s.buffer = mark.buffer;
+        s.kill_ring.truncate(mark.kill_len);
+        s.checkpoints.truncate(mark.checkpoints_len);
+        drop(s);
+        self.undo_ring = mark.undo_ring;
+        self.last_failure_dirty.set(false);
     }
 
     /// Shared core of [`run`]/[`rehearse`]: clear the per-program

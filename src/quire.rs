@@ -2783,6 +2783,9 @@ impl TextStore for Quire {
     fn file_stamp(&self) -> Option<&crate::safety::FileStamp> {
         self.stamp.as_ref()
     }
+    fn set_file_stamp(&mut self, stamp: Option<crate::safety::FileStamp>) {
+        self.stamp = stamp;
+    }
     fn drifted(&self) -> bool {
         self.original.drifted()
     }

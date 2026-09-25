@@ -328,7 +328,7 @@ pub fn handle_request(req: Value, store: &mut WorkspaceStore, ctx: &CallContext)
         "notifications/initialized" | "initialized" => return None,
         "ping" => json!({}),
         "server/discover" => discover_result(),
-        "tools/list" => crate::mcp::tools_list_result(),
+        "tools/list" => crate::mcp::tools_list_result(ctx.transport),
         "tools/call" => tools_call(&params, store, ctx, era),
         other => {
             if is_notification {
@@ -368,6 +368,10 @@ fn tools_call(params: &Value, store: &mut WorkspaceStore, ctx: &CallContext, era
     // rewrites alias spellings in place).
     let no_args = json!({});
     let args = params.get("arguments").unwrap_or(&no_args);
+    // A tool this transport does not list is not callable on it either.
+    if !crate::mcp::tool_listed(name, ctx.transport) {
+        return tool_text(format!("unknown tool: {name}"), true);
+    }
     // The two workspace tools act on the store, not on a session map, so they
     // never pass through `mcp::tools_call_result`.
     if matches!(name, "open_workspace" | "close_workspace") {
@@ -457,6 +461,7 @@ fn close_workspace(args: &Value, store: &mut WorkspaceStore, ctx: &CallContext) 
     let Some(h) = args.get("workspace").and_then(Value::as_str) else {
         return ToolOutput::error("close_workspace needs `workspace`".into());
     };
+    // Guards stdio, should close_workspace ever be listed there.
     if ctx.transport == Transport::Stdio && ctx.implicit_workspace == Some(h) {
         return ToolOutput::error(
             "cannot close the stdio default workspace — close_session drops one session".into(),
@@ -856,9 +861,14 @@ mod tests {
 
     #[test]
     fn open_workspace_isolates_session_names() {
+        // open_workspace only means anything on HTTP, where several agents
+        // share one process.
         let mut store = WorkspaceStore::new();
         let h = store.mint();
-        let ctx = stdio_ctx(&h);
+        let ctx = CallContext {
+            transport: Transport::Http,
+            implicit_workspace: Some(&h),
+        };
         call(
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"open_text","arguments":{"text":"first\n","session":"c"}}}"#,
             &mut store,
@@ -899,7 +909,8 @@ mod tests {
     }
 
     #[test]
-    fn close_workspace_refuses_the_implicit_one_on_stdio_but_drops_a_minted_one() {
+    fn close_workspace_is_unknown_on_stdio_and_drops_a_minted_one_on_http() {
+        // close_workspace is not listed on stdio at all.
         let mut store = WorkspaceStore::new();
         let h = store.mint();
         let ctx = stdio_ctx(&h);
@@ -908,8 +919,13 @@ mod tests {
         );
         let r = call(&req, &mut store, &ctx);
         assert_eq!(r["result"]["isError"], true);
-        assert!(text_of(&r).contains("cannot close"), "{}", text_of(&r));
+        assert!(text_of(&r).contains("unknown tool"), "{}", text_of(&r));
 
+        // On HTTP, where it IS listed: drops a minted workspace.
+        let ctx = CallContext {
+            transport: Transport::Http,
+            implicit_workspace: None,
+        };
         let h2 = store.mint();
         let req = format!(
             r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"close_workspace","arguments":{{"workspace":"{h2}"}}}}}}"#
@@ -1013,12 +1029,16 @@ mod tests {
                 r["result"]
             );
         }
-        // close_workspace is prose as well.
+        // close_workspace is prose as well — it only lists on HTTP.
+        let http_ctx = CallContext {
+            transport: Transport::Http,
+            implicit_workspace: Some(&h),
+        };
         let h2 = store.mint();
         let req = format!(
             r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"close_workspace","arguments":{{"workspace":"{h2}"}}}}}}"#
         );
-        let r = call(&req, &mut store, &ctx);
+        let r = call(&req, &mut store, &http_ctx);
         assert_eq!(r["result"]["isError"], false, "{}", text_of(&r));
         assert!(r["result"].get("structuredContent").is_none());
 
@@ -1509,6 +1529,9 @@ mod tests {
 
     #[test]
     fn tools_list_order_is_stable_and_matches_the_catalogue() {
+        let _lock = crate::sequencer::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut store = WorkspaceStore::new();
         let h = store.mint();
         let ctx = stdio_ctx(&h);
@@ -1531,6 +1554,7 @@ mod tests {
             .collect();
         let catalogue: Vec<&str> = crate::mcp::tool_schemas()
             .iter()
+            .filter(|t| crate::mcp::tool_listed(t["name"].as_str().unwrap(), Transport::Stdio))
             .map(|t| t["name"].as_str().unwrap())
             .collect();
         assert_eq!(names, catalogue);

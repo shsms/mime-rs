@@ -24,24 +24,14 @@ Open an in-memory text buffer into a warm session (replacing any existing sessio
 
 ## run_program
 
-Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and return a structured RunReport (unified diff, point, length before/after, any (report ...)/(message ...) output, and `value`: the final form's result — a string comes back raw (unquoted, unescaped), other types render the way tulisp prints them; present only when non-nil, so a read-only inspector like (conflict-diff N) is readable without wrapping it in (message ...)). Only the FINAL form's value comes back, so wrap any earlier result you need (e.g. a replace-regexp match count) in (report …) or it stays invisible. This is the core, general-purpose editing tool; the buffer and any defined functions persist for the next call. The callable Lisp surface is indexed in help {lisp} (help {regex|treesit|recipes} for syntax and worked examples). Name-like arguments — conflict sides, treesit languages, coding systems, checkpoint labels, report/arg keys — accept a string or a quoted symbol. Everything else (buffer names, defun/field names, free text, paths, regexes) is a string. On failure the error content is a JSON object {ok:false, error, dirty, reports, log} carrying the diagnostics the program emitted before dying; by default a failed run rolls its pre-error edits back (rolled_back:true rides in the failure JSON); dirty=true means they persist — that happens only with keep_partial:true.
+Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and return a structured RunReport (unified diff, point, length before/after, any (report ...)/(message ...) output, and `value`: the final form's result — a string comes back raw (unquoted, unescaped), other types render the way tulisp prints them; present only when non-nil, so a read-only inspector like (conflict-diff N) is readable without wrapping it in (message ...)). Only the FINAL form's value comes back, so wrap any earlier result you need (e.g. a replace-regexp match count) in (report …) or it stays invisible. This is the core, general-purpose editing tool; the edit is saved to the visited file (save: false holds it in the buffer; rehearse: true previews it), and defined functions persist for the next call. The callable Lisp surface is indexed in help {lisp} (help {regex|treesit|recipes} for syntax and worked examples). Name-like arguments — conflict sides, treesit languages, coding systems, checkpoint labels, report/arg keys — accept a string or a quoted symbol. Everything else (buffer names, defun/field names, free text, paths, regexes) is a string. On failure the error content is a JSON object {ok:false, error, dirty, reports, log} carrying the diagnostics the program emitted before dying; by default a failed run rolls its pre-error edits back (rolled_back:true rides in the failure JSON); dirty=true means they persist — that happens only with keep_partial:true.
 
 - `full_diff` — Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count.
 - `keep_partial` — On program error, KEEP the pre-error edits in the warm buffer (dirty:true in the failure JSON; undo_last reverts them) instead of rolling back to the pre-program state. Default false: a failed run is transactional.
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `program` (required) — Emacs-Lisp program, e.g. (while (re-search-forward "foo" nil t) (replace-match "bar")).
-- `save` — After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.
-- `session` — Warm session id; defaults to "default" when omitted.
-- `view` — Add a rendered viewport around point to the report (true = 4 context lines, or a line count).
-- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
-
-## rehearse
-
-Dry-run an Emacs-Lisp (tulisp) edit program and return the same RunReport run_program would (unified diff, length before/after, reports), showing what WOULD happen — then roll the session back so nothing persists: the buffer, point/mark/narrowing, kill-ring, and checkpoints are all left exactly as before (the report carries rehearsed=true). The 'try before you commit' preview; follow up with run_program to actually apply it.
-
-- `full_diff` — Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count.
-- `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
-- `program` (required) — Emacs-Lisp program to rehearse (run then roll back).
+- `rehearse` — Preview: run the edit, return what it did and its diff, then roll back — nothing reaches the buffer or the disk. Not combinable with save: true. Default false.
+- `save` — Write the edit to the visited file (atomic; refused if the file changed on disk since mime last read or wrote it; code buffers warn if they no longer parse). Default: saved when this call changed the buffer; save: false holds the edit in the warm buffer for save_buffer later; save: true writes whatever the buffer holds.
 - `session` — Warm session id; defaults to "default" when omitted.
 - `view` — Add a rendered viewport around point to the report (true = 4 context lines, or a line count).
 - `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
@@ -70,14 +60,15 @@ Render a viewport around the cursor (or a given position): a few lines of contex
 
 ## insert_text
 
-Insert literal text at point, at `pos` (a char position, or "eob" to append at the end of the file), relative to an `anchor` (a named defun, or the unique line containing a literal pattern), or relative to a structural `thing` (the block a line opens, the sexp at a position). Pass the text as a plain string — no Lisp escaping needed, the server handles it. Prefer this over run_program with (insert …) for multi-line or quote-heavy content, and over shell appends for end-of-file additions. Edits the warm buffer; call save_buffer to persist.
+Insert literal text at point, at `pos` (a char position, or "eob" to append at the end of the file), relative to an `anchor` (a named defun, or the unique line containing a literal pattern), or relative to a structural `thing` (the block a line opens, the sexp at a position). Pass the text as a plain string — no Lisp escaping needed, the server handles it. Prefer this over run_program with (insert …) for multi-line or quote-heavy content, and over shell appends for end-of-file additions. Saved like every edit (save: false holds it; rehearse: true previews).
 
 - `anchor` — E.g. {"pattern": "fn main() {", "where": "before"} — insert relative to the UNIQUE line containing a literal text ({"before": "line text"} / {"after": "line text"} are accepted shorthand for the same) — or {"defun": "name"} to target a named defun. An ambiguous pattern errors, listing the match lines. "where": "after" (default) puts the text at the end of the defun or the matched line — include separating newlines in the text. "before" puts it above the whole decorated defun (Rust #[attributes] and /// doc comments, Python decorators, the adjacent comment block of a Go / JS / TS function, and a JS `export` included), or at the start of the matched line. Not combinable with pos.
-- `diff` — Append the unified diff of the edit (clamped like run_program's; full_diff lifts the clamp) — see exactly what changed in the same call; unsaved_diff cannot show it once save:true has written the buffer out. Default false.
+- `diff` — Append the unified diff of the edit (clamped like run_program's; full_diff lifts the clamp) — see exactly what changed in the same call; unsaved_diff cannot show it once the edit is saved. Default false.
 - `full_diff` — Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count.
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `pos` — 1-based position to insert at (default: current point) — or "eob" / "bob" to append at the end / insert at the beginning of the accessible region (no position arithmetic for the common append).
-- `save` — After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.
+- `rehearse` — Preview: run the edit, return what it did and its diff, then roll back — nothing reaches the buffer or the disk. Not combinable with save: true. Default false.
+- `save` — Write the edit to the visited file (atomic; refused if the file changed on disk since mime last read or wrote it; code buffers warn if they no longer parse). Default: saved when this call changed the buffer; save: false holds the edit in the warm buffer for save_buffer later; save: true writes whatever the buffer holds.
 - `session` — Warm session id; defaults to "default" when omitted.
 - `text` (required) — The literal text to insert.
 - `thing` — Insert relative to a structural thing instead of a position: {"kind": "list", "after": "fn main() {"} is the block that line opens. With "after", kind `list` takes the LAST list beginning on the line (else the first one after it), while every other kind takes the FIRST thing at or after the line — {"kind": "sexp", "after": "old(1, 2);"} is `old`. {"kind": "sexp", "at": 1234} is the expression containing a position; "before" the last one ending before the line. kind: sexp | list | string | word | symbol | line | paragraph | defun. "up": N widens a sexp/list by N enclosing groups. Balanced brackets, strings and comments follow the file's language. `where` picks the end to insert at: "after" (default, at its end) or "before" (at its start); the result names the span it landed against, so a wrong pick is visible. Not combinable with pos/anchor.
@@ -87,18 +78,19 @@ Insert literal text at point, at `pos` (a char position, or "eob" to append at t
 
 ## replace_text
 
-Replace the FIRST occurrence of a pattern (searching from the top of the accessible region); pass all:true to replace every occurrence, or `thing` to replace a region named by structure instead of by searching. By default both strings are plain literals — no Lisp escaping, no regex (insert_text's counterpart; the fix for quote-heavy edits). mode:"regex" switches the pattern to the Emacs regex dialect (as occur/grep) with \1..\9 and \& backrefs expanding in the replacement — the one-call form of the goto-char/while/re-search-forward/replace-match loop. Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Edits the warm buffer; call save_buffer to persist. For position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.
+Replace the FIRST occurrence of a pattern (searching from the top of the accessible region); pass all:true to replace every occurrence, or `thing` to replace a region named by structure instead of by searching. By default both strings are plain literals — no Lisp escaping, no regex (insert_text's counterpart; the fix for quote-heavy edits). mode:"regex" switches the pattern to the Emacs regex dialect (as occur/grep) with \1..\9 and \& backrefs expanding in the replacement — the one-call form of the goto-char/while/re-search-forward/replace-match loop. Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Saved like every edit (save: false holds it; rehearse: true previews). For position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.
 
 - `all` — Replace every occurrence (default false: first only).
-- `diff` — Append the unified diff of the edit (clamped like run_program's; full_diff lifts the clamp) — see exactly what changed in the same call; unsaved_diff cannot show it once save:true has written the buffer out. Default false.
+- `diff` — Append the unified diff of the edit (clamped like run_program's; full_diff lifts the clamp) — see exactly what changed in the same call; unsaved_diff cannot show it once the edit is saved. Default false.
 - `edits` — Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?, mode?}, …] applied in order inside ONE transaction — all-or-nothing; a miss (or a failed uniqueness check) rolls everything back and names the failed edit.
 - `expect_unique` — Require the pattern to match exactly once: more than one match is an error (listing the match lines) and nothing is replaced. RECOMMENDED whenever the anchor text could plausibly repeat — first-match semantics would silently edit the wrong site. Default false.
 - `full_diff` — Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count.
 - `mode` — exact (default): literal search and replacement. regex: Emacs-dialect pattern with backref expansion in the replacement. With `edits`, acts as the default for entries that don't set their own.
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `pattern` — The text to find — literal by default; the Emacs regex dialect with mode:"regex".
+- `rehearse` — Preview: run the edit, return what it did and its diff, then roll back — nothing reaches the buffer or the disk. Not combinable with save: true. Default false.
 - `replacement` — The replacement text — literal by default; with mode:"regex", \1..\9 insert the numbered capture group and \& the whole match.
-- `save` — After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.
+- `save` — Write the edit to the visited file (atomic; refused if the file changed on disk since mime last read or wrote it; code buffers warn if they no longer parse). Default: saved when this call changed the buffer; save: false holds the edit in the warm buffer for save_buffer later; save: true writes whatever the buffer holds.
 - `scope` — Restrict this call to one part of the buffer without writing a program. {"defun": "name"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.
 - `session` — Warm session id; defaults to "default" when omitted.
 - `thing` — Replace the region named by structure instead of by searching: {"kind": "list", "after": "fn main() {"} is the block that line opens. With "after", kind `list` takes the LAST list beginning on the line (else the first one after it), while every other kind takes the FIRST thing at or after the line — {"kind": "sexp", "after": "old(1, 2);"} is `old`. {"kind": "sexp", "at": 1234} is the expression containing a position; "before" the last one ending before the line. kind: sexp | list | string | word | symbol | line | paragraph | defun. "up": N widens a sexp/list by N enclosing groups. Balanced brackets, strings and comments follow the file's language. Pass `replacement` only; the result names the replaced span (`KIND @START-END`) so a wrong pick is visible. Not combinable with pattern/edits/all/mode/expect_unique/scope.
@@ -107,25 +99,26 @@ Replace the FIRST occurrence of a pattern (searching from the top of the accessi
 
 ## fill_text
 
-Reflow prose to a column — Emacs fill-paragraph as one call. The unit is the comment run, block comment, Python docstring or Markdown paragraph at a position (point by default; `pos`; or the unique line an `anchor` pattern names), found through the tree-sitter parse: the comment marker (`//`, `///`, `#`, ` * `), list hanging indents, block quotes, fenced code, headings and tables all survive, and CODE IS NEVER REFLOWED — a position in code errors naming the node, a comment or docstring that shares a line with code is skipped by a range fill and refused at a position, a Python string outside docstring position is data, and a file type mime has no grammar for is refused (an explicit `prefix` fills by the lines that carry it instead). `lines: [a, b]` or `all: true` instead fills every unit the range touches (every comment in a file, every paragraph of a README) and leaves the code between alone. Default column is 80; a sentence end the source marks with a line break or two spaces keeps two spaces. Edits the warm buffer; save:true persists.
+Reflow prose to a column — Emacs fill-paragraph as one call. The unit is the comment run, block comment, Python docstring or Markdown paragraph at a position (point by default; `pos`; or the unique line an `anchor` pattern names), found through the tree-sitter parse: the comment marker (`//`, `///`, `#`, ` * `), list hanging indents, block quotes, fenced code, headings and tables all survive, and CODE IS NEVER REFLOWED — a position in code errors naming the node, a comment or docstring that shares a line with code is skipped by a range fill and refused at a position, a Python string outside docstring position is data, and a file type mime has no grammar for is refused (an explicit `prefix` fills by the lines that carry it instead). `lines: [a, b]` or `all: true` instead fills every unit the range touches (every comment in a file, every paragraph of a README) and leaves the code between alone. Default column is 80; a sentence end the source marks with a line break or two spaces keeps two spaces. Saved like every edit (save: false holds it; rehearse: true previews).
 
 - `all` — Fill every unit in the accessible region — the whole-file pass after writing a README or a batch of doc comments.
 - `anchor` — {"pattern": "literal line text"}: fill the unit holding the UNIQUE line containing that text — the natural form when you know the comment's words but not its position. An ambiguous pattern errors, listing the match lines.
 - `column` — The last column a line may reach, prefix included (default: fill-column, 80).
-- `diff` — Append the unified diff of the edit (clamped like run_program's; full_diff lifts the clamp) — see exactly what changed in the same call; unsaved_diff cannot show it once save:true has written the buffer out. Default false.
+- `diff` — Append the unified diff of the edit (clamped like run_program's; full_diff lifts the clamp) — see exactly what changed in the same call; unsaved_diff cannot show it once the edit is saved. Default false.
 - `full_diff` — Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count.
 - `lines` — [start, end] 1-based INCLUSIVE line numbers (narrowing-relative): fill every unit these lines touch.
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `pos` — 1-based char position inside the unit to fill (default: current point). One of pos / anchor / lines / all.
 - `prefix` — Explicit fill-prefix: the exact text every line of the paragraph starts with (e.g. "// "). Overrides the detected marker, and bounds the paragraph by the lines that carry it instead of by the parse — the way through when detection refuses.
-- `save` — After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.
+- `rehearse` — Preview: run the edit, return what it did and its diff, then roll back — nothing reaches the buffer or the disk. Not combinable with save: true. Default false.
+- `save` — Write the edit to the visited file (atomic; refused if the file changed on disk since mime last read or wrote it; code buffers warn if they no longer parse). Default: saved when this call changed the buffer; save: false holds the edit in the warm buffer for save_buffer later; save: true writes whatever the buffer holds.
 - `session` — Warm session id; defaults to "default" when omitted.
 - `view` — Append a rendered viewport around point after the edit (true = 4 context lines, or a line count).
 - `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## replace_in_files
 
-Apply the SAME edit spec to EVERY listed file in one call — the cross-file rename. Give pattern/replacement (with all/expect_unique, and mode:"regex" for the Emacs dialect with backrefs), or `edits` for a transactional batch per file; the absolute paths grep prints feed `files` directly. Atomic ACROSS the set: a failure in any file (a miss, a failed uniqueness check) rolls the already-edited ones back and the error names the file — every listed path must contain the pattern, so list exactly the files you grepped. Edits land in the warm buffers; with save:true the files are saved only after every file's edit succeeded. For a single file use replace_text.
+Apply the SAME edit spec to EVERY listed file in one call — the cross-file rename. Give pattern/replacement (with all/expect_unique, and mode:"regex" for the Emacs dialect with backrefs), or `edits` for a transactional batch per file; the absolute paths grep prints feed `files` directly. Atomic ACROSS the set: a failure in any file (a miss, a failed uniqueness check) rolls the already-edited ones back and the error names the file — every listed path must contain the pattern, so list exactly the files you grepped. The files are saved only after every file's edit succeeded (save: false holds the edits in the warm buffers). For a single file use replace_text.
 
 - `all` — Replace every occurrence per file (default false: first only).
 - `edits` — Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?, mode?}, …] applied in order inside ONE transaction per file — all-or-nothing across the whole call.
@@ -133,8 +126,9 @@ Apply the SAME edit spec to EVERY listed file in one call — the cross-file ren
 - `files` (required) — The files to edit — each must match the edit spec.
 - `mode` — exact (default): literal. regex: Emacs-dialect pattern with backref expansion. With `edits`, acts as the default for entries that don't set their own.
 - `pattern` — The text to find — literal by default; the Emacs regex dialect with mode:"regex".
+- `rehearse` — Preview: run the edit, return what it did and its diff, then roll back — nothing reaches the buffer or the disk. Not combinable with save: true. Default false.
 - `replacement` — The replacement text — with mode:"regex", \1..\9/\& backrefs expand.
-- `save` — After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.
+- `save` — Write the edit to the visited file (atomic; refused if the file changed on disk since mime last read or wrote it; code buffers warn if they no longer parse). Default: saved when this call changed the buffer; save: false holds the edit in the warm buffer for save_buffer later; save: true writes whatever the buffer holds.
 - `scope` — Restrict this call to one part of the buffer without writing a program. {"defun": "name"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.
 - `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
@@ -181,35 +175,18 @@ Overview of the merge-conflict hunks in the buffer: number, position + line, bra
 - `session` — Warm session id; defaults to "default" when omitted.
 - `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
-## checkpoint
-
-Capture a named restore point of the current buffer (cheap — structural sharing for files). ADVANCED: every mutating tool call already captures an automatic restore point, so undo_last is the usual safety net; reach for explicit checkpoints only to mark a spot you'll want to return to by name. Captured labels show up per session in session_status.
-
-- `label` — Optional label; auto-generated (auto-N) when omitted.
-- `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
-- `session` — Warm session id; defaults to "default" when omitted.
-- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
-
 ## undo_last
 
-Rewind the buffer to its state before the most recent mutating call — the automatic safety net for a misfired edit (every mutating tool call captures a restore point first; bounded ring of 8, no redo). Each call steps one mutating call further back. Unlike restore_checkpoint, nothing needs to have been captured up front.
+Rewind the buffer to its state before the most recent mutating call — the automatic safety net for a misfired edit (every mutating tool call captures a restore point first; bounded ring of 8, no redo). Each call steps one mutating call further back, and the rewound text is saved like any edit (save: false rewinds the buffer only).
 
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
-- `session` — Warm session id; defaults to "default" when omitted.
-- `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
-
-## restore_checkpoint
-
-Rewind the buffer to a previously captured checkpoint by label (the labels are listed per session by session_status).
-
-- `label` (required) — Label of the checkpoint to restore.
-- `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
+- `save` — Write the edit to the visited file (atomic; refused if the file changed on disk since mime last read or wrote it; code buffers warn if they no longer parse). Default: saved when this call changed the buffer; save: false holds the edit in the warm buffer for save_buffer later; save: true writes whatever the buffer holds.
 - `session` — Warm session id; defaults to "default" when omitted.
 - `workspace` — Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.
 
 ## save_buffer
 
-Write the session buffer's text to disk. Without `to`, save back to the session's visited file (atomic write, stale-read guard, parse warning — the same save the edit tools' save:true performs); with `to` pointing elsewhere, write a COPY there and leave the session bound to its original file (a later plain save still targets the original — no silent retarget). NOTE: `path` addresses WHICH session, exactly like on every other tool — the destination parameter is `to`.
+Write the session buffer's text to disk. Without `to`, save back to the session's visited file (atomic write, stale-read guard, parse warning — the same save the edit tools perform); with `to` pointing elsewhere, write a COPY there and leave the session bound to its original file (a later plain save still targets the original — no silent retarget). NOTE: `path` addresses WHICH session, exactly like on every other tool — the destination parameter is `to`.
 
 - `path` — One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.
 - `session` — Warm session id; defaults to "default" when omitted.
@@ -257,7 +234,7 @@ Mint a fresh, empty workspace (an isolated set of warm sessions) and return its 
 
 ## close_workspace
 
-Drop a workspace and every session in it, unsaved edits included. The stdio default workspace cannot be closed (use close_session for one session).
+Drop a workspace and every session in it, unsaved edits included (close_session drops one session).
 
 - `workspace` (required) — The handle of the workspace to drop (required — there is no implicit target for a close).
 

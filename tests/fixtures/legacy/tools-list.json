@@ -87,7 +87,7 @@
           "openWorldHint": false,
           "readOnlyHint": false
         },
-        "description": "Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and return a structured RunReport (unified diff, point, length before/after, any (report ...)/(message ...) output, and `value`: the final form's result — a string comes back raw (unquoted, unescaped), other types render the way tulisp prints them; present only when non-nil, so a read-only inspector like (conflict-diff N) is readable without wrapping it in (message ...)). Only the FINAL form's value comes back, so wrap any earlier result you need (e.g. a replace-regexp match count) in (report …) or it stays invisible. This is the core, general-purpose editing tool; the buffer and any defined functions persist for the next call. The callable Lisp surface is indexed in help {lisp} (help {regex|treesit|recipes} for syntax and worked examples). Name-like arguments — conflict sides, treesit languages, coding systems, checkpoint labels, report/arg keys — accept a string or a quoted symbol. Everything else (buffer names, defun/field names, free text, paths, regexes) is a string. On failure the error content is a JSON object {ok:false, error, dirty, reports, log} carrying the diagnostics the program emitted before dying; by default a failed run rolls its pre-error edits back (rolled_back:true rides in the failure JSON); dirty=true means they persist — that happens only with keep_partial:true.",
+        "description": "Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and return a structured RunReport (unified diff, point, length before/after, any (report ...)/(message ...) output, and `value`: the final form's result — a string comes back raw (unquoted, unescaped), other types render the way tulisp prints them; present only when non-nil, so a read-only inspector like (conflict-diff N) is readable without wrapping it in (message ...)). Only the FINAL form's value comes back, so wrap any earlier result you need (e.g. a replace-regexp match count) in (report …) or it stays invisible. This is the core, general-purpose editing tool; the edit is saved to the visited file (save: false holds it in the buffer; rehearse: true previews it), and defined functions persist for the next call. The callable Lisp surface is indexed in help {lisp} (help {regex|treesit|recipes} for syntax and worked examples). Name-like arguments — conflict sides, treesit languages, coding systems, checkpoint labels, report/arg keys — accept a string or a quoted symbol. Everything else (buffer names, defun/field names, free text, paths, regexes) is a string. On failure the error content is a JSON object {ok:false, error, dirty, reports, log} carrying the diagnostics the program emitted before dying; by default a failed run rolls its pre-error edits back (rolled_back:true rides in the failure JSON); dirty=true means they persist — that happens only with keep_partial:true.",
         "inputSchema": {
           "properties": {
             "full_diff": {
@@ -106,8 +106,12 @@
               "description": "Emacs-Lisp program, e.g. (while (re-search-forward \"foo\" nil t) (replace-match \"bar\")).",
               "type": "string"
             },
+            "rehearse": {
+              "description": "Preview: run the edit, return what it did and its diff, then roll back — nothing reaches the buffer or the disk. Not combinable with save: true. Default false.",
+              "type": "boolean"
+            },
             "save": {
-              "description": "After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.",
+              "description": "Write the edit to the visited file (atomic; refused if the file changed on disk since mime last read or wrote it; code buffers warn if they no longer parse). Default: saved when this call changed the buffer; save: false holds the edit in the warm buffer for save_buffer later; save: true writes whatever the buffer holds.",
               "type": "boolean"
             },
             "session": {
@@ -132,113 +136,6 @@
           "type": "object"
         },
         "name": "run_program",
-        "outputSchema": {
-          "properties": {
-            "buffer": {
-              "type": "string"
-            },
-            "diff": {
-              "type": "string"
-            },
-            "dirty": {
-              "type": "boolean"
-            },
-            "error": {
-              "type": "string"
-            },
-            "len_after": {
-              "type": "integer"
-            },
-            "len_before": {
-              "type": "integer"
-            },
-            "log": {
-              "type": "array"
-            },
-            "ok": {
-              "type": "boolean"
-            },
-            "point": {
-              "type": "integer"
-            },
-            "rehearsed": {
-              "type": "boolean"
-            },
-            "reports": {
-              "type": "object"
-            },
-            "rolled_back": {
-              "type": "boolean"
-            },
-            "saved": {
-              "type": "string"
-            },
-            "stale": {
-              "type": "boolean"
-            },
-            "unsaved": {
-              "type": "boolean"
-            },
-            "value": {
-              "type": "string"
-            },
-            "view": {
-              "type": "string"
-            },
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "ok"
-          ],
-          "type": "object"
-        }
-      },
-      {
-        "annotations": {
-          "destructiveHint": false,
-          "idempotentHint": true,
-          "openWorldHint": false,
-          "readOnlyHint": true
-        },
-        "description": "Dry-run an Emacs-Lisp (tulisp) edit program and return the same RunReport run_program would (unified diff, length before/after, reports), showing what WOULD happen — then roll the session back so nothing persists: the buffer, point/mark/narrowing, kill-ring, and checkpoints are all left exactly as before (the report carries rehearsed=true). The 'try before you commit' preview; follow up with run_program to actually apply it.",
-        "inputSchema": {
-          "properties": {
-            "full_diff": {
-              "description": "Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count.",
-              "type": "boolean"
-            },
-            "path": {
-              "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
-              "type": "string"
-            },
-            "program": {
-              "description": "Emacs-Lisp program to rehearse (run then roll back).",
-              "type": "string"
-            },
-            "session": {
-              "description": "Warm session id; defaults to \"default\" when omitted.",
-              "type": "string"
-            },
-            "view": {
-              "description": "Add a rendered viewport around point to the report (true = 4 context lines, or a line count).",
-              "type": [
-                "boolean",
-                "integer"
-              ]
-            },
-            "workspace": {
-              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "program"
-          ],
-          "type": "object"
-        },
-        "name": "rehearse",
         "outputSchema": {
           "properties": {
             "buffer": {
@@ -419,7 +316,7 @@
           "openWorldHint": false,
           "readOnlyHint": false
         },
-        "description": "Insert literal text at point, at `pos` (a char position, or \"eob\" to append at the end of the file), relative to an `anchor` (a named defun, or the unique line containing a literal pattern), or relative to a structural `thing` (the block a line opens, the sexp at a position). Pass the text as a plain string — no Lisp escaping needed, the server handles it. Prefer this over run_program with (insert …) for multi-line or quote-heavy content, and over shell appends for end-of-file additions. Edits the warm buffer; call save_buffer to persist.",
+        "description": "Insert literal text at point, at `pos` (a char position, or \"eob\" to append at the end of the file), relative to an `anchor` (a named defun, or the unique line containing a literal pattern), or relative to a structural `thing` (the block a line opens, the sexp at a position). Pass the text as a plain string — no Lisp escaping needed, the server handles it. Prefer this over run_program with (insert …) for multi-line or quote-heavy content, and over shell appends for end-of-file additions. Saved like every edit (save: false holds it; rehearse: true previews).",
         "inputSchema": {
           "properties": {
             "anchor": {
@@ -450,7 +347,7 @@
               "type": "object"
             },
             "diff": {
-              "description": "Append the unified diff of the edit (clamped like run_program's; full_diff lifts the clamp) — see exactly what changed in the same call; unsaved_diff cannot show it once save:true has written the buffer out. Default false.",
+              "description": "Append the unified diff of the edit (clamped like run_program's; full_diff lifts the clamp) — see exactly what changed in the same call; unsaved_diff cannot show it once the edit is saved. Default false.",
               "type": "boolean"
             },
             "full_diff": {
@@ -468,8 +365,12 @@
                 "string"
               ]
             },
+            "rehearse": {
+              "description": "Preview: run the edit, return what it did and its diff, then roll back — nothing reaches the buffer or the disk. Not combinable with save: true. Default false.",
+              "type": "boolean"
+            },
             "save": {
-              "description": "After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.",
+              "description": "Write the edit to the visited file (atomic; refused if the file changed on disk since mime last read or wrote it; code buffers warn if they no longer parse). Default: saved when this call changed the buffer; save: false holds the edit in the warm buffer for save_buffer later; save: true writes whatever the buffer holds.",
               "type": "boolean"
             },
             "session": {
@@ -545,7 +446,7 @@
           "openWorldHint": false,
           "readOnlyHint": false
         },
-        "description": "Replace the FIRST occurrence of a pattern (searching from the top of the accessible region); pass all:true to replace every occurrence, or `thing` to replace a region named by structure instead of by searching. By default both strings are plain literals — no Lisp escaping, no regex (insert_text's counterpart; the fix for quote-heavy edits). mode:\"regex\" switches the pattern to the Emacs regex dialect (as occur/grep) with \\1..\\9 and \\& backrefs expanding in the replacement — the one-call form of the goto-char/while/re-search-forward/replace-match loop. Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Edits the warm buffer; call save_buffer to persist. For position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.",
+        "description": "Replace the FIRST occurrence of a pattern (searching from the top of the accessible region); pass all:true to replace every occurrence, or `thing` to replace a region named by structure instead of by searching. By default both strings are plain literals — no Lisp escaping, no regex (insert_text's counterpart; the fix for quote-heavy edits). mode:\"regex\" switches the pattern to the Emacs regex dialect (as occur/grep) with \\1..\\9 and \\& backrefs expanding in the replacement — the one-call form of the goto-char/while/re-search-forward/replace-match loop. Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Saved like every edit (save: false holds it; rehearse: true previews). For position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.",
         "inputSchema": {
           "properties": {
             "all": {
@@ -553,7 +454,7 @@
               "type": "boolean"
             },
             "diff": {
-              "description": "Append the unified diff of the edit (clamped like run_program's; full_diff lifts the clamp) — see exactly what changed in the same call; unsaved_diff cannot show it once save:true has written the buffer out. Default false.",
+              "description": "Append the unified diff of the edit (clamped like run_program's; full_diff lifts the clamp) — see exactly what changed in the same call; unsaved_diff cannot show it once the edit is saved. Default false.",
               "type": "boolean"
             },
             "edits": {
@@ -608,12 +509,16 @@
               "description": "The text to find — literal by default; the Emacs regex dialect with mode:\"regex\".",
               "type": "string"
             },
+            "rehearse": {
+              "description": "Preview: run the edit, return what it did and its diff, then roll back — nothing reaches the buffer or the disk. Not combinable with save: true. Default false.",
+              "type": "boolean"
+            },
             "replacement": {
               "description": "The replacement text — literal by default; with mode:\"regex\", \\1..\\9 insert the numbered capture group and \\& the whole match.",
               "type": "string"
             },
             "save": {
-              "description": "After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.",
+              "description": "Write the edit to the visited file (atomic; refused if the file changed on disk since mime last read or wrote it; code buffers warn if they no longer parse). Default: saved when this call changed the buffer; save: false holds the edit in the warm buffer for save_buffer later; save: true writes whatever the buffer holds.",
               "type": "boolean"
             },
             "scope": {
@@ -684,7 +589,7 @@
           "openWorldHint": false,
           "readOnlyHint": false
         },
-        "description": "Reflow prose to a column — Emacs fill-paragraph as one call. The unit is the comment run, block comment, Python docstring or Markdown paragraph at a position (point by default; `pos`; or the unique line an `anchor` pattern names), found through the tree-sitter parse: the comment marker (`//`, `///`, `#`, ` * `), list hanging indents, block quotes, fenced code, headings and tables all survive, and CODE IS NEVER REFLOWED — a position in code errors naming the node, a comment or docstring that shares a line with code is skipped by a range fill and refused at a position, a Python string outside docstring position is data, and a file type mime has no grammar for is refused (an explicit `prefix` fills by the lines that carry it instead). `lines: [a, b]` or `all: true` instead fills every unit the range touches (every comment in a file, every paragraph of a README) and leaves the code between alone. Default column is 80; a sentence end the source marks with a line break or two spaces keeps two spaces. Edits the warm buffer; save:true persists.",
+        "description": "Reflow prose to a column — Emacs fill-paragraph as one call. The unit is the comment run, block comment, Python docstring or Markdown paragraph at a position (point by default; `pos`; or the unique line an `anchor` pattern names), found through the tree-sitter parse: the comment marker (`//`, `///`, `#`, ` * `), list hanging indents, block quotes, fenced code, headings and tables all survive, and CODE IS NEVER REFLOWED — a position in code errors naming the node, a comment or docstring that shares a line with code is skipped by a range fill and refused at a position, a Python string outside docstring position is data, and a file type mime has no grammar for is refused (an explicit `prefix` fills by the lines that carry it instead). `lines: [a, b]` or `all: true` instead fills every unit the range touches (every comment in a file, every paragraph of a README) and leaves the code between alone. Default column is 80; a sentence end the source marks with a line break or two spaces keeps two spaces. Saved like every edit (save: false holds it; rehearse: true previews).",
         "inputSchema": {
           "properties": {
             "all": {
@@ -705,7 +610,7 @@
               "type": "integer"
             },
             "diff": {
-              "description": "Append the unified diff of the edit (clamped like run_program's; full_diff lifts the clamp) — see exactly what changed in the same call; unsaved_diff cannot show it once save:true has written the buffer out. Default false.",
+              "description": "Append the unified diff of the edit (clamped like run_program's; full_diff lifts the clamp) — see exactly what changed in the same call; unsaved_diff cannot show it once the edit is saved. Default false.",
               "type": "boolean"
             },
             "full_diff": {
@@ -731,8 +636,12 @@
               "description": "Explicit fill-prefix: the exact text every line of the paragraph starts with (e.g. \"// \"). Overrides the detected marker, and bounds the paragraph by the lines that carry it instead of by the parse — the way through when detection refuses.",
               "type": "string"
             },
+            "rehearse": {
+              "description": "Preview: run the edit, return what it did and its diff, then roll back — nothing reaches the buffer or the disk. Not combinable with save: true. Default false.",
+              "type": "boolean"
+            },
             "save": {
-              "description": "After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.",
+              "description": "Write the edit to the visited file (atomic; refused if the file changed on disk since mime last read or wrote it; code buffers warn if they no longer parse). Default: saved when this call changed the buffer; save: false holds the edit in the warm buffer for save_buffer later; save: true writes whatever the buffer holds.",
               "type": "boolean"
             },
             "session": {
@@ -763,7 +672,7 @@
           "openWorldHint": false,
           "readOnlyHint": false
         },
-        "description": "Apply the SAME edit spec to EVERY listed file in one call — the cross-file rename. Give pattern/replacement (with all/expect_unique, and mode:\"regex\" for the Emacs dialect with backrefs), or `edits` for a transactional batch per file; the absolute paths grep prints feed `files` directly. Atomic ACROSS the set: a failure in any file (a miss, a failed uniqueness check) rolls the already-edited ones back and the error names the file — every listed path must contain the pattern, so list exactly the files you grepped. Edits land in the warm buffers; with save:true the files are saved only after every file's edit succeeded. For a single file use replace_text.",
+        "description": "Apply the SAME edit spec to EVERY listed file in one call — the cross-file rename. Give pattern/replacement (with all/expect_unique, and mode:\"regex\" for the Emacs dialect with backrefs), or `edits` for a transactional batch per file; the absolute paths grep prints feed `files` directly. Atomic ACROSS the set: a failure in any file (a miss, a failed uniqueness check) rolls the already-edited ones back and the error names the file — every listed path must contain the pattern, so list exactly the files you grepped. The files are saved only after every file's edit succeeded (save: false holds the edits in the warm buffers). For a single file use replace_text.",
         "inputSchema": {
           "properties": {
             "all": {
@@ -821,12 +730,16 @@
               "description": "The text to find — literal by default; the Emacs regex dialect with mode:\"regex\".",
               "type": "string"
             },
+            "rehearse": {
+              "description": "Preview: run the edit, return what it did and its diff, then roll back — nothing reaches the buffer or the disk. Not combinable with save: true. Default false.",
+              "type": "boolean"
+            },
             "replacement": {
               "description": "The replacement text — with mode:\"regex\", \\1..\\9/\\& backrefs expand.",
               "type": "string"
             },
             "save": {
-              "description": "After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false.",
+              "description": "Write the edit to the visited file (atomic; refused if the file changed on disk since mime last read or wrote it; code buffers warn if they no longer parse). Default: saved when this call changed the buffer; save: false holds the edit in the warm buffer for save_buffer later; save: true writes whatever the buffer holds.",
               "type": "boolean"
             },
             "scope": {
@@ -1099,49 +1012,21 @@
       },
       {
         "annotations": {
-          "destructiveHint": false,
-          "idempotentHint": false,
-          "openWorldHint": false,
-          "readOnlyHint": false
-        },
-        "description": "Capture a named restore point of the current buffer (cheap — structural sharing for files). ADVANCED: every mutating tool call already captures an automatic restore point, so undo_last is the usual safety net; reach for explicit checkpoints only to mark a spot you'll want to return to by name. Captured labels show up per session in session_status.",
-        "inputSchema": {
-          "properties": {
-            "label": {
-              "description": "Optional label; auto-generated (auto-N) when omitted.",
-              "type": "string"
-            },
-            "path": {
-              "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
-              "type": "string"
-            },
-            "session": {
-              "description": "Warm session id; defaults to \"default\" when omitted.",
-              "type": "string"
-            },
-            "workspace": {
-              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
-              "type": "string"
-            }
-          },
-          "required": [],
-          "type": "object"
-        },
-        "name": "checkpoint"
-      },
-      {
-        "annotations": {
           "destructiveHint": true,
           "idempotentHint": false,
           "openWorldHint": false,
           "readOnlyHint": false
         },
-        "description": "Rewind the buffer to its state before the most recent mutating call — the automatic safety net for a misfired edit (every mutating tool call captures a restore point first; bounded ring of 8, no redo). Each call steps one mutating call further back. Unlike restore_checkpoint, nothing needs to have been captured up front.",
+        "description": "Rewind the buffer to its state before the most recent mutating call — the automatic safety net for a misfired edit (every mutating tool call captures a restore point first; bounded ring of 8, no redo). Each call steps one mutating call further back, and the rewound text is saved like any edit (save: false rewinds the buffer only).",
         "inputSchema": {
           "properties": {
             "path": {
               "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
               "type": "string"
+            },
+            "save": {
+              "description": "Write the edit to the visited file (atomic; refused if the file changed on disk since mime last read or wrote it; code buffers warn if they no longer parse). Default: saved when this call changed the buffer; save: false holds the edit in the warm buffer for save_buffer later; save: true writes whatever the buffer holds.",
+              "type": "boolean"
             },
             "session": {
               "description": "Warm session id; defaults to \"default\" when omitted.",
@@ -1164,41 +1049,7 @@
           "openWorldHint": false,
           "readOnlyHint": false
         },
-        "description": "Rewind the buffer to a previously captured checkpoint by label (the labels are listed per session by session_status).",
-        "inputSchema": {
-          "properties": {
-            "label": {
-              "description": "Label of the checkpoint to restore.",
-              "type": "string"
-            },
-            "path": {
-              "description": "One-call alternative to open_file: auto-open this file into a session keyed by its canonical path (reused while warm). Relative paths resolve against the server's cwd. Pass path OR session, not both.",
-              "type": "string"
-            },
-            "session": {
-              "description": "Warm session id; defaults to \"default\" when omitted.",
-              "type": "string"
-            },
-            "workspace": {
-              "description": "Warm-state handle scoping session names: returned by open_workspace, or reported by every stateful call on the stateless HTTP protocol. Omit on stdio (one implicit workspace) and on a legacy HTTP session.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "label"
-          ],
-          "type": "object"
-        },
-        "name": "restore_checkpoint"
-      },
-      {
-        "annotations": {
-          "destructiveHint": true,
-          "idempotentHint": false,
-          "openWorldHint": false,
-          "readOnlyHint": false
-        },
-        "description": "Write the session buffer's text to disk. Without `to`, save back to the session's visited file (atomic write, stale-read guard, parse warning — the same save the edit tools' save:true performs); with `to` pointing elsewhere, write a COPY there and leave the session bound to its original file (a later plain save still targets the original — no silent retarget). NOTE: `path` addresses WHICH session, exactly like on every other tool — the destination parameter is `to`.",
+        "description": "Write the session buffer's text to disk. Without `to`, save back to the session's visited file (atomic write, stale-read guard, parse warning — the same save the edit tools perform); with `to` pointing elsewhere, write a COPY there and leave the session bound to its original file (a later plain save still targets the original — no silent retarget). NOTE: `path` addresses WHICH session, exactly like on every other tool — the destination parameter is `to`.",
         "inputSchema": {
           "properties": {
             "path": {
@@ -1413,53 +1264,6 @@
           ],
           "type": "object"
         }
-      },
-      {
-        "annotations": {
-          "destructiveHint": false,
-          "idempotentHint": false,
-          "openWorldHint": false,
-          "readOnlyHint": false
-        },
-        "description": "Mint a fresh, empty workspace (an isolated set of warm sessions) and return its handle. Pass the handle as `workspace` to scope later calls. Needed only on the stateless HTTP protocol when isolating several agents on one server; stdio has one implicit workspace.",
-        "inputSchema": {
-          "properties": {},
-          "type": "object"
-        },
-        "name": "open_workspace",
-        "outputSchema": {
-          "properties": {
-            "workspace": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "workspace"
-          ],
-          "type": "object"
-        }
-      },
-      {
-        "annotations": {
-          "destructiveHint": true,
-          "idempotentHint": false,
-          "openWorldHint": false,
-          "readOnlyHint": false
-        },
-        "description": "Drop a workspace and every session in it, unsaved edits included. The stdio default workspace cannot be closed (use close_session for one session).",
-        "inputSchema": {
-          "properties": {
-            "workspace": {
-              "description": "The handle of the workspace to drop (required — there is no implicit target for a close).",
-              "type": "string"
-            }
-          },
-          "required": [
-            "workspace"
-          ],
-          "type": "object"
-        },
-        "name": "close_workspace"
       },
       {
         "annotations": {
@@ -2439,38 +2243,6 @@
           "type": "object"
         },
         "name": "git_msg_fill"
-      },
-      {
-        "annotations": {
-          "destructiveHint": true,
-          "idempotentHint": false,
-          "openWorldHint": false,
-          "readOnlyHint": false
-        },
-        "description": "Run a shell command at EVERY commit of `range`, oldest-first — the pr-prep gate loop (git rebase -x's standalone sibling): each commit is checked out in place (detached), the command runs in the worktree, and the walk stops on the first failure naming the commit and the output tail. HEAD is restored afterwards either way. Refuses on a dirty worktree. DISABLED unless whoever launches the server sets MIME_EXEC=1 (the same launcher gate used for configured commit signing).",
-        "inputSchema": {
-          "properties": {
-            "command": {
-              "description": "Shell command to run at each commit (via sh -c), e.g. \"cargo check -q\".",
-              "type": "string"
-            },
-            "range": {
-              "description": "Revision range whose commits to visit, e.g. main..HEAD, or a bare HEAD for the whole history from the root (a bare rev must resolve to HEAD).",
-              "type": "string"
-            },
-            "repo": {
-              "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
-              "type": "string"
-            }
-          },
-          "required": [
-            "repo",
-            "range",
-            "command"
-          ],
-          "type": "object"
-        },
-        "name": "git_exec_over"
       }
     ],
     "ttlMs": 86400000

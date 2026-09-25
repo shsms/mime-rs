@@ -92,6 +92,11 @@ pub trait TextStore {
         None
     }
 
+    /// Replace the visited file's stamp: a restored snapshot takes the stamp of
+    /// the file as last saved, so the rewound text can be saved over it. A
+    /// no-op for a store with no backing file.
+    fn set_file_stamp(&mut self, _stamp: Option<crate::safety::FileStamp>) {}
+
     /// `true` once a read has observed the visited file drifted on disk since
     /// open — a *sticky* signal a lazy backing sets when it fetches fresh bytes
     /// from a changed file (so staleness survives an mtime reset that a bare

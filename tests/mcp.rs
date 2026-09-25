@@ -29,7 +29,9 @@ impl Server {
         cmd.arg("--mcp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::null())
+            // Tests opt into MIME_EXEC explicitly; never inherit the caller's.
+            .env_remove("MIME_EXEC");
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -142,13 +144,10 @@ fn full_session_round_trip_over_stdio() {
         "open_file",
         "open_text",
         "run_program",
-        "rehearse",
         "read_region",
         "replace_text",
         "occur",
         "conflicts",
-        "checkpoint",
-        "restore_checkpoint",
         "undo_last",
         "save_buffer",
         "session_status",
@@ -195,11 +194,12 @@ fn full_session_round_trip_over_stdio() {
     let region = s.call_ok(5, "read_region", json!({ "start": 1, "end": 6 }));
     assert_eq!(region, "hello");
 
-    // --- checkpoint, mutate, restore_checkpoint, confirm the revert ---
-    let cp = s.call_ok(6, "checkpoint", json!({ "label": "before" }));
-    assert!(cp.contains("before"), "checkpoint said: {cp}");
-
-    // Mutate: blow the buffer away.
+    // --- Lisp checkpoint, mutate, restore-checkpoint, confirm the revert ---
+    s.call_ok(
+        6,
+        "run_program",
+        json!({ "program": r#"(checkpoint "before")"# }),
+    );
     let mutated = s.call_ok(
         7,
         "run_program",
@@ -207,14 +207,13 @@ fn full_session_round_trip_over_stdio() {
     );
     let mutated: Value = serde_json::from_str(&mutated).unwrap();
     assert_eq!(mutated["len_after"], 9);
-
-    // session_status shows our checkpoint label.
     let cps = s.call_ok(8, "session_status", json!({}));
     assert!(cps.contains("before"), "session_status said: {cps}");
-
-    // Restore.
-    let restored = s.call_ok(9, "restore_checkpoint", json!({ "label": "before" }));
-    assert!(restored.contains("before"), "restore said: {restored}");
+    s.call_ok(
+        9,
+        "run_program",
+        json!({ "program": r#"(restore-checkpoint "before")"# }),
+    );
 
     // Confirm the revert via a fresh run_program: buffer is back to the
     // post-edit "hello mime", unchanged by this read-only program.
@@ -239,8 +238,8 @@ fn rehearse_previews_an_edit_then_rolls_back_over_stdio() {
     // NOT stick.
     let report_text = s.call_ok(
         3,
-        "rehearse",
-        json!({ "program": r#"(while (re-search-forward "world" nil t) (replace-match "mime")) (report "done" 1)"# }),
+        "run_program",
+        json!({ "program": r#"(while (re-search-forward "world" nil t) (replace-match "mime")) (report "done" 1)"#, "rehearse": true }),
     );
     let report: Value = serde_json::from_str(&report_text).expect("RunReport is JSON");
     // The report shows the hypothetical edit, flagged as a rehearsal.
@@ -1237,7 +1236,7 @@ fn path_reuses_a_session_already_visiting_the_file() {
     s.call_ok(
         2,
         "replace_text",
-        json!({ "path": p, "pattern": "alpha", "replacement": "beta" }),
+        json!({ "path": p, "pattern": "alpha", "replacement": "beta", "save": false }),
     );
     let status = s.call_ok(3, "session_status", json!({}));
     let status: Value = serde_json::from_str(&status).unwrap();
@@ -1325,7 +1324,7 @@ fn auto_revert_refreshes_clean_reads_while_modified_reads_warn() {
     s.call_ok(
         6,
         "run_program",
-        json!({ "path": p, "program": "(goto-char (point-max)) (insert \"mine\\n\")" }),
+        json!({ "path": p, "program": "(goto-char (point-max)) (insert \"mine\\n\")", "save": false }),
     );
     std::fs::write(&file, "THIRD external, a different length\n").unwrap();
     let view = s.call_ok(7, "view", json!({ "path": p }));
@@ -1369,7 +1368,7 @@ fn edit_tools_flag_a_stale_dirty_buffer_on_results_and_misses() {
     s.call_ok(
         1,
         "replace_text",
-        json!({ "path": p, "pattern": "alpha", "replacement": "ALPHA" }),
+        json!({ "path": p, "pattern": "alpha", "replacement": "ALPHA", "save": false }),
     );
     std::fs::write(&file, "rewritten externally, different length\n").unwrap();
 
@@ -1392,13 +1391,17 @@ fn edit_tools_flag_a_stale_dirty_buffer_on_results_and_misses() {
     let ok = s.call_ok(
         3,
         "replace_text",
-        json!({ "path": p, "pattern": "beta", "replacement": "BETA" }),
+        json!({ "path": p, "pattern": "beta", "replacement": "BETA", "save": false }),
     );
     assert!(
         ok.contains("changed on disk"),
         "the edit result must carry the stale note: {ok}"
     );
-    let ok = s.call_ok(4, "insert_text", json!({ "path": p, "text": "tail\n" }));
+    let ok = s.call_ok(
+        4,
+        "insert_text",
+        json!({ "path": p, "text": "tail\n", "save": false }),
+    );
     assert!(ok.contains("changed on disk"), "insert_text too: {ok}");
 }
 
@@ -1419,8 +1422,8 @@ fn rehearse_auto_reverts_a_clean_drifted_buffer_like_a_run_would() {
     std::fs::write(&file, "changed on disk and longer\n").unwrap();
     let preview = s.call_ok(
         2,
-        "rehearse",
-        json!({ "path": p, "program": r#"(search-forward "changed" nil t) (replace-match "previewed")"# }),
+        "run_program",
+        json!({ "path": p, "program": r#"(search-forward "changed" nil t) (replace-match "previewed")"#, "rehearse": true }),
     );
     assert!(
         preview.contains("previewed"),
@@ -1467,7 +1470,7 @@ fn unsaved_edits_are_flagged_until_saved() {
     let out: Value = serde_json::from_str(&s.call_ok(
         3,
         "run_program",
-        json!({ "path": p, "program": "(goto-char (point-max)) (insert \"beta\\n\")" }),
+        json!({ "path": p, "program": "(goto-char (point-max)) (insert \"beta\\n\")", "save": false }),
     ))
     .unwrap();
     assert_eq!(out["unsaved"], true, "an unsaved edit is flagged: {out}");
@@ -1485,7 +1488,7 @@ fn unsaved_edits_are_flagged_until_saved() {
     let msg = s.call_ok(
         5,
         "replace_text",
-        json!({ "path": p, "pattern": "alpha", "replacement": "ALPHA" }),
+        json!({ "path": p, "pattern": "alpha", "replacement": "ALPHA", "save": false }),
     );
     assert!(msg.contains("unsaved"), "edit-tool message reminds: {msg}");
 
@@ -1536,18 +1539,22 @@ fn unsaved_edits_are_flagged_until_saved() {
 }
 
 #[test]
-fn unsaved_flag_covers_insert_rehearse_and_restore_checkpoint() {
+fn unsaved_flag_covers_insert_rehearse_and_lisp_restore() {
     let dir = temp_dir("unsaved2");
     let file = dir.join("doc.txt");
     std::fs::write(&file, "alpha\n").unwrap();
     let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
     let p = file.to_string_lossy().into_owned();
-    // Explicit session id so the checkpoint tools (keyed by session, not path)
-    // address the same buffer.
+    // Explicit session id so the Lisp checkpoint forms (keyed by session, not
+    // path) address the same buffer.
     s.call_ok(1, "open_file", json!({ "session": "s", "path": p }));
 
     // insert_text without save → its text message carries the reminder.
-    let msg = s.call_ok(2, "insert_text", json!({ "session": "s", "text": "X" }));
+    let msg = s.call_ok(
+        2,
+        "insert_text",
+        json!({ "session": "s", "text": "X", "save": false }),
+    );
     assert!(msg.contains("unsaved"), "insert_text reminds: {msg}");
 
     // Save to a clean baseline, then rehearse a would-be edit: it rolls back,
@@ -1559,8 +1566,8 @@ fn unsaved_flag_covers_insert_rehearse_and_restore_checkpoint() {
     );
     let out: Value = serde_json::from_str(&s.call_ok(
         4,
-        "rehearse",
-        json!({ "session": "s", "program": "(goto-char (point-max)) (insert \"Z\")" }),
+        "run_program",
+        json!({ "session": "s", "program": "(goto-char (point-max)) (insert \"Z\")", "rehearse": true }),
     ))
     .unwrap();
     assert!(
@@ -1570,19 +1577,24 @@ fn unsaved_flag_covers_insert_rehearse_and_restore_checkpoint() {
 
     // Checkpoint at the saved state, save a DIFFERENT content to disk, then
     // restore the checkpoint — the buffer now differs from disk → unsaved.
-    s.call_ok(5, "checkpoint", json!({ "session": "s", "label": "cp0" }));
+    s.call_ok(
+        5,
+        "run_program",
+        json!({ "session": "s", "program": r#"(checkpoint "cp0")"# }),
+    );
     s.call_ok(
         6,
         "run_program",
-        json!({ "session": "s", "program": "(erase-buffer) (insert \"BETA\\n\")", "save": true }),
+        json!({ "session": "s", "program": "(erase-buffer) (insert \"BETA\\n\")" }),
     );
-    let restored = s.call_ok(
+    let restored: Value = serde_json::from_str(&s.call_ok(
         7,
-        "restore_checkpoint",
-        json!({ "session": "s", "label": "cp0" }),
-    );
-    assert!(
-        restored.contains("unsaved"),
+        "run_program",
+        json!({ "session": "s", "program": r#"(restore-checkpoint "cp0")"#, "save": false }),
+    ))
+    .unwrap();
+    assert_eq!(
+        restored["unsaved"], true,
         "a restore that diverges from disk flags unsaved: {restored}"
     );
 }
@@ -1794,7 +1806,7 @@ fn open_file_create_visits_a_new_file_written_by_the_first_save() {
     s.call_ok(
         9,
         "insert_text",
-        json!({ "session": "raced", "text": "mine\n" }),
+        json!({ "session": "raced", "text": "mine\n", "save": false }),
     );
     std::fs::write(&dest2, "theirs\n").unwrap();
     let err = s.call_err(10, "save_buffer", json!({ "session": "raced" }));
@@ -1876,37 +1888,54 @@ fn audit_journal_records_one_line_per_run() {
     let second: Value = serde_json::from_str(lines[1]).expect("audit line is JSON");
     assert_eq!(second["dirty"], false);
 
+    // A rehearsed edit persists nothing, so it is not dirty either.
+    s.call_ok(
+        5,
+        "replace_text",
+        json!({ "pattern": "abc", "replacement": "xyz", "session": "audited", "rehearse": true }),
+    );
+    let file = root.join("doc.txt");
+    std::fs::write(&file, "abc\n").unwrap();
+    s.call_ok(
+        6,
+        "insert_text",
+        json!({ "text": "uvw", "session": "audited", "rehearse": true }),
+    );
+    s.call_ok(
+        7,
+        "replace_in_files",
+        json!({ "files": [file], "pattern": "abc", "replacement": "rst", "rehearse": true }),
+    );
+    let contents = std::fs::read_to_string(&log).expect("audit log exists");
+    let rehearsed: Vec<Value> = contents
+        .lines()
+        .skip(2)
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rehearsed.len(), 3, "{contents}");
+    for (line, text) in rehearsed.iter().zip(["xyz", "uvw", "rst"]) {
+        assert!(line["program"].as_str().unwrap().contains(text), "{line}");
+        assert_eq!(line["dirty"], false, "{line}");
+    }
+
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
-fn uniform_path_addressing_on_checkpoint_and_save_tools() {
+fn save_buffer_addresses_by_path_and_saves_as() {
     let dir = temp_dir("uniform-addr");
     let file = dir.join("doc.txt");
     std::fs::write(&file, "alpha\n").unwrap();
     let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
     let p = file.to_string_lossy().into_owned();
 
-    // checkpoint / list / restore address the file by path, like every other
-    // tool — no need to know the canonical-path session id.
-    let cp = s.call_ok(1, "checkpoint", json!({ "path": p, "label": "cp" }));
-    assert!(cp.contains("cp"), "checkpoint said: {cp}");
-    s.call_ok(
-        2,
-        "replace_text",
-        json!({ "path": p, "pattern": "alpha", "replacement": "beta" }),
-    );
-    let cps = s.call_ok(3, "session_status", json!({}));
-    assert!(cps.contains("cp"), "session_status said: {cps}");
-    s.call_ok(4, "restore_checkpoint", json!({ "path": p, "label": "cp" }));
-    let txt = s.call_ok(5, "read_region", json!({ "path": p, "start": 1, "end": 6 }));
-    assert!(txt.starts_with("alpha"), "restored: {txt}");
-
-    // save_buffer without `to` writes back to the visited file.
+    // save_buffer without `to` writes back to the visited file — addressed by
+    // path, like every other tool, no need to know the canonical-path session
+    // id.
     s.call_ok(
         6,
         "replace_text",
-        json!({ "path": p, "pattern": "alpha", "replacement": "gamma" }),
+        json!({ "path": p, "pattern": "alpha", "replacement": "gamma", "save": false }),
     );
     let saved = s.call_ok(7, "save_buffer", json!({ "path": p }));
     assert!(saved.contains("saved"), "save said: {saved}");
@@ -2039,7 +2068,7 @@ fn close_session_releases_and_guards_unsaved_edits() {
     s.call_ok(
         4,
         "replace_text",
-        json!({ "path": p, "pattern": "alpha", "replacement": "beta" }),
+        json!({ "path": p, "pattern": "alpha", "replacement": "beta", "save": false }),
     );
     let err = s.call_err(5, "close_session", json!({ "path": p }));
     assert!(err.contains("unsaved"), "got: {err}");
@@ -2100,7 +2129,7 @@ fn close_session_multi_is_all_or_nothing_without_force() {
     s.call_ok(
         2,
         "replace_text",
-        json!({ "path": pb, "pattern": "beta", "replacement": "gamma" }),
+        json!({ "path": pb, "pattern": "beta", "replacement": "gamma", "save": false }),
     );
     // b is unsaved: nothing closes, and the error names the offender only.
     let err = s.call_err(3, "close_session", json!({ "paths": [pa, pb] }));
@@ -2217,7 +2246,7 @@ fn close_session_all_drops_every_warm_session() {
     s.call_ok(
         4,
         "replace_text",
-        json!({ "path": pb, "pattern": "beta", "replacement": "gamma" }),
+        json!({ "path": pb, "pattern": "beta", "replacement": "gamma", "save": false }),
     );
     let err = s.call_err(6, "close_session", json!({ "all": true }));
     assert!(err.contains("unsaved") && err.contains(&pb), "got: {err}");
@@ -2584,15 +2613,16 @@ fn rehearse_accepts_full_diff_and_view() {
     s.request(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }));
     s.call_ok(2, "open_text", json!({ "text": "alpha\nbeta\ngamma" }));
 
-    // full_diff + view are run_program args; rehearse must accept them, not
-    // reject them as unknown.
+    // full_diff + view are run_program args; rehearse: true must accept them,
+    // not reject them as unknown.
     let out: Value = serde_json::from_str(&s.call_ok(
         3,
-        "rehearse",
+        "run_program",
         json!({
             "program": r#"(goto-char (point-min)) (while (re-search-forward "a" nil t) (replace-match "A"))"#,
             "full_diff": true,
             "view": 4,
+            "rehearse": true,
         }),
     ))
     .unwrap();
@@ -2633,11 +2663,12 @@ fn modern_stdio_conversation_needs_no_handshake() {
         s.request(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta": meta()}}));
     assert_eq!(l["result"]["cacheScope"], "public");
     assert!(
-        l["result"]["tools"]
+        !l["result"]["tools"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|t| t["name"] == "open_workspace")
+            .any(|t| t["name"] == "open_workspace"),
+        "open_workspace only lists on HTTP"
     );
 
     let o = s.request(
@@ -2959,4 +2990,571 @@ fn read_region_reports_the_argument_clash_before_a_bad_line_range() {
     assert!(err.contains("not both"), "{err}");
     let err = s.call_err(3, "read_region", json!({ "session": "r", "lines": "2-4" }));
     assert!(err.contains("must be [start, end]"), "{err}");
+}
+
+#[test]
+fn edit_tools_save_by_default() {
+    let dir = temp_dir("save-default");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+
+    s.call_ok(
+        1,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "beta" }),
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "beta\n");
+    s.call_ok(
+        2,
+        "insert_text",
+        json!({ "path": p, "pos": "eob", "text": "gamma\n" }),
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "beta\ngamma\n");
+    s.call_ok(
+        3,
+        "run_program",
+        json!({ "path": p, "program": "(goto-char (point-min)) (insert \"# \")" }),
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "# beta\ngamma\n");
+
+    let other = dir.join("other.txt");
+    std::fs::write(&other, "one\n").unwrap();
+    s.call_ok(
+        4,
+        "replace_in_files",
+        json!({ "files": [other.to_string_lossy()], "pattern": "one", "replacement": "two" }),
+    );
+    assert_eq!(std::fs::read_to_string(&other).unwrap(), "two\n");
+
+    let prose = dir.join("prose.md");
+    std::fs::write(&prose, "aaa bbb ccc ddd\n").unwrap();
+    s.call_ok(
+        5,
+        "fill_text",
+        json!({ "path": prose.to_string_lossy(), "all": true, "column": 8 }),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&prose).unwrap(),
+        "aaa bbb\nccc ddd\n"
+    );
+}
+
+#[test]
+fn save_false_holds_the_edit_in_the_buffer() {
+    let dir = temp_dir("save-false");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+
+    let msg = s.call_ok(
+        1,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "beta", "save": false }),
+    );
+    assert!(
+        msg.contains("unsaved"),
+        "the reminder names the held edit: {msg}"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n");
+    s.call_ok(2, "save_buffer", json!({ "path": p }));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "beta\n");
+}
+
+#[test]
+fn rehearse_flag_previews_without_touching_buffer_or_disk() {
+    let dir = temp_dir("rehearse-flag");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let prose = dir.join("prose.md");
+    std::fs::write(&prose, "aaa bbb ccc ddd\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+    let pm = prose.to_string_lossy().into_owned();
+
+    let out = s.call_ok(
+        1,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "beta", "rehearse": true }),
+    );
+    assert!(
+        out.starts_with("rehearsed"),
+        "flagged as a rehearsal: {out}"
+    );
+    assert!(out.contains("+beta"), "the preview carries the diff: {out}");
+    assert!(!out.contains("unsaved"), "a rehearsal holds nothing: {out}");
+
+    let out = s.call_ok(
+        2,
+        "insert_text",
+        json!({ "path": p, "pos": "eob", "text": "X\n", "rehearse": true }),
+    );
+    assert!(out.contains("+X"), "insert preview: {out}");
+
+    let out = s.call_ok(
+        3,
+        "fill_text",
+        json!({ "path": pm, "all": true, "column": 8, "rehearse": true }),
+    );
+    assert!(out.contains("+aaa bbb"), "fill preview: {out}");
+
+    let out: Value = serde_json::from_str(&s.call_ok(
+        4,
+        "run_program",
+        json!({ "path": p, "program": "(insert \"Z\")", "rehearse": true }),
+    ))
+    .unwrap();
+    assert_eq!(out["rehearsed"], true);
+    assert!(out["diff"].as_str().unwrap().contains("+Zalpha"), "{out}");
+    assert!(
+        out.get("saved").is_none(),
+        "a rehearsal saves nothing: {out}"
+    );
+
+    let out = s.call_ok(
+        5,
+        "replace_in_files",
+        json!({ "files": [p], "pattern": "alpha", "replacement": "beta", "rehearse": true }),
+    );
+    assert!(out.starts_with("rehearsed"), "{out}");
+
+    // Nothing reached the disk, and no buffer holds an edit.
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n");
+    assert_eq!(
+        std::fs::read_to_string(&prose).unwrap(),
+        "aaa bbb ccc ddd\n"
+    );
+    let st: Value = serde_json::from_str(&s.call_ok(6, "session_status", json!({}))).unwrap();
+    assert!(
+        st["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["unsaved"] == false),
+        "{st}"
+    );
+
+    let err = s.call_err(
+        7,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "beta", "rehearse": true, "save": true }),
+    );
+    assert!(err.contains("drop save: true"), "got: {err}");
+
+    // A flag that is not a boolean is refused before anything runs.
+    for (id, flag) in [(9, "rehearse"), (10, "save")] {
+        let err = s.call_err(
+            id,
+            "replace_text",
+            json!({ "path": p, "pattern": "alpha", "replacement": "beta", flag: "true" }),
+        );
+        assert!(err.contains("must be a boolean"), "got: {err}");
+    }
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n");
+
+    // A real edit after the rehearsals starts from the untouched text.
+    s.call_ok(
+        8,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "gamma" }),
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "gamma\n");
+}
+
+/// A rehearsal with `view: true` runs a SECOND program afterwards
+/// (`view_echo`'s follow-up read), which also pushes onto the undo ring. On a
+/// ring already at capacity that push (and the edit's own) evict the oldest
+/// entries without changing the ring's LENGTH — so a rollback that only
+/// restores the length, not the ring's contents, would leave the rehearsed edit
+/// on top for a later undo_last to apply and save.
+#[test]
+fn rehearse_on_a_full_undo_ring_does_not_leak_onto_it() {
+    let dir = temp_dir("rehearse-undo-ring");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+
+    // Nine real, saved edits — one more than the undo ring's capacity (8) — so
+    // the ring is already full and has evicted its very first state.
+    for i in 0..9 {
+        s.call_ok(
+            i + 1,
+            "insert_text",
+            json!({ "path": p, "pos": "eob", "text": format!("l{i}\n") }),
+        );
+    }
+    let before = std::fs::read_to_string(&file).unwrap();
+    assert!(before.ends_with("l8\n"));
+
+    let out = s.call_ok(
+        10,
+        "replace_text",
+        json!({
+            "path": p, "pattern": "alpha", "replacement": "REHEARSED",
+            "rehearse": true, "view": true,
+        }),
+    );
+    assert!(out.starts_with("rehearsed"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        before,
+        "a rehearsal never touches disk, full ring or not"
+    );
+
+    // undo_last must rewind the last REAL edit (dropping "l8\n"), never the
+    // rehearsed one — and never save the rehearsed text.
+    let out = s.call_ok(11, "undo_last", json!({ "path": p }));
+    assert!(!out.contains("REHEARSED"), "got: {out}");
+    let after_undo = std::fs::read_to_string(&file).unwrap();
+    assert!(!after_undo.contains("REHEARSED"), "got: {after_undo}");
+    assert_eq!(
+        after_undo,
+        before.strip_suffix("l8\n").unwrap(),
+        "undo rewinds the last real edit, not the rehearsed one"
+    );
+
+    // The rehearsal did not cost the ring an extra real step either: draining
+    // it the rest of the way (each real edit's own save triggers a syntax check
+    // that pushes its post-edit state too, so undo_last's "the top may already
+    // be the current state" skip retires one extra entry for free on the first
+    // call above) reaches the same depth a run without any rehearsal would,
+    // then errors with nothing left — never more, never fewer.
+    let mut drained = 0;
+    loop {
+        let resp = s.request(json!({
+            "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+            "params": { "name": "undo_last", "arguments": { "path": p } },
+        }));
+        if resp["result"]["isError"] == true {
+            break;
+        }
+        drained += 1;
+    }
+    assert_eq!(
+        drained, 6,
+        "the ring's remaining real depth after the first undo"
+    );
+}
+
+#[test]
+fn a_rehearsed_replace_in_files_keeps_a_full_undo_ring() {
+    let dir = temp_dir("rif-rehearse-ring");
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    // Two files with the same history, more edits than the undo ring holds;
+    // only the first then takes a rehearsed replace_in_files. The edits stay
+    // unsaved so the ring's top is not the current text (a save's follow-up
+    // read would push it), and a push at the rehearsal evicts an entry.
+    let paths: Vec<String> = ["rehearsed.txt", "control.txt"]
+        .iter()
+        .map(|name| {
+            let file = dir.join(name);
+            std::fs::write(&file, "v0\n").unwrap();
+            file.to_string_lossy().into_owned()
+        })
+        .collect();
+    let mut id = 0;
+    for p in &paths {
+        for i in 0..9 {
+            id += 1;
+            s.call_ok(
+                id,
+                "replace_text",
+                json!({ "path": p, "pattern": format!("v{i}"), "replacement": format!("v{}", i + 1), "save": false }),
+            );
+        }
+    }
+    let out = s.call_ok(
+        100,
+        "replace_in_files",
+        json!({ "files": [paths[0]], "pattern": "v9", "replacement": "zz", "rehearse": true }),
+    );
+    assert!(out.starts_with("rehearsed"), "{out}");
+
+    // The rehearsal cost no undo step: both files rewind equally far.
+    let mut reached = Vec::new();
+    for (k, p) in paths.iter().enumerate() {
+        let mut steps = 0;
+        loop {
+            let id = 200 + 100 * k as i64 + steps;
+            let resp = s.request(json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "undo_last", "arguments": { "path": p, "save": false } },
+            }));
+            if resp["result"]["isError"] == true {
+                break;
+            }
+            steps += 1;
+        }
+        let text = s.call_ok(
+            500 + k as i64,
+            "read_region",
+            json!({ "path": p, "start": 1, "end": 3 }),
+        );
+        reached.push((steps, text));
+    }
+    assert_eq!(reached[0], reached[1], "rehearsed vs control");
+    assert_eq!(reached[0], (8, "v1".to_string()), "a full ring's worth");
+}
+
+#[test]
+fn a_read_only_program_does_not_rewrite_the_file() {
+    let dir = temp_dir("no-rewrite");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800);
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+
+    let out: Value = serde_json::from_str(&s.call_ok(
+        1,
+        "run_program",
+        json!({ "path": p, "program": "(point)" }),
+    ))
+    .unwrap();
+    assert!(out.get("saved").is_none(), "nothing to save: {out}");
+    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), old);
+}
+
+#[test]
+fn a_read_only_call_does_not_save_held_edits() {
+    let dir = temp_dir("held-edits");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+
+    s.call_ok(
+        1,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "beta", "save": false }),
+    );
+    // A read-only program changes nothing, so the default save leaves the held
+    // edit alone.
+    s.call_ok(2, "run_program", json!({ "path": p, "program": "(point)" }));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n");
+    // An explicit save: true writes whatever the buffer holds.
+    s.call_ok(
+        3,
+        "run_program",
+        json!({ "path": p, "program": "(point)", "save": true }),
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "beta\n");
+}
+
+#[test]
+fn an_edit_that_changes_no_text_leaves_the_buffer_clean() {
+    let dir = temp_dir("identity-edit");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+    let unsaved = |s: &mut Server, id| -> bool {
+        let st: Value = serde_json::from_str(&s.call_ok(id, "session_status", json!({}))).unwrap();
+        st["sessions"][0]["unsaved"] == true
+    };
+
+    let out = s.call_ok(
+        1,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "alpha" }),
+    );
+    assert!(!out.contains("unsaved"), "{out}");
+    assert!(!unsaved(&mut s, 2));
+
+    // Held edits stay held: the same identity edit neither saves them nor marks
+    // the buffer clean.
+    s.call_ok(
+        3,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "beta", "save": false }),
+    );
+    s.call_ok(
+        4,
+        "replace_text",
+        json!({ "path": p, "pattern": "beta", "replacement": "beta" }),
+    );
+    assert!(unsaved(&mut s, 5));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n");
+}
+
+#[test]
+fn replace_in_files_writes_nothing_when_one_file_is_stale() {
+    let dir = temp_dir("rif-stale");
+    let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
+    std::fs::write(&a, "foo a\n").unwrap();
+    std::fs::write(&b, "foo b\nzzz\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let (pa, pb) = (
+        a.to_string_lossy().into_owned(),
+        b.to_string_lossy().into_owned(),
+    );
+
+    // b holds an unsaved edit when an outside writer changes its file.
+    s.call_ok(
+        1,
+        "replace_text",
+        json!({ "path": pb, "pattern": "zzz", "replacement": "yyy", "save": false }),
+    );
+    std::fs::write(&b, "foo b, written outside\n").unwrap();
+
+    let err = s.call_err(
+        2,
+        "replace_in_files",
+        json!({ "files": [pa, pb], "pattern": "foo", "replacement": "bar" }),
+    );
+    assert!(err.contains("no file was written"), "{err}");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "foo a\n");
+    assert_eq!(
+        std::fs::read_to_string(&b).unwrap(),
+        "foo b, written outside\n"
+    );
+
+    // a's edit rolled back too, so the same edit on a alone lands once.
+    s.call_ok(
+        3,
+        "replace_in_files",
+        json!({ "files": [pa], "pattern": "foo", "replacement": "bar" }),
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "bar a\n");
+}
+
+#[test]
+fn replace_in_files_saves_past_a_session_it_evicted() {
+    // More files than the session cap: opening the later ones evicts the
+    // earliest clean session, here one whose edit left its text as it was.
+    let dir = temp_dir("rif-evict");
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let files: Vec<String> = (0..18)
+        .map(|i| {
+            let file = dir.join(format!("f{i}.txt"));
+            std::fs::write(&file, if i == 1 { "Bar\n" } else { "Foo\n" }).unwrap();
+            file.to_string_lossy().into_owned()
+        })
+        .collect();
+    s.call_ok(
+        1,
+        "replace_in_files",
+        json!({ "files": files, "pattern": "Foo\\|Bar", "replacement": "Bar", "mode": "regex" }),
+    );
+    for f in &files {
+        assert_eq!(std::fs::read_to_string(f).unwrap(), "Bar\n", "{f}");
+    }
+}
+
+#[test]
+fn replace_in_files_saves_only_the_files_it_changed() {
+    let dir = temp_dir("rif-count");
+    let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
+    std::fs::write(&a, "Foo\n").unwrap();
+    std::fs::write(&b, "Bar\n").unwrap();
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&b)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let out = s.call_ok(
+        1,
+        "replace_in_files",
+        json!({ "files": [a, b], "pattern": "Foo\\|Bar", "replacement": "Bar", "mode": "regex" }),
+    );
+    assert!(out.contains("saved 1 file(s)"), "{out}");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "Bar\n");
+    assert_eq!(std::fs::metadata(&b).unwrap().modified().unwrap(), old);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_buffer_without_a_file_skips_the_default_save() {
+    let mut s = Server::spawn();
+    s.call_ok(1, "open_text", json!({ "text": "x" }));
+    // The default save has nowhere to write, so it quietly does nothing.
+    s.call_ok(
+        2,
+        "replace_text",
+        json!({ "pattern": "x", "replacement": "y" }),
+    );
+    // An explicit save:true still errors.
+    let err = s.call_err(
+        3,
+        "replace_text",
+        json!({ "pattern": "y", "replacement": "z", "save": true }),
+    );
+    assert!(err.contains("no visited file"), "got: {err}");
+}
+
+#[test]
+fn undo_last_writes_the_rewound_text() {
+    let dir = temp_dir("undo-writes");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let p = file.to_string_lossy().into_owned();
+
+    s.call_ok(
+        1,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "beta" }),
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "beta\n");
+    s.call_ok(2, "undo_last", json!({ "path": p }));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n");
+
+    // save:false rewinds the buffer only.
+    s.call_ok(
+        3,
+        "replace_text",
+        json!({ "path": p, "pattern": "alpha", "replacement": "beta" }),
+    );
+    let out = s.call_ok(4, "undo_last", json!({ "path": p, "save": false }));
+    assert!(out.contains("unsaved"), "got: {out}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "beta\n");
+}
+
+#[test]
+fn removed_and_gated_tools_are_not_listed_on_stdio() {
+    let mut s = Server::spawn();
+    let list = s.request(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
+    let names: Vec<&str> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    for gone in [
+        "rehearse",
+        "checkpoint",
+        "restore_checkpoint",
+        "open_workspace",
+        "close_workspace",
+        "git_exec_over",
+    ] {
+        assert!(!names.contains(&gone), "{gone} is still listed");
+    }
+    let err = s.call_err(2, "rehearse", json!({ "program": "(point)" }));
+    assert!(err.contains("unknown tool"), "got: {err}");
+    let err = s.call_err(3, "open_workspace", json!({}));
+    assert!(err.contains("unknown tool"), "got: {err}");
+
+    let mut s = Server::spawn_with_env(&[("MIME_EXEC", std::path::Path::new("1"))]);
+    let list = s.request(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
+    assert!(
+        list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "git_exec_over"),
+        "MIME_EXEC=1 lists git_exec_over"
+    );
 }

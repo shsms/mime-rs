@@ -2080,7 +2080,12 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                     .find(|c| c.label == label)
                     .map(|c| c.restore());
                 match restored {
-                    Some(store) => {
+                    Some(mut store) => {
+                        // The session's stamp is the disk state it last
+                        // synced with; the checkpoint's may predate a save
+                        // since.
+                        let stamp = sess.buffer.file_stamp().cloned();
+                        store.set_file_stamp(stamp);
                         sess.buffer = store;
                         Ok(TulispObject::t())
                     }

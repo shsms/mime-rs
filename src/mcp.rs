@@ -29,6 +29,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use crate::rpc::Sessions;
+use crate::rpc::Transport;
 use crate::{Buffer, Quire, TextStore, Workspace};
 use serde_json::{Value, json};
 
@@ -144,13 +145,19 @@ pub(crate) fn tools_call_result(
     if let Err(message) = validate_args(name, &args) {
         return ToolOutput::error(message);
     }
+    // `save` and `rehearse` decide whether a call writes to disk, so a value
+    // that is not a boolean is an error, not a silent default.
+    for key in ["save", "rehearse"] {
+        if let Err(message) = strict_bool_arg(&args, key) {
+            return ToolOutput::error(format!("{name}: {message}"));
+        }
+    }
 
     // The tools that also answer as JSON say so through their `Render`; the
     // rest answer in prose and are lifted into a `ToolOutput` by
     // `From<String>`.
     let outcome: Result<ToolOutput, String> = match name {
-        "run_program" => tool_run_program(&args, sessions, false),
-        "rehearse" => tool_run_program(&args, sessions, true),
+        "run_program" => tool_run_program(&args, sessions, bool_arg(&args, "rehearse")),
         "grep" => tool_grep(&args, sessions),
         "outline" => tool_outline(&args, sessions),
         "session_status" => tool_session_status(sessions, workspace),
@@ -158,14 +165,12 @@ pub(crate) fn tools_call_result(
         "open_text" => tool_open_text(&args, sessions).map(Into::into),
         "read_region" => tool_read_region(&args, sessions).map(Into::into),
         "view" => tool_view(&args, sessions).map(Into::into),
-        "insert_text" => tool_insert_text(&args, sessions).map(Into::into),
-        "replace_text" => tool_replace_text(&args, sessions).map(Into::into),
+        "insert_text" => rehearsed(&args, sessions, tool_insert_text).map(Into::into),
+        "replace_text" => rehearsed(&args, sessions, tool_replace_text).map(Into::into),
         "replace_in_files" => tool_replace_files(&args, sessions).map(Into::into),
-        "fill_text" => tool_fill_text(&args, sessions).map(Into::into),
+        "fill_text" => rehearsed(&args, sessions, tool_fill_text).map(Into::into),
         "occur" => tool_occur(&args, sessions).map(Into::into),
         "conflicts" => tool_conflicts(&args, sessions).map(Into::into),
-        "checkpoint" => tool_checkpoint(&args, sessions).map(Into::into),
-        "restore_checkpoint" => tool_restore_checkpoint(&args, sessions).map(Into::into),
         "undo_last" => tool_undo_last(&args, sessions).map(Into::into),
         "close_session" => tool_close_session(&args, sessions).map(Into::into),
         "save_buffer" => tool_save_buffer(&args, sessions).map(Into::into),
@@ -667,6 +672,89 @@ fn save_visited(
     ))
 }
 
+/// Whether an edit tool saves: `save` defaults to true, and `save: false` holds
+/// the edit in the warm buffer.
+fn save_requested(args: &Value) -> bool {
+    args.get("save").and_then(Value::as_bool).unwrap_or(true)
+}
+
+/// The save an edit tool ends with; `changed` says whether THIS call changed
+/// the buffer. By default the buffer is written to its visited file only when
+/// it did — so a read-only program never rewrites the file or moves its
+/// timestamp, and never writes out edits an earlier `save: false` call held
+/// back. `save: false` never writes. An explicit `save: true` writes whatever
+/// the buffer holds (and stays an error for a buffer with no visited file); the
+/// default quietly skips such a buffer (open_text).
+fn save_after_edit(
+    args: &Value,
+    sessions: &mut HashMap<String, Workspace>,
+    session: &str,
+    changed: bool,
+) -> Result<String, String> {
+    match args.get("save").and_then(Value::as_bool) {
+        Some(false) => Ok(String::new()),
+        Some(true) => save_visited(sessions, session),
+        None => {
+            let Some(ws) = sessions.get(session) else {
+                return Err(no_such_session(sessions, session));
+            };
+            if changed && ws.visited_path().is_some() {
+                save_visited(sessions, session)
+            } else {
+                Ok(String::new())
+            }
+        }
+    }
+}
+
+/// A rehearsal saves nothing, so asking for both is a contradiction.
+fn reject_rehearse_with_save(args: &Value) -> Result<(), String> {
+    if bool_arg(args, "rehearse") && bool_arg(args, "save") {
+        return Err(
+            "rehearse: true previews an edit and saves nothing — drop save: true".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// `rehearse: true` on a single-buffer edit tool: run the edit, answer with
+/// what it did plus its diff, then roll the session back so nothing reaches the
+/// buffer or the disk. Without the flag, just runs `tool`.
+fn rehearsed(
+    args: &Value,
+    sessions: &mut HashMap<String, Workspace>,
+    tool: fn(&Value, &mut HashMap<String, Workspace>) -> Result<String, String>,
+) -> Result<String, String> {
+    if !bool_arg(args, "rehearse") {
+        return tool(args, sessions);
+    }
+    reject_rehearse_with_save(args)?;
+    let session = resolve_session(args, sessions)?;
+    if !sessions.contains_key(&session) {
+        return Err(no_such_session(sessions, &session));
+    }
+    let ws = sessions.get_mut(&session).expect("checked above");
+    // Re-read a clean buffer whose file drifted BEFORE marking, as
+    // run_or_rehearse does before its own snapshot: rolling back to a
+    // pre-revert mark would leave a stale buffer that reads as unsaved and
+    // refuses every later save.
+    ws.auto_revert_if_clean();
+    let mark = ws.rehearsal_mark();
+    let mut preview = args.clone();
+    preview["save"] = json!(false);
+    preview["diff"] = json!(true);
+    let out = tool(&preview, sessions);
+    if let Some(ws) = sessions.get_mut(&session) {
+        ws.roll_back(mark);
+    }
+    out.map(|text| {
+        format!(
+            "rehearsed — nothing was changed: {}",
+            text.replace(UNSAVED_NOTE, "")
+        )
+    })
+}
+
 /// A save-time syntax check for buffers tree-sitter parses as CODE (Markdown
 /// almost never errors, and huge prose buffers should not pay a parse): a
 /// non-empty warning when the buffer no longer parses. Warns, never blocks.
@@ -728,7 +816,8 @@ fn run_in_session_expecting(
 }
 
 /// Like [`run_in_session`], but `rehearse` selects a dry-run that rolls the
-/// session back afterwards (the `rehearse` tool) instead of a persisting `run`.
+/// session back afterwards (the `rehearse: true` flag) instead of a persisting
+/// `run`.
 fn run_or_rehearse(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
@@ -862,8 +951,8 @@ fn tool_close_session(
     if !unsaved.is_empty() && !bool_arg(args, "force") {
         let list: Vec<String> = unsaved.iter().map(|t| format!("\"{t}\"")).collect();
         return Err(format!(
-            "nothing closed: {} unsaved edits — save_buffer (or save: true) \
-             first, or pass force: true to discard them",
+            "nothing closed: {} unsaved edits — save_buffer first, or pass \
+             force: true to discard them",
             if list.len() == 1 {
                 format!("session {} has", list[0])
             } else {
@@ -1009,16 +1098,17 @@ fn tool_open_text(
 /// `run_program {program, session?}` — the core tool. Evaluate a tulisp edit
 /// program against the warm session and return the full `RunReport` JSON.
 ///
-/// With `rehearse = true` (the `rehearse` tool) the program is dry-run: the
-/// same `RunReport` comes back (diff/reports/len of the hypothetical edit, with
-/// `rehearsed: true`), but the buffer — and the kill-ring/checkpoints — are
-/// rolled back, so nothing persists. The two share one body since they differ
-/// only in whether the effects stick.
+/// With `rehearse = true` (the `rehearse: true` flag) the program is dry-run:
+/// the same `RunReport` comes back (diff/reports/len of the hypothetical edit,
+/// with `rehearsed: true`), but the buffer — and the kill-ring/checkpoints —
+/// are rolled back, so nothing persists. The two share one body since they
+/// differ only in whether the effects stick.
 fn tool_run_program(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
     rehearse: bool,
 ) -> Result<ToolOutput, String> {
+    reject_rehearse_with_save(args)?;
     let session = resolve_session(args, sessions)?;
     let program = str_arg(args, "program")?;
     // TODO: resource limits (needs tulisp eval interruption) — a per-program
@@ -1088,11 +1178,12 @@ fn tool_run_program(
     if sessions.get(&session).is_some_and(|ws| ws.is_stale()) {
         json["stale"] = Value::Bool(true);
     }
-    // `save` is rejected on rehearse upstream by `validate_args` (rehearse's
-    // schema declares no `save`), so only a real run reaches here.
-    if bool_arg(args, "save") {
-        let note = save_visited(sessions, &session)?;
-        json["saved"] = Value::String(note.trim_start_matches("; ").to_string());
+    // A rehearsal saves nothing (`save: true` with it was refused up front).
+    if !rehearse {
+        let note = save_after_edit(args, sessions, &session, report.dirty)?;
+        if !note.is_empty() {
+            json["saved"] = Value::String(note.trim_start_matches("; ").to_string());
+        }
     }
     // Structured, present only when true (like `stale`): the edit is in the
     // warm buffer, not on disk — saving was not requested and the buffer is
@@ -1154,12 +1245,15 @@ fn clobbers_unsaved_session<'a>(
         .map(|(id, _)| id.as_str())
 }
 
-/// A reminder appended to an edit tool's message when the edit lives only in
-/// the warm buffer, not on disk — so a forgotten `save` reads as a visible note
-/// instead of a silent loss. Empty when there's nothing to save.
+/// The reminder an edit tool appends when its edit lives only in the warm
+/// buffer (a `save: false` edit) — so a held edit is visible, not silent.
+const UNSAVED_NOTE: &str =
+    "\n(unsaved: the edit is in the warm buffer, not on disk — save_buffer writes it)";
+
+/// [`UNSAVED_NOTE`] when the session holds unsaved edits, else empty.
 fn unsaved_note(sessions: &HashMap<String, Workspace>, session: &str) -> &'static str {
     if is_unsaved(sessions, session) {
-        "\n(unsaved: edits are in the warm buffer, not on disk — pass save:true or save_buffer)"
+        UNSAVED_NOTE
     } else {
         ""
     }
@@ -1459,14 +1553,10 @@ fn tool_insert_text(
             ));
         }
     };
-    audit_tool(&session, &program, &report);
+    audit_tool(bool_arg(args, "rehearse"), &session, &program, &report);
     let chars = text.chars().count();
     let point = report_value(&report, "point").unwrap_or_default();
-    let saved = if bool_arg(args, "save") {
-        save_visited(sessions, &session)?
-    } else {
-        String::new()
-    };
+    let saved = save_after_edit(args, sessions, &session, report.dirty)?;
     let unsaved = unsaved_note(sessions, &session);
     let stale = stale_edit_note(sessions, &session);
     let view = view_echo(args, sessions, &session);
@@ -1539,7 +1629,7 @@ fn tool_fill_text(
             ));
         }
     };
-    audit_tool(&session, &program, &report);
+    audit_tool(bool_arg(args, "rehearse"), &session, &program, &report);
     let summary = if matches!(target, FillTarget::All | FillTarget::Lines(..)) {
         let seen = report_value(&report, "seen").unwrap_or_default();
         let changed = report_value(&report, "changed").unwrap_or_default();
@@ -1567,11 +1657,7 @@ fn tool_fill_text(
             format!("{kind} @{a}-{b} (lines {la}-{lb}) already fits")
         }
     };
-    let saved = if bool_arg(args, "save") {
-        save_visited(sessions, &session)?
-    } else {
-        String::new()
-    };
+    let saved = save_after_edit(args, sessions, &session, report.dirty)?;
     let unsaved = unsaved_note(sessions, &session);
     let stale = stale_edit_note(sessions, &session);
     let view = view_echo(args, sessions, &session);
@@ -1871,7 +1957,7 @@ fn tool_replace_text(
         }
         Err(e) => return Err(e),
     };
-    audit_tool(&session, &program, &report);
+    audit_tool(bool_arg(args, "rehearse"), &session, &program, &report);
     let n: usize = report_value(&report, "n")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
@@ -1887,11 +1973,7 @@ fn tool_replace_text(
         .unwrap_or(0);
     let point = report_value(&report, "point").unwrap_or_default();
     let line = report_value(&report, "line").unwrap_or_default();
-    let saved = if bool_arg(args, "save") {
-        save_visited(sessions, &session)?
-    } else {
-        String::new()
-    };
+    let saved = save_after_edit(args, sessions, &session, report.dirty)?;
     let unsaved = unsaved_note(sessions, &session);
     let stale = stale_edit_note(sessions, &session);
     let view = view_echo(args, sessions, &session);
@@ -2153,14 +2235,10 @@ fn replace_thing(
            (report \"line\" (line-number-at-pos {a})) (report \"point\" (point)))"
     );
     let report = run_in_session_expecting(sessions, session, &program, Some(version))?;
-    audit_tool(session, &program, &report);
+    audit_tool(bool_arg(args, "rehearse"), session, &program, &report);
     let line = report_value(&report, "line").unwrap_or_default();
     let point = report_value(&report, "point").unwrap_or_default();
-    let saved = if bool_arg(args, "save") {
-        save_visited(sessions, session)?
-    } else {
-        String::new()
-    };
+    let saved = save_after_edit(args, sessions, session, report.dirty)?;
     let unsaved = unsaved_note(sessions, session);
     let stale = stale_edit_note(sessions, session);
     let view = view_echo(args, sessions, session);
@@ -2371,13 +2449,10 @@ fn replace_text_batch(
     // A top-level `mode` is the default for edits that don't name their own.
     let items = with_default_mode(args, items);
     let scope = scope_prelude(args)?;
-    let (total, edit_diff) = run_batch_edits(sessions, session, &items, &scope)
+    let rehearse = bool_arg(args, "rehearse");
+    let (total, edit_diff) = run_batch_edits(sessions, session, &items, &scope, rehearse)
         .map_err(|e| format!("{e}{}", stale_edit_note(sessions, session)))?;
-    let saved = if bool_arg(args, "save") {
-        save_visited(sessions, session)?
-    } else {
-        String::new()
-    };
+    let saved = save_after_edit(args, sessions, session, !edit_diff.is_empty())?;
     let unsaved = unsaved_note(sessions, session);
     let stale = stale_edit_note(sessions, session);
     let view = view_echo(args, sessions, session);
@@ -2416,6 +2491,7 @@ fn run_batch_edits(
     session: &str,
     items: &[Value],
     scope: &Option<(String, String)>,
+    rehearse: bool,
 ) -> Result<(usize, String), String> {
     let mut body = String::new();
     for (i, item) in items.iter().enumerate() {
@@ -2516,7 +2592,7 @@ fn run_batch_edits(
             return Err(line.unwrap_or(e));
         }
     };
-    audit_tool(session, &program, &report);
+    audit_tool(rehearse, session, &program, &report);
     let total: usize = report
         .reports
         .iter()
@@ -2526,49 +2602,37 @@ fn run_batch_edits(
     Ok((total, report.diff))
 }
 
-/// `replace_in_files {files, pattern/replacement | edits, …}`: the same edit
-/// spec applied to EVERY listed file, atomically ACROSS the set — a failure in
-/// any file rolls the already-edited ones back via their undo rings, so a
-/// cross-file rename is one call that either lands everywhere or nowhere.  With
-/// `save: true` the files are saved only after every edit succeeded.  Rewind
-/// the already-edited sessions of a failed cross-file call (newest first) and
-/// describe the outcome: the all-rolled-back reassurance, or — if any session
-/// could not be rewound — a LOUD list of the files whose warm buffers may still
-/// hold the aborted edit, so a broken all-or-nothing promise never reads as
-/// kept.
-fn rollback_files(
+/// Put the sessions of a cross-file call back to the `marks` taken before each
+/// file's edit (newest first, so a file listed twice ends at its first mark).
+fn roll_back_files(
     sessions: &mut HashMap<String, Workspace>,
-    done: &[(String, String, usize)],
-) -> String {
-    let mut failed: Vec<&str> = Vec::new();
-    for (f, session, _) in done.iter().rev() {
-        let undone = sessions
-            .get_mut(session)
-            .map(|ws| ws.undo_last().is_ok())
-            .unwrap_or(false);
-        if !undone {
-            failed.push(f);
+    marks: Vec<(String, crate::engine::RehearsalMark)>,
+) {
+    for (session, mark) in marks.into_iter().rev() {
+        if let Some(ws) = sessions.get_mut(&session) {
+            ws.roll_back(mark);
         }
-    }
-    if failed.is_empty() {
-        format!(
-            "nothing changed — the {} file(s) edited before it were rolled back",
-            done.len()
-        )
-    } else {
-        format!(
-            "ROLLBACK INCOMPLETE — the warm session(s) for {} may still hold \
-             the aborted edit (undo_last each, or close_session {{force: true}} \
-             to discard)",
-            failed.join(", ")
-        )
     }
 }
 
+/// The note a failed cross-file call ends with, once `done` are rolled back.
+fn rolled_back_note(done: &[(String, String, usize)]) -> String {
+    format!(
+        "nothing changed — the {} file(s) edited before it were rolled back",
+        done.len()
+    )
+}
+
+/// `replace_in_files {files, pattern/replacement | edits, …}`: the same edit
+/// spec applied to EVERY listed file, atomically ACROSS the set — a failure in
+/// any file rolls the already-edited ones back, so a cross-file rename is one
+/// call that either lands everywhere or nowhere. The files are saved only after
+/// every edit succeeded.
 fn tool_replace_files(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
+    reject_rehearse_with_save(args)?;
     let files: Vec<String> = args
         .get("files")
         .and_then(Value::as_array)
@@ -2606,53 +2670,103 @@ fn tool_replace_files(
     };
     let scope = scope_prelude(args)?;
 
-    // Apply per file; on any failure undo the files already edited so the whole
+    // Apply per file, marking each session before its edit; on any failure, and
+    // at the end of a rehearsal, every session rolls back to its mark, so the
     // call is all-or-nothing in the warm buffers.
+    let rehearse = bool_arg(args, "rehearse");
+    let mut marks: Vec<(String, crate::engine::RehearsalMark)> = Vec::new();
     let mut done: Vec<(String, String, usize)> = Vec::new(); // (path, session, n)
+    let mut diffs: Vec<String> = Vec::new();
     for f in &files {
         let session = match resolve_session(&json!({ "path": f }), sessions) {
             Ok(s) => s,
             Err(e) => {
-                let note = rollback_files(sessions, &done);
-                return Err(format!("{f}: {e}\n{note}"));
+                roll_back_files(sessions, marks);
+                return Err(format!("{f}: {e}\n{}", rolled_back_note(&done)));
             }
         };
-        match run_batch_edits(sessions, &session, &items, &scope) {
-            Ok((n, _)) => done.push((f.clone(), session, n)),
+        if let Some(ws) = sessions.get_mut(&session) {
+            // Re-read a clean drifted buffer BEFORE marking, as `rehearsed`
+            // does.
+            ws.auto_revert_if_clean();
+            marks.push((session.clone(), ws.rehearsal_mark()));
+        }
+        match run_batch_edits(sessions, &session, &items, &scope, rehearse) {
+            Ok((n, diff)) => {
+                diffs.push(diff);
+                done.push((f.clone(), session, n))
+            }
             Err(e) => {
                 let stale = stale_edit_note(sessions, &session);
-                let note = rollback_files(sessions, &done);
-                return Err(format!("{f}: {e}{stale}\n{note}"));
+                roll_back_files(sessions, marks);
+                return Err(format!("{f}: {e}{stale}\n{}", rolled_back_note(&done)));
             }
         }
     }
 
-    // Saves happen only after every file succeeded. A failed save (the stale
-    // guard) reports precisely which files reached disk and which stay warm —
-    // nothing is silently lost.
+    let total: usize = done.iter().map(|(_, _, n)| n).sum();
+    if rehearse {
+        let shown: String = done
+            .iter()
+            .zip(&diffs)
+            .map(|((f, _, _), d)| format!("\n— diff {f} —\n{}", clamped_diff(args, d)))
+            .collect();
+        roll_back_files(sessions, marks);
+        return Ok(format!(
+            "rehearsed — nothing was changed: {total} replacement(s) in {} file(s) would \
+             be made{shown}",
+            done.len()
+        ));
+    }
+
+    // Saves happen only after every file succeeded, and only when none of the
+    // files to save changed on disk under unsaved edits: otherwise every edit
+    // rolls back and nothing is written. A save that still fails (an I/O error)
+    // reports which files reached disk and which stay warm.
     let mut save_note = String::new();
-    if bool_arg(args, "save") {
+    if save_requested(args) {
+        // Only a file whose text changed is saved, unless `save: true`.
+        let explicit = bool_arg(args, "save");
+        let to_save = |d: &String| explicit || !d.is_empty();
+        if let Some(((f, _, _), _)) = done.iter().zip(&diffs).find(|((_, session, _), d)| {
+            to_save(d) && sessions.get(session).is_some_and(Workspace::is_stale)
+        }) {
+            roll_back_files(sessions, marks);
+            return Err(format!(
+                "{f}: refusing to save: the file changed on disk after it was read and \
+                 its buffer holds unsaved edits — run_program (revert-buffer) discards \
+                 them and re-reads the file\n{}; no file was written",
+                rolled_back_note(&done)
+            ));
+        }
         let mut saved = 0usize;
-        for (f, session, _) in &done {
-            if let Err(e) = save_visited(sessions, session) {
-                return Err(format!(
-                    "{f}: {e}\n({saved} file(s) before it were saved; the rest hold their \
-                     edits in warm sessions)"
-                ));
+        for ((f, session, _), d) in done.iter().zip(&diffs) {
+            // A later file's open may evict this one's session; only a clean
+            // session is evicted, so its file already holds its text.
+            if !sessions.contains_key(session) {
+                continue;
             }
-            saved += 1;
+            match save_after_edit(args, sessions, session, !d.is_empty()) {
+                Ok(note) if note.is_empty() => {}
+                Ok(_) => saved += 1,
+                Err(e) => {
+                    return Err(format!(
+                        "{f}: {e}\n({saved} file(s) before it were saved; the rest hold \
+                         their edits in warm sessions)"
+                    ));
+                }
+            }
         }
         save_note = format!("; saved {saved} file(s)");
     }
-    let total: usize = done.iter().map(|(_, _, n)| n).sum();
     let lines: Vec<String> = done
         .iter()
         .map(|(f, _, n)| format!("  {f} — {n} replacement(s)"))
         .collect();
-    let unsaved = if bool_arg(args, "save") {
+    let unsaved = if save_requested(args) {
         ""
     } else {
-        "\n(unsaved: edits are in the warm buffers, not on disk — pass save:true or save_buffer each)"
+        "\n(unsaved: the edits are in the warm buffers, not on disk — save_buffer writes each)"
     };
     Ok(format!(
         "applied {} edit(s) in {} file(s), {total} replacement(s) total:\n{}{save_note}{unsaved}",
@@ -3234,44 +3348,10 @@ fn tool_conflicts(
     run_message(sessions, &session, "(conflict-hunks)", "conflicts")
 }
 
-/// `checkpoint {session?, label?}` — capture a restore point. Returns the label
-/// the engine assigned (auto-generated when omitted).
-fn tool_checkpoint(
-    args: &Value,
-    sessions: &mut HashMap<String, Workspace>,
-) -> Result<String, String> {
-    let session = resolve_session(args, sessions)?;
-    let program = match args.get("label").and_then(Value::as_str) {
-        Some(label) => format!("(report \"label\" (checkpoint \"{}\"))", lisp_escape(label)),
-        None => "(report \"label\" (checkpoint))".to_string(),
-    };
-    let report = run_in_session(sessions, &session, &program)?;
-    // The engine reports the label via tulisp's printer, which quotes strings;
-    // unquote it for a clean message.
-    let label = report_value(&report, "label")
-        .map(|s| s.trim_matches('"').to_string())
-        .unwrap_or_default();
-    Ok(format!("checkpoint \"{label}\" captured"))
-}
-
-/// `restore_checkpoint {session?, label}` — rewind the buffer to a checkpoint.
-fn tool_restore_checkpoint(
-    args: &Value,
-    sessions: &mut HashMap<String, Workspace>,
-) -> Result<String, String> {
-    let session = resolve_session(args, sessions)?;
-    let label = str_arg(args, "label")?;
-    let program = format!("(restore-checkpoint \"{}\")", lisp_escape(&label));
-    run_in_session(sessions, &session, &program)?;
-    // Rewinding the buffer can leave it modified vs. disk — flag it like the
-    // edit tools so the restore isn't a silent unsaved change.
-    let unsaved = unsaved_note(sessions, &session);
-    Ok(format!("restored to checkpoint \"{label}\"{unsaved}"))
-}
-
-/// `undo_last {session?|path?}` — rewind to the state before the most recent
-/// mutating call (each call steps one further back; no redo). The automatic
-/// safety net: unlike restore_checkpoint it needs no label captured up front.
+/// `undo_last {session?|path?, save?}` — rewind to the state before the most
+/// recent mutating call (each call steps one further back; no redo) and save
+/// the rewound text, unless `save: false`. The automatic safety net: it needs
+/// no label captured up front.
 fn tool_undo_last(
     args: &Value,
     sessions: &mut HashMap<String, Workspace>,
@@ -3283,9 +3363,12 @@ fn tool_undo_last(
     let ws = sessions.get_mut(&session).expect("checked above");
     ws.undo_last()?;
     let len = ws.char_len();
+    // A rewind always changes the buffer (undo_last skips states equal to the
+    // current one).
+    let saved = save_after_edit(args, sessions, &session, true)?;
     let unsaved = unsaved_note(sessions, &session);
     Ok(format!(
-        "rewound to the state before the last mutating call ({len} chars){unsaved}"
+        "rewound to the state before the last mutating call ({len} chars){saved}{unsaved}"
     ))
 }
 
@@ -3468,13 +3551,14 @@ fn lisp_literal(s: &str) -> String {
 }
 
 /// Journal a convenience-tool edit exactly like `run_program` audits its
-/// programs, so the audit trail covers every mutating tool.
-fn audit_tool(session: &str, program: &str, report: &crate::RunReport) {
+/// programs, so the audit trail covers every mutating tool. A rehearsal
+/// persists nothing, so it audits as a non-mutating event.
+fn audit_tool(rehearse: bool, session: &str, program: &str, report: &crate::RunReport) {
     crate::safety::audit(
         "mime-mcp",
         session,
         program,
-        report.dirty,
+        report.dirty && !rehearse,
         report.len_before,
         report.len_after,
     );
@@ -3500,8 +3584,7 @@ fn view_echo(args: &Value, sessions: &mut HashMap<String, Workspace>, session: &
 /// `diff: true` on an edit tool: the unified diff the edit produced (the
 /// engine's own, from its run report), clamped like run_program's and appended
 /// after the result line — what the edit did, visible without a follow-up call
-/// (and unsaved_diff has nothing to show once save:true has written the buffer
-/// out).
+/// (and unsaved_diff has nothing to show once the edit is saved).
 fn diff_echo(args: &Value, diff: &str) -> String {
     if !bool_arg(args, "diff") {
         return String::new();
@@ -3566,10 +3649,26 @@ fn unprint_string_value(value: &str) -> Option<String> {
 
 // ---- the tool catalogue ----------------------------------------------------
 
-/// `tools/list` result — every tool with a JSON Schema `inputSchema`.
-pub(crate) fn tools_list_result() -> Value {
+/// Whether `name` is offered on `transport`. The workspace tools only mean
+/// something on the HTTP server, where several agents share one process; and
+/// git_exec_over only runs when the launcher set MIME_EXEC.
+pub(crate) fn tool_listed(name: &str, transport: Transport) -> bool {
+    match name {
+        "open_workspace" | "close_workspace" => transport == Transport::Http,
+        "git_exec_over" => crate::sequencer::exec_allowed(),
+        _ => true,
+    }
+}
+
+/// `tools/list` result — every tool offered on `transport`, with a JSON Schema
+/// `inputSchema`.
+pub(crate) fn tools_list_result(transport: Transport) -> Value {
+    let tools: Vec<&Value> = tool_schemas()
+        .iter()
+        .filter(|t| tool_listed(t["name"].as_str().unwrap_or(""), transport))
+        .collect();
     json!({
-        "tools": tool_schemas(),
+        "tools": tools,
         "ttlMs": crate::rpc::LIST_TTL_MS,
         "cacheScope": "public",
     })
@@ -4606,16 +4705,6 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             A::read(),
             "list warm sessions with stale/unsaved flags + checkpoint labels",
         ),
-        "checkpoint" => (
-            Session,
-            A::append(),
-            "capture a labelled restore point (advanced; undo_last is the default net)",
-        ),
-        "restore_checkpoint" => (
-            Session,
-            A::destructive(),
-            "rewind the buffer to a checkpoint",
-        ),
         "undo_last" => (
             Session,
             A::destructive(),
@@ -4634,11 +4723,6 @@ fn meta(name: &str) -> (Category, ToolAnnotations, &'static str) {
             Editing,
             A::destructive(),
             "run an Emacs-Lisp edit program against the buffer",
-        ),
-        "rehearse" => (
-            Editing,
-            A::read(),
-            "dry-run a program; preview the diff, persist nothing",
         ),
         "insert_text" => (
             Editing,
@@ -4901,7 +4985,11 @@ fn build_tool_schemas() -> Vec<Value> {
     });
     let save = json!({
         "type": "boolean",
-        "description": "After a successful edit, atomically save back to the visited file (stale-guard + audit apply); code buffers warn if they no longer parse. Default false."
+        "description": "Write the edit to the visited file (atomic; refused if the file changed on disk since mime last read or wrote it; code buffers warn if they no longer parse). Default: saved when this call changed the buffer; save: false holds the edit in the warm buffer for save_buffer later; save: true writes whatever the buffer holds."
+    });
+    let rehearse = json!({
+        "type": "boolean",
+        "description": "Preview: run the edit, return what it did and its diff, then roll back — nothing reaches the buffer or the disk. Not combinable with save: true. Default false."
     });
     // `full_diff` lifts the 200-line clamp every tool that answers with a diff
     // applies; `edit_diff` is the edit tools' opt-in diff echo.
@@ -4911,18 +4999,18 @@ fn build_tool_schemas() -> Vec<Value> {
     });
     let edit_diff = json!({
         "type": "boolean",
-        "description": "Append the unified diff of the edit (clamped like run_program's; full_diff lifts the clamp) — see exactly what changed in the same call; unsaved_diff cannot show it once save:true has written the buffer out. Default false."
+        "description": "Append the unified diff of the edit (clamped like run_program's; full_diff lifts the clamp) — see exactly what changed in the same call; unsaved_diff cannot show it once the edit is saved. Default false."
     });
     let scope = json!({
         "type": "object",
         "description": "Restrict this call to one part of the buffer without writing a program. {\"defun\": \"name\"} narrows to that function/class/section (see the outline tool for names) for just this call; an unknown name errors and lists the defuns that exist.",
         "properties": { "defun": { "type": "string" } },
     });
-    // The RunReport shape run_program and rehearse both answer with. Every key
-    // either tool can emit is declared: the conditional ones (`stale`, `saved`,
-    // `unsaved`, `view`) ride only when they apply. The `workspace` handle the
-    // stateless-HTTP path merges in is declared by `to_list_value`, like every
-    // other stateful tool's.
+    // The RunReport shape run_program answers with (rehearse: true included).
+    // Every key it can emit is declared: the conditional ones (`stale`,
+    // `saved`, `unsaved`, `view`) ride only when they apply. The `workspace`
+    // handle the stateless-HTTP path merges in is declared by `to_list_value`,
+    // like every other stateful tool's.
     let run_report_output = json!({
         "type": "object",
         "properties": {
@@ -4967,7 +5055,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "run_program",
-            "description": "Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and return a structured RunReport (unified diff, point, length before/after, any (report ...)/(message ...) output, and `value`: the final form's result — a string comes back raw (unquoted, unescaped), other types render the way tulisp prints them; present only when non-nil, so a read-only inspector like (conflict-diff N) is readable without wrapping it in (message ...)). Only the FINAL form's value comes back, so wrap any earlier result you need (e.g. a replace-regexp match count) in (report …) or it stays invisible. This is the core, general-purpose editing tool; the buffer and any defined functions persist for the next call. The callable Lisp surface is indexed in help {lisp} (help {regex|treesit|recipes} for syntax and worked examples). Name-like arguments — conflict sides, treesit languages, coding systems, checkpoint labels, report/arg keys — accept a string or a quoted symbol. Everything else (buffer names, defun/field names, free text, paths, regexes) is a string. On failure the error content is a JSON object {ok:false, error, dirty, reports, log} carrying the diagnostics the program emitted before dying; by default a failed run rolls its pre-error edits back (rolled_back:true rides in the failure JSON); dirty=true means they persist — that happens only with keep_partial:true.",
+            "description": "Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and return a structured RunReport (unified diff, point, length before/after, any (report ...)/(message ...) output, and `value`: the final form's result — a string comes back raw (unquoted, unescaped), other types render the way tulisp prints them; present only when non-nil, so a read-only inspector like (conflict-diff N) is readable without wrapping it in (message ...)). Only the FINAL form's value comes back, so wrap any earlier result you need (e.g. a replace-regexp match count) in (report …) or it stays invisible. This is the core, general-purpose editing tool; the edit is saved to the visited file (save: false holds it in the buffer; rehearse: true previews it), and defined functions persist for the next call. The callable Lisp surface is indexed in help {lisp} (help {regex|treesit|recipes} for syntax and worked examples). Name-like arguments — conflict sides, treesit languages, coding systems, checkpoint labels, report/arg keys — accept a string or a quoted symbol. Everything else (buffer names, defun/field names, free text, paths, regexes) is a string. On failure the error content is a JSON object {ok:false, error, dirty, reports, log} carrying the diagnostics the program emitted before dying; by default a failed run rolls its pre-error edits back (rolled_back:true rides in the failure JSON); dirty=true means they persist — that happens only with keep_partial:true.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4978,22 +5066,7 @@ fn build_tool_schemas() -> Vec<Value> {
                     "session": session,
                     "path": path,
                     "save": save,
-                },
-                "required": ["program"],
-            },
-            "outputSchema": run_report_output.clone(),
-        }),
-        json!({
-            "name": "rehearse",
-            "description": "Dry-run an Emacs-Lisp (tulisp) edit program and return the same RunReport run_program would (unified diff, length before/after, reports), showing what WOULD happen — then roll the session back so nothing persists: the buffer, point/mark/narrowing, kill-ring, and checkpoints are all left exactly as before (the report carries rehearsed=true). The 'try before you commit' preview; follow up with run_program to actually apply it.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "program": { "type": "string", "description": "Emacs-Lisp program to rehearse (run then roll back)." },
-                    "full_diff": full_diff,
-                    "view": { "type": ["boolean", "integer"], "description": "Add a rendered viewport around point to the report (true = 4 context lines, or a line count)." },
-                    "session": session,
-                    "path": path,
+                    "rehearse": rehearse,
                 },
                 "required": ["program"],
             },
@@ -5031,7 +5104,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "insert_text",
-            "description": "Insert literal text at point, at `pos` (a char position, or \"eob\" to append at the end of the file), relative to an `anchor` (a named defun, or the unique line containing a literal pattern), or relative to a structural `thing` (the block a line opens, the sexp at a position). Pass the text as a plain string — no Lisp escaping needed, the server handles it. Prefer this over run_program with (insert …) for multi-line or quote-heavy content, and over shell appends for end-of-file additions. Edits the warm buffer; call save_buffer to persist.",
+            "description": "Insert literal text at point, at `pos` (a char position, or \"eob\" to append at the end of the file), relative to an `anchor` (a named defun, or the unique line containing a literal pattern), or relative to a structural `thing` (the block a line opens, the sexp at a position). Pass the text as a plain string — no Lisp escaping needed, the server handles it. Prefer this over run_program with (insert …) for multi-line or quote-heavy content, and over shell appends for end-of-file additions. Saved like every edit (save: false holds it; rehearse: true previews).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5046,13 +5119,14 @@ fn build_tool_schemas() -> Vec<Value> {
                     "session": session,
                     "path": path,
                     "save": save,
+                    "rehearse": rehearse,
                 },
                 "required": ["text"],
             },
         }),
         json!({
             "name": "replace_text",
-            "description": "Replace the FIRST occurrence of a pattern (searching from the top of the accessible region); pass all:true to replace every occurrence, or `thing` to replace a region named by structure instead of by searching. By default both strings are plain literals — no Lisp escaping, no regex (insert_text's counterpart; the fix for quote-heavy edits). mode:\"regex\" switches the pattern to the Emacs regex dialect (as occur/grep) with \\1..\\9 and \\& backrefs expanding in the replacement — the one-call form of the goto-char/while/re-search-forward/replace-match loop. Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Edits the warm buffer; call save_buffer to persist. For position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.",
+            "description": "Replace the FIRST occurrence of a pattern (searching from the top of the accessible region); pass all:true to replace every occurrence, or `thing` to replace a region named by structure instead of by searching. By default both strings are plain literals — no Lisp escaping, no regex (insert_text's counterpart; the fix for quote-heavy edits). mode:\"regex\" switches the pattern to the Emacs regex dialect (as occur/grep) with \\1..\\9 and \\& backrefs expanding in the replacement — the one-call form of the goto-char/while/re-search-forward/replace-match loop. Errors when nothing matches (and leaves point untouched); a single replace reports how many more matches remain. Pattern occurrences INSIDE just-inserted replacement text are not re-matched or counted. Saved like every edit (save: false holds it; rehearse: true previews). For position-scoped replacement, use run_program; to apply one edit spec across MANY files, use replace_in_files.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5070,13 +5144,14 @@ fn build_tool_schemas() -> Vec<Value> {
                     "session": session,
                     "path": path,
                     "save": save,
+                    "rehearse": rehearse,
                 },
                 "required": [],
             },
         }),
         json!({
             "name": "fill_text",
-            "description": "Reflow prose to a column — Emacs fill-paragraph as one call. The unit is the comment run, block comment, Python docstring or Markdown paragraph at a position (point by default; `pos`; or the unique line an `anchor` pattern names), found through the tree-sitter parse: the comment marker (`//`, `///`, `#`, ` * `), list hanging indents, block quotes, fenced code, headings and tables all survive, and CODE IS NEVER REFLOWED — a position in code errors naming the node, a comment or docstring that shares a line with code is skipped by a range fill and refused at a position, a Python string outside docstring position is data, and a file type mime has no grammar for is refused (an explicit `prefix` fills by the lines that carry it instead). `lines: [a, b]` or `all: true` instead fills every unit the range touches (every comment in a file, every paragraph of a README) and leaves the code between alone. Default column is 80; a sentence end the source marks with a line break or two spaces keeps two spaces. Edits the warm buffer; save:true persists.",
+            "description": "Reflow prose to a column — Emacs fill-paragraph as one call. The unit is the comment run, block comment, Python docstring or Markdown paragraph at a position (point by default; `pos`; or the unique line an `anchor` pattern names), found through the tree-sitter parse: the comment marker (`//`, `///`, `#`, ` * `), list hanging indents, block quotes, fenced code, headings and tables all survive, and CODE IS NEVER REFLOWED — a position in code errors naming the node, a comment or docstring that shares a line with code is skipped by a range fill and refused at a position, a Python string outside docstring position is data, and a file type mime has no grammar for is refused (an explicit `prefix` fills by the lines that carry it instead). `lines: [a, b]` or `all: true` instead fills every unit the range touches (every comment in a file, every paragraph of a README) and leaves the code between alone. Default column is 80; a sentence end the source marks with a line break or two spaces keeps two spaces. Saved like every edit (save: false holds it; rehearse: true previews).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5092,13 +5167,14 @@ fn build_tool_schemas() -> Vec<Value> {
                     "session": session,
                     "path": path,
                     "save": save,
+                    "rehearse": rehearse,
                 },
                 "required": [],
             },
         }),
         json!({
             "name": "replace_in_files",
-            "description": "Apply the SAME edit spec to EVERY listed file in one call — the cross-file rename. Give pattern/replacement (with all/expect_unique, and mode:\"regex\" for the Emacs dialect with backrefs), or `edits` for a transactional batch per file; the absolute paths grep prints feed `files` directly. Atomic ACROSS the set: a failure in any file (a miss, a failed uniqueness check) rolls the already-edited ones back and the error names the file — every listed path must contain the pattern, so list exactly the files you grepped. Edits land in the warm buffers; with save:true the files are saved only after every file's edit succeeded. For a single file use replace_text.",
+            "description": "Apply the SAME edit spec to EVERY listed file in one call — the cross-file rename. Give pattern/replacement (with all/expect_unique, and mode:\"regex\" for the Emacs dialect with backrefs), or `edits` for a transactional batch per file; the absolute paths grep prints feed `files` directly. Atomic ACROSS the set: a failure in any file (a miss, a failed uniqueness check) rolls the already-edited ones back and the error names the file — every listed path must contain the pattern, so list exactly the files you grepped. The files are saved only after every file's edit succeeded (save: false holds the edits in the warm buffers). For a single file use replace_text.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5111,6 +5187,7 @@ fn build_tool_schemas() -> Vec<Value> {
                     "edits": { "type": "array", "description": "Instead of pattern/replacement: [{pattern, replacement, all?, expect_unique?, mode?}, …] applied in order inside ONE transaction per file — all-or-nothing across the whole call.", "items": { "type": "object", "properties": { "pattern": { "type": "string" }, "replacement": { "type": "string" }, "all": { "type": "boolean" }, "expect_unique": { "type": "boolean" }, "mode": { "type": "string", "enum": ["exact", "regex"] } } } },
                     "scope": scope,
                     "save": save,
+                    "rehearse": rehearse,
                 },
                 "required": ["files"],
             },
@@ -5202,46 +5279,21 @@ fn build_tool_schemas() -> Vec<Value> {
             },
         }),
         json!({
-            "name": "checkpoint",
-            "description": "Capture a named restore point of the current buffer (cheap — structural sharing for files). ADVANCED: every mutating tool call already captures an automatic restore point, so undo_last is the usual safety net; reach for explicit checkpoints only to mark a spot you'll want to return to by name. Captured labels show up per session in session_status.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "label": { "type": "string", "description": "Optional label; auto-generated (auto-N) when omitted." },
-                    "session": session,
-                    "path": path,
-                },
-                "required": [],
-            },
-        }),
-        json!({
             "name": "undo_last",
-            "description": "Rewind the buffer to its state before the most recent mutating call — the automatic safety net for a misfired edit (every mutating tool call captures a restore point first; bounded ring of 8, no redo). Each call steps one mutating call further back. Unlike restore_checkpoint, nothing needs to have been captured up front.",
+            "description": "Rewind the buffer to its state before the most recent mutating call — the automatic safety net for a misfired edit (every mutating tool call captures a restore point first; bounded ring of 8, no redo). Each call steps one mutating call further back, and the rewound text is saved like any edit (save: false rewinds the buffer only).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session": session,
                     "path": path,
+                    "save": save,
                 },
                 "required": [],
-            },
-        }),
-        json!({
-            "name": "restore_checkpoint",
-            "description": "Rewind the buffer to a previously captured checkpoint by label (the labels are listed per session by session_status).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "label": { "type": "string", "description": "Label of the checkpoint to restore." },
-                    "session": session,
-                    "path": path,
-                },
-                "required": ["label"],
             },
         }),
         json!({
             "name": "save_buffer",
-            "description": "Write the session buffer's text to disk. Without `to`, save back to the session's visited file (atomic write, stale-read guard, parse warning — the same save the edit tools' save:true performs); with `to` pointing elsewhere, write a COPY there and leave the session bound to its original file (a later plain save still targets the original — no silent retarget). NOTE: `path` addresses WHICH session, exactly like on every other tool — the destination parameter is `to`.",
+            "description": "Write the session buffer's text to disk. Without `to`, save back to the session's visited file (atomic write, stale-read guard, parse warning — the same save the edit tools perform); with `to` pointing elsewhere, write a COPY there and leave the session bound to its original file (a later plain save still targets the original — no silent retarget). NOTE: `path` addresses WHICH session, exactly like on every other tool — the destination parameter is `to`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5331,7 +5383,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "close_workspace",
-            "description": "Drop a workspace and every session in it, unsaved edits included. The stdio default workspace cannot be closed (use close_session for one session).",
+            "description": "Drop a workspace and every session in it, unsaved edits included (close_session drops one session).",
             "inputSchema": {
                 "type": "object",
                 "properties": { "workspace": json!({
@@ -5553,7 +5605,7 @@ mod git_tool_tests {
         )
         .unwrap();
         let s = rehearsed.structured.unwrap();
-        conforms(&output_schema("rehearse"), &s, "rehearse").unwrap();
+        conforms(&output_schema("run_program"), &s, "run_program").unwrap();
         assert_eq!(s["rehearsed"], true);
 
         // On the stateless protocol `rpc::tools_call` merges the workspace
@@ -6203,10 +6255,27 @@ mod git_tool_tests {
                 "grep",
                 "open_workspace",
                 "outline",
-                "rehearse",
                 "run_program",
                 "session_status"
             ]
         );
+    }
+
+    #[test]
+    fn workspace_tools_are_listed_on_http_only() {
+        let names = |t: crate::rpc::Transport| -> Vec<String> {
+            tools_list_result(t)["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let http = names(crate::rpc::Transport::Http);
+        let stdio = names(crate::rpc::Transport::Stdio);
+        for tool in ["open_workspace", "close_workspace"] {
+            assert!(http.iter().any(|n| n == tool), "{tool} on HTTP");
+            assert!(!stdio.iter().any(|n| n == tool), "{tool} not on stdio");
+        }
     }
 }

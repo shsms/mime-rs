@@ -41,7 +41,12 @@ fn estr(msg: &str) -> Error {
     Error::from_str(msg)
 }
 
-fn exec_allowed() -> bool {
+/// Serializes the tests that set or read MIME_EXEC, directly or through the
+/// tool listing.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn exec_allowed() -> bool {
     std::env::var("MIME_EXEC")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -5906,8 +5911,6 @@ mod tests {
     use crate::buffer::Buffer;
     use git2::Signature;
     use std::path::Path;
-
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct EnvGuard(&'static str, Option<std::ffi::OsString>);
 
