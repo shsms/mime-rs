@@ -2008,7 +2008,7 @@ fn anchor_abort(
             stale_edit_note(sessions, session)
         )
     } else if e.contains("__ambiguous_anchor__") {
-        let matches = match_lines(sessions, session, &lisp_literal(pat), false);
+        let matches = match_lines(sessions, session, &lisp_literal(pat), false, None);
         format!(
             "anchor: the pattern {:?} matches at lines {} — an anchor must \
              be unique; {not_done} (occur shows every match in context)",
@@ -2068,40 +2068,37 @@ fn tool_replace_text(
     // match. A miss restores point — a failed replace is a no-op, not a stealth
     // (goto-char (point-min)).
     //
-    // expect_unique wraps the same loop in a transaction and errors (rolling
-    // the replacement back) if the pattern still matches afterwards — a
-    // repeated anchor means the FIRST hit may not be the intended one, so
-    // ambiguity is an error, not a silent edit.
-    let program = if unique && regex {
-        // Same transaction + ambiguity post-check as the literal form, with the
-        // regex search/replace pair (replace-match expands \\1 backrefs).
+    // expect_unique counts the matches first, in the text as it stands (and
+    // inside the scope): more than one is an error before anything changes —
+    // a repeated anchor means the FIRST hit may not be the intended one. The
+    // count comes before the edit because a regex that looks at its
+    // neighbours (\b, ^) can match differently once the edit is made, and the
+    // ambiguity error's listing counts the unedited text too.
+    let program = if unique {
+        let count = each_match(&pat, regex, "(setq n (1+ n))");
+        // replace-match expands \\1 backrefs; the literal form inserts as is.
+        let (find, edit) = if regex {
+            (
+                format!("(re-search-forward \"{pat}\" nil t)"),
+                format!("(replace-match \"{rep}\")"),
+            )
+        } else {
+            (
+                format!("(search-forward \"{pat}\" nil t)"),
+                format!("(delete-region (match-beginning 0) (point)) (insert \"{rep}\")"),
+            )
+        };
         format!(
-            "(with-transaction (let ((n 0) (line 0))\
-               (goto-char (point-min))\
-               (while (and (= n 0) (re-search-forward \"{pat}\" nil t))\
-                 (replace-match \"{rep}\")\
-                 (setq line (line-number-at-pos (point)))\
-                 (setq n (+ n 1)))\
+            "(let ((n 0))\
+               (save-excursion (goto-char (point-min)) {count})\
                (if (= n 0) (error \"__miss__\"))\
-               (if (re-search-forward \"{pat}\" nil t) (error \"__ambiguous__\"))\
-               (report \"n\" n)\
-               (report \"line\" line)\
-               (report \"point\" (point))))"
-        )
-    } else if unique {
-        format!(
-            "(with-transaction (let ((n 0) (line 0))\
+               (if (> n 1) (error \"__ambiguous__\"))\
                (goto-char (point-min))\
-               (while (and (= n 0) (search-forward \"{pat}\" nil t))\
-                 (delete-region (match-beginning 0) (point))\
-                 (insert \"{rep}\")\
-                 (setq line (line-number-at-pos (point)))\
-                 (setq n (+ n 1)))\
-               (if (= n 0) (error \"__miss__\"))\
-               (if (search-forward \"{pat}\" nil t) (error \"__ambiguous__\"))\
-               (report \"n\" n)\
-               (report \"line\" line)\
-               (report \"point\" (point))))"
+               {find}\
+               {edit}\
+               (report \"n\" 1)\
+               (report \"line\" (line-number-at-pos (point)))\
+               (report \"point\" (point)))"
         )
     } else if regex && all {
         // The bulk pass is the native replace-regexp: one call locates every
@@ -2161,7 +2158,8 @@ fn tool_replace_text(
             ));
         }
         Err(e) if unique && e.contains("__ambiguous__") => {
-            let matches = match_lines(sessions, &session, &pat, regex);
+            let prelude = scope.as_ref().map(|(_, p)| p.as_str());
+            let matches = match_lines(sessions, &session, &pat, regex, prelude);
             return Err(format!(
                 "replace_text: pattern {:?} matches at lines {} — nothing was \
                  replaced. Make the pattern unique, pass all:true to replace \
@@ -2374,7 +2372,7 @@ fn anchor_line(
             truncate_for_error(pat)
         )),
         Err(e) if e.contains("__ambiguous_anchor__") => {
-            let matches = match_lines(sessions, session, &lp, false);
+            let matches = match_lines(sessions, session, &lp, false, None);
             Err(format!(
                 "thing: the pattern {:?} matches at lines {} — an anchor must be unique \
                  (occur shows every match in context)",
@@ -2640,19 +2638,24 @@ fn each_match(pat: &str, regex: bool, body: &str) -> String {
 
 /// Where every occurrence of the (already lisp-escaped) pattern `pat` is: its
 /// line and the defun holding it — the detail an ambiguity error needs to be
-/// actionable. Point is preserved.
+/// actionable. With a `scope` prelude only the matches inside it are listed,
+/// as the scoped edit saw them; lines are still counted from the top of the
+/// file. Point is preserved.
 fn match_lines(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
     pat: &str,
     regex: bool,
+    scope: Option<&str>,
 ) -> MatchLines {
     let program = format!(
-        "(save-excursion (goto-char (point-min)) {})",
+        "(save-excursion (save-restriction {} (goto-char (point-min)) {}))",
+        scope.unwrap_or(""),
         each_match(
             pat,
             regex,
-            "(report \"line\" (line-number-at-pos (match-beginning 0)))\
+            "(report \"line\" (save-restriction (widen) \
+                 (line-number-at-pos (match-beginning 0))))\
              (treesit-defun-name (match-beginning 0))"
         )
     );
@@ -2823,20 +2826,19 @@ fn run_batch_edits(
             truncate_for_error(&pattern)
         ));
         let all_flag = if all { "t" } else { "nil" };
-        // The uniqueness post-check searches on from point (just past the
-        // replacement), so a later genuine occurrence aborts the whole
-        // transaction — evaluated against the buffer as the previous edits left
-        // it, like everything else in the batch.
-        let search = if regex {
-            "re-search-forward"
-        } else {
-            "search-forward"
-        };
+        // Uniqueness is counted before the edit, in the buffer as the previous
+        // edits left it: counted afterwards, a regex that looks at its
+        // neighbours (\b, ^) could match differently in the edited text.
         let unique_check = if unique {
-            format!("(if ({search} \"{pat}\" nil t) (error \"{ambiguous}\"))")
+            format!(
+                "(goto-char (point-min))\
+                 (let ((n 0)) {} (if (> n 1) (error \"{ambiguous}\")))",
+                each_match(&pat, regex, "(setq n (1+ n))")
+            )
         } else {
             String::new()
         };
+        body.push_str(&unique_check);
         if regex {
             // replace-match expands \\N backrefs; a zero-width match steps one
             // char forward so the sweep terminates.
@@ -2850,7 +2852,6 @@ fn run_batch_edits(
                        (setq n (+ n 1))\
                        (if empty (if (< (point) (point-max)) (forward-char 1) (setq stop t)))))\
                    (if (= n 0) (error \"{miss}\"))\
-                   {unique_check}\
                    (report \"n\" n))"
             ));
         } else {
@@ -2862,7 +2863,6 @@ fn run_batch_edits(
                      (insert \"{rep}\")\
                      (setq n (+ n 1)))\
                    (if (= n 0) (error \"{miss}\"))\
-                   {unique_check}\
                    (report \"n\" n))"
             ));
         }

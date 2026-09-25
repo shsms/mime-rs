@@ -2541,6 +2541,58 @@ fn ambiguity_errors_name_the_defun_of_each_match() {
                 "expect_unique": true, "scope": { "defun": "absorb" } }),
     );
     assert!(!err.contains("scope: {defun"), "got: {err}");
+    // Only the matches the scoped call saw, still numbered from the top of
+    // the file.
+    assert!(
+        err.contains("matches at lines 2 (absorb), 3 (absorb) —"),
+        "got: {err}"
+    );
+    let err = s.call_err(
+        7,
+        "replace_text",
+        json!({ "path": p, "pattern": "pair();", "replacement": "x();",
+                "scope": { "defun": "twin" } }),
+    );
+    assert!(
+        err.contains("matches at lines 13 (twin), 14 (twin) —"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn a_context_regex_is_counted_before_the_edit() {
+    // `\bbar` matches only the first `bar` of `barbar`; deleting it gives the
+    // second a word boundary, which a count taken after the edit would see.
+    let mut s = Server::spawn();
+    s.call_ok(1, "open_text", json!({ "text": "barbar\n" }));
+    let out = s.call_ok(
+        2,
+        "replace_text",
+        json!({ "pattern": "\\bbar", "replacement": "", "mode": "regex" }),
+    );
+    assert!(out.contains("replaced 1 occurrence"), "got: {out}");
+    assert_eq!(s.read_text(3, json!({ "start": 1, "end": 5 })), "bar\n");
+
+    // The same inside an edits batch, counted against the text the earlier
+    // edits left.
+    s.call_ok(
+        4,
+        "open_text",
+        json!({ "text": "xbarbar\n", "session": "b" }),
+    );
+    let out = s.call_ok(
+        5,
+        "replace_text",
+        json!({ "session": "b", "edits": [
+            { "pattern": "x", "replacement": "" },
+            { "pattern": "\\bbar", "replacement": "", "mode": "regex" }
+        ] }),
+    );
+    assert!(out.contains("applied 2 edit(s)"), "got: {out}");
+    assert_eq!(
+        s.read_text(6, json!({ "session": "b", "start": 1, "end": 5 })),
+        "bar\n"
+    );
 }
 
 #[test]

@@ -1349,8 +1349,9 @@ function. Replacing ~match_lines~ in src/mcp.rs with
 of ~replace_text_batch~ instead. The defun whose name is on LINE should
 count as the one at LINE.
 
-** TODO A scoped ambiguity error lists matches outside the scope [#C]   :mcp:
+** DONE A scoped ambiguity error lists matches outside the scope [#C]   :mcp:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-09-25 Fr 22:31]
 - State "TODO"       from              [2026-09-25 Fr 16:30]
 :END:
 
@@ -1379,8 +1380,9 @@ saves nothing, but the buffer's version moves, so it records an undo
 step and can push a real one off a full ring (seen in the randomized
 test's shortened sequences). A step should need a changed text.
 
-** TODO Scope hint can loop for a regex that depends on its context [#C] :mcp:
+** DONE Scope hint can loop for a regex that depends on its context [#C] :mcp:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-09-25 Fr 22:31]
 - State "TODO"       from              [2026-09-25 Fr 17:44]
 :END:
 
