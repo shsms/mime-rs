@@ -926,17 +926,14 @@ fn run_or_rehearse(
     if expect_version.is_some_and(|v| ws.version() != v) {
         return Err("the buffer changed since its positions were resolved; retry".to_string());
     }
-    if !rehearse {
-        // Auto-capture the pre-program state (version-deduped, bounded) so
-        // undo_last can rewind a misfired edit without prior checkpoint
-        // discipline. After the auto-revert, so undo never resurrects bytes an
-        // external writer already replaced.
-        ws.push_undo();
-    }
     if rehearse {
         ws.rehearse_value(program)
     } else {
-        ws.run_value_with(program, keep_partial)
+        // Records the pre-program state on the undo ring when the program
+        // changes the buffer, so undo_last can rewind a misfired edit without
+        // prior checkpoint discipline. After the auto-revert, so undo never
+        // resurrects bytes an external writer already replaced.
+        ws.run_value_undoable(program, keep_partial)
     }
 }
 

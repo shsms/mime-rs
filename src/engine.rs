@@ -252,9 +252,9 @@ pub type SharedSession = Rc<RefCell<Session>>;
 /// What a rehearsal rolls back to: the buffer as it was, how long the kill ring
 /// and the checkpoints were, the re-read generation, the synced version, and a
 /// full copy of the undo ring — a length alone cannot restore a ring at
-/// capacity, where the rehearsed program's own `push_undo` calls (e.g. from
-/// `view_echo`'s follow-up read) evict the ring's oldest entries without
-/// changing its length.
+/// capacity, where the undo step of the rehearsed tool's edit (it runs as an
+/// ordinary program inside the rehearsal) evicts the ring's oldest entry
+/// without changing its length.
 pub struct RehearsalMark {
     buffer: Box<dyn TextStore>,
     kill_len: usize,
@@ -416,20 +416,26 @@ impl Workspace {
         self.last_used.get()
     }
 
-    /// Capture the current buffer state onto the undo ring unless its top
-    /// already holds this exact text state (same version) — so read-only
-    /// programs and repeated probes don't churn the ring. The MCP front-end
-    /// calls this before every (non-rehearse) program.
-    pub fn push_undo(&mut self) {
-        let v = self.session.borrow().buffer.version();
-        if self.undo_ring.last().is_some_and(|c| c.version() == v) {
-            return;
+    /// [`run_value_with`](Self::run_value_with), recording the state before the
+    /// program on the undo ring when the program changed the buffer — the MCP
+    /// front-end runs every non-rehearsed program through this, so undo_last
+    /// can rewind a misfired edit. A program that changed nothing (a read, a
+    /// probe) records nothing.
+    pub fn run_value_undoable(
+        &mut self,
+        program: &str,
+        keep_partial: bool,
+    ) -> Result<(RunReport, String), String> {
+        let before = self.version();
+        let step = Checkpoint::capture(format!("undo-{before}"), &self.session.borrow());
+        let result = self.run_value_with(program, keep_partial);
+        if self.version() != before {
+            self.undo_ring.push(step);
+            if self.undo_ring.len() > UNDO_RING_CAP {
+                self.undo_ring.remove(0);
+            }
         }
-        let cp = Checkpoint::capture(format!("undo-{v}"), &self.session.borrow());
-        self.undo_ring.push(cp);
-        if self.undo_ring.len() > UNDO_RING_CAP {
-            self.undo_ring.remove(0);
-        }
+        result
     }
 
     /// Rewind the buffer to the most recent undo-ring state and pop it — each
@@ -437,9 +443,8 @@ impl Workspace {
     /// carries point/mark/narrowing; there is no redo. `Err` when the ring is
     /// empty.
     pub fn undo_last(&mut self) -> Result<(), String> {
-        // The top may BE the current state — captured before a read or a
-        // program that ended up clean; rewinding to it would be a no-op that
-        // burns a step, so skip those first.
+        // Skip any state equal to the current one: rewinding to it would
+        // change nothing and burn a step.
         let cur = self.session.borrow().buffer.version();
         while self.undo_ring.last().is_some_and(|c| c.version() == cur) {
             self.undo_ring.pop();
@@ -1546,6 +1551,21 @@ mod tests {
         assert_eq!(ws.text(), "v2 external\nmine\n", "the edits are preserved");
         assert!(ws.is_stale(), "still flagged for the user to resolve");
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn a_program_that_changes_nothing_takes_no_undo_step() {
+        let mut ws = Workspace::new(Box::new(crate::Buffer::from_string("*t*", "")));
+        for word in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+            ws.run_value_undoable(&format!("(insert \"{word}\")"), false)
+                .unwrap();
+        }
+        // The ring is full; a read must not push the first edit's step off.
+        ws.run_value_undoable("(buffer-size)", false).unwrap();
+        for _ in 0..8 {
+            ws.undo_last().unwrap();
+        }
+        assert_eq!(ws.text(), "", "every edit rewound");
     }
 
     #[test]

@@ -3487,11 +3487,8 @@ fn rehearse_on_a_full_undo_ring_does_not_leak_onto_it() {
         "undo rewinds the last real edit, not the rehearsed one"
     );
 
-    // The rehearsal did not cost the ring an extra real step either: draining
-    // it the rest of the way (each real edit's own save triggers a syntax check
-    // that pushes its post-edit state too, so undo_last's "the top may already
-    // be the current state" skip retires one extra entry for free on the first
-    // call above) reaches the same depth a run without any rehearsal would,
+    // The rehearsal did not cost the ring a real step either: the ring held the
+    // last eight edits, so draining it the rest of the way rewinds seven more,
     // then errors with nothing left — never more, never fewer.
     let mut drained = 0;
     loop {
@@ -3505,7 +3502,7 @@ fn rehearse_on_a_full_undo_ring_does_not_leak_onto_it() {
         drained += 1;
     }
     assert_eq!(
-        drained, 6,
+        drained, 7,
         "the ring's remaining real depth after the first undo"
     );
 }
