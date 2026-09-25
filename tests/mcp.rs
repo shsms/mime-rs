@@ -1494,6 +1494,64 @@ fn git_fixup_moves_a_stacked_branch_unless_told_not_to() {
     assert_eq!(a_tip(), new_a);
 }
 
+/// The sparse rewrites and `git_move` take `update_refs` through the server
+/// too: `git_reword` moves a branch at the reworded commit unless told not to.
+#[test]
+fn git_reword_moves_a_stacked_branch_unless_told_not_to() {
+    let dir = temp_dir("update-refs-reword");
+    let repo = git2::Repository::init(&dir).unwrap();
+    let mut config = repo.config().unwrap();
+    config.set_str("user.name", "T").unwrap();
+    config.set_str("user.email", "t@example.invalid").unwrap();
+    config.set_bool("commit.gpgsign", false).unwrap();
+    drop(config);
+    let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
+    let repo_arg = dir.to_string_lossy().into_owned();
+    for (id, (file, msg)) in [("f.txt", "base"), ("g.txt", "add g"), ("h.txt", "add h")]
+        .into_iter()
+        .enumerate()
+    {
+        std::fs::write(dir.join(file), "1\n").unwrap();
+        s.call_ok(
+            id as i64 + 1,
+            "git_commit",
+            json!({ "repo": repo_arg, "paths": [file], "message": msg }),
+        );
+        if file == "g.txt" {
+            let g = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("a", &g, false).unwrap();
+        }
+    }
+    let a_tip = || repo.refname_to_id("refs/heads/a").unwrap();
+    let old_a = a_tip();
+
+    let out = s.call_ok(
+        4,
+        "git_reword",
+        json!({ "repo": repo_arg, "commit": "a", "message": "add g, reworded" }),
+    );
+    assert!(out.contains("moved a "), "{out}");
+    let new_a = a_tip();
+    assert_ne!(new_a, old_a);
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(
+        head.parent_id(0).unwrap(),
+        new_a,
+        "a sits under the new tip"
+    );
+
+    let out = s.call_ok(
+        5,
+        "git_reword",
+        json!({ "repo": repo_arg, "commit": "a", "message": "add g, again", "update_refs": false }),
+    );
+    assert!(
+        out.contains("left behind: a → old") && out.contains("(update_refs: false)"),
+        "{out}"
+    );
+    assert_eq!(a_tip(), new_a);
+}
+
 fn temp_dir(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!("mime-mcp-it-{tag}-{}", std::process::id()));

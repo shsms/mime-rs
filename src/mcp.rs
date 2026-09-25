@@ -4377,7 +4377,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
                 .and_then(Value::as_array)
                 .ok_or("git_msg_rewrite: message_edits must be a non-empty array")?;
             seq::cmd_msg_rewrite(
-                &repo,
+                with_refs,
                 &str_arg(args, "range")?,
                 &msg_edit_specs(edits)?,
                 fill_arg(args, "git_msg_rewrite")?,
@@ -4385,7 +4385,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
             )
         }
         "git_msg_fill" => seq::cmd_msg_fill(
-            &repo,
+            with_refs,
             &str_arg(args, "range")?,
             column_arg(args, "git_msg_fill")?,
             bool_arg(args, "rehearse"),
@@ -4396,7 +4396,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
                 None => Vec::new(),
             };
             seq::cmd_reword(
-                &repo,
+                with_refs,
                 &str_arg(args, "commit")?,
                 args.get("message").and_then(Value::as_str),
                 &edits,
@@ -4414,7 +4414,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
             seq::cmd_range_diff(&repo, &str_arg(args, "old")?, &str_arg(args, "new")?)
         }
         "git_move" => seq::cmd_move(
-            &repo,
+            with_refs,
             &str_arg(args, "from")?,
             &str_arg(args, "to")?,
             &opt_str_list(args, "paths"),
@@ -4688,7 +4688,8 @@ fn git_tool_schemas() -> Vec<Value> {
                             },
                             "required": ["path"]
                         }
-                    }
+                    },
+                    "update_refs": update_refs("")
                 },
                 "required": ["repo", "from", "to"],
             },
@@ -4799,14 +4800,15 @@ fn git_tool_schemas() -> Vec<Value> {
                         }
                     },
                     "rehearse": { "type": "boolean", "description": "Preview the new message without applying." },
-                    "fill": fill("Fill the resulting message body — with neither `message` nor `message_edits`, the call just fills the commit's own body —")
+                    "fill": fill("Fill the resulting message body — with neither `message` nor `message_edits`, the call just fills the commit's own body —"),
+                    "update_refs": update_refs("")
                 },
                 "required": ["repo", "commit"],
             },
         }),
         json!({
             "name": "git_msg_rewrite",
-            "description": "Apply one message_edits vocabulary to EVERY commit of `range` (which must end at HEAD) — the bulk trailer strip/add, or the s/old-symbol/new/ sweep after a rename. A sparse rewrite touching only messages: each commit is re-created with its OWN tree (byte-identical by construction, nothing can conflict) and re-parented; an untouched prefix keeps its identical oids. Other branches/tags left on the old history — at a rewritten commit or ahead of one — are named in the report, in a rehearsal too. The report carries per-commit replacement counts, so zero application in one commit is visible; a `find` matching NOWHERE in the range is an error and nothing changes. rehearse:true previews the counts. For one commit's message use git_reword.",
+            "description": "Apply one message_edits vocabulary to EVERY commit of `range` (which must end at HEAD) — the bulk trailer strip/add, or the s/old-symbol/new/ sweep after a rename. A sparse rewrite touching only messages: each commit is re-created with its OWN tree (byte-identical by construction, nothing can conflict) and re-parented; an untouched prefix keeps its identical oids. Other local branches at a rewritten commit move with it (update_refs); the refs left on the old history — a branch with commits of its own on top of a rewritten commit, one in use in another worktree, a tag — are named in the report, in a rehearsal too. The report carries per-commit replacement counts, so zero application in one commit is visible; a `find` matching NOWHERE in the range is an error and nothing changes. rehearse:true previews the counts. For one commit's message use git_reword.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4826,7 +4828,8 @@ fn git_tool_schemas() -> Vec<Value> {
                         }
                     },
                     "rehearse": { "type": "boolean", "description": "Preview the per-commit replacement counts without applying." },
-                    "fill": fill("Also fill every rewritten message's body — the report marks each commit whose body changed; for the fill alone, without edits, use git_msg_fill —")
+                    "fill": fill("Also fill every rewritten message's body — the report marks each commit whose body changed; for the fill alone, without edits, use git_msg_fill —"),
+                    "update_refs": update_refs("")
                 },
                 "required": ["repo", "range", "message_edits"],
             },
@@ -4840,7 +4843,8 @@ fn git_tool_schemas() -> Vec<Value> {
                     "repo": repo,
                     "range": { "type": "string", "description": "Revision range whose messages to fill, e.g. main..HEAD, or a bare rev like HEAD for the whole history; must end at HEAD, linear history only." },
                     "column": { "type": "integer", "description": "The fill column. Default 72." },
-                    "rehearse": { "type": "boolean", "description": "Report which commits would change without applying." }
+                    "rehearse": { "type": "boolean", "description": "Report which commits would change without applying." },
+                    "update_refs": update_refs("")
                 },
                 "required": ["repo", "range"],
             },
@@ -6670,6 +6674,32 @@ mod git_tool_tests {
             assert!(t["name"].as_str().unwrap().starts_with("git_"));
             assert!(!t["description"].as_str().unwrap().is_empty());
             assert_eq!(t["inputSchema"]["type"], "object");
+        }
+    }
+
+    #[test]
+    fn every_tool_that_rewrites_commits_takes_update_refs() {
+        let schemas = git_tool_schemas();
+        let takes = |name: &str| {
+            let t = schemas.iter().find(|t| t["name"] == name).unwrap();
+            t["inputSchema"]["properties"]["update_refs"]["type"] == "boolean"
+        };
+        for name in [
+            "git_rebase",
+            "git_fixup",
+            "git_absorb",
+            "git_split",
+            "git_move",
+            "git_reword",
+            "git_msg_rewrite",
+            "git_msg_fill",
+            "git_commit",
+        ] {
+            assert!(takes(name), "{name} lacks update_refs");
+        }
+        // The picks from elsewhere never move a branch.
+        for name in ["git_cherry_pick", "git_revert"] {
+            assert!(!takes(name), "{name} takes update_refs");
         }
     }
 

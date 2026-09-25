@@ -447,12 +447,16 @@ impl<'a> From<&'a std::path::PathBuf> for RepoArg<'a> {
 
 /// What a rewrite does with the other branches pointing into it: the tool's
 /// name (for the reflog), the base of the replayed range (`None`: nothing is
-/// considered), and whether they move.
+/// considered), whether they move, and the commits of the range the tool
+/// re-created itself before the replay (`(old, new)`): a branch at one of them
+/// moves to its new commit and a branch split off from one is told to rebase
+/// onto it, without the marks rule.
 #[derive(Clone, Debug)]
 pub struct RefMoves {
     pub tool: &'static str,
     pub base: Option<Oid>,
     pub update_refs: bool,
+    pub prefilled: Vec<(Oid, Oid)>,
 }
 
 impl RefMoves {
@@ -462,15 +466,17 @@ impl RefMoves {
             tool: "",
             base: None,
             update_refs: false,
+            prefilled: Vec::new(),
         }
     }
 
-    /// The range `base..HEAD`.
+    /// The range `base..HEAD`, with nothing re-created before the replay.
     pub fn range(tool: &'static str, base: Oid, update_refs: bool) -> RefMoves {
         RefMoves {
             tool,
             base: Some(base),
             update_refs,
+            prefilled: Vec::new(),
         }
     }
 
@@ -1517,7 +1523,28 @@ fn begin(repo: &Repository, plan: Plan, mode: Mode, refs: RefMoves) -> Result<Ou
 
     // The other branches pointing into the range, placed in the replay; they
     // are written only at the end (`finish`), so an abort has nothing to undo.
-    let (marks, left) = refs.place(repo, &branch, orig, &plan.steps)?;
+    let (mut marks, mut left) = refs.place(repo, &branch, orig, &plan.steps)?;
+    // At a commit the tool already re-created, the new commit is known: the
+    // mark is filled now (and written only at the end, like the others).
+    let known = |c: Oid| {
+        refs.prefilled
+            .iter()
+            .find(|(old, _)| *old == c)
+            .map(|p| p.1)
+    };
+    for m in &mut marks {
+        if let Some(new) = known(m.old) {
+            m.new = Some(new);
+            m.dropped_tip = false;
+        }
+    }
+    for l in &mut left {
+        if let LeftBehind::SplitOff { from, new, .. } = l
+            && let Some(n) = known(*from)
+        {
+            *new = Some(n);
+        }
+    }
 
     // Stamp a recovery ref at the pre-op tip BEFORE touching anything, so the
     // original branch state is always reachable (history rewriting is otherwise
@@ -3016,6 +3043,7 @@ fn move_changes(
     to: Oid,
     paths: &[String],
     hunks: &[HunkSel],
+    update_refs: bool,
 ) -> Result<String, Error> {
     if paths.is_empty() && hunks.is_empty() {
         return Err(estr("move: name at least one path or hunk to move"));
@@ -3110,14 +3138,20 @@ fn move_changes(
 
     // Replay the commits after `newer` onto the rebuilt pair via the sequencer,
     // reusing its conflict handling + backup ref. Empty tail = just move the
-    // branch.
+    // branch. The range the other branches move with starts below `older`; a
+    // branch at either rebuilt commit takes its new id, written only at the end
+    // like every other move (an abort moves nothing).
     let tail = commits_since(repo, newer.id())?;
     let note = backup_note(repo);
     let plan = Plan {
         onto: newer_prime,
         steps: tail.into_iter().map(pick_step).collect(),
     };
-    let out = start(repo, plan)?;
+    let refs = RefMoves {
+        prefilled: vec![(older.id(), older_prime), (newer.id(), newer_prime)],
+        ..RefMoves::range("git_move", base_commit.id(), update_refs)
+    };
+    let out = start_with(repo, plan, refs)?;
     Ok(format!("{}{note}", outcome_with_tree_note(repo, &out)))
 }
 
@@ -3444,7 +3478,8 @@ fn landing(repo: &Repository, base: Oid, tip: Oid, steps: &[Step]) -> Result<usi
     Ok(after)
 }
 
-/// The commits of `base..tip`.
+/// The commits of `base..tip`; a zero `base` (a range that starts at the root)
+/// hides nothing.
 fn range_set(
     repo: &Repository,
     base: Oid,
@@ -3452,8 +3487,77 @@ fn range_set(
 ) -> Result<std::collections::HashSet<Oid>, Error> {
     let mut walk = repo.revwalk()?;
     walk.push(tip)?;
-    walk.hide(base)?;
+    if !base.is_zero() {
+        walk.hide(base)?;
+    }
     walk.collect()
+}
+
+// ---- the sparse rewrites (reword, msg_rewrite): the same branches ----------
+
+/// The marks and left-behind refs of a sparse rewrite that re-creates
+/// `recreated` (oldest first, a chain ending at `orig`), placed as a replay
+/// would place them with one step per re-created commit — so a branch lands on
+/// the rewrite of its own tip. The base is the first commit's parent (zero for
+/// a root).
+fn sparse_marks(
+    repo: &Repository,
+    branch: &str,
+    orig: Oid,
+    recreated: &[Oid],
+    update_refs: bool,
+) -> Result<(Vec<BranchMove>, Vec<LeftBehind>), Error> {
+    let Some(first) = recreated.first() else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let first = repo.find_commit(*first)?;
+    let base = first.parent_ids().next().unwrap_or_else(Oid::zero);
+    let steps: Vec<Step> = recreated.iter().map(|o| pick_step(*o)).collect();
+    place_marks(repo, branch, base, orig, &steps, update_refs)
+}
+
+/// Fill a sparse rewrite's marks and split-offs from its new commits: `new[i]`
+/// is the rewrite of step `i`. Every candidate sits at or above the first
+/// re-created commit, so its boundary is at least 1.
+fn fill_sparse(marks: &mut [BranchMove], left: &mut [LeftBehind], new: &[Oid]) {
+    let at = |after: usize| after.checked_sub(1).and_then(|i| new.get(i).copied());
+    for m in marks {
+        m.new = at(m.after);
+    }
+    for l in left {
+        if let LeftBehind::SplitOff { after, new: n, .. } = l {
+            *n = at(*after);
+        }
+    }
+}
+
+/// A sparse rewrite's rehearsal lines for the other refs: where each branch
+/// would go (named by the old commit it lands on, since no new commit exists
+/// yet), then the refs it would leave behind. Each line ends with a newline.
+fn sparse_rehearsal_text(
+    repo: &Repository,
+    recreated: &[Oid],
+    marks: &[BranchMove],
+    left: &[LeftBehind],
+) -> String {
+    let mut out = String::new();
+    for m in marks {
+        let Some(old) = m.after.checked_sub(1).and_then(|i| recreated.get(i)) else {
+            continue;
+        };
+        let subject = repo
+            .find_commit(*old)
+            .ok()
+            .and_then(|c| c.summary().map(str::to_string))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "  would move {} to the rewrite of {} {subject}\n",
+            short_branch(&m.branch),
+            short(*old)
+        ));
+    }
+    push_report_lines(&mut out, &left_text(repo, left));
+    out
 }
 
 /// Branches another worktree has in use — full refname → that worktree's
@@ -5551,13 +5655,17 @@ fn exec_over(repo: &Repository, range: &str, command: &str) -> Result<String, Er
 /// (byte-identical by construction) and re-parented, so nothing can conflict.
 /// Per-commit replacement counts ride in the report; a `find` that matches
 /// NOWHERE in the range is an error and nothing changes.
-pub fn cmd_msg_rewrite(
-    repo_path: &std::path::Path,
+pub fn cmd_msg_rewrite<'a>(
+    repo: impl Into<RepoArg<'a>>,
     range: &str,
     specs: &[MsgEditSpec],
     fill: Option<usize>,
     rehearse_only: bool,
 ) -> Result<String, String> {
+    let RepoArg {
+        path: repo_path,
+        update_refs,
+    } = repo.into();
     let repo = open(repo_path)?;
     if specs.is_empty() {
         return Err("git_msg_rewrite: message_edits must not be empty".to_string());
@@ -5566,7 +5674,16 @@ pub fn cmd_msg_rewrite(
         .iter()
         .map(MsgEdit::from_spec)
         .collect::<Result<_, _>>()?;
-    msg_rewrite(&repo, range, &edits, fill, rehearse_only).map_err(gerr)
+    msg_rewrite(
+        &repo,
+        "git_msg_rewrite",
+        range,
+        &edits,
+        fill,
+        rehearse_only,
+        update_refs,
+    )
+    .map_err(gerr)
 }
 
 /// Fill the body of EVERY commit message of `range` at `column` — the sweep
@@ -5574,14 +5691,27 @@ pub fn cmd_msg_rewrite(
 /// rewrite as [`cmd_msg_rewrite`] with no edits: trees byte-identical, the
 /// commits below the first one that needs filling keep their oids, and when
 /// every body fits nothing is created at all.
-pub fn cmd_msg_fill(
-    repo_path: &std::path::Path,
+pub fn cmd_msg_fill<'a>(
+    repo: impl Into<RepoArg<'a>>,
     range: &str,
     column: usize,
     rehearse_only: bool,
 ) -> Result<String, String> {
+    let RepoArg {
+        path: repo_path,
+        update_refs,
+    } = repo.into();
     let repo = open(repo_path)?;
-    msg_rewrite(&repo, range, &[], Some(column), rehearse_only).map_err(gerr)
+    msg_rewrite(
+        &repo,
+        "git_msg_fill",
+        range,
+        &[],
+        Some(column),
+        rehearse_only,
+        update_refs,
+    )
+    .map_err(gerr)
 }
 
 /// Reword ONE commit's message — `message` replaces it wholesale, or
@@ -5589,14 +5719,18 @@ pub fn cmd_msg_fill(
 /// descendants are re-created with their own trees (byte-identical, nothing can
 /// conflict), no plan transcription needed. The everyday follow-up to a review
 /// comment.
-pub fn cmd_reword(
-    repo_path: &std::path::Path,
+pub fn cmd_reword<'a>(
+    repo: impl Into<RepoArg<'a>>,
     commit: &str,
     message: Option<&str>,
     specs: &[MsgEditSpec],
     fill: Option<usize>,
     rehearse_only: bool,
 ) -> Result<String, String> {
+    let RepoArg {
+        path: repo_path,
+        update_refs,
+    } = repo.into();
     let repo = open(repo_path)?;
     if message.is_none() && specs.is_empty() && fill.is_none() {
         return Err("git_reword: pass `message` (wholesale) and/or `message_edits`".to_string());
@@ -5606,7 +5740,16 @@ pub fn cmd_reword(
         .map(MsgEdit::from_spec)
         .collect::<Result<_, _>>()?;
     let target = resolve_s(&repo, commit)?;
-    reword(&repo, target, message, &edits, fill, rehearse_only).map_err(gerr)
+    reword(
+        &repo,
+        target,
+        message,
+        &edits,
+        fill,
+        rehearse_only,
+        update_refs,
+    )
+    .map_err(gerr)
 }
 
 fn reword(
@@ -5616,6 +5759,7 @@ fn reword(
     edits: &[MsgEdit],
     fill: Option<usize>,
     rehearse_only: bool,
+    update_refs: bool,
 ) -> Result<String, Error> {
     let head_ref = repo.head()?;
     if !head_ref.is_branch() {
@@ -5652,12 +5796,18 @@ fn reword(
             short(*merge)
         )));
     }
+    // The other branches on the re-created commits move with them.
+    let recreated: Vec<Oid> = std::iter::once(target)
+        .chain(tail.iter().copied())
+        .collect();
+    let (mut marks, mut left) = sparse_marks(repo, &branch, head, &recreated, update_refs)?;
     if rehearse_only {
         return Ok(format!(
             "rehearse: would reword {} to:\n{}\n(the tree and every descendant's \
-             tree stay byte-identical)\n{}",
+             tree stay byte-identical)\n{}{}",
             short(target),
             new_msg.trim_end(),
+            sparse_rehearsal_text(repo, &recreated, &marks, &left),
             signing_rehearsal_note(repo).trim_end()
         ));
     }
@@ -5679,6 +5829,7 @@ fn reword(
         true,
     )?;
     let reworded = tip;
+    let mut new = vec![reworded];
     for oid in tail {
         let c = repo.find_commit(oid)?;
         let parent = repo.find_commit(tip)?;
@@ -5692,54 +5843,37 @@ fn reword(
             &[&parent],
             true,
         )?;
+        new.push(tip);
     }
     repo.reference(&branch, tip, true, "mime reword")?;
+    fill_sparse(&mut marks, &mut left, &new);
+    let (moved, skipped) = move_branches(repo, "git_reword", &branch, &marks);
     Ok(format!(
-        "reworded {} → {}; every tree is byte-identical{}{}",
+        "reworded {} → {}; every tree is byte-identical{}{}{}",
         short(target),
         short(reworded),
         backup_note(repo),
-        fill_note(&edited, &new_msg, fill).map_or_else(String::new, |n| format!("\n  {n}"))
+        fill_note(&edited, &new_msg, fill).map_or_else(String::new, |n| format!("\n  {n}")),
+        ref_report_text(
+            repo,
+            head,
+            &RefReport {
+                moved,
+                skipped,
+                left
+            }
+        )
     ))
-}
-
-/// Branches and tags other than `branch` that msg_rewrite leaves on the old
-/// history: those at `first` (the oldest commit re-created) or at a descendant
-/// of it. Empty when nothing is left behind.
-fn stranded_refs(repo: &Repository, branch: &str, first: Oid) -> Result<String, Error> {
-    let mut out = String::new();
-    for r in repo.references()? {
-        let r = r?;
-        let Some(name) = r.name().filter(|n| {
-            *n != branch && (n.starts_with("refs/heads/") || n.starts_with("refs/tags/"))
-        }) else {
-            continue;
-        };
-        if let Ok(c) = r.peel_to_commit()
-            && (c.id() == first || repo.graph_descendant_of(c.id(), first).unwrap_or(false))
-        {
-            out.push_str(&format!(
-                "  {name} → old {}
-",
-                short(c.id())
-            ));
-        }
-    }
-    if !out.is_empty() {
-        out = format!(
-            "left behind on the old history (only {branch} is moved):
-{out}"
-        );
-    }
-    Ok(out)
 }
 
 fn msg_rewrite(
     repo: &Repository,
+    tool: &str,
     range: &str,
     edits: &[MsgEdit],
     fill: Option<usize>,
     rehearse_only: bool,
+    update_refs: bool,
 ) -> Result<String, Error> {
     let head_ref = repo.head()?;
     if !head_ref.is_branch() {
@@ -5817,7 +5951,9 @@ fn msg_rewrite(
     } else {
         first_msg
     };
-    let stranded = stranded_refs(repo, &branch, commits[start])?;
+    // The other branches on the re-created commits move with them.
+    let recreated = &commits[start..];
+    let (mut marks, mut left) = sparse_marks(repo, &branch, head, recreated, update_refs)?;
 
     // What happened to commit `i`: kept as it is, or re-created — for the
     // per-edit counts, the fill, a new parent, or a fresh signature.
@@ -5857,7 +5993,7 @@ fn msg_rewrite(
         for (i, (oid, _, counts, note)) in new_msgs.iter().enumerate() {
             out.push_str(&format!("  {}  {}\n", short(*oid), what(i, counts, note)));
         }
-        out.push_str(&stranded);
+        out.push_str(&sparse_rehearsal_text(repo, recreated, &marks, &left));
         out.push_str(&signing_rehearsal_note(repo));
         return Ok(out);
     }
@@ -5869,6 +6005,7 @@ fn msg_rewrite(
     rotate_backup_ring(repo, &branch, head)?;
     let mut out = String::new();
     let mut tip = head;
+    let mut new_oids = Vec::new();
     for (i, (oid, msg, counts, note)) in new_msgs.iter().enumerate() {
         if i < start {
             out.push_str(&format!("  {}  {}\n", short(*oid), what(i, counts, note)));
@@ -5898,10 +6035,22 @@ fn msg_rewrite(
             what(i, counts, note)
         ));
         tip = new;
+        new_oids.push(new);
     }
     repo.reference(&branch, tip, true, "mime msg_rewrite")?;
 
-    out.push_str(&stranded);
+    fill_sparse(&mut marks, &mut left, &new_oids);
+    let (moved, skipped) = move_branches(repo, tool, &branch, &marks);
+    let refs = ref_report_text(
+        repo,
+        head,
+        &RefReport {
+            moved,
+            skipped,
+            left,
+        },
+    );
+    push_report_lines(&mut out, &refs);
     Ok(format!(
         "rewrote the messages of {} commit(s) in {range}; every tree is \
          byte-identical{}\n{out}",
@@ -7102,17 +7251,21 @@ pub fn cmd_blame(
     }
 }
 
-pub fn cmd_move(
-    repo_path: &std::path::Path,
+pub fn cmd_move<'a>(
+    repo: impl Into<RepoArg<'a>>,
     from: &str,
     to: &str,
     paths: &[String],
     hunks: &[HunkSel],
 ) -> Result<String, String> {
+    let RepoArg {
+        path: repo_path,
+        update_refs,
+    } = repo.into();
     let repo = open(repo_path)?;
     let from = resolve_s(&repo, from)?;
     let to = resolve_s(&repo, to)?;
-    move_changes(&repo, from, to, paths, hunks).map_err(gerr)
+    move_changes(&repo, from, to, paths, hunks, update_refs).map_err(gerr)
 }
 
 #[cfg(test)]
@@ -8828,18 +8981,36 @@ mod tests {
 
         // The rehearsal names the refs before anything moves.
         let out = cmd_msg_rewrite(&dir, "HEAD", &specs, None, true).unwrap();
-        assert!(out.contains("left behind"), "{out}");
-        assert!(out.contains("refs/heads/dev"), "{out}");
+        assert!(
+            out.contains(&format!(
+                "would move dev to the rewrite of {} mid",
+                short(c1)
+            )),
+            "{out}"
+        );
+        assert!(out.contains("left behind: feature "), "{out}");
         assert_eq!(repo.head().unwrap().target(), Some(c2));
 
+        // dev, at a rewritten commit, moves; feature (ahead of the tip, with a
+        // commit of its own) and the tag stay, reported by short name.
         let out = cmd_msg_rewrite(&dir, "HEAD", &specs, None, false).unwrap();
-        for stranded in ["refs/tags/v1", "refs/heads/dev", "refs/heads/feature"] {
+        assert!(
+            out.contains(&format!("moved dev {} → ", short(c1))),
+            "{out}"
+        );
+        let dev = repo.find_commit(tip(&repo, "dev")).unwrap();
+        assert_eq!(dev.message(), Some("mid new_name\n"));
+        for stranded in ["left behind: tag: v1 ", "left behind: feature "] {
             assert!(out.contains(stranded), "{stranded} missing: {out}");
         }
+        assert!(
+            !out.contains("refs/heads/") && !out.contains("refs/tags/"),
+            "{out}"
+        );
         // The untouched root kept its oid, so a tag on it or a branch forked
         // from it is not stranded.
-        assert!(!out.contains("refs/tags/v0"), "{out}");
-        assert!(!out.contains("refs/heads/side"), "{out}");
+        assert!(!out.contains("tag: v0"), "{out}");
+        assert!(!out.contains("side"), "{out}");
     }
 
     #[test]
@@ -8895,8 +9066,8 @@ mod tests {
             append: None,
         }];
         let out = cmd_msg_rewrite(&dir, "HEAD~1..HEAD", &specs, None, false).unwrap();
-        assert!(out.contains("refs/tags/inside"), "{out}");
-        assert!(!out.contains("refs/tags/below"), "{out}");
+        assert!(out.contains("left behind: tag: inside "), "{out}");
+        assert!(!out.contains("below"), "{out}");
     }
 
     #[test]
@@ -12785,7 +12956,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("refs/tags/on-fits"),
+            out.contains("left behind: tag: on-fits "),
             "a tag on the re-signed prefix is left behind: {out}"
         );
         let branch = commits_since(&repo, base).unwrap();
@@ -14246,5 +14417,376 @@ mod tests {
             old.contains("rebase it onto that commit's rewrite"),
             "{old}"
         );
+    }
+
+    fn edit(find: &str, with: &str) -> Vec<MsgEditSpec> {
+        vec![MsgEditSpec {
+            find: Some(find.into()),
+            replace: Some(with.into()),
+            append: None,
+        }]
+    }
+
+    /// The last reflog message of branch `name`.
+    fn last_reflog(repo: &Repository, name: &str) -> String {
+        let log = repo.reflog(&format!("refs/heads/{name}")).unwrap();
+        log.get(0).unwrap().message().unwrap_or("").to_string()
+    }
+
+    #[test]
+    fn reword_and_msg_rewrite_move_the_stacked_branches() {
+        let (repo, base, [a1, _a2, _b1, _c1]) = stack("ur-reword");
+        let dir = repo.workdir().unwrap().to_path_buf();
+        let out = cmd_reword(&dir, &a1.to_string(), Some("a1 reworded"), &[], None, false).unwrap();
+        assert!(
+            out.contains("moved a ") && out.contains("moved b "),
+            "{out}"
+        );
+        assert_eq!(
+            subjects(&repo, base, tip(&repo, "a")),
+            ["a1 reworded", "a2"]
+        );
+        assert_eq!(
+            subjects(&repo, base, tip(&repo, "b")),
+            ["a1 reworded", "a2", "b1"]
+        );
+        assert_eq!(
+            subjects(&repo, base, tip(&repo, "c")),
+            ["a1 reworded", "a2", "b1", "c1"]
+        );
+        assert_eq!(
+            last_reflog(&repo, "a"),
+            "mime git_reword: moved with the rewrite of c"
+        );
+        let out = cmd_msg_rewrite(&dir, "main..HEAD", &edit("b1", "b-one"), None, false).unwrap();
+        assert!(out.contains("moved b "), "{out}");
+        assert!(!out.contains("moved a "), "a is below the rewrite: {out}");
+        assert_eq!(
+            subjects(&repo, base, tip(&repo, "b")),
+            ["a1 reworded", "a2", "b-one"]
+        );
+        assert_eq!(
+            last_reflog(&repo, "b"),
+            "mime git_msg_rewrite: moved with the rewrite of c"
+        );
+    }
+
+    #[test]
+    fn msg_fill_moves_the_stacked_branches_and_update_refs_false_keeps_them() {
+        let (repo, base, [a1, _a2, _b1, _c1]) = stack("ur-msgfill");
+        let dir = repo.workdir().unwrap().to_path_buf();
+        // A body too wide for 72 columns, written without filling.
+        let long = format!("a1\n\n{}\n", ["word"; 30].join(" "));
+        cmd_reword(&dir, &a1.to_string(), Some(&long), &[], None, false).unwrap();
+        let old_b = tip(&repo, "b");
+        let out = cmd_msg_fill(&dir, "main..HEAD", 72, false).unwrap();
+        assert!(
+            out.contains("moved a ") && out.contains("moved b "),
+            "{out}"
+        );
+        assert_ne!(tip(&repo, "b"), old_b);
+        assert_eq!(subjects(&repo, base, tip(&repo, "b")), ["a1", "a2", "b1"]);
+        assert_eq!(
+            last_reflog(&repo, "b"),
+            "mime git_msg_fill: moved with the rewrite of c"
+        );
+
+        // With update_refs: false the branches stay, reported as kept.
+        let (a, b) = (tip(&repo, "a"), tip(&repo, "b"));
+        let kept = |update_refs| RepoArg {
+            path: &dir,
+            update_refs,
+        };
+        let out = cmd_msg_fill(kept(false), "main..HEAD", 3, true).unwrap();
+        assert!(!out.contains("would move"), "{out}");
+        assert!(
+            out.contains(&format!(
+                "left behind: b → old {} (update_refs: false)",
+                short(b)
+            )),
+            "{out}"
+        );
+        let out =
+            cmd_msg_rewrite(kept(false), "main..HEAD", &edit("b1", "b-one"), None, false).unwrap();
+        assert_eq!(tip(&repo, "b"), b);
+        assert!(
+            out.contains(&format!(
+                "left behind: b → old {} (update_refs: false)",
+                short(b)
+            )),
+            "{out}"
+        );
+        let a1_now = repo.find_commit(a).unwrap().parent_id(0).unwrap();
+        let out = cmd_reword(
+            kept(false),
+            &a1_now.to_string(),
+            Some("a1 again"),
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(tip(&repo, "a"), a);
+        assert!(
+            out.contains(&format!(
+                "left behind: a → old {} (update_refs: false)",
+                short(a)
+            )),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_msg_rewrite_rehearsal_says_where_branches_would_go() {
+        let (repo, _base, [a1, a2, b1, _c1]) = stack("ur-msg-rehearse");
+        let dir = repo.workdir().unwrap().to_path_buf();
+        repo.reference("refs/tags/v1", a1, true, "t").unwrap();
+        let out = cmd_msg_rewrite(&dir, "main..HEAD", &edit("a1", "A1"), None, true).unwrap();
+        assert!(
+            out.contains(&format!("would move a to the rewrite of {} a2", short(a2))),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("would move b to the rewrite of {} b1", short(b1))),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("left behind: tag: v1 → old {}", short(a1))),
+            "{out}"
+        );
+        assert_eq!(tip(&repo, "a"), a2);
+        // git_reword's rehearsal says the same.
+        let out = cmd_reword(&dir, &a2.to_string(), Some("a2!"), &[], None, true).unwrap();
+        assert!(
+            out.contains(&format!("would move a to the rewrite of {} a2", short(a2))),
+            "{out}"
+        );
+        assert!(!out.contains("tag: v1"), "v1 is below the reword: {out}");
+        assert_eq!(tip(&repo, "a"), a2);
+    }
+
+    #[test]
+    fn a_msg_rewrite_from_the_root_moves_a_branch_at_the_root() {
+        let dir = tmp("ur-root");
+        let repo = Repository::init(&dir).unwrap();
+        let root = commit(&repo, &[], &[("a", "1\n")], "root old_name\n");
+        let c1 = commit(&repo, &[root], &[("a", "2\n")], "one\n");
+        on_branch(&repo, "main", c1);
+        repo.reference("refs/heads/first", root, true, "t").unwrap();
+        let out =
+            cmd_msg_rewrite(&dir, "HEAD", &edit("old_name", "new_name"), None, false).unwrap();
+        assert!(out.contains("moved first "), "{out}");
+        let first = repo.find_commit(tip(&repo, "first")).unwrap();
+        assert_eq!(first.message(), Some("root new_name\n"));
+        assert_eq!(first.parent_count(), 0);
+        assert_eq!(
+            repo.head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .parent_id(0)
+                .unwrap(),
+            first.id()
+        );
+    }
+
+    /// base ← a1 (adds a) ← a2 (adds g) ← b1 ← c1: branches main at base, at-a1
+    /// at a1, a at a2, b at b1, c checked out at c1. a2's `g` can move into a1,
+    /// which does not touch it.
+    fn move_stack(tag: &str) -> (Repository, Oid, [Oid; 4]) {
+        let dir = tmp(tag);
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("f", "0\n")], "base");
+        let a1 = commit(&repo, &[base], &[("f", "0\n"), ("a", "1\n")], "a1");
+        let a2 = commit(
+            &repo,
+            &[a1],
+            &[("f", "0\n"), ("a", "1\n"), ("g", "1\n")],
+            "a2",
+        );
+        let b1 = commit(
+            &repo,
+            &[a2],
+            &[("f", "0\n"), ("a", "1\n"), ("g", "1\n"), ("b", "1\n")],
+            "b1",
+        );
+        let c1 = commit(
+            &repo,
+            &[b1],
+            &[
+                ("f", "0\n"),
+                ("a", "1\n"),
+                ("g", "1\n"),
+                ("b", "1\n"),
+                ("c", "1\n"),
+            ],
+            "c1",
+        );
+        repo.reference("refs/heads/main", base, true, "t").unwrap();
+        repo.reference("refs/heads/at-a1", a1, true, "t").unwrap();
+        repo.reference("refs/heads/a", a2, true, "t").unwrap();
+        repo.reference("refs/heads/b", b1, true, "t").unwrap();
+        on_branch(&repo, "c", c1);
+        (repo, base, [a1, a2, b1, c1])
+    }
+
+    fn has(repo: &Repository, commit: Oid, path: &str) -> bool {
+        let tree = repo.find_commit(commit).unwrap().tree().unwrap();
+        tree.get_path(Path::new(path)).is_ok()
+    }
+
+    #[test]
+    fn git_move_moves_branches_at_its_two_commits() {
+        let (repo, base, [a1, a2, _b1, _c1]) = move_stack("ur-move");
+        let dir = repo.workdir().unwrap().to_path_buf();
+        repo.reference("refs/tags/v1", a1, true, "t").unwrap();
+        // side has a commit of its own on top of a1.
+        let s1 = commit(
+            &repo,
+            &[a1],
+            &[("f", "0\n"), ("a", "1\n"), ("s", "1\n")],
+            "s1",
+        );
+        repo.reference("refs/heads/side", s1, true, "t").unwrap();
+        // Move a2's `g` back into a1.
+        let out = cmd_move(
+            &dir,
+            &a2.to_string(),
+            &a1.to_string(),
+            &["g".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        let new_a1 = tip(&repo, "at-a1");
+        assert_eq!(subjects(&repo, base, new_a1), ["a1"]);
+        assert!(has(&repo, new_a1, "g"), "g moved into a1's rewrite");
+        assert_eq!(subjects(&repo, base, tip(&repo, "a")), ["a1", "a2"]);
+        assert_eq!(
+            repo.find_commit(tip(&repo, "a"))
+                .unwrap()
+                .parent_id(0)
+                .unwrap(),
+            new_a1
+        );
+        assert_eq!(subjects(&repo, base, tip(&repo, "b")), ["a1", "a2", "b1"]);
+        assert_eq!(
+            subjects(&repo, base, tip(&repo, "c")),
+            ["a1", "a2", "b1", "c1"]
+        );
+        assert!(
+            out.contains(&format!("moved at-a1 {} → {}", short(a1), short(new_a1))),
+            "{out}"
+        );
+        assert!(
+            out.contains("moved a ") && out.contains("moved b "),
+            "{out}"
+        );
+        assert!(!out.contains("was dropped"), "{out}");
+        assert!(
+            out.contains(&format!("left behind: tag: v1 → old {}", short(a1))),
+            "{out}"
+        );
+        // side is told to rebase onto a1's rewrite, not a2's.
+        assert!(
+            out.contains(&format!(
+                "left behind: side has commits of its own on top of {} — rebase it onto {}",
+                short(a1),
+                short(new_a1)
+            )),
+            "{out}"
+        );
+        assert_eq!(
+            repo.refname_to_id(&backup_slot("refs/heads/at-a1", 0))
+                .unwrap(),
+            a1
+        );
+        assert_eq!(
+            last_reflog(&repo, "at-a1"),
+            "mime git_move: moved with the rewrite of c"
+        );
+    }
+
+    #[test]
+    fn git_move_with_nothing_after_it_moves_a_branch_at_the_tip() {
+        let (repo, _base, [a1, a2, _b1, _c1]) = move_stack("ur-move-tip");
+        let dir = repo.workdir().unwrap().to_path_buf();
+        on_branch(&repo, "a", a2);
+        repo.reference("refs/heads/keep", a2, true, "t").unwrap();
+        let out = cmd_move(
+            &dir,
+            &a2.to_string(),
+            &a1.to_string(),
+            &["g".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert!(out.starts_with("done"), "{out}");
+        let new_a2 = tip(&repo, "a");
+        assert_eq!(tip(&repo, "keep"), new_a2, "{out}");
+        assert!(out.contains("(it was at the old tip"), "{out}");
+        let new_a1 = tip(&repo, "at-a1");
+        assert_eq!(
+            repo.find_commit(new_a2).unwrap().parent_id(0).unwrap(),
+            new_a1
+        );
+        // b has b1 on top of a2: left, with a2's rewrite to rebase onto.
+        assert!(
+            out.contains(&format!(
+                "left behind: b has commits of its own on top of {} — rebase it onto {}",
+                short(a2),
+                short(new_a2)
+            )),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn git_move_abort_moves_no_branch() {
+        let dir = tmp("ur-move-abort");
+        let repo = Repository::init(&dir).unwrap();
+        // The move keeps a2's tree, so a linear tail always replays cleanly; a
+        // side commit merged in after a2 is replayed onto the new a2 too, and
+        // its `a` clashes with a1's.
+        let base = commit(&repo, &[], &[("f", "0\n")], "base");
+        let a1 = commit(&repo, &[base], &[("f", "0\n"), ("a", "1\n")], "a1");
+        let a2 = commit(
+            &repo,
+            &[a1],
+            &[("f", "0\n"), ("a", "1\n"), ("g", "1\n")],
+            "a2",
+        );
+        let s1 = commit(&repo, &[base], &[("f", "0\n"), ("a", "side\n")], "s1");
+        let m = commit(
+            &repo,
+            &[a2, s1],
+            &[("f", "0\n"), ("a", "1\n"), ("g", "1\n")],
+            "merge side",
+        );
+        repo.reference("refs/heads/at-a1", a1, true, "t").unwrap();
+        repo.reference("refs/heads/a", a2, true, "t").unwrap();
+        on_branch(&repo, "c", m);
+        let out = cmd_move(
+            &dir,
+            &a2.to_string(),
+            &a1.to_string(),
+            &["g".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert!(out.contains("stopped on a conflict"), "{out}");
+        // The two hand-made commits are marks already filled, not yet written.
+        assert_eq!((tip(&repo, "at-a1"), tip(&repo, "a")), (a1, a2));
+        let st = status_text(status(&repo).unwrap());
+        assert!(
+            st.contains("branches that move at the end: ")
+                && st.contains("at-a1 → ")
+                && (st.contains(": a → ") || st.contains(", a → ")),
+            "{st}"
+        );
+        abort(&repo).unwrap();
+        assert_eq!((tip(&repo, "at-a1"), tip(&repo, "a")), (a1, a2));
+        assert_eq!(tip(&repo, "c"), m);
+        assert!(repo.refname_to_id(&backup_slot("refs/heads/a", 0)).is_err());
     }
 }
