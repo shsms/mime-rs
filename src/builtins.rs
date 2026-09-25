@@ -4865,6 +4865,19 @@ mod tests {
         );
         assert!(!ws.is_modified());
 
+        // Only a re-read of a file changed on disk raises the count, and a
+        // failed run puts it back.
+        let mut ws = Workspace::new(Box::new(crate::Quire::open(&a).unwrap()));
+        let count = |ws: &Workspace| ws.with_session(|s| Ok(s.reread_generation)).unwrap();
+        let before = count(&ws);
+        crate::safety::write_atomic(&a, b"changed").unwrap();
+        assert!(ws.run(r#"(revert-buffer) (error "stop")"#).is_err());
+        assert_eq!(count(&ws), before);
+        ws.run("(revert-buffer)").unwrap();
+        assert_eq!(count(&ws), before + 1);
+        ws.run("(revert-buffer)").unwrap();
+        assert_eq!(count(&ws), before + 1, "unchanged since");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

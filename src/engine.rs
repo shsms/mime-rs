@@ -126,10 +126,14 @@ pub struct Session {
     /// sufficient; a per-buffer baseline would be needed before extending it to
     /// the trusted tier's inactive/switched buffers.
     pub synced_version: u64,
-    /// How many times the session has read a file from disk after it began:
-    /// `revert_in_place` (auto-revert and `(revert-buffer)`) and `find-file`.
-    /// Checkpoints and undo-ring entries record it; see
-    /// [`Checkpoint::restore`].
+    /// How many times the session has read a file from disk that may hold
+    /// text it never wrote: `find-file`, and a `revert_in_place` (auto-revert
+    /// or `(revert-buffer)`) that found the file changed on disk, judged by its
+    /// stamp or by an earlier read that saw the file change. A re-read of an
+    /// unchanged file does not count, as the file still holds what the session
+    /// loaded or saved. Checkpoints and undo-ring entries record it; see
+    /// [`Checkpoint::restore`]. A program that raises it empties the undo ring
+    /// (see [`Workspace::run_value_undoable`]).
     pub reread_generation: u64,
 }
 
@@ -420,13 +424,15 @@ impl Workspace {
     /// program on the undo ring when the program changed the buffer — the MCP
     /// front-end runs every non-rehearsed program through this, so undo_last
     /// can rewind a misfired edit. A program that changed nothing (a read, a
-    /// probe) records nothing.
+    /// probe) records nothing. A program that re-read a file changed on disk
+    /// empties the ring instead.
     pub fn run_value_undoable(
         &mut self,
         program: &str,
         keep_partial: bool,
     ) -> Result<(RunReport, String), String> {
         let before = self.version();
+        let generation_before = self.session.borrow().reread_generation;
         let step = Checkpoint::capture(format!("undo-{before}"), &self.session.borrow());
         let result = self.run_value_with(program, keep_partial);
         // Changed means the text differs, not that the version moved: an edit
@@ -435,7 +441,15 @@ impl Workspace {
             Ok((report, _)) => report.dirty,
             Err(_) => self.last_failure_dirty.get(),
         };
-        if changed {
+        // A failed run that is rolled back restores the generation with the
+        // buffer, so only a re-read that stayed counts.
+        if self.session.borrow().reread_generation != generation_before {
+            // The program re-read a file that had changed on disk (an
+            // explicit revert-buffer): every state on the ring, and the one
+            // before this program, is text the file no longer holds — undo to
+            // it could only be refused at save.
+            self.undo_ring.clear();
+        } else if changed {
             self.undo_ring.push(step);
             if self.undo_ring.len() > UNDO_RING_CAP {
                 self.undo_ring.remove(0);
@@ -856,8 +870,7 @@ impl Workspace {
     /// reporting it after a fresh read already saw the change (so an mtime
     /// reset can't make a corrupted read look clean again).
     pub fn is_stale(&self) -> bool {
-        let s = self.session.borrow();
-        s.buffer.drifted() || s.buffer.file_stamp().is_some_and(|st| st.check().is_some())
+        store_is_stale(self.session.borrow().buffer.as_ref())
     }
 
     /// Whether the buffer has unsaved edits since its last load/save (its
@@ -1008,6 +1021,8 @@ pub(crate) fn revert_in_place(sess: &mut Session) -> Result<(), String> {
     let markers = sess.buffer.marker_count();
     let mut store = crate::Quire::open(&path)
         .map_err(|e| format!("revert-buffer: cannot re-read {}: {e}", path.display()))?;
+    // Checked after the read, so a write that lands just before it counts.
+    let drifted = store_is_stale(sess.buffer.as_ref());
     crate::store::TextStore::set_name(&mut store, &name);
     sess.buffer = Box::new(store);
     for _ in 0..markers {
@@ -1016,7 +1031,9 @@ pub(crate) fn revert_in_place(sess: &mut Session) -> Result<(), String> {
     let max = sess.buffer.point_max();
     sess.buffer.goto_char(point.min(max));
     sess.synced_version = sess.buffer.version();
-    sess.reread_generation += 1;
+    if drifted {
+        sess.reread_generation += 1;
+    }
     Ok(())
 }
 
@@ -1039,6 +1056,11 @@ fn primary_buffer<'a>(s: &'a Session, name: &str) -> &'a dyn TextStore {
         .find(|b| b.name() == name)
         .map(|b| b.as_ref())
         .unwrap_or(s.buffer.as_ref())
+}
+
+/// [`Workspace::is_stale`] for any store.
+fn store_is_stale(store: &dyn TextStore) -> bool {
+    store.drifted() || store.file_stamp().is_some_and(|st| st.check().is_some())
 }
 
 /// `Some(reason)` when `store` visits `path` and the file on disk has drifted
@@ -1583,6 +1605,49 @@ mod tests {
         let err = ws.undo_last().expect_err("no undo across a re-read");
         assert!(err.contains("nothing to undo"), "got: {err}");
         assert_eq!(ws.text(), "v2 external\n");
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn an_explicit_revert_empties_undo_only_when_the_file_changed() {
+        let tmp =
+            std::env::temp_dir().join(format!("mime-undo-explicit-{}.txt", std::process::id()));
+        std::fs::write(&tmp, "v1\n").unwrap();
+        let mut ws = Workspace::new(Box::new(Quire::open(&tmp).unwrap()));
+
+        // The file is unchanged: the revert only discards the unsaved edit.
+        // undo_last brings it back, and each step before it, and every one
+        // of them can be saved.
+        ws.run_value_undoable(r#"(goto-char (point-max)) (insert "saved\n")"#, false)
+            .unwrap();
+        ws.save_to(&tmp).unwrap();
+        ws.run_value_undoable(r#"(goto-char (point-max)) (insert "mine\n")"#, false)
+            .unwrap();
+        ws.run_value_undoable("(revert-buffer)", false).unwrap();
+        assert_eq!(ws.text(), "v1\nsaved\n");
+        for text in ["v1\nsaved\nmine\n", "v1\nsaved\n", "v1\n"] {
+            ws.undo_last().expect("the revert can be undone");
+            assert_eq!(ws.text(), text);
+            ws.save_to(&tmp).expect("nothing outside changed");
+        }
+
+        // The file changes on disk. A failed program's re-read is rolled
+        // back, and the ring stays.
+        ws.run_value_undoable(r#"(insert "x")"#, false).unwrap();
+        crate::safety::write_atomic(&tmp, b"v2 outside\n").unwrap();
+        assert!(
+            ws.run_value_undoable(r#"(revert-buffer) (error "stop")"#, false)
+                .is_err()
+        );
+        assert_eq!(ws.text(), "xv1\n");
+        assert_eq!(ws.undo_ring.len(), 1, "the ring survives");
+
+        // A re-read that stays empties the ring, since no state on it could
+        // be saved over the outside change.
+        ws.run_value_undoable("(revert-buffer)", false).unwrap();
+        assert_eq!(ws.text(), "v2 outside\n");
+        let err = ws.undo_last().expect_err("nothing before the re-read");
+        assert!(err.contains("nothing to undo"), "got: {err}");
         std::fs::remove_file(&tmp).ok();
     }
 

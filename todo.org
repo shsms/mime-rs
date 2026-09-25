@@ -1394,8 +1394,9 @@ different set of matches than the listing did, so following the
 suggested ~scope~ can give the same ambiguity error again. Found by
 pr-prep on branch agent-ux-fixes (2026-09-25).
 
-** TODO undo_last after an explicit (revert-buffer) can leave saves refused [#C] :mcp:
+** DONE undo_last after an explicit (revert-buffer) can leave saves refused [#C] :mcp:
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-09-25 Fr 22:34]
 - State "TODO"       from              [2026-09-25 Fr 17:44]
 :END:
 
