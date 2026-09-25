@@ -2258,13 +2258,14 @@ fn ambiguity_errors_name_the_defun_of_each_match() {
     let file = dir.join("lib.rs");
     std::fs::write(
         &file,
-        "fn absorb() {\n    step();\n    step();\n}\n\nfn discard() {\n    step();\n}\n\nstatic S: u8 = 0; // step();\n",
+        "fn absorb() {\n    step();\n    step();\n}\n\nfn discard() {\n    step();\n}\n\nstatic S: u8 = 0; // step();\n\nfn twin() {\n    pair();\n    pair();\n}\n\nfn outer() {\n    nest();\n    fn inner() {\n        nest();\n    }\n}\n",
     )
     .unwrap();
     let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
     let p = file.to_string_lossy().into_owned();
 
     // Each match names its function; one outside any function is a bare line.
+    // `discard` holds one match, so `scope` can pick it.
     let err = s.call_err(
         1,
         "replace_text",
@@ -2274,8 +2275,9 @@ fn ambiguity_errors_name_the_defun_of_each_match() {
         err.contains("matches at lines 2 (absorb), 3 (absorb), 7 (discard), 10 —"),
         "got: {err}"
     );
+    assert!(err.contains("scope: {defun: \"discard\"}"), "got: {err}");
 
-    // A regex is listed the same way.
+    // A regex is listed and counted the same way.
     let err = s.call_err(
         2,
         "replace_text",
@@ -2286,6 +2288,7 @@ fn ambiguity_errors_name_the_defun_of_each_match() {
         err.contains("matches at lines 2 (absorb), 3 (absorb), 7 (discard), 10 —"),
         "got: {err}"
     );
+    assert!(err.contains("scope: {defun: \"discard\"}"), "got: {err}");
 
     // Anchors list the defuns too.
     let err = s.call_err(
@@ -2304,6 +2307,40 @@ fn ambiguity_errors_name_the_defun_of_each_match() {
             .count(),
         4
     );
+
+    // No function holds exactly one match: no scope can pick one.
+    let err = s.call_err(
+        4,
+        "replace_text",
+        json!({ "path": p, "pattern": "pair();", "replacement": "x();", "expect_unique": true }),
+    );
+    assert!(
+        err.contains("matches at lines 13 (twin), 14 (twin) —"),
+        "got: {err}"
+    );
+    assert!(!err.contains("scope: {defun"), "got: {err}");
+
+    // `outer` holds `inner`'s match too, so only `inner` picks one.
+    let err = s.call_err(
+        5,
+        "replace_text",
+        json!({ "path": p, "pattern": "nest();", "replacement": "x();", "expect_unique": true }),
+    );
+    assert!(
+        err.contains("matches at lines 18 (outer), 20 (inner) —"),
+        "got: {err}"
+    );
+    assert!(err.contains("scope: {defun: \"inner\"}"), "got: {err}");
+
+    // Already scoped (and still ambiguous): the hint would only repeat what the
+    // caller did.
+    let err = s.call_err(
+        6,
+        "replace_text",
+        json!({ "path": p, "pattern": "step();", "replacement": "x();",
+                "expect_unique": true, "scope": { "defun": "absorb" } }),
+    );
+    assert!(!err.contains("scope: {defun"), "got: {err}");
 }
 
 #[test]

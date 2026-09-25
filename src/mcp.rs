@@ -1987,11 +1987,12 @@ fn anchor_abort(
             stale_edit_note(sessions, session)
         )
     } else if e.contains("__ambiguous_anchor__") {
-        let lines = match_lines(sessions, session, &lisp_literal(pat), false);
+        let matches = match_lines(sessions, session, &lisp_literal(pat), false);
         format!(
-            "anchor: the pattern {:?} matches at lines {lines} — an anchor must \
+            "anchor: the pattern {:?} matches at lines {} — an anchor must \
              be unique; {not_done} (occur shows every match in context)",
-            truncate_for_error(pat)
+            truncate_for_error(pat),
+            matches.listing
         )
     } else {
         e
@@ -2142,12 +2143,18 @@ fn tool_replace_text(
             ));
         }
         Err(e) if unique && e.contains("__ambiguous__") => {
-            let lines = match_lines(sessions, &session, &pat, regex);
+            let matches = match_lines(sessions, &session, &pat, regex);
             return Err(format!(
-                "replace_text: pattern {:?} matches at lines {lines} — expect_unique \
+                "replace_text: pattern {:?} matches at lines {} — expect_unique \
                  requires exactly one; nothing was replaced. Refine the anchor \
-                 (occur shows every match in context).",
-                truncate_for_error(&pattern)
+                 (occur shows every match in context).{}",
+                truncate_for_error(&pattern),
+                matches.listing,
+                if scope.is_some() {
+                    String::new()
+                } else {
+                    scope_hint(sessions, &session, &pat, regex, &matches.defuns)
+                }
             ));
         }
         Err(e) if unique && e.contains("__miss__") => {
@@ -2349,11 +2356,12 @@ fn anchor_line(
             truncate_for_error(pat)
         )),
         Err(e) if e.contains("__ambiguous_anchor__") => {
-            let lines = match_lines(sessions, session, &lp, false);
+            let matches = match_lines(sessions, session, &lp, false);
             Err(format!(
-                "thing: the pattern {:?} matches at lines {lines} — an anchor must be unique \
+                "thing: the pattern {:?} matches at lines {} — an anchor must be unique \
                  (occur shows every match in context)",
-                truncate_for_error(pat)
+                truncate_for_error(pat),
+                matches.listing
             ))
         }
         Err(e) => Err(e),
@@ -2612,16 +2620,15 @@ fn each_match(pat: &str, regex: bool, body: &str) -> String {
     )
 }
 
-/// Where every occurrence of the (already lisp-escaped) pattern `pat` is, as
-/// "12 (absorb), 40 (discard), 73" clamped to the first eight: its line and
-/// the defun holding it — the detail an ambiguity error needs to be
+/// Where every occurrence of the (already lisp-escaped) pattern `pat` is: its
+/// line and the defun holding it — the detail an ambiguity error needs to be
 /// actionable. Point is preserved.
 fn match_lines(
     sessions: &mut HashMap<String, Workspace>,
     session: &str,
     pat: &str,
     regex: bool,
-) -> String {
+) -> MatchLines {
     let program = format!(
         "(save-excursion (goto-char (point-min)) {})",
         each_match(
@@ -2656,11 +2663,57 @@ fn match_lines(
             None => line.clone(),
         })
         .collect();
-    if matches.len() > 8 {
+    let listing = if matches.len() > 8 {
         format!("{} … ({} total)", shown.join(", "), matches.len())
     } else {
         shown.join(", ")
+    };
+    let mut defuns: Vec<String> = Vec::new();
+    for name in matches.into_iter().filter_map(|(_, defun)| defun) {
+        if !defuns.contains(&name) {
+            defuns.push(name);
+        }
     }
+    MatchLines { listing, defuns }
+}
+
+/// Where the matches of an ambiguous pattern are: the listing an ambiguity
+/// error prints, and the names of the defuns holding them.
+struct MatchLines {
+    /// "12 (absorb), 40 (discard), 73", clamped to the first eight.
+    listing: String,
+    /// Each name once, in the order of the matches.
+    defuns: Vec<String>,
+}
+
+/// The `scope` retry that picks exactly one match of the (already
+/// lisp-escaped) pattern `pat`: the first of `defuns` (up to eight are tried)
+/// whose `scope` narrowing holds one match. Empty when none does. Each
+/// candidate is counted through the same narrowing `scope` uses, so a nested
+/// or same-named defun cannot make the hint point at a wrong one.
+fn scope_hint(
+    sessions: &mut HashMap<String, Workspace>,
+    session: &str,
+    pat: &str,
+    regex: bool,
+    defuns: &[String],
+) -> String {
+    let count = each_match(pat, regex, "(setq n (1+ n))");
+    for name in defuns.iter().take(8) {
+        let program = format!(
+            "(save-excursion (save-restriction \
+               (when (treesit-goto-defun \"{}\")\
+                 (treesit-narrow-to-defun) (goto-char (point-min))\
+                 (let ((n 0)) {count} (report \"n\" n)))))",
+            lisp_escape(name)
+        );
+        let one = run_in_session(sessions, session, &program)
+            .is_ok_and(|r| r.reports.iter().any(|(k, v)| k == "n" && v == "1"));
+        if one {
+            return format!(" scope: {{defun: {name:?}}} limits the edit to the one match there.");
+        }
+    }
+    String::new()
 }
 
 /// The `edits: [{pattern, replacement, all?}, …]` form of `replace_text`:
