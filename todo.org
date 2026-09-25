@@ -15,7 +15,11 @@ engine must see every byte to say "no"); and global-replace a multi-GB
 file across cores.
 /Exit: global-replace a multi-GB file across cores./
 
-** TODO Paged reader holds an open fd per buffer [#C]
+** DONE Paged reader holds an open fd per buffer [#C]
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-09-25 Fr 11:13]
+:END:
+
 DECIDED (2026-06): a drifted paged buffer must NOT re-open the path
 mid-life — swapping inodes under a live piece tree mixes old and new
 bytes, and the old inode IS the correctness anchor for a modified
@@ -25,6 +29,11 @@ cap (clean-LRU eviction) bounds held fds, and ~close_session~ releases
 deliberately — together these also bound the ~.nfsXXXX~ silly-rename
 lingering on NFS (now gitignored). Remaining idea, if fd pressure ever
 shows up in practice: a re-open-on-demand mode for CLEAN buffers only.
+
+DONE (2026-09-25): files under IN_MEMORY_LIMIT (16 MiB) no longer hold an
+fd — they are read whole into memory at open and at the post-save
+rebase, with the handle closed at once. Larger files still keep the
+paged reader, which holds the handle.
 
 ** TODO Dogfooding friction: MCP "insert relative to a defun/node" [#C]
 

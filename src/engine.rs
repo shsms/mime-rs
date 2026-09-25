@@ -1003,15 +1003,16 @@ mod tests {
             r#"(goto-char (point-min)) (search-forward "line 0700" nil t) (insert " INSERTED-THREE ")"#,
         ];
 
-        // Quire opened from a real file → mmap-backed original (the open_file
-        // path the MCP server uses), which from_string-based tests don't
-        // exercise.
+        // Quire opened from a real file → paged file-backed original (the
+        // open_file path the MCP server uses), which from_string-based tests
+        // don't exercise.
         let path =
             std::env::temp_dir().join(format!("mime-warm-regression-{}.txt", std::process::id()));
         std::fs::write(&path, &text).unwrap();
 
         let mut oracle = Workspace::new(Box::new(Buffer::from_string("t", &text)));
-        let mut quire = Workspace::new(Box::new(Quire::open(&path).unwrap()));
+        // Limit 0: the paged file-backed store, not the in-memory one.
+        let mut quire = Workspace::new(Box::new(Quire::open_with_limit(&path, 0).unwrap()));
         for p in progs {
             oracle.run(p).unwrap();
             quire.run(p).unwrap();
@@ -1216,6 +1217,37 @@ mod tests {
             b"\xEF\xBB\xBFone\r\ntwo\r\nNEW\r\nthree\r\nend\r\n"
         );
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn stale_guard_and_auto_revert_work_for_both_storage_kinds() {
+        // Drift detection comes from the file stamp, not the handle: an
+        // in-memory store and a paged one must both report stale, auto-revert
+        // when clean, and refuse to save over an external write when dirty.
+        for (kind, limit) in [("memory", crate::quire::IN_MEMORY_LIMIT), ("paged", 0)] {
+            let tmp =
+                std::env::temp_dir().join(format!("mime-stale-{kind}-{}.txt", std::process::id()));
+            std::fs::write(&tmp, "v1\n").unwrap();
+            let mut ws = Workspace::new(Box::new(Quire::open_with_limit(&tmp, limit).unwrap()));
+            assert!(!ws.is_stale(), "{kind}: clean right after open");
+
+            crate::safety::write_atomic(&tmp, b"v2 external\n").unwrap();
+            assert!(ws.is_stale(), "{kind}: an external write is seen");
+            assert!(ws.auto_revert_if_clean(), "{kind}: a clean buffer reverts");
+            assert_eq!(ws.text(), "v2 external\n");
+            assert!(!ws.is_stale(), "{kind}: fresh after the revert");
+
+            ws.run(r#"(goto-char (point-max)) (insert "ours\n")"#)
+                .unwrap();
+            crate::safety::write_atomic(&tmp, b"v3 external\n").unwrap();
+            assert!(
+                !ws.auto_revert_if_clean(),
+                "{kind}: a dirty buffer is left alone"
+            );
+            let err = ws.save_to(&tmp).unwrap_err().to_string();
+            assert!(err.contains("refusing to save"), "{kind}: {err}");
+            std::fs::remove_file(&tmp).ok();
+        }
     }
 
     #[test]
@@ -2316,7 +2348,8 @@ mod tests {
         std::fs::write(&path, "alpha\nbeta — gamma\n").unwrap();
         let mut oracle =
             Workspace::new(Box::new(Buffer::from_string("t", "alpha\nbeta — gamma\n")));
-        let mut quire = Workspace::new(Box::new(Quire::open(&path).unwrap()));
+        // Limit 0: the paged file-backed store, not the in-memory one.
+        let mut quire = Workspace::new(Box::new(Quire::open_with_limit(&path, 0).unwrap()));
         for prog in [
             r#"(report "hit" (if (search-forward "beta" nil t) 1 0))"#,
             r#"(goto-char (point-min)) (search-forward "alpha" nil t) (insert "!")"#,
@@ -2378,7 +2411,8 @@ mod tests {
         let text = "alpha — beta\ngamma alpha délta\nalpha end\n";
         std::fs::write(&path, text).unwrap();
         let mut oracle = Workspace::new(Box::new(Buffer::from_string("t", text)));
-        let mut quire = Workspace::new(Box::new(Quire::open(&path).unwrap()));
+        // Limit 0: the paged file-backed store, not the in-memory one.
+        let mut quire = Workspace::new(Box::new(Quire::open_with_limit(&path, 0).unwrap()));
         let prog = r#"(end-of-buffer)
                       (report "p1" (re-search-backward "alpha"))
                       (report "p2" (re-search-backward "alpha" nil t))
@@ -2483,7 +2517,8 @@ mod tests {
         let text = "one\ntwo\nthree\n";
         std::fs::write(&path, text).unwrap();
         let mut oracle = Workspace::new(Box::new(Buffer::from_string("t", text)));
-        let mut quire = Workspace::new(Box::new(Quire::open(&path).unwrap()));
+        // Limit 0: the paged file-backed store, not the in-memory one.
+        let mut quire = Workspace::new(Box::new(Quire::open_with_limit(&path, 0).unwrap()));
         let prog = r#"(goto-char 9) ; on "three"
             (report "full" (forward-line -2))   ; lands on line 1 → complete
             (report "stuck" (forward-line -1))  ; already at the start → short

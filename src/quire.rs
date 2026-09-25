@@ -140,16 +140,19 @@ thread_local! {
 /// so a long hop back costs bounded memory rather than the piece prefix.
 const BACK_WINDOW: usize = 8 * 1024;
 
-/// The immutable original: either owned text (`from_string`) or a file read on
-/// demand a page at a time (`open`). Read uniformly through
-/// [`Original::for_bytes`] — never one contiguous `&[u8]` over the whole thing
-/// — so the file backing need not be fully resident. Shared via [`Rc`] so every
-/// snapshot shares it.
+/// The immutable original: held in memory (`from_string` text, or a file under
+/// [`IN_MEMORY_LIMIT`]) or a larger file read on demand a page at a time
+/// (`open`). Read uniformly through [`Original::for_bytes`] — never one
+/// contiguous `&[u8]` over the whole thing — so the file backing need not be
+/// fully resident. Shared via [`Rc`] so every snapshot shares it.
 enum Original {
-    /// `from_string` — owns its "original" text (no file). Needed for tests and
-    /// scratch buffers without a path.
+    /// The whole original held in memory: `from_string` text (no file), or a
+    /// file under [`IN_MEMORY_LIMIT`] read at open with its RAW bytes — a BOM
+    /// and `\r\n` kept, exactly as a paged file keeps them — and its handle
+    /// already closed.
     Owned(String),
-    /// `open` — the file, read on demand into a bounded page cache.
+    /// `open` of a file at or over [`IN_MEMORY_LIMIT`] — read on demand into a
+    /// bounded page cache; holds the file handle.
     Paged(PagedFile),
 }
 
@@ -194,13 +197,91 @@ impl Original {
     }
 
     /// Whether a paged file has been observed drifted on a fresh read since
-    /// open (always `false` for owned text — it has no file to drift).
+    /// open (always `false` for an owned original — its bytes were all read at
+    /// open, so no later read touches the file).
     fn drifted(&self) -> bool {
         match self {
             Original::Owned(_) => false,
             Original::Paged(p) => p.drifted(),
         }
     }
+
+    /// Stream the RAW bytes from the start, outside any cache: an owned
+    /// original yields itself in one slice, a paged one reads through
+    /// [`PagedFile::stream`]. `f` returns `false` to stop early.
+    fn scan_raw(&self, f: &mut dyn FnMut(&[u8]) -> bool) {
+        match self {
+            Original::Owned(s) => {
+                f(s.as_bytes());
+            }
+            Original::Paged(p) => p.stream(f),
+        }
+    }
+
+    /// Detect the BOM and DOS/Unix line ending by scanning to the first `\n`
+    /// (DOS iff it is preceded by `\r`). Uncapped: a huge first line is still
+    /// classified correctly, and a newline-free file reads through (Unix).
+    /// CR-only (classic-Mac) files have no `\n`, so they are Unix and kept
+    /// byte-exact.
+    fn detect_coding(&self) -> crate::coding::FileCoding {
+        use crate::coding::{Eol, FileCoding};
+        let mut head: Vec<u8> = Vec::with_capacity(3);
+        let mut prev = 0u8;
+        let mut eol = Eol::Unix;
+        self.scan_raw(&mut |chunk| {
+            for &b in chunk {
+                if head.len() < 3 {
+                    head.push(b);
+                }
+                if b == b'\n' {
+                    if prev == b'\r' {
+                        eol = Eol::Dos;
+                    }
+                    return false;
+                }
+                prev = b;
+            }
+            true
+        });
+        FileCoding::new(head.starts_with(&crate::coding::BOM), eol)
+    }
+
+    /// LOGICAL char/line counts for the normalized view: a leading BOM and the
+    /// `\r` of each `\r\n` count as neither char nor (for the `\r`) line. One
+    /// streaming pass; a paged original never materializes.
+    fn count_view(&self, had_bom: bool, dos: bool) -> (usize, usize) {
+        let (mut chars, mut lines) = (0usize, 0usize);
+        let mut prev: Option<u8> = None; // carried across chunks
+        let mut off = 0usize;
+        self.scan_raw(&mut |chunk| {
+            for (k, &b) in chunk.iter().enumerate() {
+                let is_bom = had_bom && off + k < 3;
+                chars += usize::from(starts_char(b, prev, dos) && !is_bom);
+                lines += usize::from(b == b'\n');
+                prev = Some(b);
+            }
+            off += chunk.len();
+            true
+        });
+        (chars, lines)
+    }
+}
+
+/// Read all of `file` into memory, `len` (its size at the stat) sizing the
+/// buffer, and close the handle: an in-memory original pins no inode. The bytes
+/// are returned as read, so their length differs from `len` when the file
+/// changed after the stat. A file that yields more than `limit` bytes (one that
+/// grew, or a `/proc` file that reports size 0) is an error.
+fn read_whole(file: std::fs::File, len: usize, limit: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::with_capacity(len);
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(std::io::Error::other(format!(
+            "the file yields more than {limit} bytes, the most read into memory"
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Bytes per page the on-demand reader fetches and caches.
@@ -209,6 +290,13 @@ const PAGE: usize = 64 * 1024;
 /// eviction past it), bounding a paged Quire's read footprint regardless of
 /// file size. 256 × 64 KiB = 16 MiB.
 const CACHE_PAGES: usize = 256;
+
+/// Files smaller than this are read whole into memory at open (and at the
+/// post-save rebase), and their handle is closed at once. A file that stays
+/// open pins its inode: when git or a formatter replaces it on an NFS mount,
+/// the old inode lingers as a `.nfs*` file until the handle closes. Larger
+/// files keep the paged reader, which holds the handle, to bound memory.
+pub(crate) const IN_MEMORY_LIMIT: usize = 16 * 1024 * 1024;
 
 /// Initial chars materialized by an adaptively-windowed regex
 /// search/`looking_at` before it grows toward the bound. A hit within this
@@ -351,60 +439,20 @@ impl PagedFile {
         filled
     }
 
-    /// Detect the BOM and DOS/Unix line ending by scanning to the first `\n`
-    /// (DOS iff it is preceded by `\r`). Uncapped: a file whose first line is
-    /// huge is still classified correctly, and a newline-free file simply reads
-    /// through (Unix). Reads in modest chunks, so for real text (first `\n`
-    /// early) only the leading bytes are touched. CR-only (classic-Mac) files
-    /// have no `\n`, so they are Unix and kept byte-exact.
-    fn detect_coding(&self) -> crate::coding::FileCoding {
-        use crate::coding::{Eol, FileCoding};
-        const CHUNK: usize = 8 * 1024;
-        let mut head = [0u8; 3];
-        let n0 = self.read_into(&mut head, 0);
-        let had_bom = head[..n0].starts_with(&crate::coding::BOM);
-        let mut prev = 0u8;
-        let mut off = 0usize;
-        let mut buf = vec![0u8; CHUNK];
-        while off < self.len {
-            let n = self.read_into(&mut buf[..CHUNK.min(self.len - off)], off);
-            if n == 0 {
-                break;
-            }
-            for &b in &buf[..n] {
-                if b == b'\n' {
-                    let eol = if prev == b'\r' { Eol::Dos } else { Eol::Unix };
-                    return FileCoding::new(had_bom, eol);
-                }
-                prev = b;
-            }
-            off += n;
-        }
-        FileCoding::new(had_bom, Eol::Unix) // no `\n` anywhere
-    }
-
-    /// LOGICAL char/line counts for the normalized view: a leading BOM and the
-    /// `\r` of each `\r\n` count as neither char nor (for the `\r`) line. One
-    /// streaming pass; bounded RAM (the view never materializes the file).
-    fn count_view(&self, had_bom: bool, dos: bool) -> (usize, usize) {
-        let (mut chars, mut lines) = (0usize, 0usize);
-        let mut prev: Option<u8> = None; // carried across page reads
-        let mut off = 0usize;
+    /// Stream the whole file through `f` in [`PAGE`]-sized chunks with
+    /// `read_at`, bypassing the page cache (so it neither fills the cache nor
+    /// stats for drift — the open-time scans must leave both untouched); `f`
+    /// returns `false` to stop early.
+    fn stream(&self, f: &mut dyn FnMut(&[u8]) -> bool) {
         let mut buf = vec![0u8; PAGE];
+        let mut off = 0usize;
         while off < self.len {
             let n = self.read_into(&mut buf[..PAGE.min(self.len - off)], off);
-            if n == 0 {
+            if n == 0 || !f(&buf[..n]) {
                 break;
-            }
-            for (k, &b) in buf[..n].iter().enumerate() {
-                let is_bom = had_bom && off + k < 3;
-                chars += usize::from(starts_char(b, prev, dos) && !is_bom);
-                lines += usize::from(b == b'\n');
-                prev = Some(b);
             }
             off += n;
         }
-        (chars, lines)
     }
 
     /// The page at index `pno`, reading + caching it on a miss. The page is the
@@ -964,46 +1012,87 @@ pub struct Quire {
 }
 
 impl Quire {
-    /// Open `path` as the immutable original, read on demand a page at a time
-    /// (no mmap — so external truncation can't SIGBUS and an in-place rewrite
-    /// can't alias an in-flight read). Rejects non-UTF-8 input via a streaming
-    /// scan (an explicit byte mode can come later, per the plan).
+    /// Build the Original for a just-opened file of `len` bytes: under
+    /// `in_memory_limit` it is read whole and `file` is dropped (closing the
+    /// handle) before returning; otherwise it becomes a paged original that
+    /// keeps `file`. Also returns the RAW char/line counts from the one
+    /// validating pass. `Err(InvalidData)` for non-UTF-8 content.
+    fn load_original(
+        file: std::fs::File,
+        len: usize,
+        stamp: &crate::safety::FileStamp,
+        in_memory_limit: usize,
+    ) -> std::io::Result<(Original, (usize, usize))> {
+        let not_utf8 =
+            || std::io::Error::new(std::io::ErrorKind::InvalidData, "file is not valid UTF-8");
+        if len < in_memory_limit {
+            let bytes = read_whole(file, len, in_memory_limit)?;
+            let text = String::from_utf8(bytes).map_err(|_| not_utf8())?;
+            let original = Original::Owned(text);
+            let counts = original.count_chars_lines();
+            Ok((original, counts))
+        } else {
+            let paged = PagedFile::open(file, len, stamp.clone());
+            // One fused pass: UTF-8 validation AND the char/line index.
+            let counts = paged.validate_and_count().ok_or_else(not_utf8)?;
+            Ok((Original::Paged(paged), counts))
+        }
+    }
+
+    /// Open `path` as the immutable original. A file under 16 MiB is read whole
+    /// into memory and its handle closed; one of 16 MiB or more is read on
+    /// demand a page at a time (no mmap — so external truncation can't SIGBUS
+    /// and an in-place rewrite can't alias an in-flight read). Rejects
+    /// non-UTF-8 input.
     pub fn open(path: &Path) -> std::io::Result<Quire> {
+        Quire::open_with_limit(path, IN_MEMORY_LIMIT)
+    }
+
+    /// [`open`](Self::open) with the in-memory limit given: a regular file of
+    /// `len < in_memory_limit` bytes is held in memory, anything else pages (so
+    /// 0 always pages — the tests' way to reach the paged reader with a small
+    /// file). Anything but a regular file (a device, a FIFO) always pages: it
+    /// may report size 0 and never end. A directory is an error.
+    pub(crate) fn open_with_limit(path: &Path, in_memory_limit: usize) -> std::io::Result<Quire> {
         let file = std::fs::File::open(path)?;
-        let len = file.metadata()?.len() as usize;
+        let meta = file.metadata()?;
+        if meta.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                format!("Quire::open: {} is a directory", path.display()),
+            ));
+        }
+        let len = meta.len() as usize;
+        let in_memory_limit = if meta.is_file() { in_memory_limit } else { 0 };
         // Stamp the visited file so save paths (and the pager's fresh-read
         // drift check) can detect an external writer. Captured right after the
         // open; the open→stat window is tiny and a writer landing inside it
         // still differs from the *saved* stamp later.
         let stamp = crate::safety::FileStamp::capture(path)?;
-        let paged = PagedFile::open(file, len, stamp.clone());
-        // One fused pass: UTF-8 validation AND the char/line index (the two
-        // used to be separate whole-file scans — the dominant open cost).
-        let Some(raw_counts) = paged.validate_and_count() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Quire::open: file is not valid UTF-8",
-            ));
-        };
-        let name = Quire::buffer_name_of(path);
-        // A non-plain file keeps its raw BOM/CRLF bytes on the paged backing
-        // (no materialization, so large-file support is preserved); the
-        // char/byte scan primitives present a normalized LF view
-        // (`strips_crlf`) and the BOM is excluded from the piece below, so the
-        // tree's piece summaries must be the LOGICAL counts, not the raw ones.
-        let coding = paged.detect_coding();
+        let (original, raw_counts) = Quire::load_original(file, len, &stamp, in_memory_limit)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("Quire::open: {e}")))?;
+        // A non-plain file keeps its raw BOM/CRLF bytes in the original (held
+        // or paged alike); the char/byte scan primitives present a normalized
+        // LF view (`strips_crlf`) and the BOM is excluded from the piece below,
+        // so the tree's piece summaries must be the LOGICAL counts, not the raw
+        // ones.
+        let coding = original.detect_coding();
         let counts = if coding.is_plain() {
             raw_counts
         } else {
-            paged.count_view(coding.had_bom, coding.eol == crate::coding::Eol::Dos)
+            original.count_view(coding.had_bom, coding.eol == crate::coding::Eol::Dos)
         };
         // The BOM bytes are NOT part of any piece: the Original starts 3 bytes
         // in, and `write_to` re-emits the BOM. This keeps the signature robust
         // against inserts/deletes at the buffer start (it can't be relocated or
         // pruned).
         let start = if coding.had_bom { 3 } else { 0 };
-        let mut quire =
-            Quire::with_original_counted(name, Original::Paged(paged), Some(counts), start);
+        let mut quire = Quire::with_original_counted(
+            Quire::buffer_name_of(path),
+            original,
+            Some(counts),
+            start,
+        );
         quire.stamp = Some(stamp);
         quire.coding = coding;
         quire.view_coding = coding;
@@ -1101,13 +1190,24 @@ impl Quire {
     }
 
     /// Re-base onto `path` after the buffer was just saved there: re-open the
-    /// new file as a single paged `Original` piece and drop the pre-save
-    /// backing (the old, now-unlinked inode + its page cache) plus the add
-    /// buffer.  Point/mark/narrowing/markers are kept. The saved file is
-    /// byte-identical to the current content, so the char/line totals are
-    /// reused from the live summary — no re-scan, no UTF-8 re-validation. O(1)
-    /// + open.
+    /// new file as a single `Original` piece — in memory under 16 MiB, else
+    /// paged — and drop the pre-save backing (the old, now-unlinked inode + its
+    /// page cache) plus the add buffer.  Point/mark/narrowing/markers are kept.
+    /// The saved file is byte-identical to the current content, so the
+    /// char/line totals are reused from the live summary — no re-scan, no UTF-8
+    /// re-validation. O(1) + open.
     pub fn rebase_to(&mut self, path: &Path) -> std::io::Result<()> {
+        self.rebase_to_with_limit(path, IN_MEMORY_LIMIT)
+    }
+
+    /// [`rebase_to`](Self::rebase_to) with the in-memory limit given (see
+    /// [`open_with_limit`](Self::open_with_limit)); the kind follows the SAVED
+    /// file's size.
+    pub(crate) fn rebase_to_with_limit(
+        &mut self,
+        path: &Path,
+        in_memory_limit: usize,
+    ) -> std::io::Result<()> {
         let stamp = crate::safety::FileStamp::capture(path)?;
         let file = std::fs::File::open(path)?;
         let bytes_len = file.metadata()?.len() as usize;
@@ -1123,16 +1223,32 @@ impl Quire {
                 || bytes_len == self.total_bytes(),
             "rebase: a fully-plain saved file's size must equal the content"
         );
+        let original = if bytes_len < in_memory_limit {
+            let bytes = read_whole(file, bytes_len, in_memory_limit)?;
+            // The summary below is reused, not recounted: a file that changed
+            // between the stat and the read would not match it. Refuse; the
+            // caller keeps the pre-save backing and an unrefreshed stamp.
+            if bytes.len() != bytes_len {
+                return Err(std::io::Error::other(
+                    "rebase: the saved file changed while it was re-read",
+                ));
+            }
+            let text = String::from_utf8(bytes).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "rebase: the saved file is not valid UTF-8",
+                )
+            })?;
+            Original::Owned(text)
+        } else {
+            Original::Paged(PagedFile::open(file, bytes_len, stamp.clone()))
+        };
         let summary = self.root.summary();
         // The saved file is now in the TARGET coding; its BOM (if any) precedes
         // the Original piece, which therefore starts at byte 3.
         let bom_off = if self.coding.had_bom { 3 } else { 0 };
         let root = single_original_root(bom_off, bytes_len - bom_off, summary.chars, summary.lines);
-        self.original = Rc::new(Original::Paged(PagedFile::open(
-            file,
-            bytes_len,
-            stamp.clone(),
-        )));
+        self.original = Rc::new(original);
         self.add = Arc::new(Vec::new());
         self.root = root;
         self.stamp = Some(stamp);
@@ -1222,10 +1338,10 @@ impl Quire {
     /// `true` when reads of `source` strip CRLF → LF for the normalized view.
     /// The BOM is NOT handled here: its bytes are excluded from every piece's
     /// range at open (the Original starts after them) and re-emitted on save,
-    /// so it survives edits at the buffer start. Only the paged Original of a
-    /// DOS file is stripped; the add buffer (inserted text) is always plain LF.
-    /// `write_to` bypasses this and emits raw Original bytes, so untouched
-    /// regions save byte-exact.
+    /// so it survives edits at the buffer start. Only the Original of a DOS
+    /// file (owned or paged, both hold the raw bytes) is stripped; the add
+    /// buffer (inserted text) is always plain LF.  `write_to` bypasses this and
+    /// emits raw Original bytes, so untouched regions save byte-exact.
     fn strips_crlf(&self, source: Source) -> bool {
         source == Source::Original && self.view_coding.eol == crate::coding::Eol::Dos
     }
@@ -2752,6 +2868,12 @@ mod tests {
     use super::*;
     use crate::buffer::Buffer;
 
+    /// Open through the paged reader whatever the file's size — the path these
+    /// tests were written for (limit 0 never holds a file in memory).
+    fn open_paged(path: &std::path::Path) -> std::io::Result<Quire> {
+        Quire::open_with_limit(path, 0)
+    }
+
     // ---- focused unit tests (mirror buffer.rs so failures localize) ----
 
     #[test]
@@ -3110,7 +3232,7 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("quire_open_test_{}.txt", std::process::id()));
         std::fs::write(&path, "line one\nline two\nαβγ\n").unwrap();
-        let mut q = Quire::open(&path).unwrap();
+        let mut q = open_paged(&path).unwrap();
         assert_eq!(TextStore::text(&q), "line one\nline two\nαβγ\n");
         let pmax = TextStore::point_max(&q);
         assert_eq!(TextStore::line_number_at_pos(&q, pmax), 4);
@@ -3190,7 +3312,7 @@ mod tests {
         text.push('é');
         text.push_str("tail\n");
         std::fs::write(&path, &text).unwrap();
-        let q = Quire::open(&path).unwrap();
+        let q = open_paged(&path).unwrap();
         assert_eq!(Quire::char_len(&q), text.chars().count());
         assert_eq!(TextStore::char_after(&q, PAGE), Some('é'));
         assert_eq!(
@@ -3206,7 +3328,7 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("quire_bad_utf8_{}.bin", std::process::id()));
         std::fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
-        match Quire::open(&path) {
+        match open_paged(&path) {
             Ok(_) => panic!("expected non-UTF-8 file to be rejected"),
             Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
         }
@@ -3228,10 +3350,242 @@ mod tests {
         bytes.extend_from_slice(&"€".as_bytes()[..2]); // drop the final byte
         std::fs::write(&path, &bytes).unwrap();
         assert!(
-            Quire::open(&path).is_err(),
+            open_paged(&path).is_err(),
             "truncated trailing char must fail"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Whether this process holds a file descriptor on `path` — the Linux view
+    /// of "the handle is still open" (each `/proc/self/fd` entry is a link to
+    /// what the fd refers to).
+    #[cfg(target_os = "linux")]
+    fn fd_open_on(path: &std::path::Path) -> bool {
+        let want = path.canonicalize().unwrap();
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|e| std::fs::read_link(e.path()).ok())
+            .any(|target| target == want)
+    }
+
+    fn is_in_memory(q: &Quire) -> bool {
+        matches!(q.original.as_ref(), Original::Owned(_))
+    }
+
+    #[test]
+    fn read_whole_refuses_a_file_that_yields_more_than_the_limit() {
+        let path = tmp_path("read-whole-limit");
+        std::fs::write(&path, "0123456789").unwrap();
+        let open = || std::fs::File::open(&path).unwrap();
+        assert_eq!(read_whole(open(), 0, 10).unwrap(), b"0123456789");
+        assert!(read_whole(open(), 0, 9).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_device_pages_and_a_proc_file_reads_whole() {
+        // /dev/zero reports size 0 and never ends: it pages, as an empty
+        // buffer.
+        let zero = Quire::open(Path::new("/dev/zero")).unwrap();
+        assert!(!is_in_memory(&zero));
+        assert_eq!(zero.text(), "");
+        // A /proc file also reports size 0 but is regular: it is read whole.
+        let status = Quire::open(Path::new("/proc/self/status")).unwrap();
+        assert!(is_in_memory(&status));
+        assert!(status.text().contains("Name:"));
+        // A directory is no text file at all.
+        let e = Quire::open(Path::new("/tmp")).err().map(|e| e.kind());
+        assert_eq!(e, Some(std::io::ErrorKind::IsADirectory));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn small_file_is_held_in_memory_with_no_handle_before_or_after_a_save() {
+        let path = tmp_path("in-memory-fd");
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+        let mut q = Quire::open(&path).unwrap();
+        assert!(is_in_memory(&q), "a small file opens in memory");
+        assert!(!fd_open_on(&path), "open must not keep the file handle");
+
+        q.goto_char(q.char_len() + 1);
+        q.insert("gamma\n");
+        crate::safety::write_atomic(&path, q.full_text().as_bytes()).unwrap();
+        q.rebase_to(&path).unwrap();
+        assert!(is_in_memory(&q), "the post-save rebase stays in memory");
+        assert!(!fd_open_on(&path), "the rebase must not reopen a handle");
+        assert_eq!(q.full_text(), "alpha\nbeta\ngamma\n");
+        assert_eq!(q.stamp.as_ref().unwrap().check(), None, "rebase re-stamps");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_follows_the_limit_exactly() {
+        // The limit is exclusive: under it → memory, at it → paged (and the
+        // paged store really does hold a handle, so the fd check above means
+        // something).
+        let path = tmp_path("at-limit");
+        std::fs::write(&path, "x".repeat(100)).unwrap();
+        let under = Quire::open_with_limit(&path, 101).unwrap();
+        assert!(is_in_memory(&under));
+        let at = Quire::open_with_limit(&path, 100).unwrap();
+        assert!(!is_in_memory(&at), "a file of exactly the limit pages");
+        assert!(fd_open_on(&path), "the paged store holds its handle");
+        drop(at);
+        assert!(!fd_open_on(&path));
+        assert_eq!(TextStore::text(&under), "x".repeat(100));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rebase_follows_the_limit_both_ways() {
+        // The kind after a save is chosen by the SAVED size: a paged store
+        // whose file shrank under the limit goes in memory, and an in-memory
+        // one whose file grew past it pages.
+        let path = tmp_path("rebase-limit");
+        std::fs::write(&path, "x".repeat(50)).unwrap();
+        let mut q = Quire::open_with_limit(&path, 10).unwrap();
+        assert!(!is_in_memory(&q));
+        q.delete_region(1, q.char_len() + 1);
+        q.insert("short");
+        std::fs::write(&path, q.full_text()).unwrap();
+        q.rebase_to_with_limit(&path, 10).unwrap();
+        assert!(is_in_memory(&q), "shrunk under the limit → memory");
+
+        q.insert(&"y".repeat(20));
+        std::fs::write(&path, q.full_text()).unwrap();
+        q.rebase_to_with_limit(&path, 10).unwrap();
+        assert!(!is_in_memory(&q), "grown past the limit → paged");
+        assert_eq!(q.full_text(), format!("short{}", "y".repeat(20)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn in_memory_open_rejects_non_utf8() {
+        let bad = tmp_path("mem-bad-utf8");
+        std::fs::write(&bad, [0xff, 0xfe, 0x00]).unwrap();
+        let err = Quire::open(&bad).err().expect("non-UTF-8 must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let trunc = tmp_path("mem-trunc-char");
+        let mut bytes = b"ok\n".to_vec();
+        bytes.extend_from_slice(&"€".as_bytes()[..2]);
+        std::fs::write(&trunc, &bytes).unwrap();
+        assert!(
+            Quire::open(&trunc).is_err(),
+            "truncated trailing char must fail"
+        );
+        let _ = std::fs::remove_file(&bad);
+        let _ = std::fs::remove_file(&trunc);
+    }
+
+    #[test]
+    fn coding_detection_agrees_across_storage_kinds() {
+        // BOM/EOL detection, the logical counts, the LF view and the byte-exact
+        // save must be identical whether the original is held in memory or
+        // paged — including the edge shapes: empty, BOM only, `\n` right after
+        // the BOM, CRLF, lone CR, LF.
+        use crate::coding::{BOM, Eol, FileCoding};
+        let with_bom = |s: &[u8]| {
+            let mut v = BOM.to_vec();
+            v.extend_from_slice(s);
+            v
+        };
+        let cases: Vec<(&str, Vec<u8>, FileCoding, &str)> = vec![
+            ("empty", Vec::new(), FileCoding::new(false, Eol::Unix), ""),
+            (
+                "bom-only",
+                with_bom(b""),
+                FileCoding::new(true, Eol::Unix),
+                "",
+            ),
+            (
+                "bom-nl",
+                with_bom(b"\na\n"),
+                FileCoding::new(true, Eol::Unix),
+                "\na\n",
+            ),
+            (
+                "lf",
+                b"a\nb\n".to_vec(),
+                FileCoding::new(false, Eol::Unix),
+                "a\nb\n",
+            ),
+            (
+                "crlf",
+                b"a\r\nb\r\n".to_vec(),
+                FileCoding::new(false, Eol::Dos),
+                "a\nb\n",
+            ),
+            (
+                "bom-crlf",
+                with_bom("é\r\nb\r\n".as_bytes()),
+                FileCoding::new(true, Eol::Dos),
+                "é\nb\n",
+            ),
+            (
+                "lone-cr",
+                b"a\rb".to_vec(),
+                FileCoding::new(false, Eol::Unix),
+                "a\rb",
+            ),
+        ];
+        for (label, bytes, coding, view) in cases {
+            let path = tmp_path(&format!("coding-{label}"));
+            std::fs::write(&path, &bytes).unwrap();
+            for (kind, q) in [
+                ("memory", Quire::open(&path).unwrap()),
+                ("paged", open_paged(&path).unwrap()),
+            ] {
+                assert_eq!(q.view_coding, coding, "{label}/{kind}: detected coding");
+                assert_eq!(TextStore::text(&q), view, "{label}/{kind}: LF view");
+                assert_eq!(
+                    TextStore::char_len(&q),
+                    view.chars().count(),
+                    "{label}/{kind}: logical char count"
+                );
+                let mut out = Vec::new();
+                TextStore::write_to(&q, &mut out).unwrap();
+                assert_eq!(out, bytes, "{label}/{kind}: byte-exact save");
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn differential_with_held_snapshots_in_memory() {
+        // The random-op stress of `differential_with_held_snapshots_paged`,
+        // over a file held in memory.
+        let path = tmp_path("snap-mem");
+        std::fs::write(&path, SNAP_INITIAL).unwrap();
+        for seed in SNAP_SEEDS {
+            let q = Quire::open(&path).unwrap();
+            assert!(is_in_memory(&q));
+            run_diff_snap(seed, 4000, SNAP_INITIAL, q);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn differential_crlf_view_in_memory() {
+        // `differential_crlf_view_paged`, with the CRLF / BOM+CRLF file held in
+        // memory: the stripped view must stay in lockstep with an LF oracle
+        // through every edit, read, search and snapshot.
+        let crlf = SNAP_INITIAL.replace('\n', "\r\n");
+        let mut bom_crlf = crate::coding::BOM.to_vec();
+        bom_crlf.extend_from_slice(crlf.as_bytes());
+        for (label, bytes) in [("crlf", crlf.into_bytes()), ("bom-crlf", bom_crlf)] {
+            let path = tmp_path(&format!("crlf-mem-{label}"));
+            std::fs::write(&path, &bytes).unwrap();
+            for seed in SNAP_SEEDS {
+                let q = Quire::open(&path).unwrap();
+                assert!(is_in_memory(&q));
+                run_diff_snap(seed, 4000, SNAP_INITIAL, q);
+            }
+            std::fs::remove_file(&path).ok();
+        }
     }
 
     #[test]
@@ -3242,7 +3596,7 @@ mod tests {
         // it.
         let path = tmp_path("empty");
         std::fs::write(&path, b"").unwrap();
-        let q = Quire::open(&path).unwrap();
+        let q = open_paged(&path).unwrap();
         assert_eq!(TextStore::char_len(&q), 0);
         assert_eq!(TextStore::text(&q), "");
         assert_eq!(TextStore::char_after(&q, 1), None);
@@ -3264,7 +3618,7 @@ mod tests {
         }
         std::fs::write(&path, &content).unwrap();
 
-        let mut q = Quire::open(&path).unwrap();
+        let mut q = open_paged(&path).unwrap();
         let mut oracle = Buffer::from_string("oracle", &content);
         assert_eq!(TextStore::text(&q), TextStore::text(&oracle));
         assert_eq!(TextStore::char_len(&q), TextStore::char_len(&oracle));
@@ -3309,7 +3663,7 @@ mod tests {
         }
         std::fs::write(&path, &content).unwrap();
 
-        let q = Quire::open(&path).unwrap();
+        let q = open_paged(&path).unwrap();
         let oracle = Buffer::from_string("oracle", &content);
         assert!(
             content.len() > budget,
@@ -3337,7 +3691,7 @@ mod tests {
         let path = tmp_path("trunc");
         let content = "x".repeat(3 * PAGE);
         std::fs::write(&path, &content).unwrap();
-        let q = Quire::open(&path).unwrap();
+        let q = open_paged(&path).unwrap();
         let len_at_open = TextStore::char_len(&q);
         assert_eq!(len_at_open, 3 * PAGE);
 
@@ -3362,7 +3716,7 @@ mod tests {
         let path = tmp_path("drift");
         std::fs::write(&path, "a".repeat(3 * PAGE)).unwrap();
         let orig_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
-        let q = Quire::open(&path).unwrap();
+        let q = open_paged(&path).unwrap();
         // Read page 0 → clean (the open just stamped the file).
         assert_eq!(TextStore::char_after(&q, 1), Some('a'));
         assert!(!TextStore::drifted(&q), "clean right after open");
@@ -3426,7 +3780,7 @@ mod tests {
         let path = tmp_path("drift-stats");
         let len = 3 * PAGE + 7;
         std::fs::write(&path, "a".repeat(len)).unwrap();
-        let q = Quire::open(&path).unwrap();
+        let q = open_paged(&path).unwrap();
         assert_eq!(
             drift_stats(&q),
             0,
@@ -3462,7 +3816,7 @@ mod tests {
         let path = tmp_path("drift-cached");
         std::fs::write(&path, "a".repeat(100)).unwrap();
         let orig_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
-        let q = Quire::open(&path).unwrap();
+        let q = open_paged(&path).unwrap();
         assert_eq!(read_all(&q, 100), 100); // the whole (sub-page) file is resident now
         assert_eq!(drift_stats(&q), 1);
 
@@ -3502,7 +3856,7 @@ mod tests {
         content.push('\n');
         std::fs::write(&path, &content).unwrap();
 
-        let mut q = Quire::open(&path).unwrap();
+        let mut q = open_paged(&path).unwrap();
         let mut oracle = Buffer::from_string("oracle", &content);
         TextStore::goto_char(&mut q, 1);
         TextStore::goto_char(&mut oracle, 1);
@@ -3525,7 +3879,7 @@ mod tests {
         content2.push('\n');
         let path2 = tmp_path("search-big");
         std::fs::write(&path2, &content2).unwrap();
-        let mut q2 = Quire::open(&path2).unwrap();
+        let mut q2 = open_paged(&path2).unwrap();
         let mut o2 = Buffer::from_string("oracle2", &content2);
         assert_eq!(
             TextStore::search_forward(&mut q2, &big, None),
@@ -3549,7 +3903,7 @@ mod tests {
         content.push_str("bcMARKERdef\n");
         std::fs::write(&path, &content).unwrap();
 
-        let mut q = Quire::open(&path).unwrap();
+        let mut q = open_paged(&path).unwrap();
         let mut oracle = Buffer::from_string("oracle", &content);
         // A needle after the straddle, and one that itself spans the straddle.
         for n in ["MARKER", "a€bc"] {
@@ -4004,7 +4358,7 @@ mod tests {
         );
         let tmp = std::env::temp_dir().join(format!("mime-atomic-{}.txt", std::process::id()));
         std::fs::write(&tmp, &initial).unwrap();
-        let mut q = Quire::open(&tmp).unwrap();
+        let mut q = open_paged(&tmp).unwrap();
         // Insert near the front so every Original byte after it shifts
         // position.
         q.goto_char(1);
@@ -4034,7 +4388,7 @@ mod tests {
         std::fs::write(&tmp, "hello stamp\n").unwrap();
 
         // Opening from a file records a clean stamp; from_string records none.
-        let mut q = Quire::open(&tmp).unwrap();
+        let mut q = open_paged(&tmp).unwrap();
         assert_eq!(q.stamp.as_ref().unwrap().check(), None);
         assert!(Quire::from_string("s", "x").stamp.is_none());
 
@@ -4064,7 +4418,7 @@ mod tests {
             "αβγ HEAD line\nmiddle filler line\nUNIQUE-TAIL café\n",
         )
         .unwrap();
-        let mut q = Quire::open(&tmp).unwrap();
+        let mut q = open_paged(&tmp).unwrap();
         q.goto_char(1);
         assert!(
             q.re_search_forward(&regex::Regex::new("HEAD").unwrap(), None)
@@ -4222,7 +4576,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("mime-quire-snap-{}.txt", std::process::id()));
         std::fs::write(&path, SNAP_INITIAL).unwrap();
         for seed in SNAP_SEEDS {
-            run_diff_snap(seed, 4000, SNAP_INITIAL, Quire::open(&path).unwrap());
+            run_diff_snap(seed, 4000, SNAP_INITIAL, open_paged(&path).unwrap());
         }
         std::fs::remove_file(&path).ok();
     }
@@ -4248,7 +4602,7 @@ mod tests {
             ));
             std::fs::write(&path, &bytes).unwrap();
             for seed in SNAP_SEEDS {
-                run_diff_snap(seed, 4000, SNAP_INITIAL, Quire::open(&path).unwrap());
+                run_diff_snap(seed, 4000, SNAP_INITIAL, open_paged(&path).unwrap());
             }
             std::fs::remove_file(&path).ok();
         }
@@ -4265,7 +4619,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("mime-pageb-{}.txt", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
 
-        let q = Quire::open(&path).unwrap();
+        let q = open_paged(&path).unwrap();
         let mut want = String::from_utf8(vec![b'x'; PAGE - 1]).unwrap();
         want.push_str("\ntail\n");
         assert_eq!(TextStore::text(&q), want, "view across the page seam");
@@ -4360,7 +4714,7 @@ mod tests {
         // pair lands a byte off and the line count drifts.
         let path = tmp_path("seek-crlf-small");
         std::fs::write(&path, b"ab\r\ncd\r\n").unwrap();
-        let fresh = || Quire::open(&path).unwrap();
+        let fresh = || open_paged(&path).unwrap();
         let q = fresh();
         assert_eq!(TextStore::text(&q), "ab\ncd\n");
         assert_seeks_match_fresh(&q, &fresh, &[1, 2, 3, 4, 5, 6, 5, 4, 3, 2, 1, 6, 3]);
@@ -4377,7 +4731,7 @@ mod tests {
         // The same over many pairs, so a reverse hop crosses several of them.
         let path = tmp_path("seek-crlf-many");
         std::fs::write(&path, "ünï✓ line\r\n".repeat(60).as_bytes()).unwrap();
-        let fresh = || Quire::open(&path).unwrap();
+        let fresh = || open_paged(&path).unwrap();
         let q = fresh();
         let len = TextStore::char_len(&q);
         let mut ps: Vec<usize> = (0..30).map(|i| 1 + i * 13).collect();
@@ -4408,7 +4762,7 @@ mod tests {
 
         let path = tmp_path("seek-dos-mixed-eol");
         std::fs::write(&path, text.as_bytes()).unwrap();
-        let fresh = || Quire::open(&path).unwrap();
+        let fresh = || open_paged(&path).unwrap();
         let q = fresh();
         assert_eq!(TextStore::text(&q), decoded);
         let b = Buffer::from_string("t", &decoded);
@@ -4489,7 +4843,7 @@ mod tests {
         let text = "abc\r\n".repeat(4000);
         std::fs::write(&path, text.as_bytes()).unwrap();
         let bytes = text.as_bytes();
-        let fresh = || Quire::open(&path).unwrap();
+        let fresh = || open_paged(&path).unwrap();
         let hop = BACK_WINDOW / 5 * 4 + 8;
         // Four chars to every five bytes: char index `n` starts at byte `n / 4
         // * 5 + n % 4` (offset 3 is the `\r` that starts the folded newline
@@ -4577,7 +4931,7 @@ mod tests {
         let line = "the quick brown fox jumps over the lazy dog\n";
         let pages = 40;
         std::fs::write(&path, line.repeat(pages * PAGE / line.len())).unwrap();
-        let fresh = || Quire::open(&path).unwrap();
+        let fresh = || open_paged(&path).unwrap();
 
         let q = fresh();
         assert_eq!(
@@ -4707,11 +5061,11 @@ mod tests {
         let after = format!("abü{tail}");
         assert_eq!(before.len(), after.len());
         std::fs::write(&path, &before).unwrap();
-        let mut q = Quire::open(&path).unwrap();
+        let mut q = open_paged(&path).unwrap();
         assert_eq!(TextStore::char_after(&q, 3), Some('b')); // primes the memo
         std::fs::write(&path, &after).unwrap();
         q.rebase_to(&path).unwrap();
-        let fresh = || Quire::open(&path).unwrap();
+        let fresh = || open_paged(&path).unwrap();
         assert_eq!(TextStore::text(&q), after);
         assert_seeks_match_fresh(&q, &fresh, &[3, 2, 1, 4, 30, 29]);
         std::fs::remove_file(&path).ok();

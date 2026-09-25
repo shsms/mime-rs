@@ -34,11 +34,12 @@ use serde_json::{Value, json};
 
 const DEFAULT_SESSION: &str = "default";
 
-/// Cap on warm sessions. Each file-backed session pins an open fd and a warm
-/// buffer; agents rarely work more than a handful of files, so past the cap the
-/// least-recently-used CLEAN session is evicted to make room. Sessions with
-/// un-persisted content (file-backed unsaved edits, or any modified scratch
-/// buffer) are never evicted — boundedness must not cost edits.
+/// Cap on warm sessions. Each session holds a warm buffer (a file at or over
+/// `quire::IN_MEMORY_LIMIT` also pins an open fd); agents rarely work more than
+/// a handful of files, so past the cap the least-recently-used CLEAN session is
+/// evicted to make room. Sessions with un-persisted content (file-backed
+/// unsaved edits, or any modified scratch buffer) are never evicted —
+/// boundedness must not cost edits.
 const SESSION_CAP: usize = 16;
 
 /// The next recency stamp for [`Workspace::touch`].
