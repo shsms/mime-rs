@@ -152,9 +152,10 @@ pub(crate) fn tools_call_result(
     if let Err(message) = validate_args(name, &args) {
         return ToolOutput::error(message);
     }
-    // `save` and `rehearse` decide whether a call writes to disk, so a value
-    // that is not a boolean is an error, not a silent default.
-    for key in ["save", "rehearse"] {
+    // `save` and `rehearse` decide whether a call writes to disk, and
+    // `update_refs` which branches a rewrite moves, so a value that is not a
+    // boolean is an error, not a silent default.
+    for key in ["save", "rehearse", "update_refs"] {
         if let Err(message) = strict_bool_arg(&args, key) {
             return ToolOutput::error(format!("{name}: {message}"));
         }
@@ -4243,6 +4244,15 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
         );
     }
     let repo = repo_path(args)?;
+    // The tools that rewrite existing commits move the branches stacked on them
+    // unless told not to (a non-boolean was refused before dispatch).
+    let with_refs = seq::RepoArg {
+        path: &repo,
+        update_refs: args
+            .get("update_refs")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+    };
     match name {
         "git_rebase" => {
             // A non-string `from` must not silently degrade to the two-arg
@@ -4251,7 +4261,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
                 return Err("git_rebase: `from` must be a string revspec".to_string());
             }
             seq::cmd_rebase(
-                &repo,
+                with_refs,
                 &str_arg(args, "onto")?,
                 args.get("from").and_then(Value::as_str),
                 plan_arg(args)?,
@@ -4275,7 +4285,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
                     );
                 }
                 seq::cmd_fixup_worktree(
-                    &repo,
+                    with_refs,
                     &str_arg(args, "target")?,
                     &paths,
                     &hunks,
@@ -4283,7 +4293,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
                 )
             } else {
                 seq::cmd_fixup(
-                    &repo,
+                    with_refs,
                     &str_arg(args, "target")?,
                     &str_arg(args, "source")?,
                     bool_arg(args, "rehearse"),
@@ -4291,7 +4301,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
             }
         }
         "git_split" => seq::cmd_split(
-            &repo,
+            with_refs,
             &str_arg(args, "commit")?,
             split_parts(
                 args.get("into")
@@ -4310,7 +4320,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
                 return Err("git_commit: `after` must be a string revspec".to_string());
             }
             seq::cmd_commit(
-                &repo,
+                with_refs,
                 &present_str_list(args, "paths")?,
                 &hunk_sels_arg(args, "hunks")?,
                 &str_arg(args, "message")?,
@@ -4354,7 +4364,7 @@ fn dispatch_git(name: &str, args: &Value) -> Result<String, String> {
             )
         }
         "git_absorb" => seq::cmd_absorb(
-            &repo,
+            with_refs,
             args.get("since").and_then(Value::as_str),
             bool_arg(args, "rehearse"),
         ),
@@ -4426,6 +4436,14 @@ fn git_tool_schemas() -> Vec<Value> {
         "items": { "type": "string" },
         "description": "Commits to apply, in order — each an oid, ref, or revspec (e.g. HEAD~2)."
     });
+    // The `update_refs` knob of every tool that rewrites existing commits:
+    // `lead` qualifies when it applies, the rest is the same everywhere.
+    let update_refs = |lead: &str| {
+        json!({
+            "type": "boolean",
+            "description": format!("{lead}Move the other local branches that point at the rewritten commits along with the rewrite (git's --update-refs; default true). A branch checked out in another worktree, one with commits of its own on top, and tags are left and reported; each moved branch's old tip goes into its backup ring (refs/mime-backup/<branch>/0).")
+        })
+    };
     // The `fill` knob of every message-authoring tool: `lead` says which
     // message, the rest is the same everywhere.
     let fill = |lead: &str| {
@@ -4485,7 +4503,8 @@ fn git_tool_schemas() -> Vec<Value> {
                     },
                     "rehearse": { "type": "boolean", "description": "Dry-run: preview the resulting commits and whether the tree is unchanged (a pure reorder/fold), applying nothing. Unlike a real run, the rehearsal does NOT stop at the first conflict: it lists EVERY step that would conflict, each with the commit that last reshaped the conflicted lines (usually the right fold target) — repair the whole plan in one pass. Default false." },
                     "reapply_cherry_picks": { "type": "boolean", "description": "Plan-less pick-all only: keep commits already present in `onto` by patch-id instead of dropping them. Default false — like `git rebase`, a commit whose change already sits in the new base (e.g. after the base was reordered/amended below the merge-base) is skipped so a stacked branch isn't duplicated; the skipped commits are reported. Set true to replay them anyway. Ignored when an explicit `plan` or `autosquash` is given." },
-                    "fill": fill("Fill the body of every message a step authors — a reword's message, a squash meld, an edit's or a fixup's when it brings a message change; a pick and a bare edit or fixup keep their message either way —")
+                    "fill": fill("Fill the body of every message a step authors — a reword's message, a squash meld, an edit's or a fixup's when it brings a message change; a pick and a bare edit or fixup keep their message either way —"),
+                    "update_refs": update_refs("")
                 },
                 "required": ["repo", "onto"],
             },
@@ -4524,7 +4543,8 @@ fn git_tool_schemas() -> Vec<Value> {
                         }
                     },
                     "rehearse": { "type": "boolean", "description": "Preview the resulting commits without applying. Default false." },
-                    "fill": fill("Fill each part's message body")
+                    "fill": fill("Fill each part's message body"),
+                    "update_refs": update_refs("")
                 },
                 "required": ["repo", "commit", "into"],
             },
@@ -4552,7 +4572,8 @@ fn git_tool_schemas() -> Vec<Value> {
                     },
                     "message": { "type": "string", "description": "The commit message." },
                     "after": { "type": "string", "description": "Optional placement: an ancestor commit (oid/ref/revspec) the new commit should sit directly after, instead of at the branch tip. Not combinable with `hunks`." },
-                    "fill": fill("Fill the message body before committing")
+                    "fill": fill("Fill the message body before committing"),
+                    "update_refs": update_refs("With `after`: ")
                 },
                 "required": ["repo", "message"],
             },
@@ -4696,7 +4717,8 @@ fn git_tool_schemas() -> Vec<Value> {
                         }
                     },
                     "worktree": { "type": "boolean", "description": "Fold EVERY uncommitted change into target (no path/hunk selection needed). Default false." },
-                    "rehearse": { "type": "boolean", "description": "Preview the resulting history without applying." }
+                    "rehearse": { "type": "boolean", "description": "Preview the resulting history without applying." },
+                    "update_refs": update_refs("")
                 },
                 "required": ["repo", "target"],
             },
@@ -4709,7 +4731,8 @@ fn git_tool_schemas() -> Vec<Value> {
                 "properties": {
                     "repo": repo,
                     "since": { "type": "string", "description": "Scope owners to `since..HEAD` (oid/ref/revspec, e.g. main — usually the branch base): hunks owned at or beyond the boundary stay in the worktree instead of rewriting history past it. Recommended on shared-history branches." },
-                    "rehearse": { "type": "boolean", "description": "Preview the hunk→commit grouping and the resulting history without applying." }
+                    "rehearse": { "type": "boolean", "description": "Preview the hunk→commit grouping and the resulting history without applying." },
+                    "update_refs": update_refs("")
                 },
                 "required": ["repo"],
             },

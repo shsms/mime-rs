@@ -244,6 +244,7 @@ Rebase the current branch onto `onto`, replaying onto..HEAD — or an explicit `
 - `reapply_cherry_picks` — Plan-less pick-all only: keep commits already present in `onto` by patch-id instead of dropping them. Default false — like `git rebase`, a commit whose change already sits in the new base (e.g. after the base was reordered/amended below the merge-base) is skipped so a stacked branch isn't duplicated; the skipped commits are reported. Set true to replay them anyway. Ignored when an explicit `plan` or `autosquash` is given.
 - `rehearse` — Dry-run: preview the resulting commits and whether the tree is unchanged (a pure reorder/fold), applying nothing. Unlike a real run, the rehearsal does NOT stop at the first conflict: it lists EVERY step that would conflict, each with the commit that last reshaped the conflicted lines (usually the right fold target) — repair the whole plan in one pass. Default false.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+- `update_refs` — Move the other local branches that point at the rewritten commits along with the rewrite (git's --update-refs; default true). A branch checked out in another worktree, one with commits of its own on top, and tags are left and reported; each moved branch's old tip goes into its backup ring (refs/mime-backup/<branch>/0).
 
 ## git_split
 
@@ -254,6 +255,7 @@ Split ONE commit into several: partition its changes into the commits listed in 
 - `into` (required) — The output commits, in order. Each is {message, paths?, hunks?}: `paths` takes whole files, `hunks` takes specific hunks of a file by post-commit line range or by a text their changed lines contain. One part may omit both to be the catch-all collecting every change no other part claims. Every change the commit makes must be covered exactly once; tracked files can be split across parts by hunk.
 - `rehearse` — Preview the resulting commits without applying. Default false.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+- `update_refs` — Move the other local branches that point at the rewritten commits along with the rewrite (git's --update-refs; default true). A branch checked out in another worktree, one with commits of its own on top, and tags are left and reported; each moved branch's old tip goes into its backup ring (refs/mime-backup/<branch>/0).
 
 ## git_commit
 
@@ -265,6 +267,7 @@ Commit exactly `paths` with `message` on the current branch: each listed file is
 - `message` (required) — The commit message.
 - `paths` — The files to commit whole, each named explicitly — absolute or repo-relative; directories are refused. Required unless `hunks` selects something.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
+- `update_refs` — With `after`: Move the other local branches that point at the rewritten commits along with the rewrite (git's --update-refs; default true). A branch checked out in another worktree, one with commits of its own on top, and tags are left and reported; each moved branch's old tip goes into its backup ring (refs/mime-backup/<branch>/0).
 
 ## git_cherry_pick
 
@@ -352,6 +355,7 @@ Fold changes into `target`, which keeps its own — already signed-off — messa
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 - `source` — A COMMITTED commit whose changes to fold in (oid/ref/revspec). Omit to fold from the worktree instead (paths/hunks/worktree).
 - `target` (required) — The commit to fold into — keeps its message (oid/ref/revspec).
+- `update_refs` — Move the other local branches that point at the rewritten commits along with the rewrite (git's --update-refs; default true). A branch checked out in another worktree, one with commits of its own on top, and tags are left and reported; each moved branch's old tip goes into its backup ring (refs/mime-backup/<branch>/0).
 - `worktree` — Fold EVERY uncommitted change into target (no path/hunk selection needed). Default false.
 
 ## git_absorb
@@ -361,6 +365,7 @@ Fold EVERY uncommitted hunk into the commit that owns its lines, automatically �
 - `rehearse` — Preview the hunk→commit grouping and the resulting history without applying.
 - `repo` (required) — Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).
 - `since` — Scope owners to `since..HEAD` (oid/ref/revspec, e.g. main — usually the branch base): hunks owned at or beyond the boundary stay in the worktree instead of rewriting history past it. Recommended on shared-history branches.
+- `update_refs` — Move the other local branches that point at the rewritten commits along with the rewrite (git's --update-refs; default true). A branch checked out in another worktree, one with commits of its own on top, and tags are left and reported; each moved branch's old tip goes into its backup ring (refs/mime-backup/<branch>/0).
 
 ## git_range_diff
 

@@ -1370,6 +1370,10 @@
             "repo": {
               "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
               "type": "string"
+            },
+            "update_refs": {
+              "description": "Move the other local branches that point at the rewritten commits along with the rewrite (git's --update-refs; default true). A branch checked out in another worktree, one with commits of its own on top, and tags are left and reported; each moved branch's old tip goes into its backup ring (refs/mime-backup/<branch>/0).",
+              "type": "boolean"
             }
           },
           "required": [
@@ -1458,6 +1462,10 @@
             "repo": {
               "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
               "type": "string"
+            },
+            "update_refs": {
+              "description": "Move the other local branches that point at the rewritten commits along with the rewrite (git's --update-refs; default true). A branch checked out in another worktree, one with commits of its own on top, and tags are left and reported; each moved branch's old tip goes into its backup ring (refs/mime-backup/<branch>/0).",
+              "type": "boolean"
             }
           },
           "required": [
@@ -1531,6 +1539,10 @@
             "repo": {
               "description": "Path to the git repository (its working-tree root). Must resolve inside an allowed root (MIME_ROOTS).",
               "type": "string"
+            },
+            "update_refs": {
+              "description": "With `after`: Move the other local branches that point at the rewritten commits along with the rewrite (git's --update-refs; default true). A branch checked out in another worktree, one with commits of its own on top, and tags are left and reported; each moved branch's old tip goes into its backup ring (refs/mime-backup/<branch>/0).",
+              "type": "boolean"
             }
           },
           "required": [
@@ -1931,6 +1943,10 @@
               "description": "The commit to fold into — keeps its message (oid/ref/revspec).",
               "type": "string"
             },
+            "update_refs": {
+              "description": "Move the other local branches that point at the rewritten commits along with the rewrite (git's --update-refs; default true). A branch checked out in another worktree, one with commits of its own on top, and tags are left and reported; each moved branch's old tip goes into its backup ring (refs/mime-backup/<branch>/0).",
+              "type": "boolean"
+            },
             "worktree": {
               "description": "Fold EVERY uncommitted change into target (no path/hunk selection needed). Default false.",
               "type": "boolean"
@@ -1965,6 +1981,10 @@
             "since": {
               "description": "Scope owners to `since..HEAD` (oid/ref/revspec, e.g. main — usually the branch base): hunks owned at or beyond the boundary stay in the worktree instead of rewriting history past it. Recommended on shared-history branches.",
               "type": "string"
+            },
+            "update_refs": {
+              "description": "Move the other local branches that point at the rewritten commits along with the rewrite (git's --update-refs; default true). A branch checked out in another worktree, one with commits of its own on top, and tags are left and reported; each moved branch's old tip goes into its backup ring (refs/mime-backup/<branch>/0).",
+              "type": "boolean"
             }
           },
           "required": [
