@@ -167,7 +167,7 @@ decorators, the comment block adjacent above a Go / JS / TS function and a JS
 node accessors like treesit-node-start stay faithful to the bare node).
 Gotchas: editing OUTDATES nodes from the old parse (re-fetch after edits);
 treesit positions are whole-document even under narrowing.
-(treesit-has-error) must be nil before saving code (save: true warns
+(treesit-has-error) must be nil before saving code (a save warns
 automatically)."#;
 
 const CONFLICTS: &str = r#"— merge-conflict workflow —
@@ -309,19 +309,25 @@ On the stateless HTTP protocol (2026-07-28) a call reports `workspace: <handle>`
 when it was given one, or when it was made without one and created warm state
 (JSON tools carry it inside their JSON); pass it as `workspace` on later calls.
 session_status shows `workspace: null` except on that protocol.
-open_workspace mints one explicitly;
+open_workspace mints one explicitly (HTTP only);
 close_workspace drops one with all its sessions (unsaved edits included).
 
-Saving: edits live in the warm buffer until saved. Pass save:true on an
-edit tool, or call save_buffer ({path} = save the visited file; to:"…" on a
-DIFFERENT file = save-as a COPY — it does not rebind the session, so a later
-plain save still targets the original; to:"…" on the visited file is just an
-in-place save, and an unbound in-memory buffer adopts the file). A visited-file
-save is atomic and stale-guarded: if the file changed on disk since open, the
-save refuses and the edit stays warm — re-check, then save_buffer elsewhere or
-(revert-buffer) to discard. A save-as copy is atomic but NOT stale-guarded (it
-writes a different file). A clean-but-drifted buffer auto-reverts before reads,
-programs, and rehearsals.
+Saving: the edit tools (replace_text, insert_text, replace_in_files,
+fill_text, run_program) and undo_last save to the visited file by default —
+an atomic, stale-guarded write, skipped when the buffer did not change.
+save:false holds an edit in the warm buffer for a later call (session_status
+flags it unsaved; unsaved_diff shows it); rehearse:true runs the edit,
+returns its diff and puts the buffer back. save_buffer writes explicitly
+({path} = save the visited file; to:"…" on a DIFFERENT file = save-as a COPY
+— it does not rebind the session, so a later plain save still targets the
+original; to:"…" on the visited file is just an in-place save, and an unbound
+in-memory buffer adopts the file). If the file changed on disk while the
+buffer held save:false edits, the save refuses and the edit stays warm —
+re-check, then save_buffer elsewhere or (revert-buffer) to discard;
+replace_in_files instead rolls every file back and writes none. A save-as
+copy is atomic but NOT stale-guarded (it writes a different file). A buffer
+from open_text has no file: the default save skips it. A clean-but-drifted
+buffer auto-reverts before reads, programs, and rehearsals.
 
 Re-sync after EXTERNAL changes (a git checkout/rebase, another editor):
 nothing to do — passing `path` re-reads a CLEAN drifted buffer from disk
@@ -331,8 +337,8 @@ needed; unsaved_diff {path} shows buffer-vs-disk when unsure.
 
 Coding: a file's BOM and DOS (`\r\n`) line endings are detected on open and the
 buffer is a normalized VIEW (no BOM character, LF lines — so `\n` patterns and
-char positions behave) over the raw paged file, so even huge CRLF files are NOT
-materialized. Save keeps untouched regions byte-exact (mixed endings preserved)
+char positions behave) over the raw bytes; a file of 16 MiB or more is paged
+from disk, so even huge CRLF files are NOT materialized. Save keeps untouched regions byte-exact (mixed endings preserved)
 and encodes inserted text to the file's EOL. A lone `\r` (classic-Mac CR) is NOT
 a line ending — such a file is plain utf-8-unix, its `\r`s kept byte-for-byte.
 session_status shows a `coding` (e.g. utf-8-with-signature-dos) when it isn't the
@@ -340,20 +346,20 @@ plain utf-8-unix default. `(set-buffer-file-coding-system "utf-8-unix")` strips 
 BOM and forces LF on the next save (re-encoding the whole file — the "re-save as
 UTF-8" idiom); "utf-8-dos" / "…-with-signature" force those.
 
-Safety ladder: rehearse = dry-run with full report, nothing persists;
-(with-transaction …) = all-or-nothing inside a program; checkpoint /
-restore_checkpoint = named restore points; undo_last = automatic rewind
-to before the last mutating call (ring of 8, no redo). replace_text's
-expect_unique:true makes a repeated anchor an error instead of a silent
-wrong-site edit. A FAILED run_program rolls its pre-error edits back
-(rolled_back:true in the failure JSON); pass keep_partial:true to keep
-them for inspection — dirty:true then says they persist, and undo_last
-reverts them."#;
+Safety ladder: rehearse:true = dry-run with the full report, nothing
+persists; (with-transaction …) = all-or-nothing inside a program;
+(checkpoint) / (restore-checkpoint) in a program = named restore points;
+undo_last = automatic rewind to before the last mutating call, saved like
+any edit (ring of 8, no redo). replace_text's expect_unique:true makes a
+repeated anchor an error instead of a silent wrong-site edit. A FAILED
+run_program rolls its pre-error edits back (rolled_back:true in the failure
+JSON); pass keep_partial:true to keep them for inspection — dirty:true then
+says they persist, and undo_last reverts them."#;
 
 const RECIPES: &str = r#"— recipes —
 Cross-file rename (one call, atomic across the set, saved only if every
 file succeeds — list exactly the files you grepped):
-  replace_in_files {files: [p1, p2, …], pattern, replacement, all: true, save: true}
+  replace_in_files {files: [p1, p2, …], pattern, replacement, all: true}
 Replace inside one function (no program needed):
   replace_text {path, pattern, replacement, scope: {defun: "name"}}
 Add a function after another:
@@ -363,7 +369,7 @@ Insert above/below the unique line containing a literal text:
   shorthand for {pattern: "LINE", where: "before"}
 Replace the block after a line (structural — nothing to pattern-match):
   replace_text {path, thing: {kind: "list", after: "fn main() {"}, replacement: "{ … }"}
-  view {thing: {kind: "sexp", at: 1234, up: 1}}   ; the form one level out
+  view {path, thing: {kind: "sexp", at: 1234, up: 1}}   ; the form one level out
 Bulk regex sweep with count:
   run_program: (goto-char (point-min)) (report "n" (replace-regexp "PAT" "REP"))
 Per-match logic:
@@ -398,12 +404,14 @@ Mixed per-hunk: (conflict-keep "ours"|"theirs"|"both" N) or a hand-merge
 renumbers after every resolve, so resolve the HIGHEST N first. Then check
 (treesit-has-error) and save.
 Reflow prose you just wrote — never wrap by hand (code is left alone):
-  fill_text {path, all: true, save: true}                 ; every README paragraph
+  fill_text {path, all: true}                            ; every README paragraph
   fill_text {path, anchor: {pattern: "/// Returns the"}}  ; the doc comment holding that line
   fill_text {path, lines: [40, 60], column: 72}           ; every comment those lines touch
+  fill_text {path, all: true, rehearse: true}             ; preview a reflow of existing prose
   (let ((fill-column 72)) (fill-paragraph))               ; the lisp form, at point
-Preview anything non-trivial first: rehearse {program}, inspect the diff,
-then run_program the same program (with save:true when done)."#;
+Preview anything non-trivial first: the same call with rehearse:true (e.g.
+run_program {path, program, rehearse: true}) returns the diff and keeps
+nothing; then make the call without it."#;
 
 #[cfg(test)]
 mod tests {

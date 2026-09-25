@@ -189,7 +189,7 @@ Write the session buffer's text to disk. Without `to`, save back to the session'
 
 ## close_session
 
-Drop warm sessions: releases each buffer and the open file handle a file-backed session holds. Name one target (path or session), several (paths and/or sessions), or all:true for every warm session. All-or-nothing: an unsaved target refuses the whole call (naming the unsaved sessions) unless force:true discards their edits, and a target that is not warm closes nothing. Use it when done with a file, or to force a clean re-open from disk.
+Drop warm sessions: releases each buffer (and the open file handle a file of 16 MiB or more keeps). Name one target (path or session), several (paths and/or sessions), or all:true for every warm session. All-or-nothing: an unsaved target refuses the whole call (naming the unsaved sessions) unless force:true discards their edits, and a target that is not warm closes nothing. Use it when done with a file, or to force a clean re-open from disk.
 
 - `all` — Close every warm session. Not combinable with path/session/paths/sessions.
 - `force` — Discard unsaved edits. Default false: closing an unsaved session is an error.

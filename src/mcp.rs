@@ -5107,44 +5107,56 @@ fn catalogue() -> Vec<ToolDoc> {
         .collect()
 }
 
-/// The MCP server `instructions` (returned from `initialize`): how to drive
-/// mime, plus a category-grouped tool index — all client-agnostic, so any
-/// harness onboards its model from the protocol rather than an out-of-band
-/// file.  The index is generated from the catalogue, so it can't drift from the
-/// tools.
-pub(crate) fn instructions() -> String {
-    let mut s = String::from(
-        "mime-rs is a transactional text-editing engine — make it your DEFAULT for ALL file \
-         EDITING: run every edit through it, from a one-off unique-string replace to \
-         rule-shaped, bulk, regex, structural (tree-sitter), cross-file, or very large \
-         changes, plus in-process git rebase/cherry-pick/revert and merge-conflict \
-         resolution. For lookup, reach for it where warm state pays: outline to survey a \
-         file, occur to grep an open buffer (narrowing-aware), view around \
-         an edit site, and grep to find the files a cross-file replace_in_files will touch. \
-         Opening is implicit: pass `path` to any tool and the \
-         file becomes a warm session (or `session` for an in-memory buffer); buffers stay \
-         warm and NOTHING is written until you save (`save: true` on an edit, or save_buffer). \
-         Typical flow: orient with outline / occur / grep → rehearse → run_program or \
-         replace_text {save:true} → undo_last if it misfired. Prefer one call: replace_text / \
-         insert_text for literal edits — set `expect_unique: true` when the anchor text could \
-         repeat, so an ambiguous match is an error, not a silent wrong edit — and run_program \
-         (Emacs-Lisp) when you need regex or structure. Three persistence levels: `rehearse` \
-         previews a program then rolls the buffer back (nothing persists); `run_program`/the \
-         edit tools persist to the warm buffer for later calls but NOT to disk; `save` (or \
-         save_buffer) writes to disk. A FAILED run_program rolls its pre-error edits back \
-         (keep_partial:true keeps them; undo_last then reverts). A CLEAN buffer whose visited \
-         file changes on disk auto-reverts on next use; one with unsaved edits is left alone \
-         and flagged stale instead. Positions: \
-         @N and point are ABSOLUTE (goto-char); line numbers are narrowing-relative \
-         (goto-line). On the stateless HTTP protocol, a call that has a workspace \
-         reports its `workspace` handle (inside a JSON tool's text, or as a trailing \
-         line); pass it back on every later call. A call made without `workspace` \
-         reports one only if it created warm state (stdio: ignore workspaces).\n\nTools:\n",
-    );
+/// The core of the MCP server `instructions`: what an agent must know to drive
+/// mime, most important first. Claude Code keeps only the first 2,048
+/// characters of a server's instructions, so this — plus the HTTP-only
+/// workspace note — must stay under that (tested); the tool index after it is
+/// for clients that show more.
+const INSTRUCTIONS_CORE: &str = "mime-rs is a transactional text-editing engine: make it your DEFAULT for ALL \
+file edits — one-off replaces, regex and structural (tree-sitter) edits, cross-file renames, prose \
+reflow, git history surgery, and merge conflicts. Pass `path` to any tool: the file opens implicitly \
+and stays warm between calls.\n\n\
+Edits SAVE to disk by default. `rehearse: true` previews an edit (diff only, nothing kept); \
+`save: false` holds it in the buffer for a later call; undo_last rewinds the last edit, on disk too. \
+A failed edit rolls back; a refused save keeps the edit, but replace_in_files rolls every file back.\n\n\
+Editing: replace_text / insert_text for literal edits — `expect_unique: true` on replace_text errors \
+instead of guessing when the pattern repeats (an insert_text anchor must already be unique); \
+`edits: [...]` batches several into one all-or-nothing call. replace_in_files for a cross-file change. \
+run_program (Emacs Lisp) for regex, per-match logic or structure — skim help {lisp} or help {recipes} \
+before writing one. fill_text reflows a comment, docstring or paragraph you wrote (all: true for a \
+whole file); rehearse it first on existing prose. view {path, lines: [a, b]} reads a range.\n\n\
+Git: git_rebase, git_fixup, git_absorb, git_split, git_reword, git_msg_rewrite and git_msg_fill \
+rewrite history in-process — pass `rehearse: true` first to see the outcome without touching the \
+branch. git_blame {worktree: true} names the commit each dirty hunk belongs to.\n\n\
+Conflicts: `conflicts` lists them; resolve with conflict-keep / conflict-replace inside run_program \
+(help {conflicts}), then git_continue.\n\n\
+A clean buffer whose file changed on disk re-reads it automatically; one with unsaved edits is \
+flagged stale and its save refused. Positions: @N and point are absolute (goto-char); line numbers \
+are narrowing-relative (goto-line). help {topic} covers lisp, regex, treesit, conflicts, git, \
+sessions and recipes.";
+
+/// Appended to the core on the HTTP transport only: stdio has one implicit
+/// workspace and never shows a handle.
+const INSTRUCTIONS_HTTP: &str = " On HTTP, a call reports a `workspace` handle when it has one; pass \
+it back on every later call.";
+
+/// The MCP server `instructions` (returned from `initialize` and
+/// `server/discover`): [`INSTRUCTIONS_CORE`], then a category-grouped index of
+/// the tools this transport lists — generated from the catalogue, so it can't
+/// drift from the tools.
+pub(crate) fn instructions(transport: Transport) -> String {
+    let mut s = String::from(INSTRUCTIONS_CORE);
+    if transport == Transport::Http {
+        s.push_str(INSTRUCTIONS_HTTP);
+    }
+    s.push_str("\n\nTools:\n");
     let cat = catalogue();
     for category in Category::ORDER {
         let mut first = true;
-        for d in cat.iter().filter(|d| d.category == category) {
+        for d in cat
+            .iter()
+            .filter(|d| d.category == category && tool_listed(d.name(), transport))
+        {
             if first {
                 s.push_str(&format!("\n{}:\n", category.title()));
                 first = false;
@@ -5152,12 +5164,6 @@ pub(crate) fn instructions() -> String {
             s.push_str(&format!("  {} — {}\n", d.name(), d.summary));
         }
     }
-    s.push_str(
-        "\nThe deep vocabulary — regex, treesit structural editing, and conflict \
-         resolution (conflict-keep / conflict-replace / …) — lives inside run_program \
-         by design: a small tool surface over a deep engine. BEFORE writing a run_program, skim \
-         help {lisp} (the verb index) or help {recipes} (worked patterns); help {regex|treesit|conflicts|git|sessions} cover specifics (or help {tool: \"name\"}).",
-    );
     s
 }
 
@@ -5497,7 +5503,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "close_session",
-            "description": "Drop warm sessions: releases each buffer and the open file handle a file-backed session holds. Name one target (path or session), several (paths and/or sessions), or all:true for every warm session. All-or-nothing: an unsaved target refuses the whole call (naming the unsaved sessions) unless force:true discards their edits, and a target that is not warm closes nothing. Use it when done with a file, or to force a clean re-open from disk.",
+            "description": "Drop warm sessions: releases each buffer (and the open file handle a file of 16 MiB or more keeps). Name one target (path or session), several (paths and/or sessions), or all:true for every warm session. All-or-nothing: an unsaved target refuses the whole call (naming the unsaved sessions) unless force:true discards their edits, and a target that is not warm closes nothing. Use it when done with a file, or to force a clean re-open from disk.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -6423,10 +6429,89 @@ mod git_tool_tests {
     }
 
     #[test]
-    fn instructions_index_lists_every_tool() {
-        let text = instructions();
-        for d in catalogue() {
-            assert!(text.contains(d.name()), "instructions omit {}", d.name());
+    fn instructions_index_lists_every_listed_tool() {
+        let _lock = crate::sequencer::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for transport in [Transport::Stdio, Transport::Http] {
+            let text = instructions(transport);
+            for d in catalogue()
+                .iter()
+                .filter(|d| tool_listed(d.name(), transport))
+            {
+                assert!(
+                    text.contains(d.name()),
+                    "{transport:?} instructions omit {}",
+                    d.name()
+                );
+            }
+        }
+        assert!(!instructions(Transport::Stdio).contains("open_workspace"));
+    }
+
+    #[test]
+    fn instructions_core_fits_the_2048_character_cut() {
+        // Claude Code keeps only the first 2,048 characters of a server's
+        // instructions; everything that matters must sit before the index.
+        // Bytes, not chars: stricter, so it holds under either count.
+        for transport in [Transport::Stdio, Transport::Http] {
+            let text = instructions(transport);
+            let core = text.split("\n\nTools:\n").next().unwrap();
+            assert!(
+                core.len() < 2048,
+                "{transport:?} core is {} bytes",
+                core.len()
+            );
+            for must in [
+                "save: false",
+                "rehearse: true",
+                "expect_unique",
+                "help {lisp}",
+                "help {topic}",
+            ] {
+                assert!(core.contains(must), "{transport:?} core lacks {must:?}");
+            }
+        }
+        let stdio = instructions(Transport::Stdio);
+        let stdio_core = stdio.split("\n\nTools:\n").next().unwrap();
+        assert!(!stdio_core.contains("workspace"), "{stdio_core}");
+        assert!(instructions(Transport::Http).contains("`workspace` handle"));
+    }
+
+    #[test]
+    fn no_surface_mentions_a_removed_tool_or_the_old_save_default() {
+        let mut surfaces: Vec<(String, String)> = vec![
+            (
+                "instructions (stdio)".into(),
+                instructions(Transport::Stdio),
+            ),
+            ("instructions (http)".into(), instructions(Transport::Http)),
+        ];
+        for s in tool_schemas() {
+            surfaces.push((s["name"].as_str().unwrap_or("?").into(), s.to_string()));
+        }
+        for (name, _) in crate::help::TOPICS {
+            surfaces.push((
+                format!("help {name}"),
+                crate::help::topic(name).unwrap().to_string(),
+            ));
+        }
+        for (name, text) in &surfaces {
+            for stale in [
+                "read_region",
+                "restore_checkpoint",
+                "rehearse {",
+                "the rehearse tool",
+                "`rehearse` tool",
+                "save_buffer to persist",
+                "save:true persists",
+                "save: true persists",
+                "NOT to disk",
+                "until saved",
+                "until you save",
+            ] {
+                assert!(!text.contains(stale), "{name} still says {stale:?}");
+            }
         }
     }
 

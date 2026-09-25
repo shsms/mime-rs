@@ -108,11 +108,11 @@ pub fn server_info() -> Value {
 
 /// What both handshake-free `server/discover` and the legacy `initialize`
 /// answer say about this server, independently of version negotiation.
-fn server_identity() -> Value {
+fn server_identity(transport: Transport) -> Value {
     json!({
         "capabilities": { "tools": {} },
         "serverInfo": server_info(),
-        "instructions": crate::mcp::instructions(),
+        "instructions": crate::mcp::instructions(transport),
     })
 }
 
@@ -129,9 +129,9 @@ fn extend(mut base: Value, more: Value) -> Value {
 }
 
 /// `server/discover`: the handshake-free way to learn what this server speaks.
-fn discover_result() -> Value {
+fn discover_result(transport: Transport) -> Value {
     extend(
-        server_identity(),
+        server_identity(transport),
         json!({
             "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
             "ttlMs": LIST_TTL_MS,
@@ -323,11 +323,11 @@ pub fn handle_request(req: Value, store: &mut WorkspaceStore, ctx: &CallContext)
     }
 
     let result = match method {
-        "initialize" => initialize_result(&params),
+        "initialize" => initialize_result(&params, ctx.transport),
         // Pure notification — nothing to do, no response.
         "notifications/initialized" | "initialized" => return None,
         "ping" => json!({}),
-        "server/discover" => discover_result(),
+        "server/discover" => discover_result(ctx.transport),
         "tools/list" => crate::mcp::tools_list_result(ctx.transport),
         "tools/call" => tools_call(&params, store, ctx, era),
         other => {
@@ -556,7 +556,7 @@ fn shape_result(era: Era, mut result: Value) -> Value {
     result
 }
 
-fn initialize_result(params: &Value) -> Value {
+fn initialize_result(params: &Value, transport: Transport) -> Value {
     // Echo the client's version when it is a legacy one we implement; an
     // unknown or absent one — or the modern version, which has no handshake —
     // gets our newest legacy version.
@@ -565,7 +565,10 @@ fn initialize_result(params: &Value) -> Value {
         .and_then(Value::as_str)
         .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v) && *v != MODERN_VERSION)
         .unwrap_or(LATEST_LEGACY_VERSION);
-    extend(server_identity(), json!({ "protocolVersion": version }))
+    extend(
+        server_identity(transport),
+        json!({ "protocolVersion": version }),
+    )
 }
 
 /// The workspace handle a prose tool reports on its trailing line — for the

@@ -2,8 +2,9 @@
 
 A scriptable, **transactional** text-editing engine. You hand it a small
 Emacs-Lisp program — or a single declarative tool call — and it edits a buffer
-and hands back a unified diff plus machine-readable reports. Nothing touches
-disk until you save, and anything can be rewound.
+and hands back a unified diff plus machine-readable reports. Every edit can be
+previewed first, is written atomically (never over a file someone else changed),
+and can be rewound.
 
 ```elisp
 ;; prog.tl — the vocabulary is Emacs Lisp
@@ -39,12 +40,13 @@ front end and the capability tier differ.
 
 ## What makes it different
 
-- **Transactional everywhere.** `rehearse` dry-runs any program and returns the
-  diff it *would* make, changing nothing. `(with-transaction …)` makes a
-  multi-step program all-or-nothing. Checkpoints and an undo ring let you
-  rewind.  Saves are atomic and **refuse to clobber** a file an external writer
-  changed since you opened it — the edit stays warm in the session instead of
-  vanishing.
+- **Transactional everywhere.** `rehearse: true` (or `mime rehearse` on the
+  command line) dry-runs any edit and returns the diff it *would* make, changing
+  nothing. `(with-transaction …)` makes a multi-step program all-or-nothing,
+  `(checkpoint)` / `(restore-checkpoint)` mark and return to named points across
+  programs, and `undo_last` rewinds the last edit. Saves are atomic and **refuse
+  to clobber** a file an external writer changed since you opened it — the edit
+  stays in the session instead of vanishing.
 
 - **Structural editing, twelve languages.** Outline a file, jump to a function
   *by name*, scope an edit to a single defun, or run a tree-sitter query —
@@ -56,17 +58,19 @@ front end and the capability tier differ.
   code buffer.
 
 - **Huge files stay cheap.** The file-backed store is a persistent B-tree piece
-  table over a paged, read-on-demand original: O(log n) piece lookup with
-  memoized within-piece seeks, O(1) snapshots, streaming searches, and a single
-  parallel validate-and-index pass at open. A multi-GB file never goes fully
-  resident, and a checkpoint is a pointer copy.
+  table over the original text — read into memory once for files under 16 MiB
+  (so no file handle stays open), paged and read on demand at 16 MiB or more:
+  O(log n) piece lookup with memoized within-piece seeks, O(1) snapshots,
+  streaming searches, and a single parallel validate-and-index pass at open. A
+  multi-GB file never goes fully resident, and a checkpoint is a pointer copy.
 
 - **In-process git history editing.** A `git_*` tool group drives rebase,
   cherry-pick, and revert as a sequencer (on `git2` / vendored libgit2): the
   plan is *data*, a conflicted step surfaces through the very same
-  merge-conflict vocabulary you'd use by hand, and `git_rebase` can `rehearse` a
-  plan before running it. `autosquash` folds commits without a full plan: a
-  sparse `{commit, into}` list, or `true` to fold the branch's
+  merge-conflict vocabulary you'd use by hand, and the rewriting tools
+  (`git_rebase`, `git_fixup`, `git_absorb`, `git_split` and the message tools)
+  take `rehearse: true` to preview a rewrite. `autosquash` folds commits without
+  a full plan: a sparse `{commit, into}` list, or `true` to fold the branch's
   `fixup!`/`squash!` commits into the commits their subjects name (git's
   `--autosquash`). One-call helpers sit on top: `git_fixup` and `git_absorb`
   fold worktree changes into the commits that own them, `git_reword` /
@@ -162,30 +166,32 @@ the handle. On HTTP a legacy client's `Mcp-Session-Id` *is* its workspace; a
 kept only if the call created warm state; the result then reports the handle (in
 `structuredContent` for a tool that returns one, and as a trailing `workspace:`
 line of any prose text) and the client passes it to later calls.
-`open_workspace` / `close_workspace` manage them explicitly.
+`open_workspace` / `close_workspace` (listed on HTTP only) manage them
+explicitly.
 
 Only the tools that return a structured value of their own — `session_status`,
-`run_program`, `rehearse`, `grep`, `outline` and `open_workspace` — declare an
+`run_program`, `grep`, `outline` and `open_workspace` — declare an
 `outputSchema`; a tool error carries `structuredContent` only when the tool
 supplies one. The text-only tools carry none, since Claude Code renders a
 structured value in preference to the text. `session_status` shows the handle
 only on that protocol (`null` elsewhere, and when the call holds no workspace).
 
 Each tool takes a `path` and auto-opens the file into a warm session keyed by
-its canonical path; mutating tools take `save: true` for an atomic,
-stale-guarded write-back. The catalogue is generated from the live schemas into
-[docs/mcp-tools.md](docs/mcp-tools.md) (`make docs`), so the docs can't drift
-from the code. The edits that matter:
+its canonical path; mutating tools save to disk by default — an atomic,
+stale-guarded write-back — with `save: false` to hold an edit in the session and
+`rehearse: true` to preview it. The catalogue is generated from the live schemas
+into [docs/mcp-tools.md](docs/mcp-tools.md) (`make docs`), so the docs can't
+drift from the code. The edits that matter:
 
 ```json
-replace_text {path, pattern, replacement, expect_unique: true, save: true}
-replace_in_files {files: [a, b, c], pattern, replacement, all: true, save: true}
+replace_text {path, pattern, replacement, expect_unique: true}
+replace_in_files {files: [a, b, c], pattern, replacement, all: true}
 insert_text  {path, text, anchor: {defun: "parse_args", where: "after"}}
 view         {path, thing: {kind: "list", after: "fn main() {"}}   // the block after a line
 fill_text    {path, anchor: {pattern: "/// Returns the"}}   // reflow a comment or README paragraph
 outline      {path}            // KIND START END NAME, per defun
-rehearse     {path, program}   // dry-run any lisp program; inspect the diff
-undo_last    {path}            // rewind the last mutating call
+run_program  {path, program, rehearse: true}   // dry-run any lisp program; inspect the diff
+undo_last    {path}            // rewind the last edit, on disk too
 help         {topic}           // lisp | regex | treesit | conflicts | git | sessions | recipes
 ```
 
@@ -197,25 +203,25 @@ all-or-nothing; and warm sessions are bounded but never evicted while they hold
 unsaved work.
 
 A `git_*` group adds history editing. The core is the sequencer: `git_rebase`
-(with a `rehearse` dry-run), `git_cherry_pick`, `git_revert`, and `git_continue`
-/ `git_skip` / `git_abort`, plus the read-only `git_status` (branch, upstream
-ahead/behind, dirty paths, in-progress operation), `git_log` (`stat: true` adds
-per-commit files and line counts), `git_show`, and `git_blame` (whose worktree
-mode maps each uncommitted hunk to the commit that owns it). On top sit one-call
-helpers: `git_commit` creates a commit from explicitly listed files only (no
-`-A`/`.` sweep; `after` places it mid-series), `git_split` partitions one commit
-into several with the descendants replayed unchanged, `git_fixup` and
-`git_absorb` fold uncommitted changes into the commits that own them, `git_move`
-relocates a change between two adjacent commits, `git_reword` and
-`git_msg_rewrite` edit commit messages (one commit / a whole range), and those
-two plus `git_commit`, `git_rebase` and `git_split` fill the message bodies they
-author at 72 columns unless told not to (`fill: false`), `git_msg_fill` runs
-that fill over a range of existing commits, `git_discard` drops selected
-uncommitted hunks (recoverably), and `git_range_diff` compares a branch before
-and after a rewrite. A conflicted step stops with diff3 markers in the worktree;
-resolve them with the conflict tools above, then `git_continue` (or `git_skip` /
-`git_abort`). Repos are confined to `$MIME_ROOTS`, and each op stamps a
-`refs/mime-backup/<branch>` ref so the pre-op state is recoverable.
+(with a `rehearse: true` dry-run), `git_cherry_pick`, `git_revert`, and
+`git_continue` / `git_skip` / `git_abort`, plus the read-only `git_status`
+(branch, upstream ahead/behind, dirty paths, in-progress operation), `git_log`
+(`stat: true` adds per-commit files and line counts), `git_show`, and
+`git_blame` (whose worktree mode maps each uncommitted hunk to the commit that
+owns it). On top sit one-call helpers: `git_commit` creates a commit from
+explicitly listed files only (no `-A`/`.` sweep; `after` places it mid-series),
+`git_split` partitions one commit into several with the descendants replayed
+unchanged, `git_fixup` and `git_absorb` fold uncommitted changes into the
+commits that own them, `git_move` relocates a change between two adjacent
+commits, `git_reword` and `git_msg_rewrite` edit commit messages (one commit / a
+whole range), and those two plus `git_commit`, `git_rebase` and `git_split` fill
+the message bodies they author at 72 columns unless told not to (`fill: false`),
+`git_msg_fill` runs that fill over a range of existing commits, `git_discard`
+drops selected uncommitted hunks (recoverably), and `git_range_diff` compares a
+branch before and after a rewrite. A conflicted step stops with diff3 markers in
+the worktree; resolve them with the conflict tools above, then `git_continue`
+(or `git_skip` / `git_abort`). Repos are confined to `$MIME_ROOTS`, and each op
+stamps a `refs/mime-backup/<branch>` ref so the pre-op state is recoverable.
 
 ## How it works
 
@@ -233,7 +239,7 @@ resolve them with the conflict tools above, then `git_continue` (or `git_skip` /
                 store.rs                            ← the TextStore trait
                 /        \
           buffer.rs     quire.rs                    ← in-memory oracle / the
-        (the oracle)  (piece-tree-over-mmap)           real file-backed store
+        (the oracle)  (piece tree over the file)       real file-backed store
                           \
                        safety.rs                    ← roots, atomic saves, audit
 ```
@@ -241,7 +247,8 @@ resolve them with the conflict tools above, then `git_continue` (or `git_skip` /
 - **`store.rs`** defines `TextStore`, the buffer interface every primitive edits
   through. **`buffer.rs`** is a simple in-memory implementation that doubles as
   a differential-testing oracle; **`quire.rs`** is the production store — the
-  persistent B-tree piece table over a paged mmap.
+  persistent B-tree piece table over the file's text (in memory under 16 MiB,
+  paged at 16 MiB or more).
 - **`engine.rs`** owns warm sessions, the capability tier, and time travel
   (checkpoints + the undo ring). The tier is fixed at construction: the CLI gets
   trusted orchestration; the MCP server and daemon get the sandboxed vocabulary.
