@@ -609,20 +609,58 @@ impl MsgEdit {
     }
 }
 
-/// Apply `edits` to `msg` in order. A `find` that is absent is an error (a
-/// typo'd anchor fails loudly rather than silently doing nothing); one that
-/// matches replaces EVERY occurrence — zero-or-all, never a silent partial
-/// application. Replacements never re-match text they inserted.
+/// Apply `edits` to `msg` in order. A `find` is matched exactly first; only
+/// when that finds nothing is it matched ignoring how its words are spaced and
+/// wrapped ([`loose_find`]). A `find` absent both ways is an error (a typo'd
+/// anchor fails loudly rather than silently doing nothing); one that matches
+/// replaces EVERY occurrence — zero-or-all, never a silent partial application.
+/// Replacements never re-match text they inserted.
 fn apply_msg_edits(msg: String, edits: &[MsgEdit]) -> Result<String, Error> {
     let (out, counts) = apply_msg_edits_counted(&msg, edits);
     for (e, n) in edits.iter().zip(&counts) {
         if let (MsgEdit::Replace { find, .. }, 0) = (e, *n) {
             return Err(estr(&format!(
-                "message edit: text not found in the commit message: {find:?}"
+                "message edit: text not found in the commit message (also \
+                 compared ignoring line breaks and spacing): {find:?}"
             )));
         }
     }
     Ok(out)
+}
+
+/// `find` as a pattern that ignores how its text is spaced and wrapped — the
+/// fallback when the exact text is absent, so a quote wrapped differently from
+/// the message (a rewrap by git_msg_fill, a paragraph copied from a diff) still
+/// lands. Each word is literal; a gap between words that holds no blank line
+/// matches spaces, tabs, or one line break, and a gap that holds a blank line
+/// matches a paragraph break, so a loose match never joins two paragraphs. Any
+/// whitespace at the very start or end of `find` (a stray space or newline
+/// picked up when quoting a rewrapped line) is trimmed before building the
+/// pattern, so it never forces a matching gap to exist right at the message's
+/// start/end or next to punctuation. `None` when `find`, once trimmed, is a
+/// single word: there is no spacing to loosen, and a bare search for the word
+/// could hit it inside another word.
+fn loose_find(find: &str) -> Option<regex::Regex> {
+    const LINE_GAP: &str = r"(?:[ \t]+|[ \t]*\n[ \t]*)";
+    const PARA_GAP: &str = r"[ \t]*\n(?:[ \t]*\n)+[ \t]*";
+    let mut rest = find.trim();
+    if !rest.contains(char::is_whitespace) {
+        return None;
+    }
+    let mut pattern = String::new();
+    while !rest.is_empty() {
+        let gap = rest.len() - rest.trim_start().len();
+        if gap > 0 {
+            let blank_line = rest[..gap].matches('\n').count() >= 2;
+            pattern.push_str(if blank_line { PARA_GAP } else { LINE_GAP });
+            rest = &rest[gap..];
+            continue;
+        }
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        pattern.push_str(&regex::escape(&rest[..end]));
+        rest = &rest[end..];
+    }
+    regex::Regex::new(&pattern).ok()
 }
 
 /// The counting core of [`apply_msg_edits`]: per-edit replacement counts
@@ -641,6 +679,21 @@ fn apply_msg_edits_counted(msg: &str, edits: &[MsgEdit]) -> (String, Vec<usize>)
                     msg.replace_range(pos..pos + find.len(), with);
                     at = pos + with.len();
                     n += 1;
+                }
+                // Only when the exact text is absent: an exact match elsewhere
+                // must not let a looser one edit a second site.
+                if n == 0
+                    && let Some(re) = loose_find(find)
+                {
+                    // A closure replacer counts the matches in the same pass
+                    // and inserts `with` verbatim: `$1` in it is text, not a
+                    // capture-group reference.
+                    msg = re
+                        .replace_all(&msg, |_: &regex::Captures| {
+                            n += 1;
+                            with.as_str()
+                        })
+                        .into_owned();
                 }
                 counts.push(n);
             }
@@ -4612,8 +4665,8 @@ fn msg_rewrite(
     for (e, t) in edits.iter().zip(&totals) {
         if let (MsgEdit::Replace { find, .. }, 0) = (e, *t) {
             return Err(estr(&format!(
-                "msg_rewrite: {find:?} matches no commit message in {range} — \
-                 nothing changed"
+                "msg_rewrite: {find:?} matches no commit message in {range}, \
+                 even ignoring line breaks and spacing — nothing changed"
             )));
         }
     }
@@ -9653,6 +9706,230 @@ mod tests {
             before,
             "no mutation on a pre-validated message-edit error"
         );
+    }
+
+    #[test]
+    fn message_edit_find_ignores_how_the_text_is_wrapped() {
+        // The quote breaks after "in a"; the message after "in".
+        let msg = apply_msg_edits(
+            "subject\n\nA quoted defun in\na program no longer defines it.\n".to_string(),
+            &[MsgEdit::Replace {
+                find: "defun in a\nprogram no longer".to_string(),
+                with: "defun in a program never".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            msg,
+            "subject\n\nA quoted defun in a program never defines it.\n"
+        );
+    }
+
+    #[test]
+    fn message_edit_exact_match_wins_over_the_loose_one() {
+        // "a b" is present verbatim once; the differently spaced "a\nb" must
+        // stay, because the loose pass only runs when the exact one finds
+        // nothing.
+        let msg = apply_msg_edits(
+            "a b\n\na\nb\n".to_string(),
+            &[MsgEdit::Replace {
+                find: "a b".to_string(),
+                with: "X".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(msg, "X\n\na\nb\n");
+    }
+
+    #[test]
+    fn message_edit_loose_replacement_is_literal() {
+        // `$1` in the replacement is text, not a capture-group reference.
+        let msg = apply_msg_edits(
+            "cost is\nhigh\n".to_string(),
+            &[MsgEdit::Replace {
+                find: "is high".to_string(),
+                with: "is $1 now".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(msg, "cost is $1 now\n");
+    }
+
+    #[test]
+    fn message_edit_loose_find_does_not_cross_a_paragraph_break() {
+        // A single space in `find` matches spaces or one line break, never a
+        // blank line: the replacement would otherwise join the paragraphs.
+        let err = apply_msg_edits(
+            "one two\n\nthree\n".to_string(),
+            &[MsgEdit::Replace {
+                find: "two three".to_string(),
+                with: "X".to_string(),
+            }],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("text not found"), "{err}");
+        // A `find` that itself spans a blank line matches one.
+        let msg = apply_msg_edits(
+            "one two\n\n\nthree\n".to_string(),
+            &[MsgEdit::Replace {
+                find: "two\n\nthree".to_string(),
+                with: "two three".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(msg, "one two three\n");
+    }
+
+    #[test]
+    fn message_edit_whitespace_only_find_has_no_loose_fallback() {
+        // No word to anchor on: a loose pattern would match every space.
+        assert!(
+            apply_msg_edits(
+                "a \n \nb\n".to_string(),
+                &[MsgEdit::Replace {
+                    find: "\n\n".to_string(),
+                    with: "X".to_string(),
+                }],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn message_edit_loose_find_ignores_leading_whitespace_at_message_start() {
+        // Copied with a stray leading space and trailing newline (an artifact
+        // of quoting a rewrapped line); the phrase sits at the very start of
+        // the message, where there is no character before it for a leading gap
+        // to match.
+        let msg = apply_msg_edits(
+            "old\nname is used here.\n".to_string(),
+            &[MsgEdit::Replace {
+                find: " old\nname\n".to_string(),
+                with: "new name".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(msg, "new name is used here.\n");
+    }
+
+    #[test]
+    fn message_edit_loose_find_needs_a_gap_between_words() {
+        // Trimmed, " id" is one word: the loose pass has no spacing to ignore,
+        // so it must not fall back to a bare substring search (which would also
+        // hit "valid").
+        let err = apply_msg_edits(
+            "subject\n\nid is valid\n".to_string(),
+            &[MsgEdit::Replace {
+                find: " id".to_string(),
+                with: " ID".to_string(),
+            }],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn message_edit_loose_find_ignores_trailing_whitespace_before_punctuation() {
+        // The same stray leading space and trailing newline, but the phrase now
+        // sits right before a period, where there is no line break for a
+        // trailing gap to match.
+        let msg = apply_msg_edits(
+            "subject\n\nthe old\nname.\n".to_string(),
+            &[MsgEdit::Replace {
+                find: " old\nname\n".to_string(),
+                with: "new name".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(msg, "subject\n\nthe new name.\n");
+    }
+
+    #[test]
+    fn message_edit_not_found_says_spacing_was_ignored() {
+        let err = apply_msg_edits(
+            "nothing here\n".to_string(),
+            &[MsgEdit::Replace {
+                find: "absent words".to_string(),
+                with: "y".to_string(),
+            }],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("text not found in the commit message"),
+            "{err}"
+        );
+        assert!(err.contains("ignoring line breaks and spacing"), "{err}");
+    }
+
+    #[test]
+    fn msg_rewrite_matches_rewrapped_text() {
+        let dir = tmp("msgloose-range");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let c1 = commit(
+            &repo,
+            &[base],
+            &[("a", "2\n")],
+            "one\n\nthe old\nwording here\n",
+        );
+        on_branch(&repo, "main", c1);
+        let specs = vec![MsgEditSpec {
+            find: Some("the old wording".into()),
+            replace: Some("the new wording".into()),
+            append: None,
+        }];
+        cmd_msg_rewrite(&dir, "HEAD~1..HEAD", &specs, None, false).unwrap();
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(tip.message().unwrap(), "one\n\nthe new wording here\n");
+
+        // A range-wide miss names the looser comparison too.
+        let specs = vec![MsgEditSpec {
+            find: Some("never there".into()),
+            replace: Some("x".into()),
+            append: None,
+        }];
+        let err = cmd_msg_rewrite(&dir, "HEAD~1..HEAD", &specs, None, false).unwrap_err();
+        assert!(err.contains("matches no commit message"), "{err}");
+        assert!(err.contains("ignoring line breaks and spacing"), "{err}");
+    }
+
+    #[test]
+    fn plan_message_edits_match_rewrapped_text() {
+        let dir = tmp("msgloose-plan");
+        let repo = Repository::init(&dir).unwrap();
+        let base = commit(&repo, &[], &[("a", "1\n")], "base");
+        let f1 = commit(
+            &repo,
+            &[base],
+            &[("a", "1\n"), ("b", "1\n")],
+            "Add b\n\nkeeps the\nold name\n",
+        );
+        let m1 = commit(&repo, &[base], &[("a", "2\n")], "change a");
+        on_branch(&repo, "topic", f1);
+
+        let s = Step {
+            commit: f1,
+            action: Action::Reword,
+            fill: None,
+            message: None,
+            message_edits: vec![MsgEdit::Replace {
+                find: "the old name".to_string(),
+                with: "the new name".to_string(),
+            }],
+            split_into: Vec::new(),
+        };
+        start(
+            &repo,
+            Plan {
+                onto: m1,
+                steps: vec![s],
+            },
+        )
+        .unwrap();
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(tip.message().unwrap(), "Add b\n\nkeeps the new name\n");
     }
 
     #[test]
