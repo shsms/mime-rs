@@ -74,14 +74,9 @@ pub fn run() {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
-    // One store; stdio is a single client, so one implicit workspace minted at
-    // startup is where every call without a `workspace` lands. Not behind a
-    // lock — the server is single-threaded (a `Workspace` is `!Send`).
-    let mut store = crate::rpc::WorkspaceStore::new();
-    let default = store.mint();
-    // Pinned: an open_workspace flood must not evict the workspace every
-    // handle-free call lands in, warm unsaved buffers and all.
-    store.pin(&default);
+    // Not behind a lock — the server is single-threaded (a `Workspace` is
+    // `!Send`).
+    let (mut store, default) = stdio_store();
     let ctx = crate::rpc::CallContext {
         transport: crate::rpc::Transport::Stdio,
         implicit_workspace: Some(&default),
@@ -112,6 +107,18 @@ pub fn run() {
             let _ = out.flush();
         }
     }
+}
+
+/// The store a single stdio client works in (`mime --mcp`, `mime call`), and
+/// the handle of its one implicit workspace, where every call without a
+/// `workspace` lands.
+pub fn stdio_store() -> (crate::rpc::WorkspaceStore, String) {
+    let mut store = crate::rpc::WorkspaceStore::new();
+    let default = store.mint();
+    // Pinned: an open_workspace flood must not evict the workspace every
+    // handle-free call lands in, warm unsaved buffers and all.
+    store.pin(&default);
+    (store, default)
 }
 
 // ---- tool dispatch ---------------------------------------------------------

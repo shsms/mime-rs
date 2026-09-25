@@ -341,6 +341,24 @@ pub fn handle_request(req: Value, store: &mut WorkspaceStore, ctx: &CallContext)
     reply(id, is_notification, shape_result(era, result))
 }
 
+/// Run one tool call as a stdio client's `tools/call` request would, and hand
+/// back the tool result (`content`, `isError`) — the dispatch `mime call` uses.
+pub fn call_tool(name: &str, args: Value, store: &mut WorkspaceStore, ctx: &CallContext) -> Value {
+    let params = json!({ "name": name, "arguments": args });
+    tools_call(&params, store, ctx, Era::Legacy)
+}
+
+/// A tool result's text blocks, one per line.
+pub fn result_text(result: &Value) -> String {
+    let texts: Vec<&str> = result["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c["text"].as_str())
+        .collect();
+    texts.join("\n")
+}
+
 /// Dispatch `tools/call`: the two workspace tools act on the store itself;
 /// everything else runs against one resolved workspace's session map (or a
 /// throwaway map for tools that never touch warm state: git_*, help).

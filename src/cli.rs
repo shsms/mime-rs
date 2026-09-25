@@ -1,6 +1,7 @@
 //! The CLI front-end (the `mime` default mode).
 //!
-//! Three modes share one parser:
+//! Four modes; all but `call`, which takes a tool name and JSON, share one
+//! parser:
 //!
 //! * One-shot, embedded (no daemon) — the default for `run`/`rehearse`: `mime
 //!   run PROG.tl [--file FILE] [--write]` — or just `mime PROG.tl` — runs a
@@ -13,6 +14,10 @@
 //!   the diff + reports + value for each. State (buffer, kill-ring,
 //!   checkpoints, `defun`s) persists across lines; nothing is ever written back
 //!   to disk.
+//!
+//! * MCP tool calls, embedded: `mime call TOOL [JSON | -]` runs one call
+//!   through the same dispatch as `mime --mcp`; `mime call --script FILE` runs
+//!   one call per line in one warm workspace.
 //!
 //! * Daemon-backed — opt in with `--session S` (or `$MIME_SESSION`), which
 //!   talks to `mime --daemon` over its unix socket (`$MIME_SOCKET` or
@@ -50,6 +55,11 @@ struct Args {
 
 pub fn run() {
     let argv: Vec<String> = std::env::args().collect();
+    // `call` takes a tool name and JSON, not a program and flags: its own
+    // grammar, parsed apart from the rest.
+    if argv.get(1).is_some_and(|v| v == "call") {
+        run_call(&argv[2..]);
+    }
     let args = parse(&argv);
 
     // A bare program path with no verb is shorthand for a one-shot `run` (`mime
@@ -627,6 +637,177 @@ fn require_session(args: &Args) -> String {
         })
 }
 
+/// `mime call TOOL [JSON | -]` and `mime call --script FILE | -`: MCP tool
+/// calls from the shell, through the same dispatch as `mime --mcp` (argument
+/// aliases and checks, the tools stdio lists, `$MIME_ROOTS`, `$MIME_EXEC`).
+/// One call prints its text (to stderr when it failed); `--script` runs one
+/// `{"name", "arguments"}` object per line in one warm workspace — the way to
+/// reproduce a bug that takes several calls — and prints each result under a
+/// `--- NAME` header. `--json` prints the whole result instead: pretty for one
+/// call, one line per call for a script. The warm buffers end with the
+/// process, so an edit held with `save: false` and never saved is reported
+/// on stderr as discarded. Exits 1 when any call failed, 2 on a usage error.
+fn run_call(rest: &[String]) -> ! {
+    let mut json = false;
+    let mut script: Option<String> = None;
+    let mut positional: Vec<&str> = Vec::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--json" => json = true,
+            "--script" => match it.next() {
+                Some(f) => script = Some(f.clone()),
+                None => call_usage("--script needs a FILE (or - for stdin)"),
+            },
+            flag if flag.starts_with("--") => call_usage(&format!("unknown flag {flag}")),
+            other => positional.push(other),
+        }
+    }
+    let calls = match (&script, positional.as_slice()) {
+        (Some(source), []) => {
+            let text = if source == "-" {
+                read_stdin()
+            } else {
+                read_or_die(source, "script")
+            };
+            parse_call_script(&text).unwrap_or_else(|e| call_usage(&e))
+        }
+        (None, [tool]) => vec![(tool.to_string(), serde_json::json!({}))],
+        (None, [tool, args]) => {
+            let text = if *args == "-" {
+                read_stdin()
+            } else {
+                args.to_string()
+            };
+            let args = parse_call_args(&text).unwrap_or_else(|e| call_usage(&e));
+            vec![(tool.to_string(), args)]
+        }
+        _ => call_usage("give TOOL [JSON | -], or --script FILE | -"),
+    };
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    let ok = call_tools(
+        &calls,
+        json,
+        script.is_some(),
+        &mut stdout.lock(),
+        &mut stderr.lock(),
+    );
+    exit(if ok { 0 } else { 1 });
+}
+
+fn call_usage(problem: &str) -> ! {
+    eprintln!("mime call: {problem}");
+    eprintln!("usage: mime call TOOL [JSON | -] [--json]");
+    eprintln!(
+        "       mime call --script FILE | - [--json]   (one {{\"name\", \"arguments\"}} per line)"
+    );
+    exit(2);
+}
+
+/// All of stdin, for a `-` in place of the arguments or the script.
+fn read_stdin() -> String {
+    let mut text = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut text) {
+        call_usage(&format!("cannot read stdin: {e}"));
+    }
+    text
+}
+
+/// A tool's arguments: a JSON object.
+fn parse_call_args(text: &str) -> Result<serde_json::Value, String> {
+    match serde_json::from_str(text) {
+        Ok(v @ serde_json::Value::Object(_)) => Ok(v),
+        Ok(_) => Err("the arguments must be a JSON object".to_string()),
+        Err(e) => Err(format!("the arguments are not JSON: {e}")),
+    }
+}
+
+/// One call per line: `{"name": TOOL, "arguments": {…}}`, `arguments` optional.
+/// Blank lines and `#` comments are skipped. Every line is parsed before
+/// anything runs, so a malformed line 9 does not leave eight calls' worth of
+/// edits behind.
+fn parse_call_script(text: &str) -> Result<Vec<(String, serde_json::Value)>, String> {
+    let mut calls = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let bad = |why: &str| format!("script line {}: {why}", i + 1);
+        let call: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| bad(&format!("not JSON: {e}")))?;
+        let name = call
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| bad("no \"name\""))?;
+        let args = match call.get("arguments") {
+            None => serde_json::json!({}),
+            Some(v) if v.is_object() => v.clone(),
+            Some(_) => return Err(bad("\"arguments\" must be a JSON object")),
+        };
+        calls.push((name.to_string(), args));
+    }
+    if calls.is_empty() {
+        return Err("the script has no calls".to_string());
+    }
+    Ok(calls)
+}
+
+/// Run `calls` in order in one stdio workspace and print their results (see
+/// [`run_call`]). Returns whether every call succeeded.
+fn call_tools(
+    calls: &[(String, serde_json::Value)],
+    json: bool,
+    script: bool,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> bool {
+    let (mut store, default) = crate::mcp::stdio_store();
+    let ctx = crate::rpc::CallContext {
+        transport: crate::rpc::Transport::Stdio,
+        implicit_workspace: Some(&default),
+    };
+    let mut all_ok = true;
+    for (name, args) in calls {
+        let result = crate::rpc::call_tool(name, args.clone(), &mut store, &ctx);
+        let failed = result["isError"] == true;
+        all_ok &= !failed;
+        let text = crate::rpc::result_text(&result);
+        let _ = match (json, script) {
+            (true, true) => writeln!(out, "{result}"),
+            (true, false) => writeln!(out, "{result:#}"),
+            (false, true) => {
+                let mark = if failed { " (error)" } else { "" };
+                writeln!(out, "--- {name}{mark}\n{text}")
+            }
+            (false, false) if failed => writeln!(err, "{text}"),
+            (false, false) => writeln!(out, "{text}"),
+        };
+    }
+    // The warm buffers die with this process: an edit held with `save: false`
+    // and never saved is gone, whatever the tool's own note suggested.
+    let mut held: Vec<String> = store
+        .get_mut(&default)
+        .into_iter()
+        .flat_map(|sessions| sessions.values())
+        .filter(|ws| ws.is_modified())
+        .filter_map(|ws| ws.visited_path())
+        .map(|p| p.display().to_string())
+        .collect();
+    held.sort();
+    held.dedup();
+    if !held.is_empty() {
+        let _ = writeln!(
+            err,
+            "mime call: unsaved edits to {} were discarded on exit — drop save: false, \
+             or save_buffer them later in the same --script",
+            held.join(", ")
+        );
+    }
+    all_ok
+}
+
 fn usage() {
     let rows = [
         (
@@ -640,6 +821,14 @@ fn usage() {
         (
             "mime repl [--file FILE]",
             "interactive warm session; never writes",
+        ),
+        (
+            "mime call TOOL [JSON | -] [--json]",
+            "one MCP tool call, as `mime --mcp` would run it",
+        ),
+        (
+            "mime call --script FILE | - [--json]",
+            "a call per line, in one warm workspace",
         ),
         (
             "mime describe-mcp",

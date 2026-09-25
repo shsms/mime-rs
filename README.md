@@ -149,6 +149,18 @@ make claude        # cargo install + register `mime --mcp` (MIME_ROOTS) with Cla
 make claude-exec   # the same, with MIME_EXEC=1 granted (git_exec_over, gpg signing)
 ```
 
+Every tool can also be called from the shell, without a client: `mime call` runs
+one call exactly as `mime --mcp` would (the same argument checks, roots and exec
+setting) and prints its text; `--script` runs one call per line in one warm
+workspace, which is how to reproduce a bug that takes several calls.
+
+```sh
+mime call replace_text '{"path": "in.txt", "pattern": "a", "replacement": "b"}'
+mime call view - < args.json          # arguments from stdin
+mime call --script repro.jsonl        # {"name": …, "arguments": {…}} per line
+mime call occur '{"path": "in.txt", "pattern": "b"}' --json   # the whole result
+```
+
 ### Protocol
 
 mime is a *dual-era* MCP server. It speaks the stateless `2026-07-28` revision
