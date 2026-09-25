@@ -546,6 +546,70 @@ fn insert_text_appends_at_eob_and_anchors_on_a_unique_line() {
 }
 
 #[test]
+fn insert_text_accepts_expect_unique_and_keeps_anchors_unique() {
+    let mut s = Server::spawn();
+    s.call_ok(
+        1,
+        "open_text",
+        json!({ "text": "a\nb\na\n", "session": "u" }),
+    );
+
+    s.call_ok(
+        2,
+        "insert_text",
+        json!({ "session": "u", "text": "\nx", "anchor": { "pattern": "b" }, "expect_unique": true }),
+    );
+    assert_eq!(
+        s.read_text(3, json!({ "session": "u", "start": 1, "end": 9 })),
+        "a\nb\nx\na\n"
+    );
+
+    let err = s.call_err(
+        4,
+        "insert_text",
+        json!({ "session": "u", "text": "y", "anchor": { "pattern": "a" }, "expect_unique": true }),
+    );
+    assert!(err.contains("must be unique"), "{err}");
+
+    let err = s.call_err(
+        5,
+        "insert_text",
+        json!({ "session": "u", "text": "y", "anchor": { "pattern": "b" }, "expect_unique": false }),
+    );
+    assert!(err.contains("always match exactly one line"), "{err}");
+}
+
+#[test]
+fn guessed_names_reach_the_tools() {
+    let mut s = Server::spawn();
+    s.call_ok(1, "open_text", json!({ "text": "a a a", "session": "g" }));
+    s.call_ok(
+        2,
+        "replace_text",
+        json!({ "session": "g", "pattern": "a", "replacement": "z", "replace_all": true }),
+    );
+    assert_eq!(
+        s.read_text(3, json!({ "session": "g", "start": 1, "end": 6 })),
+        "z z z"
+    );
+
+    let git = s.call_ok(4, "help", json!({ "topic": ["git"] }));
+    assert!(
+        git.starts_with("— git history workflow —"),
+        "the one-item list reads as the topic: {git}"
+    );
+
+    s.call_ok(5, "open_text", json!({ "text": "x", "session": "h" }));
+    s.call_ok(6, "close_session", json!({ "session": "*" }));
+    let status: Value = serde_json::from_str(&s.call_ok(7, "session_status", json!({}))).unwrap();
+    assert_eq!(
+        status["sessions"],
+        json!([]),
+        "session \"*\" closed them all: {status}"
+    );
+}
+
+#[test]
 fn view_reads_each_form_as_numbered_lines_without_moving_point() {
     let mut s = Server::spawn();
     s.call_ok(

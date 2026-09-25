@@ -199,6 +199,7 @@ fn alias_table(tool: &str) -> &'static [(&'static str, &'static str)] {
             ("new", "replacement"),
             ("new_text", "replacement"),
             ("replace", "replacement"),
+            ("replace_all", "all"),
         ],
         "insert_text" => &[("location", "pos"), ("position", "pos"), ("at", "pos")],
         "fill_text" => &[
@@ -210,11 +211,18 @@ fn alias_table(tool: &str) -> &'static [(&'static str, &'static str)] {
         ],
         "view" => &[("from", "start"), ("to", "end"), ("count", "context")],
         "git_rebase" => &[("upstream", "from"), ("path", "repo")],
+        "git_fixup" => &[("commit", "target"), ("path", "repo")],
+        "git_show" => &[("rev", "commit"), ("path", "repo")],
+        // `edits` is replace_text's batch key; here it can only mean the
+        // message edits. It is renamed before normalize_aliases walks an
+        // `edits` array, so no message edit is rewritten as a text edit.
+        "git_msg_rewrite" => &[("edits", "message_edits"), ("path", "repo")],
         // `path` names a FILE in git_blame, and git_commit's explicit `paths`
         // makes a stray singular `path` too ambiguous to absorb — in both it
         // stays an error (whose message lists the valid keys) instead of
-        // silently meaning the repo.
-        "git_blame" | "git_commit" => &[],
+        // silently meaning the repo. `file` is the guess for blame's `path`.
+        "git_blame" => &[("file", "path")],
+        "git_commit" => &[],
         git if git.starts_with("git_") => &[("path", "repo")],
         _ => &[],
     }
@@ -232,7 +240,7 @@ fn normalize_aliases(tool: &str, args: &mut Value) -> Result<(), String> {
     }
     let table = alias_table(tool);
     if table.is_empty() {
-        return Ok(());
+        return normalize_values(tool, args);
     }
     // "regexp"/"regex" say more than the key name: the caller wants regex
     // matching. Remember that before the key is rewritten away, and default
@@ -268,6 +276,34 @@ fn normalize_aliases(tool: &str, args: &mut Value) -> Result<(), String> {
         for e in edits {
             rewrite(e)?;
         }
+    }
+    normalize_values(tool, args)
+}
+
+/// Values with one reading, rewritten after the key aliases: `close_session
+/// {session: "*"}` is `{all: true}`, and `help {topic: ["git"]}` (a one-item
+/// list) is that topic.
+fn normalize_values(tool: &str, args: &mut Value) -> Result<(), String> {
+    let Some(obj) = args.as_object_mut() else {
+        return Ok(());
+    };
+    match tool {
+        "close_session" if obj.get("session").and_then(Value::as_str) == Some("*") => {
+            if obj.contains_key("all") {
+                return Err("close_session: session \"*\" means all: true — pass one".to_string());
+            }
+            obj.remove("session");
+            obj.insert("all".to_string(), Value::Bool(true));
+        }
+        "help" => {
+            if let Some(topic) = obj.get_mut("topic")
+                && let Value::Array(items) = topic
+                && let [only @ Value::String(_)] = items.as_mut_slice()
+            {
+                *topic = only.take();
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -1617,6 +1653,15 @@ fn tool_insert_text(
     sessions: &mut HashMap<String, Workspace>,
 ) -> Result<String, String> {
     let session = resolve_session(args, sessions)?;
+    // `expect_unique` is replace_text's knob; an insert_text anchor is always
+    // unique, so true restates the rule and false (first-match) is refused.
+    if args.get("expect_unique").and_then(Value::as_bool) == Some(false) {
+        return Err(
+            "insert_text: an anchor must always match exactly one line — \
+                    expect_unique: false is not supported (drop it)"
+                .to_string(),
+        );
+    }
     let text = str_arg(args, "text")?;
     let escaped = lisp_literal(&text);
     let anchor = anchor_prelude(args)?;
@@ -5256,6 +5301,7 @@ fn build_tool_schemas() -> Vec<Value> {
                     "text": { "type": "string", "description": "The literal text to insert." },
                     "pos": { "type": ["integer", "string"], "description": "1-based position to insert at (default: current point) — or \"eob\" / \"bob\" to append at the end / insert at the beginning of the accessible region (no position arithmetic for the common append)." },
                     "anchor": { "type": "object", "description": "E.g. {\"pattern\": \"fn main() {\", \"where\": \"before\"} — insert relative to the UNIQUE line containing a literal text ({\"before\": \"line text\"} / {\"after\": \"line text\"} are accepted shorthand for the same) — or {\"defun\": \"name\"} to target a named defun. An ambiguous pattern errors, listing the match lines. \"where\": \"after\" (default) puts the text at the end of the defun or the matched line — include separating newlines in the text. \"before\" puts it above the whole decorated defun (Rust #[attributes] and /// doc comments, Python decorators, the adjacent comment block of a Go / JS / TS function, and a JS `export` included), or at the start of the matched line. Not combinable with pos.", "properties": { "defun": { "type": "string" }, "pattern": { "type": "string" }, "where": { "type": "string", "enum": ["after", "before"] }, "before": { "type": "string", "description": "Shorthand for {\"pattern\": <this text>, \"where\": \"before\"}." }, "after": { "type": "string", "description": "Shorthand for {\"pattern\": <this text>, \"where\": \"after\"}." } } },
+                    "expect_unique": { "type": "boolean", "description": "Accepted for symmetry with replace_text: an anchor pattern must ALWAYS match exactly one line (an ambiguous one errors, listing the matches), so true changes nothing and false is refused." },
                     "thing": thing_schema("Insert relative to a structural thing instead of a position:", ". `where` picks the end to insert at: \"after\" (default, at its end) or \"before\" (at its start); the result names the span it landed against, so a wrong pick is visible. Not combinable with pos/anchor."),
                     "where": { "type": "string", "enum": ["after", "before"], "description": "With `thing`: insert at its end (after, default) or its start (before). Applies to `thing` ONLY — the anchor form carries its own `where` inside the anchor object, and a top-level one without a `thing` is an error rather than a silently dropped placement." },
                     "view": { "type": ["boolean", "integer"], "description": "Append a rendered viewport around point after the edit (true = 4 context lines, or a line count) — confirm the insert landed right without a follow-up view call." },
@@ -6031,6 +6077,78 @@ mod git_tool_tests {
         let mut args = json!({ "repo": "/r", "path": "src/a.rs" });
         normalize_aliases("git_blame", &mut args).unwrap();
         assert_eq!(args, json!({ "repo": "/r", "path": "src/a.rs" }));
+    }
+
+    #[test]
+    fn guessed_argument_names_normalize_and_validate() {
+        for (tool, guess, canonical) in [
+            ("git_fixup", "commit", "target"),
+            ("replace_text", "replace_all", "all"),
+            ("replace_in_files", "replace_all", "all"),
+            ("git_show", "rev", "commit"),
+            ("git_blame", "file", "path"),
+            ("git_msg_rewrite", "edits", "message_edits"),
+        ] {
+            let mut args = Value::Object([(guess.to_string(), json!(true))].into_iter().collect());
+            normalize_aliases(tool, &mut args).unwrap();
+            let want = Value::Object([(canonical.to_string(), json!(true))].into_iter().collect());
+            assert_eq!(args, want, "{tool}: {guess}");
+            validate_args(tool, &args).unwrap();
+        }
+
+        // replace_all inside an edits[] batch too.
+        let mut args =
+            json!({ "edits": [{ "pattern": "a", "replacement": "b", "replace_all": true }] });
+        normalize_aliases("replace_text", &mut args).unwrap();
+        assert_eq!(
+            args,
+            json!({ "edits": [{ "pattern": "a", "replacement": "b", "all": true }] })
+        );
+
+        // The git tools keep path → repo alongside their own guess.
+        let mut args = json!({ "path": "/r", "commit": "HEAD~1" });
+        normalize_aliases("git_fixup", &mut args).unwrap();
+        assert_eq!(args, json!({ "repo": "/r", "target": "HEAD~1" }));
+
+        // A guess plus the name it stands for stays ambiguous.
+        let mut args = json!({ "commit": "a", "target": "b" });
+        assert!(
+            normalize_aliases("git_fixup", &mut args)
+                .unwrap_err()
+                .contains("alias")
+        );
+    }
+
+    #[test]
+    fn value_spellings_normalize() {
+        let mut args = json!({ "session": "*" });
+        normalize_aliases("close_session", &mut args).unwrap();
+        assert_eq!(args, json!({ "all": true }));
+        validate_args("close_session", &args).unwrap();
+
+        let mut args = json!({ "session": "*", "all": true });
+        let err = normalize_aliases("close_session", &mut args).unwrap_err();
+        assert!(err.contains("pass one"), "{err}");
+
+        let mut args = json!({ "session": "s1" });
+        normalize_aliases("close_session", &mut args).unwrap();
+        assert_eq!(args, json!({ "session": "s1" }));
+
+        let mut args = json!({ "topic": ["git"] });
+        normalize_aliases("help", &mut args).unwrap();
+        assert_eq!(args, json!({ "topic": "git" }));
+
+        let mut args = json!({ "topics": ["regex"] });
+        normalize_aliases("help", &mut args).unwrap();
+        assert_eq!(args, json!({ "topic": "regex" }));
+
+        let mut args = json!({ "topic": ["git", "regex"] });
+        normalize_aliases("help", &mut args).unwrap();
+        assert_eq!(
+            args,
+            json!({ "topic": ["git", "regex"] }),
+            "two topics stay a list"
+        );
     }
 
     #[test]

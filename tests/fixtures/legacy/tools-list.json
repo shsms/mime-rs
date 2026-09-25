@@ -326,6 +326,10 @@
               "description": "Append the unified diff of the edit (clamped like run_program's; full_diff lifts the clamp) — see exactly what changed in the same call; unsaved_diff cannot show it once the edit is saved. Default false.",
               "type": "boolean"
             },
+            "expect_unique": {
+              "description": "Accepted for symmetry with replace_text: an anchor pattern must ALWAYS match exactly one line (an ambiguous one errors, listing the matches), so true changes nothing and false is refused.",
+              "type": "boolean"
+            },
             "full_diff": {
               "description": "Return the whole unified diff. Default false: diffs beyond 200 lines come back clamped to head + tail around an elision line carrying the suppressed count.",
               "type": "boolean"
