@@ -205,6 +205,14 @@ the find-the-commit half for a fixup/edit plan; `since` scopes to your commits,
 `worktree` maps each UNCOMMITTED hunk to the commit that owns it (omit path to
 sweep the whole tree; group_by: "commit" buckets the hunks per owner — feed
 into git_fixup, or let git_absorb fold them all).
+Stacks: a rewrite moves the other local branches that point at the commits
+it rewrites (update_refs, default true): each lands after its last surviving
+commit, so a fixup into the bottom of a stack carries every branch above it.
+A branch in use in another worktree (checked out, or being rebased,
+bisected or rewritten there), one with commits of its own on top, and tags
+are left and reported. The result lists each move (`moved a OLD → NEW`); a
+moved branch's old tip is in refs/mime-backup/<branch>/0. rehearse shows the
+moves first (`would move a …`); git_log shows where branches sit.
   git_rebase {onto, from?, plan?}  plan = [{commit, action, message?,
     message_edits?}], action = pick|reword|squash|fixup|edit|drop; list order
     is the new commit order. Omit plan to replay all of onto..HEAD; from (git's

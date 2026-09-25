@@ -1427,7 +1427,8 @@ fn git_tools_fill_message_bodies_by_default() {
 
 /// `git_fixup` through the server moves a branch stacked on the rewritten
 /// commits and says so; `update_refs: false` leaves it and says that; a
-/// non-boolean `update_refs` is refused.
+/// non-boolean `update_refs` is refused. `git_log` afterwards shows the tip and
+/// the moved branch sitting on their new commits.
 #[test]
 fn git_fixup_moves_a_stacked_branch_unless_told_not_to() {
     let dir = temp_dir("update-refs");
@@ -1439,6 +1440,7 @@ fn git_fixup_moves_a_stacked_branch_unless_told_not_to() {
     drop(config);
     let mut s = Server::spawn_with_env(&[("MIME_ROOTS", dir.as_path())]);
     let repo_arg = dir.to_string_lossy().into_owned();
+    let mut base_oid = None;
     for (id, (file, msg)) in [("f.txt", "base"), ("g.txt", "add g"), ("h.txt", "add h")]
         .into_iter()
         .enumerate()
@@ -1449,11 +1451,15 @@ fn git_fixup_moves_a_stacked_branch_unless_told_not_to() {
             "git_commit",
             json!({ "repo": repo_arg, "paths": [file], "message": msg }),
         );
+        if file == "f.txt" {
+            base_oid = Some(repo.head().unwrap().peel_to_commit().unwrap().id());
+        }
         if file == "g.txt" {
             let g = repo.head().unwrap().peel_to_commit().unwrap();
             repo.branch("a", &g, false).unwrap();
         }
     }
+    let base_oid = base_oid.unwrap();
     let a_tip = || repo.refname_to_id("refs/heads/a").unwrap();
     let old_a = a_tip();
 
@@ -1481,9 +1487,21 @@ fn git_fixup_moves_a_stacked_branch_unless_told_not_to() {
         "a sits under the new tip"
     );
 
+    let head_branch = repo.head().unwrap().shorthand().unwrap().to_string();
+    let log = s.call_ok(
+        6,
+        "git_log",
+        json!({ "repo": repo_arg, "range": format!("{base_oid}..HEAD") }),
+    );
+    assert!(
+        log.contains(&format!("(HEAD -> {head_branch}) add h")),
+        "{log}"
+    );
+    assert!(log.contains("(a) add g"), "{log}");
+
     std::fs::write(dir.join("g.txt"), "3\n").unwrap();
     let out = s.call_ok(
-        6,
+        7,
         "git_fixup",
         json!({ "repo": repo_arg, "target": "a", "worktree": true, "update_refs": false }),
     );
