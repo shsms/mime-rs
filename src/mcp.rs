@@ -879,11 +879,7 @@ fn make_workspace(store: Box<dyn TextStore>, read_only: bool) -> Workspace {
     // Sandboxed (agent-facing) tier: the MCP server registers the core editing
     // vocabulary only, never the orchestration group — read-only vs writable is
     // the only per-session distinction.
-    let ws = if read_only {
-        Workspace::new_read_only(store)
-    } else {
-        Workspace::new(store)
-    };
+    let ws = Workspace::for_agent(store, read_only);
     // Creation counts as a use, so eviction order is well-defined from birth.
     ws.touch(next_stamp());
     ws
@@ -1208,8 +1204,6 @@ fn tool_run_program(
     reject_rehearse_with_save(args)?;
     let session = resolve_session(args, sessions)?;
     let program = str_arg(args, "program")?;
-    // TODO: resource limits (needs tulisp eval interruption) — a per-program
-    // wall-clock/CPU bound can't be enforced until tulisp eval is cancellable.
     let (report, value) = match run_or_rehearse(
         sessions,
         &session,
@@ -5425,7 +5419,7 @@ fn build_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "run_program",
-            "description": "Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and return a structured RunReport (unified diff, point, length before/after, any (report ...)/(message ...) output, and `value`: the final form's result — a string comes back raw (unquoted, unescaped), other types render the way tulisp prints them; present only when non-nil, so a read-only inspector like (conflict-diff N) is readable without wrapping it in (message ...)). Only the FINAL form's value comes back, so wrap any earlier result you need (e.g. a replace-regexp match count) in (report …) or it stays invisible. This is the core, general-purpose editing tool; the edit is saved to the visited file (save: false holds it in the buffer; rehearse: true previews it), and defined functions persist for the next call. The callable Lisp surface is indexed in help {lisp} (help {regex|treesit|recipes} for syntax and worked examples). Name-like arguments — conflict sides, treesit languages, coding systems, checkpoint labels, report/arg keys — accept a string or a quoted symbol. Everything else (buffer names, defun/field names, free text, paths, regexes) is a string. On failure the error content is a JSON object {ok:false, error, dirty, reports, log} carrying the diagnostics the program emitted before dying; by default a failed run rolls its pre-error edits back (rolled_back:true rides in the failure JSON); dirty=true means they persist — that happens only with keep_partial:true.",
+            "description": "Evaluate an Emacs-Lisp (tulisp) edit program against the session buffer and return a structured RunReport (unified diff, point, length before/after, any (report ...)/(message ...) output, and `value`: the final form's result — a string comes back raw (unquoted, unescaped), other types render the way tulisp prints them; present only when non-nil, so a read-only inspector like (conflict-diff N) is readable without wrapping it in (message ...)). Only the FINAL form's value comes back, so wrap any earlier result you need (e.g. a replace-regexp match count) in (report …) or it stays invisible. This is the core, general-purpose editing tool; the edit is saved to the visited file (save: false holds it in the buffer; rehearse: true previews it), and defined functions persist for the next call. The callable Lisp surface is indexed in help {lisp} (help {regex|treesit|recipes} for syntax and worked examples). Name-like arguments — conflict sides, treesit languages, coding systems, checkpoint labels, report/arg keys — accept a string or a quoted symbol. Everything else (buffer names, defun/field names, free text, paths, regexes) is a string. On failure the error content is a JSON object {ok:false, error, dirty, reports, log} carrying the diagnostics the program emitted before dying; by default a failed run rolls its pre-error edits back (rolled_back:true rides in the failure JSON); dirty=true means they persist — that happens only with keep_partial:true. A program still running after 30 s stops and fails the same way.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5979,6 +5973,32 @@ mod git_tool_tests {
         conforms(&output_schema("outline"), &shaped, "outline(shaped)").unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_stops_a_program_past_the_time_limit() {
+        let mut sessions = HashMap::new();
+        tool_open_text(&json!({"session": "limit", "text": "abc"}), &mut sessions).unwrap();
+        let ws = sessions.get_mut("limit").unwrap();
+        assert_eq!(ws.time_limit(), Some(crate::engine::PROGRAM_TIME_LIMIT));
+        ws.set_time_limit(Some(std::time::Duration::from_millis(50)));
+        // The programs mime's tools write are bounded too: they call functions
+        // the agent can redefine. The loop runs far longer than the limit but
+        // ends, so a missing limit fails the test instead of hanging it.
+        let long = "(dotimes (i 10000000))";
+        tool_run_program(
+            &json!({"session": "limit", "program": format!("(defun search-forward (&rest _) {long})")}),
+            &mut sessions,
+            false,
+        )
+        .unwrap();
+        let e = tool_replace_text(
+            &json!({"session": "limit", "pattern": "a", "replacement": "b"}),
+            &mut sessions,
+        )
+        .unwrap_err();
+        assert!(e.contains("ran longer than"), "{e}");
+        assert_eq!(sessions["limit"].text(), "abc");
     }
 
     #[test]

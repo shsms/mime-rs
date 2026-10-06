@@ -316,6 +316,10 @@ pub struct Workspace {
 /// states are version-deduped, so this is a safety-net depth, not a cost knob.
 const UNDO_RING_CAP: usize = 8;
 
+/// The longest a program in an agent's session may run; see
+/// [`Workspace::for_agent`].
+pub(crate) const PROGRAM_TIME_LIMIT: Duration = Duration::from_secs(30);
+
 /// The trust tier a workspace runs at, chosen by the front-end MODE at launch
 /// (not by the program). `Sandboxed` (the agent-facing MCP / daemon) registers
 /// only the core editing vocabulary; `Trusted` (the local `mime` CLI) also
@@ -345,6 +349,16 @@ impl Workspace {
     /// arguments).
     pub fn new_trusted(buffer: Box<dyn TextStore>) -> Workspace {
         Workspace::with_mode(buffer, false, Capabilities::Trusted)
+    }
+
+    /// A sandboxed workspace for an agent's session, as the MCP server and the
+    /// daemon open: read-only when asked, and each program it runs limited to
+    /// 30 seconds. The limit covers the programs mime's own tools write too,
+    /// since an agent can redefine the functions they call.
+    pub fn for_agent(buffer: Box<dyn TextStore>, read_only: bool) -> Workspace {
+        let mut ws = Workspace::with_mode(buffer, read_only, Capabilities::Sandboxed);
+        ws.set_time_limit(Some(PROGRAM_TIME_LIMIT));
+        ws
     }
 
     /// This workspace's trust tier.

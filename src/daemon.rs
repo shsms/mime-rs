@@ -153,11 +153,7 @@ fn op_open(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>) -> Value {
     // Sandboxed (agent-facing) tier: core editing vocabulary only — the daemon
     // never registers the orchestration group. (A local daemon could opt up
     // with a future --trusted flag.)
-    let workspace = if read_only {
-        Workspace::new_read_only(store)
-    } else {
-        Workspace::new(store)
-    };
+    let workspace = Workspace::for_agent(store, read_only);
     sessions.lock().unwrap().insert(session.clone(), workspace);
     json!({ "ok": true, "session": session, "buffer": name, "read_only": read_only })
 }
@@ -179,8 +175,6 @@ fn op_run(req: &Value, sessions: &Mutex<HashMap<String, Workspace>>, rehearse: b
     let Some(ws) = map.get_mut(&session) else {
         return err(&format!("no such session: {session}"));
     };
-    // TODO: resource limits (needs tulisp eval interruption) — a per-program
-    // wall-clock/CPU bound can't be enforced until tulisp eval is cancellable.
     let result = if rehearse {
         ws.rehearse(&program)
     } else {
@@ -301,4 +295,25 @@ fn str_field(req: &Value, field: &str) -> Result<String, Value> {
 
 fn err(msg: &str) -> Value {
     json!({ "ok": false, "error": msg })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_session_has_the_program_time_limit() {
+        let sessions = Mutex::new(HashMap::new());
+        for read_only in [false, true] {
+            let request =
+                json!({"op": "open", "session": "s", "text": "abc", "read_only": read_only});
+            let open = handle_line(&request.to_string(), &sessions);
+            assert_eq!(open["ok"], true, "{open}");
+            assert_eq!(
+                sessions.lock().unwrap()["s"].time_limit(),
+                Some(crate::engine::PROGRAM_TIME_LIMIT),
+                "read_only: {read_only}"
+            );
+        }
+    }
 }

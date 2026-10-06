@@ -95,7 +95,9 @@ front end and the capability tier differ.
   one exception is `git_exec_over`, which runs a build command at each commit —
   it stays disabled unless the host sets `MIME_EXEC=1` (the same grant lets
   `commit.gpgsign` run the configured signer). `make claude` registers the
-  server without it; `make claude-exec` registers it with that grant.
+  server without it; `make claude-exec` registers it with that grant. A Lisp
+  program in the MCP/daemon tier stops once it has run for 30 seconds (a builtin
+  that does not call back into Lisp runs to its end first).
 
 ## Install
 

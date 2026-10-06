@@ -85,7 +85,11 @@ backward window also gained edge context, so ~$~ at point and ~\b~ at
 the bound judge the real buffer too. Quire stays adaptively windowed;
 only the final window carries one context char past the bound.
 
-** TODO Per-program resource limits
+** DONE Per-program resource limits
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-10-06 Di 21:12] \\
+  A wall-clock limit of 30 s for each program an MCP or daemon session runs, tool-generated ones included (engine.rs PROGRAM_TIME_LIMIT, Workspace::set_time_limit), through tulisp's interrupt check; a program past it fails like any failed program.
+:END:
 
 A wall-clock/CPU bound per program — blocked on tulisp cooperative
 cancellation (eval interruption), see the wishlist below.
