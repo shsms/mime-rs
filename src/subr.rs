@@ -1,24 +1,12 @@
 //! Core library (the Emacs `subr.el` corner) — list and function helpers the
-//! tulisp base lacks: push, identity, delete-dups, nreverse, butlast,
+//! tulisp base lacks: identity, delete-dups, nreverse, butlast,
 //! number-sequence, fboundp, seq-remove, seq-uniq, format-message, user-error.
 //! Pure Lisp-value functions with no buffer state, registered in every tier
 //! alongside the string library. Semantics are checked against GNU Emacs 30 in
 //! the tests.
-use tulisp::{Error, TulispContext, TulispObject, destruct_bind, list};
+use tulisp::{Error, TulispContext, TulispObject};
 
 pub fn register(ctx: &mut TulispContext) {
-    // (push NEWELT PLACE) — macro expanding to (setq PLACE (cons NEWELT
-    // PLACE)).  PLACE must be a symbol; Emacs's generalized places (setf-able
-    // forms) are not supported.
-    ctx.defmacro("push", |ctx, args| {
-        destruct_bind!((newelt place) = args);
-        list!(
-            ,ctx.intern("setq")
-            ,place.clone()
-            ,list!(,ctx.intern("cons") ,newelt ,place)?
-        )
-    });
-
     // (identity ARG) — return ARG unchanged.
     ctx.defun("identity", |arg: TulispObject| -> TulispObject { arg });
 
@@ -103,32 +91,26 @@ pub fn register(ctx: &mut TulispContext) {
     );
 
     // (fboundp SYMBOL) — t when SYMBOL names a function, macro or special form.
-    // tulisp keeps one value cell per symbol, so this is "bound, and bound to
-    // something callable": unlike Emacs, a variable holding a lambda counts
-    // too. Function values print as their kind (`Defun`, `Func`, …); a symbol
-    // that merely prints that way is excluded by `symbolp`.
-    ctx.defun("fboundp", |sym: TulispObject| -> Result<bool, Error> {
-        // nil is itself a symbol in Emacs (unlike tulisp's own `Nil` variant,
-        // which `symbolp` excludes) — answer nil for it rather than falling
-        // into the non-symbol error below.
-        if sym.null() {
-            return Ok(false);
-        }
-        if !sym.symbolp() {
-            return Err(Error::type_mismatch(format!(
-                "Wrong type argument: symbolp, {sym}"
-            )));
-        }
-        if !sym.boundp() {
-            return Ok(false);
-        }
-        let value = sym.get()?;
-        Ok(!value.symbolp()
-            && matches!(
-                value.to_string().as_str(),
-                "Func" | "Defun" | "Macro" | "Defmacro" | "Lambda" | "CompiledDefun"
-            ))
-    });
+    // tulisp keeps one value cell per symbol, so unlike Emacs, a variable
+    // holding a lambda counts too.
+    ctx.defun(
+        "fboundp",
+        |ctx: &mut TulispContext, sym: TulispObject| -> Result<bool, Error> {
+            if !sym.symbolp() {
+                return Err(Error::type_mismatch(format!(
+                    "Wrong type argument: symbolp, {sym}"
+                )));
+            }
+            // A symbol that make-symbol made is not the one its name
+            // interns, so it is asked about its own value.
+            let name = sym.symbol_name()?;
+            if ctx.intern(&name).eq(&sym) {
+                Ok(ctx.fboundp(&name))
+            } else {
+                Ok(sym.functionp(ctx))
+            }
+        },
+    );
 
     // Helpers that call back into Lisp live as Lisp: a Rust defun that funcalls
     // a compiled predicate deadlocks (see tulisp's prelude.lisp).
@@ -305,6 +287,14 @@ mod tests {
         // A symbol holding data, even data that prints like a function type.
         assert_eq!(p("(progn (setq fb-data 5) (fboundp 'fb-data))"), "nil");
         assert_eq!(p("(progn (setq fb-sym 'Func) (fboundp 'fb-sym))"), "nil");
+        // A symbol make-symbol made answers for itself, not for the interned
+        // symbol of the same name. Its value counts, as for any symbol in
+        // tulisp; Emacs answers nil for the lambda.
+        assert_eq!(p(r#"(fboundp (make-symbol "car"))"#), "nil");
+        assert_eq!(
+            p(r#"(let ((s (make-symbol "f"))) (set s (lambda () 1)) (fboundp s))"#),
+            "t"
+        );
 
         // Emacs: (fboundp 5) and (fboundp "identity") signal
         // (wrong-type-argument symbolp …); nil is itself a symbol, so it still

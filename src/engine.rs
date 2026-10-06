@@ -357,6 +357,12 @@ impl Workspace {
         self.session.borrow_mut().args = args;
     }
 
+    /// A Lisp error as a failed program reports it: printed with its file
+    /// names, and a newline.
+    fn error_text(&self, e: tulisp::Error) -> String {
+        format!("{}\n", e.with_file_names(&self.ctx))
+    }
+
     /// Run `f` on the session behind this workspace — for tool code that
     /// resolves positions in Rust instead of through a program. A Lisp error is
     /// rendered the way a failed program's is.
@@ -364,7 +370,7 @@ impl Workspace {
         &self,
         f: impl FnOnce(&mut Session) -> Result<R, tulisp::Error>,
     ) -> Result<R, String> {
-        f(&mut self.session.borrow_mut()).map_err(|e| e.format(&self.ctx))
+        f(&mut self.session.borrow_mut()).map_err(|e| self.error_text(e))
     }
 
     fn with_mode(
@@ -785,7 +791,7 @@ impl Workspace {
                 let dirty = b.version() != version_before && b.text() != snap.text();
                 drop(s);
                 self.last_failure_dirty.set(dirty);
-                return Err(e.format(&self.ctx));
+                return Err(self.error_text(e));
             }
         };
 

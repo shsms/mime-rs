@@ -8,7 +8,9 @@ use crate::motion::{is_word_char, move_paragraphs, move_units};
 use crate::sexp::{Kind, ScanError, Scanner, Sexp, SexpKind, TokenKind};
 use crate::store::TextStore;
 use crate::syntax::{Lang, NodeRef, ProseKind, ProseUnit, Syntax};
-use tulisp::{Error, Shared, TulispContext, TulispConvertible, TulispObject, TulispValue};
+use std::borrow::Cow;
+
+use tulisp::{Error, Form, Rest, TulispAny, TulispContext, TulispObject};
 
 fn bad_regex(e: regex::Error) -> Error {
     Error::lisp_error(format!("Invalid regexp: {e}"))
@@ -92,12 +94,13 @@ fn err(msg: &str) -> Error {
 fn name_arg(what: &str, v: &TulispObject) -> Result<String, Error> {
     // Any string passes verbatim — the MCP layer generates string spellings
     // from free-form JSON values, colons and all.
-    if let Ok(s) = v.as_string() {
-        return Ok(s);
+    if v.stringp() {
+        return String::try_from(v);
     }
-    let name = v
-        .as_symbol()
-        .map_err(|_| err(&format!("{what} must be a string or symbol, got: {v}")))?;
+    let name = match v.symbol_name() {
+        Ok(name) if name != "nil" && name != "t" => name,
+        _ => return Err(err(&format!("{what} must be a string or symbol, got: {v}"))),
+    };
     // A keyword is a symbol whose name keeps the colon; accepting it would
     // silently mint labels/keys spelled ":x" that 'x can never address.
     if let Some(bare) = name.strip_prefix(':') {
@@ -110,9 +113,9 @@ fn name_arg(what: &str, v: &TulispObject) -> Result<String, Error> {
 
 /// A buffer marker: a durable position handle. The `id` indexes the store's
 /// marker registry (`TextStore::marker_*`), where the live position lives and
-/// auto-adjusts across edits. A first-class tulisp value (via
-/// `TulispConvertible`) so `markerp` can tell it apart from a plain integer
-/// position, and `goto-char` accepts either.
+/// auto-adjusts across edits. A first-class tulisp value (via `TulispAny`) so
+/// `markerp` can tell it apart from a plain integer position, and `goto-char`
+/// accepts either.
 #[derive(Clone, Copy)]
 struct Marker {
     id: usize,
@@ -124,17 +127,15 @@ impl std::fmt::Display for Marker {
     }
 }
 
-impl TulispConvertible for Marker {
-    fn from_tulisp(value: &TulispObject) -> Result<Self, Error> {
-        value
-            .as_any()
-            .ok()
-            .and_then(|v| v.downcast_ref::<Marker>().copied())
-            .ok_or_else(|| err("expected a marker"))
+impl TulispAny for Marker {
+    fn lisp_type_name() -> Cow<'static, str> {
+        Cow::Borrowed("marker")
     }
-    fn into_tulisp(self) -> TulispObject {
-        Shared::new(self).into()
-    }
+}
+
+/// The marker `v` holds, if it is one.
+fn marker_of(v: &TulispObject) -> Option<Marker> {
+    v.downcast::<Marker>().map(|m| *m)
 }
 
 /// A first-class parse-tree node: a [`NodeRef`] paired with the `Rc`'d
@@ -186,26 +187,9 @@ impl std::fmt::Display for TsNode {
     }
 }
 
-impl TulispConvertible for TsNode {
-    fn from_tulisp(value: &TulispObject) -> Result<Self, Error> {
-        value
-            .as_any()
-            .ok()
-            .and_then(|v| v.downcast_ref::<TsNode>().cloned())
-            .ok_or_else(|| err("expected a tree-sitter node"))
-    }
-    fn into_tulisp(self) -> TulispObject {
-        Shared::new(self).into()
-    }
-}
-
-/// `Some(node)` → the node value, `None` → nil (relational dead ends).
-trait IntoTulispOpt {
-    fn into_tulisp_opt(self) -> TulispObject;
-}
-impl IntoTulispOpt for Option<TsNode> {
-    fn into_tulisp_opt(self) -> TulispObject {
-        self.map_or_else(TulispObject::nil, TulispConvertible::into_tulisp)
+impl TulispAny for TsNode {
+    fn lisp_type_name() -> Cow<'static, str> {
+        Cow::Borrowed("tree-sitter node")
     }
 }
 
@@ -367,12 +351,14 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // Accepts an integer position or a marker (Emacs `goto-char`).
         ctx.defun("goto-char", move |p: TulispObject| -> Result<i64, Error> {
             let mut b = s.borrow_mut();
-            let pos = if let Ok(m) = Marker::from_tulisp(&p) {
+            let pos = if !p.integerp()
+                && let Some(m) = marker_of(&p)
+            {
                 b.buffer
                     .marker_position(m.id)
                     .ok_or_else(|| err("goto-char: marker points nowhere"))?
             } else {
-                i64::from_tulisp(&p)?.max(1) as usize
+                i64::try_from(&p)?.max(1) as usize
             };
             b.buffer.goto_char(pos);
             Ok(b.buffer.point() as i64)
@@ -1035,20 +1021,14 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     {
         let s = session.clone();
         // (marker-position MARKER) — its position, or nil if detached.
-        ctx.defun(
-            "marker-position",
-            move |m: Marker| -> Result<TulispObject, Error> {
-                Ok(match s.borrow().buffer.marker_position(m.id) {
-                    Some(p) => TulispValue::from(p as i64).into_ref(None),
-                    None => TulispObject::nil(),
-                })
-            },
-        );
+        ctx.defun("marker-position", move |m: Marker| -> Option<i64> {
+            s.borrow().buffer.marker_position(m.id).map(|p| p as i64)
+        });
     }
     {
         // (markerp OBJECT) — t if OBJECT is a marker.
         ctx.defun("markerp", move |obj: TulispObject| -> bool {
-            Marker::from_tulisp(&obj).is_ok()
+            marker_of(&obj).is_some()
         });
     }
 
@@ -1173,27 +1153,33 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     {
         // (save-excursion BODY...) — run BODY, then restore point and mark.
         let s = session.clone();
-        ctx.defspecial("save-excursion", move |ctx, args| {
-            let (pt, mk) = {
-                let sess = s.borrow();
-                (sess.buffer.point(), sess.buffer.mark())
-            };
-            let res = ctx.eval_progn(args);
-            let mut sess = s.borrow_mut();
-            sess.buffer.goto_char(pt);
-            sess.buffer.set_mark_opt(mk);
-            res
-        });
+        ctx.defspecial(
+            "save-excursion",
+            move |ctx: &mut TulispContext, body: Rest<Form>| {
+                let (pt, mk) = {
+                    let sess = s.borrow();
+                    (sess.buffer.point(), sess.buffer.mark())
+                };
+                let res = body.eval_progn(ctx);
+                let mut sess = s.borrow_mut();
+                sess.buffer.goto_char(pt);
+                sess.buffer.set_mark_opt(mk);
+                res
+            },
+        );
     }
     {
         // (save-restriction BODY...) — run BODY, then restore the narrowing.
         let s = session.clone();
-        ctx.defspecial("save-restriction", move |ctx, args| {
-            let saved = s.borrow().buffer.narrowing();
-            let res = ctx.eval_progn(args);
-            s.borrow_mut().buffer.set_restriction(saved);
-            res
-        });
+        ctx.defspecial(
+            "save-restriction",
+            move |ctx: &mut TulispContext, body: Rest<Form>| {
+                let saved = s.borrow().buffer.narrowing();
+                let res = body.eval_progn(ctx);
+                s.borrow_mut().buffer.set_restriction(saved);
+                res
+            },
+        );
     }
 
     // ---- kill ring ----
@@ -1522,17 +1508,12 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         ctx.defun(
             "match-string",
-            move |n: i64, _string: Option<String>| -> Result<TulispObject, Error> {
-                let text = s
-                    .borrow()
+            move |n: i64, _string: Option<String>| -> Option<String> {
+                s.borrow()
                     .buffer
                     .last_match()
                     .and_then(|md| md.groups.get(n.max(0) as usize).cloned())
-                    .flatten();
-                Ok(match text {
-                    Some(t) => TulispValue::from(t).into_ref(None),
-                    None => TulispObject::nil(),
-                })
+                    .flatten()
             },
         );
     }
@@ -1542,35 +1523,21 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     // subexp argument yields nil.
     {
         let s = session.clone();
-        ctx.defun(
-            "match-beginning",
-            move |n: Option<i64>| -> Result<TulispObject, Error> {
-                let pos = match n.unwrap_or(0) {
-                    0 => s.borrow().buffer.last_match().map(|md| md.start as i64),
-                    _ => None,
-                };
-                Ok(match pos {
-                    Some(p) => TulispValue::from(p).into_ref(None),
-                    None => TulispObject::nil(),
-                })
-            },
-        );
+        ctx.defun("match-beginning", move |n: Option<i64>| -> Option<i64> {
+            match n.unwrap_or(0) {
+                0 => s.borrow().buffer.last_match().map(|md| md.start as i64),
+                _ => None,
+            }
+        });
     }
     {
         let s = session.clone();
-        ctx.defun(
-            "match-end",
-            move |n: Option<i64>| -> Result<TulispObject, Error> {
-                let pos = match n.unwrap_or(0) {
-                    0 => s.borrow().buffer.last_match().map(|md| md.end as i64),
-                    _ => None,
-                };
-                Ok(match pos {
-                    Some(p) => TulispValue::from(p).into_ref(None),
-                    None => TulispObject::nil(),
-                })
-            },
-        );
+        ctx.defun("match-end", move |n: Option<i64>| -> Option<i64> {
+            match n.unwrap_or(0) {
+                0 => s.borrow().buffer.last_match().map(|md| md.end as i64),
+                _ => None,
+            }
+        });
     }
 
     // ---- buffer-level replace commands (map-shaped bulk edits) ---- Both are
@@ -1707,17 +1674,20 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     // ---- transactions (atomic edits: roll the workspace back on error) ----
     {
         let s = session.clone();
-        ctx.defspecial("with-transaction", move |ctx, args| {
-            let snapshot = {
-                let sess = s.borrow();
-                sess.buffer.snapshot()
-            };
-            let res = ctx.eval_progn(args);
-            if res.is_err() {
-                s.borrow_mut().buffer = snapshot;
-            }
-            res
-        });
+        ctx.defspecial(
+            "with-transaction",
+            move |ctx: &mut TulispContext, body: Rest<Form>| {
+                let snapshot = {
+                    let sess = s.borrow();
+                    sess.buffer.snapshot()
+                };
+                let res = body.eval_progn(ctx);
+                if res.is_err() {
+                    s.borrow_mut().buffer = snapshot;
+                }
+                res
+            },
+        );
     }
 
     // ---- regexp-quote: escape regex metacharacters so a string matches
@@ -1762,18 +1732,12 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         // nil for a buffer with no visited file (like Emacs, and symmetric with
         // the setter, which rejects fileless buffers).
-        ctx.defun(
-            "buffer-file-coding-system",
-            move || -> Result<TulispObject, Error> {
-                let sess = s.borrow();
-                Ok(match sess.buffer.file_stamp() {
-                    Some(_) => {
-                        TulispValue::from(sess.buffer.coding().name().to_string()).into_ref(None)
-                    }
-                    None => TulispObject::nil(),
-                })
-            },
-        );
+        ctx.defun("buffer-file-coding-system", move || -> Option<String> {
+            let sess = s.borrow();
+            sess.buffer
+                .file_stamp()
+                .map(|_| sess.buffer.coding().name().to_string())
+        });
     }
 
     // (float-time) — seconds since the epoch as a float (Emacs `float-time`),
@@ -2083,7 +2047,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         let s = session.clone();
         ctx.defun(
             "checkpoint",
-            move |label: Option<TulispObject>| -> Result<TulispObject, Error> {
+            move |label: Option<TulispObject>| -> Result<String, Error> {
                 // tulisp binds an explicit nil as None, same as an omitted arg.
                 let mut sess = s.borrow_mut();
                 let label = match label {
@@ -2092,7 +2056,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                 };
                 let cp = Checkpoint::capture(label.clone(), &sess);
                 sess.checkpoints.push(cp);
-                Ok(TulispValue::from(label).into_ref(None))
+                Ok(label)
             },
         );
     }
@@ -2508,25 +2472,23 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // child-by-field-name / type / start / end / text.
         ctx.defun(
             "treesit-node-at",
-            move |pos: Option<i64>| -> Result<TulispObject, Error> {
+            move |pos: Option<i64>| -> Result<Option<TsNode>, Error> {
                 let mut sess = s.borrow_mut();
                 let p = pos.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
                 let version = sess.buffer.version();
                 let syn = syntax_of(&mut sess);
-                Ok(match syn.node_at(p) {
-                    Some(h) => {
-                        let node = TsNode::new(&syn, version, h);
-                        let span = node.described()?;
-                        sess.reports
-                            .push(("treesit-node-type".to_string(), span.kind));
-                        sess.reports
-                            .push(("treesit-node-start".to_string(), span.start.to_string()));
-                        sess.reports
-                            .push(("treesit-node-end".to_string(), span.end.to_string()));
-                        node.into_tulisp()
-                    }
-                    None => TulispObject::nil(),
-                })
+                let Some(h) = syn.node_at(p) else {
+                    return Ok(None);
+                };
+                let node = TsNode::new(&syn, version, h);
+                let span = node.described()?;
+                sess.reports
+                    .push(("treesit-node-type".to_string(), span.kind));
+                sess.reports
+                    .push(("treesit-node-start".to_string(), span.start.to_string()));
+                sess.reports
+                    .push(("treesit-node-end".to_string(), span.end.to_string()));
+                Ok(Some(node))
             },
         );
     }
@@ -2537,15 +2499,12 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // node-valued sibling of treesit-beginning-of-defun.
         ctx.defun(
             "treesit-defun-at",
-            move |pos: Option<i64>| -> Result<TulispObject, Error> {
+            move |pos: Option<i64>| -> Result<Option<TsNode>, Error> {
                 let mut sess = s.borrow_mut();
                 let p = pos.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
                 let version = sess.buffer.version();
                 let syn = syntax_of(&mut sess);
-                Ok(syn
-                    .defun_at(p)
-                    .map(|h| TsNode::new(&syn, version, h))
-                    .into_tulisp_opt())
+                Ok(syn.defun_at(p).map(|h| TsNode::new(&syn, version, h)))
             },
         );
     }
@@ -2602,9 +2561,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // (treesit-node-parent NODE) — the parent node, nil at the root.
         ctx.defun(
             "treesit-node-parent",
-            move |n: TsNode| -> Result<TulispObject, Error> {
+            move |n: TsNode| -> Result<Option<TsNode>, Error> {
                 live_node(&s.borrow(), &n)?;
-                Ok(n.syn.parent_of(n.h).map(|h| n.derive(h)).into_tulisp_opt())
+                Ok(n.syn.parent_of(n.h).map(|h| n.derive(h)))
             },
         );
     }
@@ -2615,22 +2574,22 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // NAMED counts named children only.
         ctx.defun(
             "treesit-node-child",
-            move |n: TsNode, i: i64, named: Option<TulispObject>| -> Result<TulispObject, Error> {
+            move |n: TsNode,
+                  i: i64,
+                  named: Option<TulispObject>|
+                  -> Result<Option<TsNode>, Error> {
                 live_node(&s.borrow(), &n)?;
                 let named = truthy(&named);
                 let i = if i < 0 {
                     let count = n.syn.child_count_of(n.h, named).unwrap_or(0) as i64;
                     if count + i < 0 {
-                        return Ok(TulispObject::nil());
+                        return Ok(None);
                     }
                     (count + i) as usize
                 } else {
                     i as usize
                 };
-                Ok(n.syn
-                    .child_of(n.h, i, named)
-                    .map(|h| n.derive(h))
-                    .into_tulisp_opt())
+                Ok(n.syn.child_of(n.h, i, named).map(|h| n.derive(h)))
             },
         );
     }
@@ -2650,12 +2609,11 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // (treesit-node-next-sibling NODE &optional NAMED).
         ctx.defun(
             "treesit-node-next-sibling",
-            move |n: TsNode, named: Option<TulispObject>| -> Result<TulispObject, Error> {
+            move |n: TsNode, named: Option<TulispObject>| -> Result<Option<TsNode>, Error> {
                 live_node(&s.borrow(), &n)?;
                 Ok(n.syn
                     .next_sibling_of(n.h, truthy(&named))
-                    .map(|h| n.derive(h))
-                    .into_tulisp_opt())
+                    .map(|h| n.derive(h)))
             },
         );
     }
@@ -2664,12 +2622,11 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // (treesit-node-prev-sibling NODE &optional NAMED).
         ctx.defun(
             "treesit-node-prev-sibling",
-            move |n: TsNode, named: Option<TulispObject>| -> Result<TulispObject, Error> {
+            move |n: TsNode, named: Option<TulispObject>| -> Result<Option<TsNode>, Error> {
                 live_node(&s.borrow(), &n)?;
                 Ok(n.syn
                     .prev_sibling_of(n.h, truthy(&named))
-                    .map(|h| n.derive(h))
-                    .into_tulisp_opt())
+                    .map(|h| n.derive(h)))
             },
         );
     }
@@ -2679,19 +2636,16 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // grammar field ("name", "body", "parameters", …); nil if unfilled.
         ctx.defun(
             "treesit-node-child-by-field-name",
-            move |n: TsNode, field: String| -> Result<TulispObject, Error> {
+            move |n: TsNode, field: String| -> Result<Option<TsNode>, Error> {
                 live_node(&s.borrow(), &n)?;
-                Ok(n.syn
-                    .child_by_field_of(n.h, &field)
-                    .map(|h| n.derive(h))
-                    .into_tulisp_opt())
+                Ok(n.syn.child_by_field_of(n.h, &field).map(|h| n.derive(h)))
             },
         );
     }
     {
         // (treesit-node-p X) — t iff X is a tree-sitter node value.
         ctx.defun("treesit-node-p", move |v: TulispObject| -> bool {
-            TsNode::from_tulisp(&v).is_ok()
+            v.downcast::<TsNode>().is_some()
         });
     }
     // ---- node-EDIT ops: splice at a node's span, return the re-parsed result.
@@ -2706,7 +2660,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // start.
         ctx.defun(
             "treesit-replace-node",
-            move |n: TsNode, text: String| -> Result<TulispObject, Error> {
+            move |n: TsNode, text: String| -> Result<Option<TsNode>, Error> {
                 let mut sess = s.borrow_mut();
                 let span = edit_span(&sess, &n)?;
                 Ok(splice_and_reparse(&mut sess, span.start, span.end, &text))
@@ -2720,7 +2674,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // Returns the re-parsed node at the wrapped region's start.
         ctx.defun(
             "treesit-wrap-node",
-            move |n: TsNode, before: String, after: String| -> Result<TulispObject, Error> {
+            move |n: TsNode, before: String, after: String| -> Result<Option<TsNode>, Error> {
                 let mut sess = s.borrow_mut();
                 let span = edit_span(&sess, &n)?;
                 {
@@ -2744,7 +2698,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // node.
         ctx.defun(
             "treesit-raise-node",
-            move |n: TsNode| -> Result<TulispObject, Error> {
+            move |n: TsNode| -> Result<Option<TsNode>, Error> {
                 let mut sess = s.borrow_mut();
                 live_current_node(&sess, &n)?;
                 let parent = n.syn.parent_of(n.h).ok_or_else(|| {
@@ -2795,7 +2749,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             move |n: TsNode,
                   text: String,
                   before: Option<TulispObject>|
-                  -> Result<TulispObject, Error> {
+                  -> Result<Option<TsNode>, Error> {
                 let mut sess = s.borrow_mut();
                 let span = edit_span(&sess, &n)?;
                 let pos = if truthy(&before) {
@@ -2852,17 +2806,13 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // text. Reports and returns it; nil if no enclosing defun or anonymous.
         ctx.defun(
             "treesit-defun-name",
-            move |pos: Option<i64>| -> TulispObject {
+            move |pos: Option<i64>| -> Option<String> {
                 let mut sess = s.borrow_mut();
                 let p = pos.map_or_else(|| sess.buffer.point(), |p| p.max(1) as usize);
-                match syntax_of(&mut sess).enclosing_defun_name(p) {
-                    Some(name) => {
-                        sess.reports
-                            .push(("treesit-defun-name".to_string(), name.clone()));
-                        TulispValue::from(name).into_ref(None)
-                    }
-                    None => TulispObject::nil(),
-                }
+                let name = syntax_of(&mut sess).enclosing_defun_name(p)?;
+                sess.reports
+                    .push(("treesit-defun-name".to_string(), name.clone()));
+                Some(name)
             },
         );
     }
@@ -2901,8 +2851,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                 let p = sess.buffer.point();
                 Ok(match thing_bounds(&mut sess, &kind, p, 0)? {
                     Some((a, b)) => TulispObject::cons(
-                        TulispValue::from(a as i64).into_ref(None),
-                        TulispValue::from(b as i64).into_ref(None),
+                        TulispObject::from(a as i64),
+                        TulispObject::from(b as i64),
                     ),
                     None => TulispObject::nil(),
                 })
@@ -2919,7 +2869,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                 let mut sess = s.borrow_mut();
                 let p = sess.buffer.point();
                 Ok(match thing_bounds(&mut sess, &kind, p, 0)? {
-                    Some((a, b)) => TulispValue::from(sess.buffer.substring(a, b)).into_ref(None),
+                    Some((a, b)) => TulispObject::from(sess.buffer.substring(a, b)),
                     None => TulispObject::nil(),
                 })
             },
@@ -2951,19 +2901,15 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
         // defun (document order) named NAME — "go to fn parse_args" without
         // knowing where it is. Reports its span and returns the new point; nil
         // (point unmoved) if no defun has that name.
-        ctx.defun("treesit-goto-defun", move |name: String| -> TulispObject {
+        ctx.defun("treesit-goto-defun", move |name: String| -> Option<i64> {
             let mut sess = s.borrow_mut();
-            match syntax_of(&mut sess).find_defun(&name) {
-                Some(d) => {
-                    sess.reports.push((
-                        "treesit-defun".to_string(),
-                        format!("{} {} {} {}", d.kind, d.start, d.end, d.name),
-                    ));
-                    sess.buffer.goto_char(d.start);
-                    TulispValue::from(sess.buffer.point() as i64).into_ref(None)
-                }
-                None => TulispObject::nil(),
-            }
+            let d = syntax_of(&mut sess).find_defun(&name)?;
+            sess.reports.push((
+                "treesit-defun".to_string(),
+                format!("{} {} {} {}", d.kind, d.start, d.end, d.name),
+            ));
+            sess.buffer.goto_char(d.start);
+            Some(sess.buffer.point() as i64)
         });
     }
     {
@@ -3050,9 +2996,9 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
             let end = replace_span(sess.buffer.as_mut(), start, end, &text, &new);
             sess.buffer.goto_char(p.min(end));
             Ok(TulispObject::from(vec![
-                TulispValue::from(kind).into_ref(None),
-                TulispValue::from(start as i64).into_ref(None),
-                TulispValue::from(end as i64).into_ref(None),
+                TulispObject::from(kind),
+                TulispObject::from(start as i64),
+                TulispObject::from(end as i64),
             ]))
         });
     }
@@ -3127,8 +3073,8 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
                 let max = sess.buffer.point_max();
                 sess.buffer.goto_char(p.min(max));
                 Ok(TulispObject::cons(
-                    TulispValue::from(units.len() as i64).into_ref(None),
-                    TulispValue::from(changed).into_ref(None),
+                    TulispObject::from(units.len() as i64),
+                    TulispObject::from(changed),
                 ))
             },
         );
@@ -3373,7 +3319,7 @@ pub fn thing_after(
     // line ends the walk, and is the answer only when the line held none.  Only
     // `list` wants this: an anchor line names the block it OPENS, which is the
     // last list to begin on it. Every other kind takes the first.
-    let last_on_line = |step: &dyn Fn(usize) -> Result<Option<Sexp>, Error>| {
+    let last_on_line = |step: &dyn Fn(usize) -> Result<Option<Sexp>, Error>| -> Result<_, Error> {
         let eol = crate::motion::skip_forward(store, pos, max, &|c| c != '\n');
         let mut p = pos;
         let mut best = None;
@@ -3631,7 +3577,7 @@ fn narrow_to_defun(sess: &mut crate::engine::Session, pos: Option<i64>) -> bool 
 
 /// `fill-column` and `sentence-end-double-space` as the filler's options.
 fn fill_opts(column: &TulispObject, double_space: &TulispObject) -> Result<Fill, Error> {
-    let column = column.get()?.as_int()?;
+    let column = i64::try_from(column.get()?)?;
     if column < 1 {
         return Err(err(&format!("fill-column must be positive, got {column}")));
     }
@@ -3645,7 +3591,7 @@ fn fill_opts(column: &TulispObject, double_space: &TulispObject) -> Result<Fill,
 fn fill_prefix_of(prefix: &TulispObject) -> Result<Option<String>, Error> {
     let v = prefix.get()?;
     if v.is_truthy() {
-        Ok(Some(v.as_string()?))
+        Ok(Some(String::try_from(v)?))
     } else {
         Ok(None)
     }
@@ -3878,12 +3824,10 @@ fn edit_span(sess: &crate::engine::Session, n: &TsNode) -> Result<crate::syntax:
 /// of every node-edit op: the splice re-stamped the version, so this re-parses
 /// and hands back the replacement, letting edits chain (replace → navigate
 /// result).
-fn reparse_at(sess: &mut crate::engine::Session, pos: usize) -> TulispObject {
+fn reparse_at(sess: &mut crate::engine::Session, pos: usize) -> Option<TsNode> {
     let version = sess.buffer.version();
     let syn = syntax_of(sess);
-    syn.node_at(pos)
-        .map(|h| TsNode::new(&syn, version, h))
-        .into_tulisp_opt()
+    syn.node_at(pos).map(|h| TsNode::new(&syn, version, h))
 }
 
 /// Splice `text` over the current buffer's char span `[start, end)` — delete
@@ -3895,7 +3839,7 @@ fn splice_and_reparse(
     start: usize,
     end: usize,
     text: &str,
-) -> TulispObject {
+) -> Option<TsNode> {
     {
         let b = sess.buffer.as_mut();
         if end > start {
@@ -3932,13 +3876,10 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
         let s = session.clone();
         // (set-buffer NAME) — make NAME the current buffer; returns NAME.
         // Errors if no such buffer exists.
-        ctx.defun(
-            "set-buffer",
-            move |name: String| -> Result<TulispObject, Error> {
-                s.borrow_mut().set_buffer(&name).map_err(|e| err(&e))?;
-                Ok(TulispValue::from(name).into_ref(None))
-            },
-        );
+        ctx.defun("set-buffer", move |name: String| -> Result<String, Error> {
+            s.borrow_mut().set_buffer(&name).map_err(|e| err(&e))?;
+            Ok(name)
+        });
     }
     {
         let s = session.clone();
@@ -3967,16 +3908,9 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
         let s = session.clone();
         // (get-buffer NAME) — NAME if such a buffer exists (current or
         // inactive), else nil.
-        ctx.defun(
-            "get-buffer",
-            move |name: String| -> Result<TulispObject, Error> {
-                Ok(if s.borrow().has_buffer(&name) {
-                    TulispValue::from(name).into_ref(None)
-                } else {
-                    TulispObject::nil()
-                })
-            },
-        );
+        ctx.defun("get-buffer", move |name: String| -> Option<String> {
+            s.borrow().has_buffer(&name).then_some(name)
+        });
     }
     {
         let s = session.clone();
@@ -3996,19 +3930,20 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
         // then restore the previously-current buffer *even if BODY errors*.
         // NAME (the first arg) is evaluated; BODY is the rest. Returns BODY's
         // value.
-        ctx.defspecial("with-current-buffer", move |ctx, args| {
-            let name_form = args.car_and_then(|f| Ok(f.clone()))?;
-            let name = ctx.eval(&name_form)?.as_string()?;
-            let body = args.cdr_and_then(|b| Ok(b.clone()))?;
-
-            let previous = s.borrow().current_buffer_name();
-            s.borrow_mut().set_buffer(&name).map_err(|e| err(&e))?;
-            // Capture BODY's result, restore the previous buffer regardless,
-            // then surface the result (value or error).
-            let res = ctx.eval_progn(&body);
-            s.borrow_mut().set_buffer(&previous).map_err(|e| err(&e))?;
-            res
-        });
+        ctx.defspecial(
+            "with-current-buffer",
+            move |ctx: &mut TulispContext, name: String, body: Rest<Form>| {
+                let previous = s.borrow().current_buffer_name();
+                s.borrow_mut().set_buffer(&name).map_err(|e| err(&e))?;
+                // Restore the previous buffer whatever BODY did. BODY's error
+                // wins over a failed restore.
+                let res = body.eval_progn(ctx);
+                let restored = s.borrow_mut().set_buffer(&previous);
+                let value = res?;
+                restored.map_err(|e| err(&e))?;
+                Ok(value)
+            },
+        );
     }
 
     // ---- file I/O (trusted tier only → UNRESTRICTED filesystem) ---- These
@@ -4158,12 +4093,10 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
         // and a string option are queried the same way.
         ctx.defun(
             "arg",
-            move |key: TulispObject| -> Result<TulispObject, Error> {
+            move |key: TulispObject| -> Result<Option<String>, Error> {
                 let key = name_arg("arg key", &key)?;
-                Ok(match s.borrow().args.iter().find(|(k, _)| *k == key) {
-                    Some((_, v)) => TulispValue::from(v.clone()).into_ref(None),
-                    None => TulispObject::nil(),
-                })
+                let args = &s.borrow().args;
+                Ok(args.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone()))
             },
         );
     }
@@ -4177,10 +4110,7 @@ pub fn register_orchestration(ctx: &mut TulispContext, session: &SharedSession) 
                 .args
                 .iter()
                 .map(|(k, v)| {
-                    TulispObject::cons(
-                        TulispValue::from(k.clone()).into_ref(None),
-                        TulispValue::from(v.clone()).into_ref(None),
-                    )
+                    TulispObject::cons(TulispObject::from(k.clone()), TulispObject::from(v.clone()))
                 })
                 .collect();
             TulispObject::from(pairs)
@@ -4332,6 +4262,26 @@ mod tests {
         // — only the *current buffer* is restored), proving BODY did run in
         // scratch.
         assert_eq!(report(&r, "scratch"), "\"X\"");
+    }
+
+    #[test]
+    fn with_current_buffer_reports_body_error_over_a_failed_restore() {
+        let restore_into_killed = |body: &str| {
+            let mut ws = trusted("MAIN");
+            ws.run(r#"(generate-new-buffer "scratch")"#).unwrap();
+            let program = format!(r#"(with-current-buffer "scratch" (kill-buffer "main") {body})"#);
+            let Err(e) = ws.run(&program) else {
+                panic!("{program}: ran to the end");
+            };
+            // The message; the lines after it repeat the program's forms.
+            e.lines().next().unwrap().to_string()
+        };
+        // BODY killed the buffer to restore, so the restore fails...
+        let e = restore_into_killed("nil");
+        assert!(e.contains("no buffer named main"), "{e}");
+        // ...but when BODY failed too, its own error is the one reported.
+        let e = restore_into_killed(r#"(error "boom")"#);
+        assert!(e.contains("boom"), "{e}");
     }
 
     #[test]
