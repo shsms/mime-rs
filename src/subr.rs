@@ -39,23 +39,23 @@ pub fn register(ctx: &mut TulispContext) {
     // (nreverse LIST) — LIST reversed. Emacs may reuse LIST's cells; this
     // builds a fresh list, which is what callers must use in Emacs too (the
     // argument's value afterwards is unspecified there).
-    ctx.defun(
-        "nreverse",
-        |list: TulispObject| -> Result<TulispObject, Error> {
-            Ok(list_items(&list)?.into_iter().rev().collect())
-        },
-    );
+    ctx.defun("nreverse", |list: Vec<TulispObject>| -> TulispObject {
+        list.into_iter().rev().collect()
+    });
 
     // (butlast LIST &optional N) — LIST without its last N elements (default
     // 1), as a fresh list; N <= 0 returns LIST itself, N >= its length nil.
     ctx.defun(
         "butlast",
-        |list: TulispObject, n: Option<i64>| -> Result<TulispObject, Error> {
+        |ctx: &mut TulispContext,
+         list: TulispObject,
+         n: Option<i64>|
+         -> Result<TulispObject, Error> {
             let n = n.unwrap_or(1);
             if n <= 0 {
                 return Ok(list);
             }
-            let mut items = list_items(&list)?;
+            let mut items: Vec<TulispObject> = list.convert(ctx)?;
             items.truncate(items.len().saturating_sub(n as usize));
             Ok(TulispObject::from(items))
         },
@@ -96,13 +96,10 @@ pub fn register(ctx: &mut TulispContext) {
     ctx.defun(
         "fboundp",
         |ctx: &mut TulispContext, sym: TulispObject| -> Result<bool, Error> {
-            if !sym.symbolp() {
-                return Err(Error::type_mismatch(format!(
-                    "Wrong type argument: symbolp, {sym}"
-                )));
-            }
-            // A symbol that make-symbol made is not the one its name
-            // interns, so it is asked about its own value.
+            // A symbol that make-symbol made is not the one its name interns,
+            // so it is asked about its own value. tulisp can only ask that
+            // value whether it is a function, so a macro or special form held
+            // there answers nil.
             let name = sym.symbol_name()?;
             if ctx.intern(&name).eq(&sym) {
                 Ok(ctx.fboundp(&name))
@@ -141,24 +138,6 @@ pub fn register(ctx: &mut TulispContext) {
     (signal 'user-error (list (apply #'format-message fmt args)))))"#,
     )
     .expect("the subr Lisp helpers define");
-}
-
-/// The elements of a proper list, in order.  Errors `wrong-type-argument listp`
-/// on an improper (dotted) list, as Emacs's `length` does — `butlast` walks a
-/// copy the same way internally.
-fn list_items(list: &TulispObject) -> Result<Vec<TulispObject>, Error> {
-    let mut items = Vec::new();
-    let mut cur = list.clone();
-    while cur.consp() {
-        items.push(cur.car()?);
-        cur = cur.cdr()?;
-    }
-    if !cur.null() {
-        return Err(Error::type_mismatch(format!(
-            "Wrong type argument: listp, {list}"
-        )));
-    }
-    Ok(items)
 }
 
 #[cfg(test)]
@@ -225,17 +204,14 @@ mod tests {
     #[test]
     fn nreverse_and_butlast_reject_improper_lists() {
         // Emacs: (nreverse (cons 1 2)) and (butlast (cons 1 2)) both signal
-        // (wrong-type-argument listp …) — butlast walks the same way internally
-        // (via `length`).
-        let mut ctx = TulispContext::new();
-        super::register(&mut ctx);
-        let e = ctx.eval_string("(nreverse (cons 1 2))").unwrap_err();
-        assert!(format!("{e:?}").contains("listp"), "{e:?}");
-
-        let mut ctx = TulispContext::new();
-        super::register(&mut ctx);
-        let e = ctx.eval_string("(butlast (cons 1 2))").unwrap_err();
-        assert!(format!("{e:?}").contains("listp"), "{e:?}");
+        // (wrong-type-argument listp 2), naming the tail that is not a list.
+        for call in ["(nreverse (cons 1 2))", "(butlast (cons 1 2))"] {
+            assert_eq!(
+                p(&format!("(condition-case e {call} (error e))")),
+                "(wrong-type-argument listp 2)",
+                "{call}"
+            );
+        }
 
         // n <= 0 short-circuits before the list is walked, as in Emacs.
         assert_eq!(p("(butlast (cons 1 2) 0)"), "(1 . 2)");
@@ -298,14 +274,13 @@ mod tests {
         // Emacs: (fboundp 5) and (fboundp "identity") signal
         // (wrong-type-argument symbolp …); nil is itself a symbol, so it still
         // answers nil rather than erroring.
-        let mut ctx = TulispContext::new();
-        super::register(&mut ctx);
-        let e = ctx.eval_string("(fboundp 5)").unwrap_err();
-        assert!(format!("{e:?}").contains("symbolp"), "{e:?}");
-
-        let mut ctx = TulispContext::new();
-        super::register(&mut ctx);
-        let e = ctx.eval_string(r#"(fboundp "identity")"#).unwrap_err();
-        assert!(format!("{e:?}").contains("symbolp"), "{e:?}");
+        assert_eq!(
+            p("(condition-case e (fboundp 5) (error e))"),
+            "(wrong-type-argument symbolp 5)"
+        );
+        assert_eq!(
+            p(r#"(condition-case e (fboundp "identity") (error e))"#),
+            r#"(wrong-type-argument symbolp "identity")"#
+        );
     }
 }
