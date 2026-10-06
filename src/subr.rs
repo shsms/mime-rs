@@ -1,9 +1,9 @@
 //! Core library (the Emacs `subr.el` corner) — list and function helpers the
 //! tulisp base lacks: identity, delete-dups, nreverse, butlast,
-//! number-sequence, fboundp, seq-remove, seq-uniq, format-message, user-error.
-//! Pure Lisp-value functions with no buffer state, registered in every tier
-//! alongside the string library. Semantics are checked against GNU Emacs 30 in
-//! the tests.
+//! number-sequence, fboundp, seq-remove, seq-uniq, format-message, and a
+//! user-error that curves its quotes as Emacs's does. Pure Lisp-value functions
+//! with no buffer state, registered in every tier alongside the string library.
+//! Semantics are checked against GNU Emacs 30 in the tests.
 use tulisp::{Error, TulispContext, TulispObject};
 
 pub fn register(ctx: &mut TulispContext) {
@@ -115,9 +115,8 @@ pub fn register(ctx: &mut TulispContext) {
     // Helpers that call back into Lisp live as Lisp: a Rust defun that funcalls
     // a compiled predicate deadlocks (see tulisp's prelude.lisp).
     // format-message curves the format string's quotes as Emacs's default
-    // text-quoting-style does, and user-error signals a plain `error` with the
-    // formatted message (a condition-case arm for `user-error` itself will not
-    // catch it).
+    // text-quoting-style does, and user-error signals tulisp's `user-error`
+    // with the message format-message makes, as Emacs's does.
     ctx.eval_string(
         r#"(progn
   (defun seq-remove (pred seq)
@@ -139,7 +138,7 @@ pub fn register(ctx: &mut TulispContext) {
   (defun format-message (fmt &rest args)
     (apply #'format (string-replace "'" "’" (string-replace "`" "‘" fmt)) args))
   (defun user-error (fmt &rest args)
-    (error (apply #'format-message fmt args))))"#,
+    (signal 'user-error (list (apply #'format-message fmt args)))))"#,
     )
     .expect("the subr Lisp helpers define");
 }

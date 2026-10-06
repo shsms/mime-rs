@@ -7078,5 +7078,14 @@ mod tests {
             Ok(_) => panic!("user-error must signal"),
         };
         assert!(e.contains("bad x"), "{e}");
+        // An error symbol of its own, under `error`, as in Emacs.
+        let r = ws
+            .run(
+                r#"(report "own" (condition-case e (user-error "no `%s'" "x") (user-error e)))
+                   (report "err" (condition-case e (user-error "no") (error (car e))))"#,
+            )
+            .unwrap();
+        assert_eq!(report(&r, "own"), "(user-error \"no \u{2018}x\u{2019}\")");
+        assert_eq!(report(&r, "err"), "user-error");
     }
 }
