@@ -109,8 +109,6 @@ pub fn register(ctx: &mut TulispContext) {
         },
     );
 
-    // Helpers that call back into Lisp live as Lisp: a Rust defun that funcalls
-    // a compiled predicate deadlocks (see tulisp's prelude.lisp).
     // format-message curves the format string's quotes as Emacs's default
     // text-quoting-style does, and user-error signals tulisp's `user-error`
     // with the message format-message makes, as Emacs's does.
