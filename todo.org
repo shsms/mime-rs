@@ -102,6 +102,14 @@ even the interim fuel counter must land in tulisp's eval loop
 (upstream change + release + dependency bump). Fully blocked on the
 tulisp wishlist item.
 
+Note [2026-10-06]: unblocked by tulisp 0.31.0's
+~TulispContext::set_interrupt_check~: a closure tulisp calls about every
+1024 function calls and loop turns, which can stop the running program
+with an error no handler catches (~Interrupt::Stop~); an ~unwind-protect~
+cleanup runs until the next check. A deadline set before each program and checked
+there bounds a ~(while t)~; a Rust builtin that runs long is not stopped
+until it returns to Lisp.
+
 ** TODO Failed-run rollback: buffers have no identity token [#C]
 [2026-07-16 review] The multi-buffer rollback restores by NAME. A program
 that kills a buffer and re-creates one with the same name and the same
@@ -1621,11 +1629,19 @@ Emacs functions on 2026-09-25.
 source string (returning the form + the rest), instead of parse-all →
 eval-all. Check what the parser already exposes before adding API.
 
-** TODO ~format~ conversions ~%x %o %c %e %g~
+** DONE ~format~ conversions ~%x %o %c %e %g~
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-10-06 Di 21:05] \\
+  tulisp 0.31.0 has them, with the + / space / # flags.
+:END:
 ** TODO Obarray introspection
 Enumerate defined symbols / arity / docs, so MCP can advertise the live
 vocabulary and tooling can reflect on a session.
-** TODO Cooperative cancellation
+** DONE Cooperative cancellation
+:LOGBOOK:
+- State "DONE"       from "TODO"       [2026-10-06 Di 21:05] \\
+  tulisp 0.31.0: TulispContext::set_interrupt_check, whose closure can stop the running evaluation (Interrupt::Stop, which no handler catches).
+:END:
 A ~thread-signal~-style interrupt — unblocks per-program resource limits
 above.
 ** TODO Parity odds & ends
@@ -1639,8 +1655,10 @@ needed (concat …) instead); also =\s-= syntax classes in regexes are
 rejected with a good pointer to [[:space:]] — error text fine, worth a
 line in the regex help topic.
 
-** TODO Reader: a symbol directly followed by ( fails to read [#C]
+** DONE Reader: a symbol directly followed by ( fails to read [#C]
 :LOGBOOK:
+- State "DONE"       from "TODO"       [2026-10-06 Di 21:05] \\
+  tulisp 0.31.0 ends a symbol where Emacs does: '(save-restriction(when t 1)) reads as (save-restriction (when t 1)).
 - State "TODO"       from              [2026-09-25 Fr 17:44]
 :END:
 
