@@ -2938,11 +2938,10 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     }
     // ---- filling ---- The Emacs variables the filler reads. `defvar` marks
     // them special, so a `let` rebinding is seen from Rust as `setq` is.
-    ctx.eval_string(
-        "(progn (defvar fill-column 80) (defvar fill-prefix nil) \
-                (defvar sentence-end-double-space t))",
-    )
-    .expect("the fill variables define");
+    ctx.defvar("fill-column", 80)
+        .and_then(|()| ctx.defvar("fill-prefix", TulispObject::nil()))
+        .and_then(|()| ctx.defvar("sentence-end-double-space", true))
+        .expect("the fill variables define");
     let fill_column = ctx.intern("fill-column");
     let fill_prefix = ctx.intern("fill-prefix");
     let double_space = ctx.intern("sentence-end-double-space");
