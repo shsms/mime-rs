@@ -9,7 +9,8 @@ use crate::result::{RunReport, unified_diff};
 use crate::store::TextStore;
 use std::cell::RefCell;
 use std::rc::Rc;
-use tulisp::TulispContext;
+use std::time::{Duration, Instant};
+use tulisp::{Interrupt, TulispContext};
 
 /// State shared between a running program and the editor builtins. The editor
 /// primitives close over an `Rc<RefCell<Session>>` (tulisp is single-threaded,
@@ -306,6 +307,9 @@ pub struct Workspace {
     /// shows in `list-checkpoints` nor is touched by rehearse's rollback.
     /// Bounded to [`UNDO_RING_CAP`]; no redo.
     undo_ring: Vec<Checkpoint>,
+    /// The longest each program may run; see
+    /// [`set_time_limit`](Self::set_time_limit).
+    time_limit: Option<Duration>,
 }
 
 /// Depth of the automatic undo ring. Snapshots are O(1) for Quire and the
@@ -413,7 +417,25 @@ impl Workspace {
             last_failure_rolled_back: std::cell::Cell::new(false),
             last_used: std::cell::Cell::new(0),
             undo_ring: Vec::new(),
+            time_limit: None,
         }
+    }
+
+    /// Stops each program this workspace runs once it has run longer than
+    /// `limit`; `None`, the default, sets no limit, and so does a limit too
+    /// large to add to the clock. A stopped program fails with an error that no
+    /// `condition-case` or `catch` catches, and is rolled back as any failed
+    /// program is, unless it keeps its partial edits. tulisp checks the clock
+    /// after about every 1024 function calls and loop turns, so an
+    /// `unwind-protect` cleanup runs only until the next check, and a builtin
+    /// that runs long stops only once it returns to Lisp or calls into it.
+    pub fn set_time_limit(&mut self, limit: Option<Duration>) {
+        self.time_limit = limit;
+    }
+
+    /// The limit [`set_time_limit`](Self::set_time_limit) set, if any.
+    pub fn time_limit(&self) -> Option<Duration> {
+        self.time_limit
     }
 
     /// Stamp this workspace as just-used (see `last_used`).
@@ -778,7 +800,22 @@ impl Workspace {
             )
         };
 
-        let value = match self.ctx.eval_string(program) {
+        if let Some(limit) = self.time_limit
+            && let Some(at) = Instant::now().checked_add(limit)
+        {
+            self.ctx.set_interrupt_check(move || {
+                if Instant::now() >= at {
+                    Interrupt::Stop(format!(
+                        "the program ran longer than {limit:?}, the limit for one program"
+                    ))
+                } else {
+                    Interrupt::Continue
+                }
+            });
+        }
+        let result = self.ctx.eval_string(program);
+        self.ctx.clear_interrupt_check();
+        let value = match result {
             Ok(v) => v.to_string(),
             // Record whether the dying program left edits behind in the primary
             // buffer (a warm run does not roll back), so the failure JSON can
@@ -2783,5 +2820,41 @@ mod tests {
             "1",
             "a mid-line restriction stays short"
         );
+    }
+
+    #[test]
+    fn a_program_past_the_time_limit_stops_and_rolls_back() {
+        let mut ws = Workspace::new(Box::new(Buffer::from_string("t", "abc")));
+        ws.set_time_limit(Some(Duration::from_millis(50)));
+        // Loops far longer than the limit, but not for long, so a missing check
+        // fails the test instead of hanging it.
+        let long = "(dotimes (i 10000000))";
+        for program in [
+            format!(r#"(insert "x") {long}"#),
+            format!("(condition-case nil {long} (t 'caught))"),
+            format!("(catch 'done {long})"),
+        ] {
+            let Err(e) = ws.run(&program) else {
+                panic!("{program}: ran to the end");
+            };
+            assert!(e.contains("ran longer than"), "{program}: {e}");
+            assert_eq!(ws.text(), "abc", "{program}: rolled back");
+        }
+        let Err(e) = ws.rehearse(&format!(r#"(insert "x") {long}"#)) else {
+            panic!("rehearse: ran to the end");
+        };
+        assert!(e.contains("ran longer than"), "rehearse: {e}");
+        // The limit is per program: the programs above together ran past it,
+        // and one that passes several checks still runs to the end.
+        ws.run(r#"(dotimes (i 5000)) (insert "y")"#).unwrap();
+        assert_eq!(ws.text(), "yabc");
+        // No limit, the default, lets a program run to the end, as does one too
+        // large to reach.
+        ws.set_time_limit(Some(Duration::MAX));
+        ws.run("(dotimes (i 5000))").unwrap();
+        ws.set_time_limit(None);
+        assert_eq!(ws.time_limit(), None);
+        ws.run(r#"(dotimes (i 300000)) (insert "z")"#).unwrap();
+        assert_eq!(ws.text(), "yzabc");
     }
 }
