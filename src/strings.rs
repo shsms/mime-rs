@@ -168,14 +168,6 @@ pub fn register(ctx: &mut TulispContext) {
         s.chars().next().map_or(0, |c| c as i64)
     });
 
-    // (string-join LIST &optional SEPARATOR) — concatenate with SEPARATOR.
-    ctx.defun(
-        "string-join",
-        |parts: Vec<String>, sep: Option<String>| -> String {
-            parts.join(sep.as_deref().unwrap_or(""))
-        },
-    );
-
     // (string-empty-p STRING) — t iff STRING is "".
     ctx.defun("string-empty-p", |s: String| -> bool { s.is_empty() });
 }
