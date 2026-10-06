@@ -138,10 +138,9 @@ pub fn register(ctx: &mut TulispContext) {
     );
 
     // (number-to-string N) — int or float to its printed form.
-    ctx.defun(
-        "number-to-string",
-        |n: TulispObject| -> Result<String, Error> { number_to_string(&n) },
-    );
+    ctx.defun("number-to-string", |n: tulisp::Number| -> String {
+        n.to_string()
+    });
     // (string-to-number STRING &optional BASE) — leading int/float; 0 if none.
     // BASE (other than 10) applies to integer parsing only, like Emacs.
     ctx.defun(
@@ -264,80 +263,6 @@ fn capitalize(s: &str) -> String {
         }
     }
     out
-}
-
-/// Print N (int or float) like Emacs's `number-to-string`.
-fn number_to_string(n: &TulispObject) -> Result<String, Error> {
-    if let Ok(i) = i64::try_from(n) {
-        Ok(i.to_string())
-    } else if let Ok(f) = f64::try_from(n) {
-        Ok(format_float(f))
-    } else {
-        Err(Error::lisp_error(format!(
-            "Wrong type argument: numberp, {n}"
-        )))
-    }
-}
-
-/// Format a float the way Emacs's `number-to-string` does: the shortest
-/// round-tripping decimal, always carrying a decimal point or exponent (so 3.0
-/// prints "3.0", not "3"). Emacs follows C `%g`'s decimal-vs-exponential rule
-/// keyed on the shortest digit string: with D significant digits and the
-/// leading digit at decimal exponent X, it prints in exponent form when X < -4
-/// or X >= max(15, D) — e.g. 1e15 -> "1e+15" but 1234567890123456.0 stays
-/// decimal — and pads the exponent to at least two digits ("1e-05").
-fn format_float(f: f64) -> String {
-    if f.is_nan() {
-        // Emacs prints these as 0.0e+NaN / N.Ne+INF; we won't hit them from
-        // ordinary arithmetic, but keep a sane fallback.
-        return "0.0e+NaN".to_string();
-    }
-    if f.is_infinite() {
-        return if f < 0.0 {
-            "-1.0e+INF".to_string()
-        } else {
-            "1.0e+INF".to_string()
-        };
-    }
-    // Rust's "{:e}" is the shortest round-tripping form, always "d[.ddd]eX",
-    // e.g. "1.5e15", "1e0", "-3e-5". Pull the sign, digits, and exponent out.
-    let sci = format!("{f:e}");
-    let (sign, rest) = match sci.strip_prefix('-') {
-        Some(r) => ("-", r),
-        None => ("", sci.as_str()),
-    };
-    let (mantissa, exp_str) = rest.split_once('e').unwrap_or((rest, "0"));
-    let exp: i32 = exp_str.parse().unwrap_or(0);
-    // Significant digits, with the decimal point removed.
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let d = digits.len() as i32;
-
-    // Emacs's %g-style cutoff on the shortest representation.
-    if exp < -4 || exp >= 15.max(d) {
-        // Exponential form: a single significant digit stays bare ("1e+15"),
-        // multiple digits carry the point ("1.5e+15").
-        let mant = if digits.len() == 1 {
-            digits.clone()
-        } else {
-            format!("{}.{}", &digits[..1], &digits[1..])
-        };
-        let esign = if exp < 0 { '-' } else { '+' };
-        format!("{sign}{mant}e{esign}{:02}", exp.abs())
-    } else if exp >= 0 {
-        // Decimal form, value >= 1. Place the point after exp+1 digits.
-        let point = (exp + 1) as usize;
-        if point >= digits.len() {
-            // Pad integer part with trailing zeros; fraction is ".0".
-            let zeros = "0".repeat(point - digits.len());
-            format!("{sign}{digits}{zeros}.0")
-        } else {
-            format!("{sign}{}.{}", &digits[..point], &digits[point..])
-        }
-    } else {
-        // Decimal form, 0 < |value| < 1: "0.00ddd" with -exp-1 leading zeros.
-        let zeros = "0".repeat((-exp - 1) as usize);
-        format!("{sign}0.{zeros}{digits}")
-    }
 }
 
 /// Parse a leading number out of STRING like Emacs's `string-to-number`,
@@ -637,6 +562,10 @@ mod tests {
         assert_eq!(s("(number-to-string 1e-5)"), "1e-05");
         assert_eq!(s("(number-to-string 9e-5)"), "9e-05");
         assert_eq!(s("(number-to-string 1e-100)"), "1e-100");
+        assert_eq!(
+            p(r#"(condition-case e (number-to-string "1") (error e))"#),
+            r#"(wrong-type-argument numberp "1")"#
+        );
     }
 
     #[test]
