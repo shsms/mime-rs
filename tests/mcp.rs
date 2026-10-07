@@ -3098,6 +3098,58 @@ fn help_serves_topics_and_lists_them_on_a_miss() {
 }
 
 #[test]
+fn replace_alls_match_the_text_as_it_stood_and_keep_literals_literal() {
+    let mut s = Server::spawn();
+    s.call_ok(
+        1,
+        "open_text",
+        json!({ "text": "        x\n    y\nDoe, John\na.b( axb(\n", "session": "re" }),
+    );
+
+    // A regex replace-all matches the text as it stood: taking one indent level
+    // off does not expose a second one to the same edit. Backrefs expand, and a
+    // literal replace-all in the same batch inserts its replacement as written.
+    let out = s.call_ok(
+        2,
+        "replace_text",
+        json!({ "session": "re", "edits": [
+            { "pattern": "^    ", "replacement": "", "mode": "regex", "all": true },
+            { "pattern": "\\([A-Za-z]+\\), \\([A-Za-z]+\\)", "replacement": "\\2 \\1",
+              "mode": "regex", "all": true },
+            { "pattern": "a.b(", "replacement": "\\1\\&", "all": true },
+        ] }),
+    );
+    assert!(
+        out.contains("applied 3 edit(s), 4 replacement(s)"),
+        "got: {out}"
+    );
+    let text = s.read_text(3, json!({ "session": "re", "start": 1, "end": 28 }));
+    assert_eq!(text, "    x\ny\nJohn Doe\n\\1\\& axb(\n");
+
+    // A literal pattern is no regex: `a.b(` counts only itself among the rest,
+    // and a literal replace-all inserts its replacement as written.
+    s.call_ok(
+        4,
+        "open_text",
+        json!({ "text": "a.b( a.b( axb(\n", "session": "lit" }),
+    );
+    let out = s.call_ok(
+        5,
+        "replace_text",
+        json!({ "session": "lit", "pattern": "a.b(", "replacement": "Q", "expect_unique": false }),
+    );
+    assert!(out.contains("1 more match(es) remain"), "got: {out}");
+    let out = s.call_ok(
+        6,
+        "replace_text",
+        json!({ "session": "lit", "pattern": "a.b(", "replacement": "\\1\\&", "all": true }),
+    );
+    assert!(out.contains("replaced 1 occurrence"), "got: {out}");
+    let text = s.read_text(7, json!({ "session": "lit", "start": 1, "end": 13 }));
+    assert_eq!(text, "Q \\1\\& axb(\n");
+}
+
+#[test]
 fn multi_file_replace_is_atomic_across_the_set() {
     let dir = temp_dir("multi-file");
     let a = dir.join("a.txt");
