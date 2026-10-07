@@ -2059,13 +2059,10 @@ fn tool_replace_text(
     let unique = unique_arg(args, all, "replace_text")?;
     let regex = regex_mode(args, "replace_text")?;
     let (pat, rep) = (lisp_literal(&pattern), lisp_literal(&replacement));
-    let all_flag = if all { "t" } else { "nil" };
-    // search → delete → insert per hit, tracking the line of the last
-    // replacement so the result can say WHERE it landed; `more` counts the
-    // matches left after the last replacement so a single replace can say "N
-    // more remain". The continue-guard runs BEFORE the search so a finished
-    // single replace does not move point past (and so under-count) the next
-    // match. A miss restores point — a failed replace is a no-op, not a stealth
+    // A replace reports the line of its last edit, so the result can say WHERE
+    // it landed, and a first-match replace (expect_unique:false) also counts
+    // the matches left after it, so it can say "N more remain". A miss restores
+    // point — a failed replace is a no-op, not a stealth
     // (goto-char (point-min)).
     //
     // expect_unique counts the matches first, in the text as it stands (and
@@ -2076,18 +2073,7 @@ fn tool_replace_text(
     // ambiguity error's listing counts the unedited text too.
     let program = if unique {
         let count = count_to_two(&pat, regex);
-        // replace-match expands \\1 backrefs; the literal form inserts as is.
-        let (find, edit) = if regex {
-            (
-                format!("(re-search-forward \"{pat}\" nil t)"),
-                format!("(replace-match \"{rep}\")"),
-            )
-        } else {
-            (
-                format!("(search-forward \"{pat}\" nil t)"),
-                format!("(delete-region (match-beginning 0) (point)) (insert \"{rep}\")"),
-            )
-        };
+        let (find, edit) = replace_once(&pat, &rep, regex);
         format!(
             "(let ((n 0))\
                (save-excursion (goto-char (point-min)) {count})\
@@ -2100,46 +2086,36 @@ fn tool_replace_text(
                (report \"line\" (line-number-at-pos (point)))\
                (report \"point\" (point)))"
         )
-    } else if regex && all {
-        // The bulk pass is the native replace-regexp: one call locates every
-        // match, expands its backrefs, and steps over zero-width matches.
+    } else if all {
+        let replace = replace_all(&pat, &rep, regex);
         format!(
             "(progn (let ((p0 (point)))\
                (goto-char (point-min))\
-               (let ((n (replace-regexp \"{pat}\" \"{rep}\")))\
+               (let ((n {replace}))\
                  (if (= n 0) (goto-char p0))\
                  (report \"n\" n)\
                  (report \"line\" (line-number-at-pos (point)))\
                  (report \"more\" 0)\
                  (report \"point\" (point)))))"
         )
-    } else if regex {
+    } else {
+        let (find, edit) = replace_once(&pat, &rep, regex);
+        let rx = if regex {
+            format!("\"{pat}\"")
+        } else {
+            format!("(regexp-quote \"{pat}\")")
+        };
         format!(
             "(progn (let ((p0 (point)) (n 0) (line 0))\
                (goto-char (point-min))\
-               (if (re-search-forward \"{pat}\" nil t)\
-                   (progn (replace-match \"{rep}\")\
+               (if {find}\
+                   (progn {edit}\
                           (setq line (line-number-at-pos (point)))\
                           (setq n 1)))\
                (if (= n 0) (goto-char p0))\
                (report \"n\" n)\
                (report \"line\" line)\
-               (report \"more\" (count-matches \"{pat}\"))\
-               (report \"point\" (point))))"
-        )
-    } else {
-        format!(
-            "(progn (let ((p0 (point)) (n 0) (line 0))\
-               (goto-char (point-min))\
-               (while (and (or {all_flag} (= n 0)) (search-forward \"{pat}\" nil t))\
-                 (delete-region (match-beginning 0) (point))\
-                 (insert \"{rep}\")\
-                 (setq line (line-number-at-pos (point)))\
-                 (setq n (+ n 1)))\
-               (if (= n 0) (goto-char p0))\
-               (report \"n\" n)\
-               (report \"line\" line)\
-               (report \"more\" (count-matches (regexp-quote \"{pat}\")))\
+               (report \"more\" (count-matches {rx}))\
                (report \"point\" (point))))"
         )
     };
@@ -2626,11 +2602,7 @@ fn regex_mode(args: &Value, what: &str) -> Result<bool, String> {
 /// alone: the loop steps over a zero-width match so the sweep terminates.
 /// `body` may set `stop` to end the sweep after this match.
 fn each_match(pat: &str, regex: bool, body: &str) -> String {
-    let search = if regex {
-        "re-search-forward"
-    } else {
-        "search-forward"
-    };
+    let search = search_command(regex);
     format!(
         "(let ((stop nil))\
            (while (and (not stop) ({search} \"{pat}\" nil t))\
@@ -2640,11 +2612,47 @@ fn each_match(pat: &str, regex: bool, body: &str) -> String {
     )
 }
 
+/// The Lisp command that searches forward for a pattern of the given mode.
+fn search_command(regex: bool) -> &'static str {
+    if regex {
+        "re-search-forward"
+    } else {
+        "search-forward"
+    }
+}
+
 /// A Lisp loop counting the matches of the (already lisp-escaped) pattern `pat`
 /// from point into the variable `n`, stopping at the second: enough to tell
 /// none, one and several apart.
 fn count_to_two(pat: &str, regex: bool) -> String {
     each_match(pat, regex, "(setq n (1+ n)) (if (> n 1) (setq stop t))")
+}
+
+/// The Lisp that finds the next match of the (already lisp-escaped) pattern
+/// `pat` from point, and the edit that then replaces it with `rep`:
+/// replace-match expands `\N` backrefs, the literal form inserts `rep` as is.
+fn replace_once(pat: &str, rep: &str, regex: bool) -> (String, String) {
+    let find = format!("({} \"{pat}\" nil t)", search_command(regex));
+    let edit = if regex {
+        format!("(replace-match \"{rep}\")")
+    } else {
+        format!("(delete-region (match-beginning 0) (point)) (insert \"{rep}\")")
+    };
+    (find, edit)
+}
+
+/// The native call that replaces every match of the (already lisp-escaped)
+/// pattern `pat` from point on with `rep`, and returns how many it replaced.
+/// Each finds every match in the text as it stands, in one pass: replace-regexp
+/// expands backrefs and steps over zero-width matches, and replace-string
+/// inserts `rep` as written.
+fn replace_all(pat: &str, rep: &str, regex: bool) -> String {
+    let replace = if regex {
+        "replace-regexp"
+    } else {
+        "replace-string"
+    };
+    format!("({replace} \"{pat}\" \"{rep}\")")
 }
 
 /// Where every occurrence of the (already lisp-escaped) pattern `pat` is: its
@@ -2836,7 +2844,6 @@ fn run_batch_edits(
             i + 1,
             truncate_for_error(&pattern)
         ));
-        let all_flag = if all { "t" } else { "nil" };
         // Uniqueness is counted before the edit, in the buffer as the previous
         // edits left it: counted afterwards, a regex that looks at its
         // neighbours (\b, ^) could match differently in the edited text.
@@ -2850,31 +2857,20 @@ fn run_batch_edits(
             String::new()
         };
         body.push_str(&unique_check);
-        if regex {
-            // replace-match expands \\N backrefs; a zero-width match steps one
-            // char forward so the sweep terminates.
+        if all {
+            let replace = replace_all(&pat, &rep, regex);
             body.push_str(&format!(
                 "(goto-char (point-min))\
-                 (let ((n 0) (stop nil))\
-                   (while (and (not stop) (or {all_flag} (= n 0))\
-                               (re-search-forward \"{pat}\" nil t))\
-                     (let ((empty (= (match-beginning 0) (match-end 0))))\
-                       (replace-match \"{rep}\")\
-                       (setq n (+ n 1))\
-                       (if empty (if (< (point) (point-max)) (forward-char 1) (setq stop t)))))\
+                 (let ((n {replace}))\
                    (if (= n 0) (error \"{miss}\"))\
                    (report \"n\" n))"
             ));
         } else {
+            let (find, edit) = replace_once(&pat, &rep, regex);
             body.push_str(&format!(
                 "(goto-char (point-min))\
-                 (let ((n 0))\
-                   (while (and (or {all_flag} (= n 0)) (search-forward \"{pat}\" nil t))\
-                     (delete-region (match-beginning 0) (point))\
-                     (insert \"{rep}\")\
-                     (setq n (+ n 1)))\
-                   (if (= n 0) (error \"{miss}\"))\
-                   (report \"n\" n))"
+                 (if {find} (progn {edit}) (error \"{miss}\"))\
+                 (report \"n\" 1)"
             ));
         }
     }
