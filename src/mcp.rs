@@ -2075,7 +2075,7 @@ fn tool_replace_text(
     // neighbours (\b, ^) can match differently once the edit is made, and the
     // ambiguity error's listing counts the unedited text too.
     let program = if unique {
-        let count = each_match(&pat, regex, "(setq n (1+ n))");
+        let count = count_to_two(&pat, regex);
         // replace-match expands \\1 backrefs; the literal form inserts as is.
         let (find, edit) = if regex {
             (
@@ -2624,6 +2624,7 @@ fn regex_mode(args: &Value, what: &str) -> Result<bool, String> {
 /// A Lisp loop running `body` at every occurrence of the (already
 /// lisp-escaped) pattern `pat` from point on. `body` must leave the match data
 /// alone: the loop steps over a zero-width match so the sweep terminates.
+/// `body` may set `stop` to end the sweep after this match.
 fn each_match(pat: &str, regex: bool, body: &str) -> String {
     let search = if regex {
         "re-search-forward"
@@ -2637,6 +2638,13 @@ fn each_match(pat: &str, regex: bool, body: &str) -> String {
              (if (= (match-beginning 0) (match-end 0))\
                  (if (< (point) (point-max)) (forward-char 1) (setq stop t)))))"
     )
+}
+
+/// A Lisp loop counting the matches of the (already lisp-escaped) pattern `pat`
+/// from point into the variable `n`, stopping at the second: enough to tell
+/// none, one and several apart.
+fn count_to_two(pat: &str, regex: bool) -> String {
+    each_match(pat, regex, "(setq n (1+ n)) (if (> n 1) (setq stop t))")
 }
 
 /// Where every occurrence of the (already lisp-escaped) pattern `pat` is: its
@@ -2722,7 +2730,7 @@ fn scope_hint(
     regex: bool,
     defuns: &[String],
 ) -> String {
-    let count = each_match(pat, regex, "(setq n (1+ n))");
+    let count = count_to_two(pat, regex);
     for name in defuns.iter().take(8) {
         let program = format!(
             "(save-excursion (save-restriction \
@@ -2836,7 +2844,7 @@ fn run_batch_edits(
             format!(
                 "(goto-char (point-min))\
                  (let ((n 0)) {} (if (> n 1) (error \"{ambiguous}\")))",
-                each_match(&pat, regex, "(setq n (1+ n))")
+                count_to_two(&pat, regex)
             )
         } else {
             String::new()
