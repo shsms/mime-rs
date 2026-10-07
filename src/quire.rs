@@ -1422,6 +1422,11 @@ impl Quire {
     /// direction is therefore amortized O(chars traversed), and a cold seek
     /// costs the distance to the nearer END of the piece, not to its head.
     fn scan_prefix(&self, piece: &Piece, n: usize) -> (usize, usize) {
+        // The piece start: nothing to read, and the memo is left for the next
+        // lookup to resume from.
+        if n == 0 {
+            return (0, 0);
+        }
         let anchor = |at: usize, bp: usize, nl: usize| SeekMemo {
             source: piece.source,
             start: piece.start,
@@ -4692,6 +4697,24 @@ mod tests {
         let q = fresh();
         let ps: Vec<usize> = (0..38).map(|i| 1 + i * 27).collect();
         assert_seeks_match_fresh(&q, &fresh, &ps);
+    }
+
+    #[test]
+    fn line_numbers_looked_up_in_order_resume_from_the_seek_memo() {
+        // Without a narrowing, a line lookup must leave the memo near its own
+        // position: one left at the file start makes each lookup in a per-match
+        // loop rescan the piece from its head.
+        let q = Quire::from_string("t", lorem(80));
+        assert_eq!(TextStore::line_number_at_pos(&q, 2), 1);
+        for line in 2..=40 {
+            let p = 1 + (line - 1) * 27;
+            let resumes = memo_resumes();
+            assert_eq!(TextStore::line_number_at_pos(&q, p), line);
+            assert!(
+                memo_resumes() > resumes,
+                "the lookup at {p} rescanned the piece"
+            );
+        }
     }
 
     #[test]
