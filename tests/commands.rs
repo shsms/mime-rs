@@ -145,18 +145,18 @@ fn fill_prefix_overrides_detection_and_bounds_the_paragraph() {
 }
 
 #[test]
-fn sentence_end_double_space_is_on_by_default() {
+fn sentence_end_double_space_is_off_by_default() {
     assert_eq!(
-        run_as("t.md", "One.\nTwo.\n", "(fill-paragraph)"),
-        "One.  Two.\n"
+        run_as("t.md", "One.\nTwo.  Three.\n", "(fill-paragraph)"),
+        "One. Two. Three.\n"
     );
     assert_eq!(
         run_as(
             "t.md",
             "One.\nTwo.\n",
-            "(setq sentence-end-double-space nil) (fill-paragraph)"
+            "(setq sentence-end-double-space t) (fill-paragraph)"
         ),
-        "One. Two.\n"
+        "One.  Two.\n"
     );
 }
 

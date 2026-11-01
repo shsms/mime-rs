@@ -833,7 +833,7 @@ fn fill_message_lf(msg: &str, column: usize) -> String {
     let mut out: Vec<String> = vec![lines[..subject_end].join("\n")];
     let opts = Fill {
         column,
-        double_space: true,
+        double_space: false,
     };
     // The body: runs of everything that is not a trailer block, filled as a
     // whole, around the trailer blocks copied through.
@@ -1451,7 +1451,7 @@ mod tests {
             out,
             "subject line that is long enough to pass the column and must stay\n\
              \n\
-             The body is one paragraph.  It\n\
+             The body is one paragraph. It\n\
              wraps.\n\
              \n\
              - a list item that runs on\n\

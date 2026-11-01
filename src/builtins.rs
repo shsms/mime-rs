@@ -2940,7 +2940,7 @@ pub fn register(ctx: &mut TulispContext, session: &SharedSession) {
     // them special, so a `let` rebinding is seen from Rust as `setq` is.
     ctx.defvar("fill-column", 80)
         .and_then(|()| ctx.defvar("fill-prefix", TulispObject::nil()))
-        .and_then(|()| ctx.defvar("sentence-end-double-space", true))
+        .and_then(|()| ctx.defvar("sentence-end-double-space", TulispObject::nil()))
         .expect("the fill variables define");
     let fill_column = ctx.intern("fill-column");
     let fill_prefix = ctx.intern("fill-prefix");
